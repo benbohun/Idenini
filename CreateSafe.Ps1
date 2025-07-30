@@ -33,7 +33,7 @@ Retrival step
 # CyberArk Account Report via CCP Credential Retrieval (With Process Logging)
 
 # --- Logging Utility ---
-$LogPath = "E:\Installation Media\RemovePendingAccount\CyberArk_AccountReport_RunLog.txt"
+$LogPath = "I:\Script\Identity\accountonboarding.txt"
 Function Write-Log {
     param([string]$Message, [string]$Color = "White")
     $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
@@ -43,11 +43,11 @@ Function Write-Log {
 }
 
 # Settings for CCP/AIMWebService
-$CCPAddress = "https://vskau1p1231.cna.com"
+$CCPAddress = "https://aam.alliantcreditunion.com"
 $location   = "AIMWebService"
-$application= "PAMDiscovery"
-$safe       = "CA_PCloud_Admins"
-$object     = "cna.com-CA_PAMDiscovery_SVC"
+$application= "PAMTEST"
+$safe       = "PAMTEST"
+$object     = "alliant-test.cyberark.cloud-botpamtest"
 
 $headers = New-Object "System.Collections.Generic.Dictionary[[String],[String]]"
 $headers.Add("Content-Type", "application/json")
@@ -96,8 +96,8 @@ if ([string]::IsNullOrEmpty($Description)) {
 }
 
 # Step 2: Define CyberArk Authentication Variables
-$IdentityTenantID = "aat4012"  # Replace with actual CyberArk Identity tenant ID
-$PCloudSubdomain = "cna-prod"  # Replace with actual CyberArk Privilege Cloud Subdomain
+$IdentityTenantID = "aap4748"  # Replace with actual CyberArk Identity tenant ID
+$PCloudSubdomain = "alliant-test"  # Replace with actual CyberArk Privilege Cloud Subdomain
 $ClientID = Read-Host "Enter your CyberArk API Client ID"
 $ClientSecret = Read-Host "Enter your CyberArk API Client Secret" -AsSecureString
 $ClientSecret = [System.Net.NetworkCredential]::new("", $ClientSecret).Password  # Convert SecureString to plain text
@@ -155,7 +155,7 @@ $SafePayload = @{
     "description"               = $Description
     "olacEnabled"               = $false  # Default value
     "autoPurgeEnabled"          = $false  # Default value
-    "managingCPM"               = "CNA_PASS_MANG"  # Default CPM
+    "managingCPM"               = "HQVUCYBARK102"  # Default CPM
     "numberOfDaysRetention" = 180  # Default retention policy
 } | ConvertTo-Json -Depth 3
 
