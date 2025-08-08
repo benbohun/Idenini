@@ -1,39 +1,22 @@
 Create Safe and Add Default Permission
  
-1. Create Safe
-2. Add safe group ACL and default permissions
- 
-Pre-requisite
- 
-Ensure to check out the BOT API Identity Account (cnarestbot@cyberark.cloud.6679) AND password from CyberArk
+Safe Create And Default Membership Permission
  
 Steps A (Create Safe)
-1. Logon to VSKAU1P1230, Navigate to E:\Installation Media\Script
-2. Click file and run PowerShell as an administrator
-3. Run .\CreateSafe.ps1 script
-4. Enter New Safe Name on the prompt 
-5. Enter New Safe Description on the prompt 
-6. Enter CyberArk API Client ID on the prompt  (Admin user with ability to change create safe)
-7. Enter API Client Secret  on the prompt (Admin user Password)
- 
-Once Safe is created, follow next steps for adding default permissions
- 
-Steps B (Add Permission)
-1. Navigate to E:\Installation Media\Script
+1. Logon to server Host, Navigate to C:\OnboardScript
 2. Click file and run powershell as an administrator
-3. Run .\AddDefaultSafemembership.ps1 script
-4. Enter Safe Name on the prompt (Newly Created Safe)
-5. Enter Group Name on the prompt  (CA_ safe group, MUST CONTAIN @CNA.COM)
-6. Enter CyberArk API Client ID on the prompt  (Admin user with ability to change create safe)
-7. Enter API Client Secret on the prompt  (Admin user Password)
-8. Logon to PVWA to validate 
+3. Run .\Autoonboardingscript.ps12 script
+4. Enter New Safe Name
+5. Enter New Safe Description
+6. Wait for safename to provision...
+7. Enter group name (in full): e.g. CA_CYBERARKADMINS@domain.com
+8. Safe Provisioning Completed
+9: Review logs E:\accountonboarding.txt
+
 :::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
 
-Retrival step
-# CyberArk Account Report via CCP Credential Retrieval (With Process Logging)
-
 # --- Logging Utility ---
-$LogPath = "I:\Script\Identity\accountonboarding.txt"
+$LogPath = "E:\Installation Media\Script\OnboardScript\accountonboarding.txt"
 Function Write-Log {
     param([string]$Message, [string]$Color = "White")
     $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
@@ -42,12 +25,12 @@ Function Write-Log {
     Add-Content -Path $LogPath -Value $LogEntry
 }
 
-# Settings for CCP/AIMWebService
-$CCPAddress = "https://aam.alliantcreditunion.com"
+# --- Retrieve CyberArk API Credentials from CCP ---
+$CCPAddress = "https://hostname.domain.com"
 $location   = "AIMWebService"
-$application= "PAMTEST"
-$safe       = "PAMTEST"
-$object     = "alliant-test.cyberark.cloud-botpamtest"
+$application= "PAMDiscovery"
+$safe       = "XXX"
+$object     = "XXXXX"
 
 $headers = New-Object "System.Collections.Generic.Dictionary[[String],[String]]"
 $headers.Add("Content-Type", "application/json")
@@ -66,67 +49,46 @@ try {
     Write-Log "ERROR: CCP credential fetch failed - $_" "Red"
     exit 1
 }
-:::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
-# Import the psPAS Module
-Import-Module psPAS
 
-# Define Log File
-$LogFile = "SafeCreationLog.txt"
-Function Write-Log {
-    Param ([string]$Message)
-    $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $LogEntry = "$Timestamp - $Message"
-    Add-Content -Path $LogFile -Value $LogEntry
-    Write-Output $LogEntry
-}
-
-# Step 1: Define Required Variables (Prompt for Safe Name & Description)
+# --- Prompt for Safe Name & Description ---
 $SafeName = Read-Host "Enter the Safe Name"
 $Description = Read-Host "Enter the Safe Description"
 
-# Ensure values are provided
 if ([string]::IsNullOrEmpty($SafeName)) {
     Write-Log "❌ ERROR: Safe Name cannot be empty. Exiting..."
     exit
 }
-
 if ([string]::IsNullOrEmpty($Description)) {
     Write-Log "❌ ERROR: Safe Description cannot be empty. Exiting..."
     exit
 }
 
-# Step 2: Define CyberArk Authentication Variables
-$IdentityTenantID = "aap4748"  # Replace with actual CyberArk Identity tenant ID
-$PCloudSubdomain = "alliant-test"  # Replace with actual CyberArk Privilege Cloud Subdomain
-$ClientID = Read-Host "Enter your CyberArk API Client ID"
-$ClientSecret = Read-Host "Enter your CyberArk API Client Secret" -AsSecureString
-$ClientSecret = [System.Net.NetworkCredential]::new("", $ClientSecret).Password  # Convert SecureString to plain text
+# --- Authentication Variables (from CCP) ---
+$IdentityTenantID = "aawxxxx"        # CyberArk Identity tenant ID
+$PCloudSubdomain  = "pcloudsubdomain"   # CyberArk Privilege Cloud Subdomain
+$ClientID         = $response.Username
+$ClientSecret     = $response.Content
 
-# Ensure variables are set correctly
 if ([string]::IsNullOrEmpty($ClientID) -or [string]::IsNullOrEmpty($ClientSecret)) {
     Write-Log "ERROR: Client ID or Client Secret is missing. Exiting..."
     exit
 }
 
-# Step 3: Request Initial Token
+# --- Request OAuth Token ---
 Write-Log "Requesting initial CyberArk ISPSS token..."
 $TokenURL = "https://$IdentityTenantID.id.cyberark.cloud/oauth2/platformtoken"
-
 $TokenBody = @{
     grant_type    = "client_credentials"
     client_id     = $ClientID
     client_secret = $ClientSecret
 }
-
-$headers = @{
+$headers_token = @{
     "Content-Type" = "application/x-www-form-urlencoded"
 }
 
 try {
-    $TokenResponse = Invoke-RestMethod -Uri $TokenURL -Method Post -Headers $headers -Body $TokenBody
-    $BearerToken = [string]$TokenResponse.access_token  # Ensure token is a string
-
-    # Ensure Token is Valid
+    $TokenResponse = Invoke-RestMethod -Uri $TokenURL -Method Post -Headers $headers_token -Body $TokenBody
+    $BearerToken = [string]$TokenResponse.access_token
     if ([string]::IsNullOrEmpty($BearerToken) -or $BearerToken.Length -lt 100) {
         Write-Log "ERROR: Received an invalid token. Length: $($BearerToken.Length)"
         exit
@@ -137,36 +99,119 @@ try {
     exit
 }
 
-# Step 4: Define Headers for API Requests
-$headers = @{
+# --- Define Headers for API Requests ---
+$headers_api = @{
     "Authorization" = "Bearer $BearerToken"
     "Content-Type"  = "application/json"
 }
 
-# Step 5: Create Safe Using API
+# --- Create Safe Using API ---
 Write-Log "🔹 Creating Safe: ${SafeName}..."
 
-# Construct API Endpoint
 $APIEndpoint = "https://$PCloudSubdomain.privilegecloud.cyberark.cloud/PasswordVault/API/Safes/"
-
-# Construct JSON Payload (Defaults Applied)
 $SafePayload = @{
     "safeName"                  = $SafeName
     "description"               = $Description
     "olacEnabled"               = $false  # Default value
     "autoPurgeEnabled"          = $false  # Default value
-    "managingCPM"               = "HQVUCYBARK102"  # Default CPM
-    "numberOfDaysRetention" = 180  # Default retention policy
+    "managingCPM"               = "CPM"  # Default CPM
+    "numberOfDaysRetention"     = 180  # Default retention policy
 } | ConvertTo-Json -Depth 3
 
 Write-Log "Creating Safe: ${SafeName} with payload: $SafePayload"
 
 try {
-    $Response = Invoke-RestMethod -Uri $APIEndpoint -Method Post -Headers $headers -Body $SafePayload -ErrorAction Stop
+    $Response = Invoke-RestMethod -Uri $APIEndpoint -Method Post -Headers $headers_api -Body $SafePayload -ErrorAction Stop
     Write-Log "✅ Successfully created Safe: ${SafeName}."
 } catch {
     Write-Log "❌ ERROR: Failed to create Safe: ${SafeName} - $_"
+    exit
 }
 
-Write-Log "🔹 Safe creation process completed."
+# --- Add Safe Members ---
+$GroupName = Read-Host "Enter the Group Name to be added to the Safe"
+if ([string]::IsNullOrEmpty($GroupName)) {
+    Write-Log "❌ ERROR: Group Name cannot be empty. Exiting..."
+    exit
+}
+
+$APIEndpointMembers = "https://$PCloudSubdomain.privilegecloud.cyberark.cloud/PasswordVault/API/Safes/$SafeName/Members/"
+
+$LimitedPermissions = @{
+    "useAccounts" = $false
+    "retrieveAccounts" = $false
+    "listAccounts" = $true
+    "addAccounts" = $false
+    "updateAccountContent" = $false
+    "updateAccountProperties" = $false
+    "initiateCPMAccountManagementOperations" = $true
+    "specifyNextAccountContent" = $false
+    "renameAccounts" = $false
+    "deleteAccounts" = $false
+    "unlockAccounts" = $true
+    "manageSafe" = $false
+    "manageSafeMembers" = $false
+    "backupSafe" = $false
+    "viewAuditLog" = $true
+    "viewSafeMembers" = $true
+    "accessWithoutConfirmation" = $true
+    "createFolders" = $false
+    "deleteFolders" = $false
+    "moveAccountsAndFolders" = $false
+    "requestsAuthorizationLevel1" = $true
+    "requestsAuthorizationLevel2" = $false
+}
+$FullPermissions = @{
+    "useAccounts" = $true
+    "retrieveAccounts" = $true
+    "listAccounts" = $true
+    "addAccounts" = $true
+    "updateAccountContent" = $true
+    "updateAccountProperties" = $true
+    "initiateCPMAccountManagementOperations" = $true
+    "specifyNextAccountContent" = $true
+    "renameAccounts" = $true
+    "deleteAccounts" = $true
+    "unlockAccounts" = $true
+    "manageSafe" = $true
+    "manageSafeMembers" = $true
+    "backupSafe" = $true
+    "viewAuditLog" = $true
+    "viewSafeMembers" = $true
+    "accessWithoutConfirmation" = $true
+    "createFolders" = $true
+    "deleteFolders" = $true
+    "moveAccountsAndFolders" = $true
+    "requestsAuthorizationLevel1" = $true
+    "requestsAuthorizationLevel2" = $false
+}
+$Members = @(
+    @{ "memberName" = $GroupName; "memberType" = "Group"; "permissions" = $LimitedPermissions },
+    @{ "memberName" = "Admin Account Group"; "memberType" = "Group"; "permissions" = $FullPermissions },
+    @{ "memberName" = "Breakglass Identity Account"; "memberType" = "User"; "permissions" = $FullPermissions },
+    @{ "memberName" = "Automation identity account"; "memberType" = "User"; "permissions" = $FullPermissions }
+)
+foreach ($Member in $Members) {
+    $MemberName = $Member.memberName
+    $MemberType = $Member.memberType
+    $Permissions = $Member.permissions
+
+    $jsonBody = @{
+        "memberName" = $MemberName
+        "searchIn" = "Vault"
+        "memberType" = $MemberType
+        "permissions" = $Permissions
+    } | ConvertTo-Json -Depth 3
+
+    Write-Log "Adding ${MemberType}: ${MemberName} to Safe: ${SafeName}..."
+
+    try {
+        $Response = Invoke-RestMethod -Uri $APIEndpointMembers -Method Post -Headers $headers_api -Body $jsonBody -ErrorAction Stop
+        Write-Log "✅ Successfully added ${MemberType}: ${MemberName} to ${SafeName}."
+    } catch {
+        Write-Log "❌ ERROR: Failed to add ${MemberType}: ${MemberName} to ${SafeName} - $_"
+    }
+}
+
+Write-Log "🔹 Safe member addition process completed."
 
