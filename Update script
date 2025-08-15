@@ -1,98 +1,90 @@
-# --- Logging Utility ---
-$LogPath = "E:\Installation Media\Script\OnboardScript\UpdateSafeVersion"
-Function Write-Log {
-    param([string]$Message, [string]$Color = "White")
-    $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $LogEntry = "$Timestamp - $Message"
-    Write-Host $LogEntry -ForegroundColor $Color
-    Add-Content -Path $LogPath -Value $LogEntry
+# =========================
+# CCP -> psPAS (no prompts) -> Update Safes
+# =========================
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+
+# --- Logging ---
+$LogFile = "E:\Installation Media\Script\OnboardScript\UpdateSafeVersion\UpdateSafes.log"
+New-Item -ItemType File -Force -Path $LogFile | Out-Null
+function Write-Log([string]$Message, [ConsoleColor]$Color='White'){
+  $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+  $line = "$ts - $Message"
+  Write-Host $line -ForegroundColor $Color
+  Add-Content -Path $LogFile -Value $line
 }
 
-# --- Retrieve CyberArk API Credentials from CCP ---
-$CCPAddress = "https://vskau1p1231.cna.com"
-$location   = "AIMWebService"
-$application= "PAMDiscovery"
-$safe       = "CA_PCloud_Admins"
-$object     = "cna.com-CA_PAMDiscovery_SVC"
+# --- Retrieve API creds from CCP (Object method) ---
+$CCPAddress  = "https://vskau1p1231.cna.com"
+$location    = "AIMWebService"
+$application = "PAMDiscovery"
+$safe        = "CA_PCloud_Admins"
+$object      = "cna.com-CA_PAMDiscovery_SVC"
+$ccpUrl      = "$CCPAddress/$location/api/Accounts?AppID=$application&Safe=$safe&Object=$object"
 
-$headers = New-Object "System.Collections.Generic.Dictionary[[String],[String]]"
-$headers.Add("Content-Type", "application/json")
-$windowsAuth = $false
+Write-Log "Fetching credentials from CCP: AppID=$application, Safe=$safe, Object=$object" Cyan
+$response = Invoke-RestMethod -Uri $ccpUrl -Method GET -Headers @{ 'Content-Type'='application/json' }
 
-Write-Log "Retrieving CyberArk API credentials from CCP via Object method..." "Cyan"
-$ccpUrl = "$CCPAddress/$location/api/Accounts?AppID=$application&Safe=$safe&Object=$object"
-try {
-    $response = Invoke-RestMethod $ccpUrl -Method 'GET' -Headers $headers -UseDefaultCredentials:$windowsAuth
-    if (-not $response -or -not $response.Username -or -not $response.Content) {
-        Write-Log "ERROR: Failed to retrieve API credentials from CCP." "Red"
-        exit 1
-    }
-    Write-Log "Successfully retrieved credentials for user: $($response.Username)" "Green"
-} catch {
-    Write-Log "ERROR: CCP credential fetch failed - $_" "Red"
-    exit 1
+if (-not $response -or -not $response.Username -or -not $response.Content){
+  Write-Log "ERROR: CCP response missing Username/Content." Red; exit 1
 }
-:::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+Write-Log "CCP returned username '$($response.Username)'." Green
 
-# Import psPAS Module
-Import-Module psPAS
+# --- Build PSCredential from CCP secret (no prompt) ---
+$securePwd = ConvertTo-SecureString -String $response.Content -AsPlainText -Force
+$UPCred    = New-Object System.Management.Automation.PSCredential ($response.Username, $securePwd)
 
-# Prompt user for CyberArk credentials
-$UPCred = Get-Credential
+# --- psPAS authentication (Identity header) ---
+Import-Module psPAS -ErrorAction Stop
+$IdentityTenantURL = "aat4012.id.cyberark.cloud"
+$PCloudSubdomain   = "cna-prod"
 
-# Get header authentication (PCLOUD Admins Only)
-$header = Get-IdentityHeader -IdentityTenantURL "aat4012.id.cyberark.cloud" -psPASFormat -PCloudSubdomain "cna-prod" -UPCreds $UPCred
-
-# Register to use header credentials for PAS session
+Write-Log "Obtaining Identity header for '$IdentityTenantURL' (subdomain '$PCloudSubdomain')." Cyan
+$header = Get-IdentityHeader -IdentityTenantURL $IdentityTenantURL -psPASFormat -PCloudSubdomain $PCloudSubdomain -UPCreds $UPCred
 Use-PASSession $header
+Write-Log "PAS session established using CCP credentials (no user prompt)." Green
 
-# Define CSV file path
+# --- Inputs/Outputs ---
 $csvFilePath = "E:\Installation Media\RemovePendingAccount\UpdateSafesParameters.csv"
-# Define log file path
-$logFilePath = "E:\Installation Media\RemovePendingAccount\UpdateLog.txt"
+$opLogFile   = "E:\Installation Media\RemovePendingAccount\UpdateLog.txt"
+New-Item -ItemType File -Force -Path $opLogFile | Out-Null
 
-# Import the CSV file for modification
-$updatedSafes = Import-Csv -Path $csvFilePath
+Write-Log "Loading CSV: $csvFilePath" Cyan
+$rows = Import-Csv -Path $csvFilePath
 
-# Create or clear log file
-New-Item -ItemType File -Path $logFilePath -Force | Out-Null
+# --- Update each safe ---
+foreach($row in $rows){
+  try{
+    $safeName    = $row.safeName
+    $managingCPM = $row.managingCPM
+    if([string]::IsNullOrWhiteSpace($safeName)){ throw "SafeName is required." }
+    if([string]::IsNullOrWhiteSpace($managingCPM)){ throw "ManagingCPM is required." }
 
-# Iterate through each safe and update parameters
-foreach ($safe in $updatedSafes) {
-    try {
-        # Validate that required fields are not empty
-        if ([string]::IsNullOrWhiteSpace($safe.safeName)) {
-            throw "SafeName cannot be empty."
-        }
-        if ([string]::IsNullOrWhiteSpace($safe.managingCPM)) {
-            throw "ManagingCPM cannot be empty."
-        }
-        
-        # Convert Boolean values properly
-        $olacEnabled = if ($safe.olacEnabled -match "(?i)true") { $true } else { $false }
+    $olacEnabled = $false
+    if($row.olacEnabled -match '^(?i:true|1|yes|y)$'){ $olacEnabled = $true }
 
-        # Construct parameters for Set-PASSafe
-        $params = @{
-            SafeName = $safe.safeName
-            ManagingCPM = $safe.managingCPM
-            NumberOfDaysRetention      = 180  # Defaulting to 180 days
-            OLACEnabled                = $olacEnabled
-        }
-
-        # Only add Location if it's not empty
-        if (-not [string]::IsNullOrWhiteSpace($safe.location)) {
-            $params["Location"] = $safe.location
-        }
-
-        # Update the safe
-        Set-PASSafe @params
-        
-        $successMessage = "[SUCCESS] Safe '$($safe.safeName)' updated successfully."
-        Write-Output $successMessage
-        Add-Content -Path $logFilePath -Value $successMessage
-    } catch {
-        $errorMessage = "[ERROR] Failed to update safe '$($safe.safeName)'. Error: $_"
-        Write-Output $errorMessage
-        Add-Content -Path $logFilePath -Value $errorMessage
+    $params = @{
+      SafeName              = $safeName
+      ManagingCPM           = $managingCPM
+      NumberOfDaysRetention = 180
+      OLACEnabled           = $olacEnabled
     }
+    if(-not [string]::IsNullOrWhiteSpace($row.location)){ $params['Location'] = $row.location }
+
+    Write-Log "Updating '$safeName' (CPM='$managingCPM', OLAC=$olacEnabled, Location='$($row.location)')" Yellow
+    Set-PASSafe @params
+
+    $msg = "[SUCCESS] $safeName updated."
+    Add-Content -Path $opLogFile -Value $msg
+    Write-Host $msg -ForegroundColor Green
+  } catch {
+    $err = "[ERROR] $safeName : $($_.Exception.Message)"
+    Add-Content -Path $opLogFile -Value $err
+    Write-Host $err -ForegroundColor Red
+    continue
+  }
 }
+
+Write-Log "Completed. See '$opLogFile' for per-item results." Green
