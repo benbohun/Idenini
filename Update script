@@ -1,28 +1,87 @@
-# Import psPAS Module
-Import-Module psPAS
+# =========================
+# CCP -> psPAS (no prompts) -> Export Safes Retention/Version Report
+# =========================
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
 
-# Prompt user for CyberArk credentials
-$UPCred = Get-Credential
+# --- Config ---
+# CCP (AIMWebService) endpoint to fetch the service user for Privilege Cloud/Identity auth
+$CCPAddress  = "https://vskau1p1231.cna.com"
+$location    = "AIMWebService"
+$application = "PAMDiscovery"
+$safe        = "CA_PCloud_Admins"
+$object      = "cna.com-CA_PAMDiscovery_SVC"
 
-# Get header authentication (PCLOUD Admins Only)
-$header = Get-IdentityHeader -IdentityTenantURL "aat4012.id.cyberark.cloud" -psPASFormat -PCloudSubdomain "cna-prod" -UPCreds $UPCred
+# Identity / Privilege Cloud
+$IdentityTenantURL = "aat4012.id.cyberark.cloud"
+$PCloudSubdomain   = "cna-prod"
 
-# Register to use header credentials for PAS session
-Use-PASSession $header
-
-# Fetch all safes
-$PSSafes = Get-PASSafe
-
-# Define CSV export path
+# Output
 $exportPath = "E:\Installation Media\RemovePendingAccount\PSSafes.csv"
 
-# Select required fields and export to CSV
-$PSSafes | Select-Object safeUrlId, safeName, safeNumber, description, location, `
-    @{Name="creator_id"; Expression={$_.creator.id}}, `
-    @{Name="creator_name"; Expression={$_.creator.name}}, `
-    olacEnabled, managingCPM, numberOfVersionsRetention, numberOfDaysRetention, `
-    autoPurgeEnabled, creationTime, lastModificationTime, isExpiredMember |
-Export-Csv -Path $exportPath -NoTypeInformation
+# --- Minimal logging helper (no secrets) ---
+function Log([string]$msg,[ConsoleColor]$c='White'){
+  $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+  Write-Host "$ts - $msg" -ForegroundColor $c
+}
 
-# Output completion message
-Write-Output "CyberArk Safes have been exported to: $exportPath"
+# --- Retrieve service credential from CCP (no prompt) ---
+$ccpUrl = "$CCPAddress/$location/api/Accounts?AppID=$application&Safe=$safe&Object=$object"
+Log "Fetching CCP credential: AppID=$application, Safe=$safe, Object=$object" Cyan
+
+try {
+  $resp = Invoke-RestMethod -Uri $ccpUrl -Method GET -Headers @{ 'Content-Type'='application/json' }
+  if (-not $resp -or -not $resp.Username -or -not $resp.Content) { throw "Missing Username/Content in CCP response." }
+  Log "CCP returned username '$($resp.Username)'." Green
+} catch {
+  Log "ERROR: CCP credential fetch failed: $($_.Exception.Message)" Red
+  throw
+}
+
+# Build PSCredential (no user prompt)
+$secPwd = ConvertTo-SecureString -String $resp.Content -AsPlainText -Force
+$UPCred = New-Object System.Management.Automation.PSCredential ($resp.Username, $secPwd)
+
+# --- psPAS auth via Identity header ---
+Import-Module psPAS -ErrorAction Stop
+Log "Requesting Identity header for '$IdentityTenantURL' (subdomain '$PCloudSubdomain')." Cyan
+try {
+  $header = Get-IdentityHeader -IdentityTenantURL $IdentityTenantURL -psPASFormat -PCloudSubdomain $PCloudSubdomain -UPCreds $UPCred
+  Use-PASSession $header
+  Log "PAS session established (no prompts)." Green
+} catch {
+  Log "ERROR: Failed to obtain Identity header / establish PAS session: $($_.Exception.Message)" Red
+  throw
+}
+
+# --- Fetch safes & export ---
+Log "Retrieving safes..." Yellow
+$PSSafes = Get-PASSafe
+
+# Ensure output directory
+$dir = Split-Path -Path $exportPath -Parent
+if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+
+Log "Exporting to: $exportPath" Yellow
+$PSSafes |
+  Select-Object `
+    safeUrlId,
+    safeName,
+    safeNumber,
+    description,
+    location,
+    @{Name="creator_id";   Expression = { $_.creator.id } },
+    @{Name="creator_name"; Expression = { $_.creator.name } },
+    olacEnabled,
+    managingCPM,
+    numberOfVersionsRetention,
+    numberOfDaysRetention,
+    autoPurgeEnabled,
+    creationTime,
+    lastModificationTime,
+    isExpiredMember |
+  Export-Csv -Path $exportPath -NoTypeInformation -Encoding UTF8
+
+Log "Done. Safes exported to: $exportPath" Green
