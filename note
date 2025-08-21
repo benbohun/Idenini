@@ -17,23 +17,54 @@ Function Write-Log {
     try { Add-Content -Path $LogPath -Value $LogEntry -ErrorAction SilentlyContinue } catch {}
 }
 
-# --- psPAS Prep ---
+# --- Hard fail on errors in functions ---
+$ErrorActionPreference = 'Stop'
+
+# --- Network/PowerShell prep ---
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
-try {
-    if (-not (Get-Module -ListAvailable -Name psPAS)) {
-        Write-Log "psPAS module not found. Install it with: Install-Module psPAS -Scope CurrentUser" "Yellow"
+
+# --- psPAS bootstrap ---
+$AutoInstallPsPAS = $false      # set to $true if you want the script to try Install-Module automatically
+$MinPsPASVersion  = '6.2.0'     # version with Set-PASServer, Use-PASSession, etc.
+
+function Ensure-psPAS {
+    try {
+        $mod = Get-Module psPAS -ListAvailable | Sort-Object Version -Descending | Select-Object -First 1
+        if (-not $mod) {
+            if (-not $AutoInstallPsPAS) {
+                Write-Log "❌ psPAS module not found. Install it (Admin PowerShell): Install-Module psPAS -Scope AllUsers" "Red"
+                throw "psPAS not installed"
+            } else {
+                Write-Log "psPAS not found. Attempting to install from PSGallery..." "Yellow"
+                Install-Module -Name psPAS -Scope CurrentUser -Force -AllowClobber
+            }
+        }
+        Import-Module psPAS -Force
+        $loaded = Get-Module psPAS
+        if (-not $loaded) { throw "Failed to import psPAS" }
+        $ver = ($loaded.Version.ToString())
+        Write-Log "psPAS loaded (v$ver)." "Green"
+
+        # Verify key commands exist
+        foreach ($cmd in 'Set-PASServer','Get-IdentityHeader','Use-PASSession','Add-PASSafe','Add-PASSafeMember','Get-PASSession') {
+            if (-not (Get-Command $cmd -ErrorAction SilentlyContinue)) {
+                Write-Log "❌ Required psPAS command missing: $cmd. Please Update-Module psPAS." "Red"
+                throw "psPAS too old/missing commands"
+            }
+        }
+    } catch {
+        throw
     }
-    Import-Module psPAS -ErrorAction Stop
-} catch {
-    Write-Log "❌ Failed to import psPAS: $($_.Exception.Message)" "Red"; exit 1
 }
+
+try { Ensure-psPAS } catch { Write-Log "❌ psPAS not ready: $($_.Exception.Message)" "Red"; exit 1 }
 
 # --- Retrieve CyberArk API Credentials from CCP (User/Pass) ---
 $CCPAddress = "https://vskau1p1231.cna.com"
 $location   = "AIMWebService"
 $application= "PAMDiscovery"
 $safe       = "CA_PCloud_Admins"
-$object     = "cna-prod.cyberark.cloud-cnarestbot@cyberark.cloud.6679"  # <-- Ensure this is a *username/password* object in CCP
+$object     = "cna-prod.cyberark.cloud-cnarestbot@cyberark.cloud.6679"  # must be a username/password account
 
 $headers = @{ "Content-Type" = "application/json" }
 $windowsAuth = $false
@@ -50,7 +81,7 @@ try {
     Write-Log "❌ ERROR: CCP credential fetch failed - $($_.Exception.Message)" "Red"; exit 1
 }
 
-# --- Build PVWA creds from CCP secret ---
+# --- Build PSCredential from CCP secret ---
 try {
     $SecurePwd = ConvertTo-SecureString $response.Content -AsPlainText -Force
     $UPCred    = New-Object System.Management.Automation.PSCredential($response.Username, $SecurePwd)
@@ -62,20 +93,14 @@ try {
 $PVWA_BaseURI      = "https://cna-prod.privilegecloud.cyberark.cloud/PasswordVault/"
 $IdentityTenantURL = "aat4012.id.cyberark.cloud"
 $PCloudSubdomain   = "cna-prod"
-$IgnoreSSLErrors   = $false  # set true if SSL inspection/self-signed
+$IgnoreSSLErrors   = $false  # set true if needed
 
 try {
-    # Tell psPAS where PVWA is
     $serverArgs = @{ BaseURI = $PVWA_BaseURI; ErrorAction = 'Stop' }
     if ($IgnoreSSLErrors) { $serverArgs.SkipCertificateCheck = $true }
     Set-PASServer @serverArgs | Out-Null
 
-    # Build Identity header formatted for psPAS and register session
-    Write-Log "Requesting CyberArk PAS authentication..." "Cyan"
-    if (-not (Get-Command Get-IdentityHeader -ErrorAction SilentlyContinue)) {
-        Write-Log "❌ Get-IdentityHeader not found in psPAS. Update psPAS to the latest version." "Red"; exit 1
-    }
-
+    Write-Log "Requesting CyberArk PAS authentication (psPAS Identity header)..." "Cyan"
     $header = Get-IdentityHeader -IdentityTenantURL $IdentityTenantURL -psPASFormat -PCloudSubdomain $PCloudSubdomain -UPCreds $UPCred
     Use-PASSession $header
 
@@ -96,7 +121,7 @@ if ([string]::IsNullOrWhiteSpace($SafeName))    { Write-Log "❌ Safe Name canno
 if ([string]::IsNullOrWhiteSpace($Description)) { Write-Log "❌ Safe Description cannot be empty." "Red"; exit 1 }
 if ($Description.Length -gt 200) { $Description = $Description.Substring(0,200) }
 
-# --- Permission Sets (as provided) ---
+# --- Permission Sets (your required values) ---
 $LimitedPermissions = @{
     "useAccounts" = $false
     "retrieveAccounts" = $false
@@ -190,7 +215,7 @@ $ManagingCPM       = "CNA_PASS_MANG"
 $NumVersionsRet    = 7
 try {
     Write-Log "🔹 Creating Safe '${SafeName}'..." "Cyan"
-    Add-PASSafe -SafeName $SafeName -ManagingCPM $ManagingCPM -NumberOfVersionsRetention $NumVersionsRet -Description $Description -ErrorAction Stop | Out-Null
+    Add-PASSafe -SafeName $SafeName -ManagingCPM $ManagingCPM -NumberOfVersionsRetention $NumVersionsRet -Description $Description | Out-Null
     Write-Log "✅ Successfully created Safe: ${SafeName}." "Green"
 } catch {
     if ($_.Exception.Message -match 'already exists') {
@@ -202,7 +227,7 @@ try {
     }
 }
 
-# --- Add Members helpers ---
+# --- Add Members helpers (psPAS) ---
 function Try-Add-Member {
     param(
         [Parameter(Mandatory)] [string] $SafeName,
@@ -251,7 +276,7 @@ do {
     if ([string]::IsNullOrWhiteSpace($GroupSam)) { Write-Log "❌ Group sAMAccountName cannot be empty." "Red" }
 } until (-not [string]::IsNullOrWhiteSpace($GroupSam))
 
-# --- Add Members in order (keep admins untouched) ---
+# --- Add Members in order (keep admins UNCHANGED) ---
 # 1) Target AD group (Directory) with Limited perms
 Add-TargetADGroup -SafeName $SafeName -SamName $GroupSam
 
