@@ -1,70 +1,31 @@
 <# ===========================
-  CyberArk Safe Provision (psPAS only)
-  - Auth with domain user (New-PASSession)
-  - Create Safe, then add members via psPAS
-  - Target AD Group via Directory (no GUID)
-  - Admin members unchanged
+  CyberArk Safe Provision (psPAS ONLY)
+  - Auth with PVWA user via New-PASSession (no ISPSS)
+  - Create Safe, then add members
+  - Target AD Group via Directory (no GUIDs)
 =========================== #>
 
 # --- Logging ---
 $LogPath = "E:\Installation Media\Script\OnboardScript\accountonboarding.txt"
 Function Write-Log {
     param([string]$Message, [string]$Color = "White")
-    $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $Line = "$Timestamp - $Message"
-    Write-Host $Line -ForegroundColor $Color
-    try { Add-Content -Path $LogPath -Value $Line -ErrorAction SilentlyContinue } catch {}
+    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $line = "$ts - $Message"
+    Write-Host $line -ForegroundColor $Color
+    try { Add-Content -Path $LogPath -Value $line -ErrorAction SilentlyContinue } catch {}
 }
 
-# --- Ensure psPAS is available ---
-try {
-    if (-not (Get-Module -ListAvailable -Name psPAS)) {
-        Write-Log "psPAS module not found. Install with: Install-Module psPAS -Scope CurrentUser" "Yellow"
-    }
-    Import-Module psPAS -ErrorAction Stop
-} catch {
-    Write-Log "❌ Failed to import psPAS: $($_.Exception.Message)" "Red"
-    exit 1
-}
-
-# --- Connect to PVWA (domain user; NO ISPSS) ---
-$PVWA_BaseURI = "https://cna-prod.privilegecloud.cyberark.cloud/PasswordVault"
-Write-Log "Connecting to PVWA at $PVWA_BaseURI (psPAS session)..." "Cyan"
-
-$UserName = Read-Host "Enter PVWA Username (e.g., user@cna.com)"
-$SecurePwd = Read-Host "Enter PVWA Password" -AsSecureString
-$Cred = [pscredential]::new($UserName, $SecurePwd)
-
-try {
-    # You can add -SkipVersionCheck or -IgnoreSSL if needed in your environment
-    New-PASSession -BaseURI $PVWA_BaseURI -Credential $Cred -ErrorAction Stop | Out-Null
-    Write-Log "✅ Connected to PVWA (psPAS session established)." "Green"
-} catch {
-    Write-Log "❌ Failed to create psPAS session: $($_.Exception.Message)" "Red"
-    exit 1
-}
-
-# --- Prompt Safe name & Description (single line) ---
-$SafeName    = Read-Host "Enter the Safe Name"
-$Description = Read-Host "Enter the Safe Description (single line, up to 200 chars)"
-
-if ([string]::IsNullOrWhiteSpace($SafeName))    { Write-Log "❌ Safe name is required." "Red"; exit 1 }
-if ([string]::IsNullOrWhiteSpace($Description)) { Write-Log "❌ Safe description is required." "Red"; exit 1 }
-
-# --- Create the Safe (first) ---
-try {
-    Write-Log "🔹 Creating Safe '${SafeName}' (psPAS Add-PASSafe)..." "Cyan"
-    # Adjust retention/cpm to your standards
-    Add-PASSafe -SafeName $SafeName -ManagingCPM "CNA_PASS_MANG" -NumberOfVersionsRetention 7 -Description $Description -ErrorAction Stop | Out-Null
-    Write-Log "✅ Successfully created Safe: ${SafeName}." "Green"
-} catch {
-    if ($_.Exception.Message -match "already exists") {
-        Write-Log "ℹ️ Safe '${SafeName}' already exists. Continuing..." "Yellow"
-    } else {
-        Write-Log "❌ Failed to create Safe '${SafeName}': $($_.Exception.Message)" "Red"
-        exit 1
-    }
-}
+# ========== CONFIG ==========
+# PVWA base URL (trailing slash recommended for psPAS)
+$PVWA_BaseURI     = "https://cna-prod.privilegecloud.cyberark.cloud/PasswordVault/"
+# Set true if you need to ignore SSL validation (TLS inspection etc.)
+$IgnoreSSLErrors  = $false
+# Managing CPM & retention
+$ManagingCPM      = "CNA_PASS_MANG"
+$VersionsRetention= 7
+# Admin members (leave unchanged)
+$AdminGroup       = "CA_PCloud_Admins@cna.com"              # Directory object
+$AdminVaultUser   = "cna_pas_admin@cyberark.cloud.6679"     # Vault user
 
 # --- Permission Sets (as requested) ---
 $LimitedPermissions = @{
@@ -116,12 +77,12 @@ $FullPermissions = @{
     requestsAuthorizationLevel2             = $false
 }
 
-# --- Helper: translate our hashtable to Add-PASSafeMember switches/splat ---
+# --- Permission helpers (map hashtable -> psPAS switches) ---
 function Get-RequestsLevel {
     param($Perms)
-    if ($Perms.requestsAuthorizationLevel2) { return 2 }
-    elseif ($Perms.requestsAuthorizationLevel1) { return 1 }
-    else { return 0 }
+    if ($Perms.requestsAuthorizationLevel2) { 2 }
+    elseif ($Perms.requestsAuthorizationLevel1) { 1 }
+    else { 0 }
 }
 function Build-PASPermSplat {
     param($Perms)
@@ -152,63 +113,71 @@ function Build-PASPermSplat {
     }
     $lvl = Get-RequestsLevel -Perms $Perms
     if ($lvl -gt 0) { $s.RequestsAuthorizationLevel = $lvl }
-    return $s
+    $s
 }
 
-# --- Add member (safe) via psPAS with retry logic for the AD group ---
-function Add-GroupMember {
-    param(
-        [Parameter(Mandatory)] [string] $SafeName,
-        [Parameter(Mandatory)] [string] $GroupSam,
-        [Parameter(Mandatory)]          $Perms
-    )
-
-    $permSplat = Build-PASPermSplat -Perms $Perms
-
-    # Try UPN with Directory
-    $upn = "$GroupSam@cna.com"
-    try {
-        Write-Log "Adding AD Group '${upn}' to ${SafeName} (Directory)..." "Cyan"
-        $params = @{
-            SafeName   = $SafeName
-            MemberType = 'Group'
-            MemberName = $upn
-            SearchIn   = 'Directory'
-            ErrorAction= 'Stop'
-        } + $permSplat
-        Add-PASSafeMember @params | Out-Null
-        Write-Log "✅ Added AD Group: ${upn}" "Green"
-        return $true
-    } catch {
-        Write-Log "⚠️ Failed to add '${upn}' - $($_.Exception.Message). Retrying with sAMAccountName..." "Yellow"
+# --- Ensure psPAS is available ---
+try {
+    if (-not (Get-Module -ListAvailable -Name psPAS)) {
+        Write-Log "psPAS module not found. Install with: Install-Module psPAS -Scope CurrentUser" "Yellow"
     }
+    Import-Module psPAS -ErrorAction Stop
+} catch {
+    Write-Log "❌ Failed to import psPAS: $($_.Exception.Message)" "Red"; exit 1
+}
 
-    # Retry sAM only with Directory
-    try {
-        Write-Log "Adding AD Group '${GroupSam}' to ${SafeName} (Directory)..." "Cyan"
-        $params = @{
-            SafeName   = $SafeName
-            MemberType = 'Group'
-            MemberName = $GroupSam
-            SearchIn   = 'Directory'
-            ErrorAction= 'Stop'
-        } + $permSplat
-        Add-PASSafeMember @params | Out-Null
-        Write-Log "✅ Added AD Group: ${GroupSam}" "Green"
-        return $true
-    } catch {
-        Write-Log "❌ Could not add AD Group '${GroupSam}'. Error: $($_.Exception.Message)" "Red"
-        return $false
+# --- Connect to PVWA with PVWA user (NO ISPSS) ---
+Write-Log "Connecting to PVWA at $PVWA_BaseURI (psPAS)..." "Cyan"
+$UserName = Read-Host "Enter PVWA Username (e.g., user@cna.com)"
+$SecurePwd = Read-Host "Enter PVWA Password" -AsSecureString
+$Cred = [pscredential]::new($UserName, $SecurePwd)
+
+try {
+    $sessionParams = @{
+        BaseURI            = $PVWA_BaseURI
+        Credential         = $Cred
+        Type               = 'LDAP'          # Directory login
+        ConcurrentSession  = $true
+        ErrorAction        = 'Stop'
+    }
+    if ($IgnoreSSLErrors) { $sessionParams.IgnoreSSLErrors = $true }
+    New-PASSession @sessionParams | Out-Null
+    Write-Log "✅ Connected to PVWA (psPAS session established)." "Green"
+} catch {
+    Write-Log "❌ Failed to create psPAS session: $($_.Exception.Message)" "Red"
+    exit 1
+}
+
+# --- Prompt for Safe inputs (single line description, 200 chars max) ---
+$SafeName    = Read-Host "Enter the Safe Name"
+$Description = Read-Host "Enter the Safe Description (single line, up to 200 chars)"
+if ([string]::IsNullOrWhiteSpace($SafeName))    { Write-Log "❌ Safe name is required." "Red"; exit 1 }
+if ([string]::IsNullOrWhiteSpace($Description)) { Write-Log "❌ Safe description is required." "Red"; exit 1 }
+if ($Description.Length -gt 200) { $Description = $Description.Substring(0,200) }
+
+# --- Create Safe first ---
+try {
+    Write-Log "🔹 Creating Safe '${SafeName}'..." "Cyan"
+    Add-PASSafe -SafeName $SafeName -ManagingCPM $ManagingCPM -NumberOfVersionsRetention $VersionsRetention -Description $Description -ErrorAction Stop | Out-Null
+    Write-Log "✅ Successfully created Safe: ${SafeName}." "Green"
+} catch {
+    if ($_.Exception.Message -match "already exists") {
+        Write-Log "ℹ️ Safe '${SafeName}' already exists. Continuing..." "Yellow"
+    } else {
+        Write-Log "❌ Failed to create Safe '${SafeName}': $($_.Exception.Message)" "Red"
+        try { Close-PASSession | Out-Null } catch {}
+        exit 1
     }
 }
 
-function Try-Add-Member-NoUpdate {
+# --- Helper to add member without updating existing ---
+function Try-Add-Member {
     param(
         [Parameter(Mandatory)] [string] $SafeName,
         [Parameter(Mandatory)] [ValidateSet('User','Group','Role')] [string] $MemberType,
         [Parameter(Mandatory)] [string] $MemberName,
-        [Parameter(Mandatory)] [string] $SearchIn,
-        [Parameter(Mandatory)]          $Perms
+        [Parameter(Mandatory)] [ValidateSet('Directory','Vault')] [string] $SearchIn,
+        [Parameter(Mandatory)] $Perms
     )
     $permSplat = Build-PASPermSplat -Perms $Perms
     try {
@@ -222,38 +191,48 @@ function Try-Add-Member-NoUpdate {
         } + $permSplat
         Add-PASSafeMember @params | Out-Null
         Write-Log "✅ Added ${MemberType}: ${MemberName}" "Green"
+        $true
     } catch {
-        if ($_.Exception.Message -match 'already exists') {
+        $msg = $_.Exception.Message
+        if ($msg -match 'already exists') {
             Write-Log "ℹ️ ${MemberType} '${MemberName}' already a member. Skipping update per requirement." "Yellow"
+            $true
         } else {
-            Write-Log "❌ Failed to add '${MemberName}' - $($_.Exception.Message)" "Red"
+            Write-Log "❌ Failed to add '${MemberName}' - $msg" "Red"
+            $false
         }
     }
 }
 
-# --- Gather target AD group sAM ---
-do {
-    $GroupSam = Read-Host "Enter the AD Safe Group (sAMAccountName only, e.g., ca_bud_ecf_prod)"
-    if ([string]::IsNullOrWhiteSpace($GroupSam)) {
-        Write-Log "❌ Group sAMAccountName cannot be empty." "Red"
-    }
-} until (-not [string]::IsNullOrWhiteSpace($GroupSam))
+# --- Target AD Group (Directory) with retry: UPN -> sAM ---
+function Add-TargetADGroup {
+    param([string]$SafeName, [string]$SamName)
 
-# --- 1) Add Target AD Group (Directory) with Limited permissions ---
-$added = Add-GroupMember -SafeName $SafeName -GroupSam $GroupSam -Perms $LimitedPermissions
-if (-not $added) {
-    Write-Log "⚠️ Target AD group '${GroupSam}' was not added. Verify PVWA Directory mapping & visibility for group@cna.com." "Yellow"
+    $upn = "$SamName@cna.com"
+    Write-Log "Adding AD Group '${upn}' as Safe member (Directory)..." "Cyan"
+    if (Try-Add-Member -SafeName $SafeName -MemberType Group -MemberName $upn -SearchIn Directory -Perms $LimitedPermissions) {
+        return
+    }
+    Write-Log "Retrying AD Group add with sAMAccountName '${SamName}' (Directory)..." "Yellow"
+    Try-Add-Member -SafeName $SafeName -MemberType Group -MemberName $SamName -SearchIn Directory -Perms $LimitedPermissions | Out-Null
 }
 
-# --- 2) Admin Group (UNCHANGED) : Directory with Full permissions ---
-Try-Add-Member-NoUpdate -SafeName $SafeName -MemberType Group `
-    -MemberName "CA_PCloud_Admins@cna.com" -SearchIn "Directory" -Perms $FullPermissions
+# --- Prompt for target AD group sAM ---
+do {
+    $GroupSam = Read-Host "Enter the AD Safe Group (sAMAccountName only, e.g., ca_bud_ecf_prod)"
+    if ([string]::IsNullOrWhiteSpace($GroupSam)) { Write-Log "❌ Group sAMAccountName cannot be empty." "Red" }
+} until (-not [string]::IsNullOrWhiteSpace($GroupSam))
 
-# --- 3) Admin Vault User (UNCHANGED) : Vault with Full permissions ---
-Try-Add-Member-NoUpdate -SafeName $SafeName -MemberType User `
-    -MemberName "cna_pas_admin@cyberark.cloud.6679" -SearchIn "Vault" -Perms $FullPermissions
+# 1) Add Target AD Group (Directory) with Limited permissions
+Add-TargetADGroup -SafeName $SafeName -SamName $GroupSam
+
+# 2) Add Admin Group (Directory) with Full permissions (unchanged)
+Try-Add-Member -SafeName $SafeName -MemberType Group -MemberName $AdminGroup -SearchIn Directory -Perms $FullPermissions | Out-Null
+
+# 3) Add Admin Vault User (Vault) with Full permissions (unchanged)
+Try-Add-Member -SafeName $SafeName -MemberType User -MemberName $AdminVaultUser -SearchIn Vault -Perms $FullPermissions | Out-Null
 
 Write-Log "🔹 Safe member addition process completed." "Cyan"
 
-# Optional: Clean up session
+# --- Close session ---
 try { Close-PASSession | Out-Null } catch {}
