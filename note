@@ -1,7 +1,7 @@
 # -------------------------------
 # CyberArk Safe Provision Script
 # - Creates Safe via PVWA REST
-# - Adds Target AD Group via psPAS (fallback to REST)
+# - Adds Target AD Group via PVWA REST using SearchIn="cnaroot.com"
 # - Adds Existing Admin Members via REST (unchanged)
 # -------------------------------
 
@@ -40,9 +40,8 @@ try {
     exit 1
 }
 
-# --- Prompt for Safe Name & Description ---
-$SafeName = Read-Host "Enter the Safe Name"
-# single-line input up to ~200 chars as requested
+# --- Prompt for Safe Name & (single-line) Description ---
+$SafeName    = Read-Host "Enter the Safe Name"
 $Description = Read-Host "Paste the Safe Description (single box, up to ~200 chars)"
 
 if ([string]::IsNullOrWhiteSpace($SafeName)) {
@@ -122,7 +121,7 @@ try {
     exit
 }
 
-# --- Permission Sets (REST expects camelCase; psPAS expects PascalCase) ---
+# --- Permission Sets (REST expects camelCase) ---
 $LimitedPermissions_REST = @{
     "useAccounts" = $false
     "retrieveAccounts" = $false
@@ -171,31 +170,6 @@ $FullPermissions_REST = @{
     "requestsAuthorizationLevel1" = $true
     "requestsAuthorizationLevel2" = $false
 }
-# psPAS permission object (PascalCase keys)
-$LimitedPermissions_psPAS = [PSCustomObject]@{
-    UseAccounts                            = $false
-    RetrieveAccounts                       = $false
-    ListAccounts                           = $true
-    AddAccounts                            = $false
-    UpdateAccountContent                   = $false
-    UpdateAccountProperties                = $false
-    InitiateCPMAccountManagementOperations = $true
-    SpecifyNextAccountContent              = $false
-    RenameAccounts                         = $false
-    DeleteAccounts                         = $false
-    UnlockAccounts                         = $true
-    ManageSafe                             = $false
-    ManageSafeMembers                      = $false
-    BackupSafe                             = $false
-    ViewAuditLog                           = $true
-    ViewSafeMembers                        = $true
-    RequestsAuthorizationLevel1            = $true
-    RequestsAuthorizationLevel2            = $false
-    AccessWithoutConfirmation              = $true
-    CreateFolders                          = $false
-    DeleteFolders                          = $false
-    MoveAccountsAndFolders                 = $false
-}
 
 # --- Prompt for Target AD Group (sAMAccountName only) ---
 do {
@@ -207,58 +181,73 @@ do {
 
 $TargetGroupUPN = "$GroupSam@cna.com"
 
-# --- Try psPAS for Target AD Group (uses Directory Mapping; no SearchIn param) ---
-$DidAddTargetGroup = $false
-$PVWA_BaseUri = "https://$PCloudSubdomain.privilegecloud.cyberark.cloud/PasswordVault"
+# --- Try PVWA REST to add Target AD Group using Directory source name ---
+# We first try with UPN and SearchIn="cnaroot.com"
+# If that fails with "Member not defined", we retry with sAMAccountName and the same SearchIn.
+# Finally, as a last resort, we try UPN with SearchIn="Directory".
+$TargetAdded = $false
 
-Write-Log "Adding AD Group '${TargetGroupUPN}' via psPAS Add-PASSafeMember..." "Cyan"
+# Attempt 1: UPN + cnaroot.com
 try {
-    Import-Module psPAS -ErrorAction Stop
-    # Try to establish a session. Some psPAS versions support bearer-style usage; if not, this will throw and we will fall back to REST.
-    try {
-        # Attempt to seed the base URL; if your psPAS supports token-based use, this will be enough for subsequent calls.
-        Set-PASSessionOption -BaseURI $PVWA_BaseUri -ErrorAction SilentlyContinue | Out-Null
-    } catch {}
+    Write-Log "Adding AD Group '${TargetGroupUPN}' as Safe member (SearchIn='cnaroot.com')..." "Cyan"
+    $bodyTarget1 = @{
+        MemberName  = $TargetGroupUPN
+        MemberType  = "Group"
+        SearchIn    = "cnaroot.com"
+        Permissions = $LimitedPermissions_REST
+    } | ConvertTo-Json -Depth 6
 
-    # Try calling Add-PASSafeMember directly; if session/base URI isn’t set, psPAS will throw the familiar “Invalid URI…” message.
-    $LimitedPermissions_psPAS | Add-PASSafeMember -SafeName $SafeName -MemberType Group -MemberName $TargetGroupUPN -ErrorAction Stop | Out-Null
-
-    # Verify
-    $members = Get-PASSafeMember -SafeName $SafeName -ErrorAction SilentlyContinue
-    if ($members -and ($members.Username -contains $TargetGroupUPN)) {
-        Write-Log "✅ Added AD Group via psPAS: ${TargetGroupUPN}." "Green"
-        $DidAddTargetGroup = $true
-    } else {
-        Write-Log "⚠️ psPAS did not confirm membership for ${TargetGroupUPN}; will fall back to REST." "Yellow"
-    }
+    $null = Invoke-RestMethod -Uri $MembersBase -Method Post -Headers $headers_api -Body $bodyTarget1 -ErrorAction Stop
+    Write-Log "✅ Added AD Group via REST: ${TargetGroupUPN} (SearchIn=cnaroot.com)." "Green"
+    $TargetAdded = $true
 } catch {
-    Write-Log "⚠️ psPAS add/set failed for '${TargetGroupUPN}' ($($_.Exception.Message)). Will fall back to REST." "Yellow"
+    Write-Log "⚠️ Attempt 1 failed for '${TargetGroupUPN}' - $($_.Exception.Message)" "Yellow"
 }
 
-# --- Fallback: PVWA REST for Target AD Group (Directory; no GUID) ---
-if (-not $DidAddTargetGroup) {
+# Attempt 2: sAMAccountName + cnaroot.com
+if (-not $TargetAdded) {
     try {
-        Write-Log "Attempting AD Group add via REST (MemberName='${TargetGroupUPN}', SearchIn='Directory')..." "Cyan"
-        $bodyTarget = @{
-            MemberName  = $TargetGroupUPN
+        Write-Log "Retrying add with sAMAccountName '${GroupSam}' (SearchIn='cnaroot.com')..." "Cyan"
+        $bodyTarget2 = @{
+            MemberName  = $GroupSam
             MemberType  = "Group"
-            SearchIn    = "Directory"    # rely on PVWA Directory Mapping to OU=Groups,OU=CyberArk,DC=cna,DC=com
+            SearchIn    = "cnaroot.com"
             Permissions = $LimitedPermissions_REST
         } | ConvertTo-Json -Depth 6
 
-        $null = Invoke-RestMethod -Uri $MembersBase -Method Post -Headers $headers_api -Body $bodyTarget -ErrorAction Stop
-        Write-Log "✅ Added AD Group via REST: ${TargetGroupUPN}." "Green"
-        $DidAddTargetGroup = $true
+        $null = Invoke-RestMethod -Uri $MembersBase -Method Post -Headers $headers_api -Body $bodyTarget2 -ErrorAction Stop
+        Write-Log "✅ Added AD Group via REST: ${GroupSam} (SearchIn=cnaroot.com)." "Green"
+        $TargetAdded = $true
     } catch {
-        Write-Log "❌ Failed to add '${TargetGroupUPN}' via REST - $($_.Exception.Message)" "Red"
-        Write-Log "This typically indicates PVWA Directory Mapping cannot resolve the group from OU=Groups,OU=CyberArk,DC=cna,DC=com." "Yellow"
+        Write-Log "⚠️ Attempt 2 failed for '${GroupSam}' - $($_.Exception.Message)" "Yellow"
+    }
+}
+
+# Attempt 3: UPN + generic Directory (fallback)
+if (-not $TargetAdded) {
+    try {
+        Write-Log "Final retry with '${TargetGroupUPN}' (SearchIn='Directory')..." "Cyan"
+        $bodyTarget3 = @{
+            MemberName  = $TargetGroupUPN
+            MemberType  = "Group"
+            SearchIn    = "Directory"
+            Permissions = $LimitedPermissions_REST
+        } | ConvertTo-Json -Depth 6
+
+        $null = Invoke-RestMethod -Uri $MembersBase -Method Post -Headers $headers_api -Body $bodyTarget3 -ErrorAction Stop
+        Write-Log "✅ Added AD Group via REST: ${TargetGroupUPN} (SearchIn=Directory)." "Green"
+        $TargetAdded = $true
+    } catch {
+        Write-Log "❌ Could not add AD group '${GroupSam}'. PVWA Directory ('cnaroot.com') did not resolve the group, and Directory fallback also failed. Error: $($_.Exception.Message)" "Red"
+        Write-Log "ℹ️ Tip: In PVWA, verify the Directory Mapping 'cnaroot.com' includes the OU path that contains this group and that the group is visible as 'group@cna.com' in search." "Yellow"
     }
 }
 
 # --- Add Existing Admin Members (UNCHANGED) via REST ---
+
 # 1) CA_PCloud_Admins@cna.com (Group) with FULL permissions, SearchIn Directory
 try {
-    Write-Log "Adding Group: CA_PCloud_Admins@cna.com to ${SafeName} (Directory)..." "Cyan"
+    Write-Log "Adding Group: CA_PCloud_Admins@cna.com to ${SafeName} (SearchIn=Directory)..." "Cyan"
     $adminGroupBody = @{
         MemberName  = "CA_PCloud_Admins@cna.com"
         MemberType  = "Group"
@@ -273,7 +262,7 @@ try {
 
 # 2) cna_pas_admin@cyberark.cloud.6679 (Vault user) with FULL permissions
 try {
-    Write-Log "Adding User: cna_pas_admin@cyberark.cloud.6679 to ${SafeName} (Vault)..." "Cyan"
+    Write-Log "Adding User: cna_pas_admin@cyberark.cloud.6679 to ${SafeName} (SearchIn=Vault)..." "Cyan"
     $adminUserBody = @{
         MemberName  = "cna_pas_admin@cyberark.cloud.6679"
         MemberType  = "User"
