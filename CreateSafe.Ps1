@@ -165,7 +165,7 @@ $FullPermissions = @{
     "requestsAuthorizationLevel2" = $false
 }
 
-# --- Add Safe Members (fixed flow) ---
+# --- Add Safe Members (target AD group via AD OU search; keep admins unchanged) ---
 $EncodedSafe = Encode-Safe $SafeName
 $MembersEndpoint = "https://$PCloudSubdomain.privilegecloud.cyberark.cloud/PasswordVault/API/Safes/$EncodedSafe/Members/"
 
@@ -181,13 +181,13 @@ if ([string]::IsNullOrWhiteSpace($GroupSam)) {
 $SearchBaseOU = 'OU=Groups,OU=CyberArk,DC=cna,DC=com'
 try {
     $adGroup = Get-ADGroup -LDAPFilter "(sAMAccountName=$GroupSam)" -SearchBase $SearchBaseOU -ErrorAction Stop
-    Write-Log "Found AD Group in $SearchBaseOU: $($adGroup.Name) (sAM=$($adGroup.sAMAccountName))" "Green"
+    Write-Log "Found AD Group in ${SearchBaseOU}: $($adGroup.Name) (sAM=$($adGroup.sAMAccountName))" "Green"
 } catch {
-    Write-Log "❌ ERROR: Could not find sAMAccountName '$GroupSam' under $SearchBaseOU. Exiting..." "Red"
+    Write-Log "❌ ERROR: Could not find sAMAccountName '$GroupSam' under ${SearchBaseOU}. Exiting..." "Red"
     exit
 }
 
-# Try add with sAM first, then with UPN
+# Helper to add group via REST (Directory search)
 function Add-GroupViaREST {
     param(
         [string]$MemberName,   # sAM or UPN
@@ -222,13 +222,13 @@ if (-not $added) {
     $added = Add-GroupViaREST -MemberName $upn -Perms $LimitedPermissions
 }
 if (-not $added) {
-    Write-Log "❌ Could not add AD group '${GroupSam}'. This typically indicates PVWA Directory Mapping cannot resolve the group from 'cna.com'. Please verify mapping includes '$SearchBaseOU'." "Red"
+    Write-Log "❌ Could not add AD group '${GroupSam}'. This typically indicates PVWA Directory Mapping cannot resolve the group from 'cna.com'. Please verify mapping includes '${SearchBaseOU}'." "Red"
 }
 
 # 2) Keep existing full-permission members exactly as before
 $AdminMembers = @(
-    @{ memberName = "CA_PCloud_Admins@cna.com";            memberType = "Group"; permissions = $FullPermissions; searchIn = "Directory" },
-    @{ memberName = "cna_pas_admin@cyberark.cloud.6679";   memberType = "User";  permissions = $FullPermissions; searchIn = "Vault" }
+    @{ memberName = "CA_PCloud_Admins@cna.com";          memberType = "Group"; permissions = $FullPermissions; searchIn = "Directory" },
+    @{ memberName = "cna_pas_admin@cyberark.cloud.6679"; memberType = "User";  permissions = $FullPermissions; searchIn = "Vault" }
 )
 
 foreach ($m in $AdminMembers) {
