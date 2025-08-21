@@ -116,21 +116,21 @@ try {
     Write-Log "✅ Successfully created Safe: ${SafeName}."
 } catch { Write-Log "❌ ERROR: Failed to create Safe: ${SafeName} - $_"; exit }
 
-# ------------------- Directory GUID (Hardcoded) -------------------
-$DirectoryGUID = "4ac5fb05-f776-4be5-9b7f-9ec01c737fa4"
+# ------------------- Directory settings for AD lookup -------------------
+$DirectoryGUID = "4ac5fb05-f776-4be5-9b7f-9ec01c737fa4"  # hardcoded Directory GUID
 $DirectoryName = "cna.com"
-$DomainNetBIOS = "CNA"   # used only for the last-resort retry
+$DomainNetBIOS = "CNA"
 
-# ------------------- Prompt for Primary AD Group (UPN style) -------------------
-function Prompt-ValidADGroupUpn {
+# ------------------- Prompt for Primary AD Group (sAMAccountName only) -------------------
+function Prompt-ValidADGroupSam {
     param([string]$PromptText)
     while ($true) {
         $group = Read-Host $PromptText
-        if ($group -match '^[^@]+@cna\.com$') { return $group }
-        Write-Log "❌ Invalid format. Enter AD group as groupname@cna.com" "Red"
+        if ($group -match '^[a-zA-Z0-9_\-\.]+$') { return $group }
+        Write-Log "❌ Invalid format. Enter the AD group using its sAMAccountName (e.g., ca_bud_ecf_prod)" "Red"
     }
 }
-$PrimaryADGroup = Prompt-ValidADGroupUpn -PromptText "Enter the AD Safe Group (groupname@cna.com) to add"
+$PrimaryADGroupSam = Prompt-ValidADGroupSam -PromptText "Enter the AD Safe Group (sAMAccountName only, e.g., ca_bud_ecf_prod)"
 
 # ------------------- Permissions -------------------
 $LimitedPermissions = @{
@@ -154,12 +154,12 @@ $FullPermissions = @{
     requestsAuthorizationLevel1=$true; requestsAuthorizationLevel2=$false
 }
 
-# ------------------- Members to Add -------------------
-$APIEndpointMembers = "https://$PCloudSubdomain.privilegecloud.cyberark.cloud/PasswordVault/API/Safes/$SafeName/Members/"
-
-# Helper: build the base member payload for directory groups
+# ------------------- Helpers -------------------
 function New-DirectoryGroupPayload {
-    param([string]$MemberName, $Permissions)
+    param(
+        [Parameter(Mandatory)][string]$MemberName,  # sAM, DOMAIN\sam, or sam@cna.com
+        [Parameter(Mandatory)]$Permissions
+    )
     return @{
         MemberName     = $MemberName
         MemberType     = "Group"
@@ -169,12 +169,16 @@ function New-DirectoryGroupPayload {
     }
 }
 
+# ------------------- Members to Add -------------------
+$APIEndpointMembers = "https://$PCloudSubdomain.privilegecloud.cyberark.cloud/PasswordVault/API/Safes/$SafeName/Members/"
 $Members = @(
-    # Primary AD group (entered as group@cna.com) — Directory
-    (New-DirectoryGroupPayload -MemberName $PrimaryADGroup             -Permissions $LimitedPermissions),
-    # CA_PCloud_Admins — Directory (explicit per your requirement)
-    (New-DirectoryGroupPayload -MemberName "CA_PCloud_Admins@cna.com"  -Permissions $FullPermissions),
-    # Cloud user — Vault
+    # Primary AD group (enter sAM only) — Directory
+    (New-DirectoryGroupPayload -MemberName $PrimaryADGroupSam -Permissions $LimitedPermissions),
+
+    # CA_PCloud_Admins (group) — Directory, Full permissions
+    (New-DirectoryGroupPayload -MemberName "CA_PCloud_Admins" -Permissions $FullPermissions),
+
+    # Cloud user — Vault, Full permissions
     @{
         MemberName  = "cna_pas_admin@cyberark.cloud.6679"
         MemberType  = "User"
@@ -185,59 +189,31 @@ $Members = @(
 
 # ------------------- Add with smart retry for SFWS0010 -------------------
 foreach ($Member in $Members) {
-    # Build initial body
-    $makeBody = {
-        param($m)
-        $m | ConvertTo-Json -Depth 8
-    }
+    $makeBody = { param($m) $m | ConvertTo-Json -Depth 8 }
 
     $jsonBody = & $makeBody $Member
     Write-Log "Adding $($Member.MemberType): $($Member.MemberName) (searchIn=$($Member.SearchIn)) to Safe: $SafeName..."
 
-    $didRetrySam = $false
     $didRetryDom = $false
+    $didRetryUpn = $false
 
     try {
         Invoke-RestMethod -Uri $APIEndpointMembers -Method Post -Headers $headers_api -Body $jsonBody -ErrorAction Stop | Out-Null
         Write-Log "✅ Successfully added $($Member.MemberType): $($Member.MemberName) to $SafeName."
     } catch {
-        # Read error body if available
         $errBody = $null
         try { $errBody = $_.Exception.Response.Content.ReadAsStringAsync().Result } catch {}
         if (-not $errBody) { $errBody = $_ | Out-String }
 
-        $isDirGroup    = ($Member.MemberType -eq "Group" -and $Member.SearchIn -match '^[0-9a-fA-F-]{32,36}$')
-        $isNotDefined  = ($errBody -match '"ErrorCode"\s*:\s*"SFWS0010"')
-        $looksLikeUpn  = ($Member.MemberName -match '^[^@]+@[^@]+\.[^@]+$')
+        $isDirGroup   = ($Member.MemberType -eq "Group" -and $Member.SearchIn -match '^[0-9a-fA-F-]{32,36}$')
+        $isNotDefined = ($errBody -match '"ErrorCode"\s*:\s*"SFWS0010"')
 
-        # Retry #1: sAM only (strip @domain)
-        if ($isDirGroup -and $isNotDefined -and $looksLikeUpn -and -not $didRetrySam) {
-            $didRetrySam = $true
-            $samOnly = $Member.MemberName.Split('@')[0]
-            Write-Log "ℹ️ Directory lookup failed for '$($Member.MemberName)'. Retrying with sAMAccountName '$samOnly'..." "Yellow"
-
-            $retrySam = $Member.PSObject.Copy()
-            $retrySam.MemberName = $samOnly
-
-            $jsonBodyRetrySam = & $makeBody $retrySam
-            try {
-                Invoke-RestMethod -Uri $APIEndpointMembers -Method Post -Headers $headers_api -Body $jsonBodyRetrySam -ErrorAction Stop | Out-Null
-                Write-Log "✅ Retry (sAM) succeeded: added Group '$samOnly' to $SafeName."
-                continue
-            } catch {
-                $retryErrSam = $null
-                try { $retryErrSam = $_.Exception.Response.Content.ReadAsStringAsync().Result } catch {}
-                if (-not $retryErrSam) { $retryErrSam = $_ | Out-String }
-                Write-Log "❌ Retry (sAM) failed for '$samOnly' - $retryErrSam" "Red"
-            }
-        }
-
-        # Retry #2: DOMAIN\sam (still Directory GUID + MemberLocation)
-        if ($isDirGroup -and $isNotDefined -and -not $didRetryDom) {
+        # Retry #1: DOMAIN\sam (still targeting the same Directory via GUID + MemberLocation)
+        if ($isDirGroup -and $isNotDefined -and -not $didRetryDom -and $Member.MemberName -notmatch '\\') {
             $didRetryDom = $true
-            $sam = ($Member.MemberName -split '@')[0]
+            $sam = ($Member.MemberName -split '@')[0]  # if memberName already is sAM, this is unchanged
             $domainSam = "$DomainNetBIOS\$sam"
-            Write-Log "ℹ️ Retrying with DOMAIN\\sAM '$domainSam' in Directory '$DirectoryName'..." "Yellow"
+            Write-Log "ℹ️ Directory lookup failed for '$($Member.MemberName)'. Retrying with DOMAIN\\sAM '$domainSam'..." "Yellow"
 
             $retryDom = $Member.PSObject.Copy()
             $retryDom.MemberName = $domainSam
@@ -255,12 +231,36 @@ foreach ($Member in $Members) {
             }
         }
 
+        # Retry #2: sam@cna.com (some tenants resolve UPN-like for groups)
+        if ($isDirGroup -and $isNotDefined -and -not $didRetryUpn -and $Member.MemberName -notmatch '@') {
+            $didRetryUpn = $true
+            $sam = ($Member.MemberName -split '\\')[-1]
+            $upn = "$sam@$DirectoryName"
+            Write-Log "ℹ️ Retrying with UPN-like '$upn' in Directory '$DirectoryName'..." "Yellow"
+
+            $retryUpn = $Member.PSObject.Copy()
+            $retryUpn.MemberName = $upn
+
+            $jsonBodyRetryUpn = & $makeBody $retryUpn
+            try {
+                Invoke-RestMethod -Uri $APIEndpointMembers -Method Post -Headers $headers_api -Body $jsonBodyRetryUpn -ErrorAction Stop | Out-Null
+                Write-Log "✅ Retry (UPN) succeeded: added Group '$upn' to $SafeName."
+                continue
+            } catch {
+                $retryErrUpn = $null
+                try { $retryErrUpn = $_.Exception.Response.Content.ReadAsStringAsync().Result } catch {}
+                if (-not $retryErrUpn) { $retryErrUpn = $_ | Out-String }
+                Write-Log "❌ Retry (UPN) failed for '$upn' - $retryErrUpn" "Red"
+            }
+        }
+
         # Final failure
         Write-Log "❌ ERROR: Failed to add $($Member.MemberType): $($Member.MemberName) to $SafeName - $errBody" "Red"
     }
 }
 
 Write-Log "🔹 Safe member addition process completed."
+
 
 
 :::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
