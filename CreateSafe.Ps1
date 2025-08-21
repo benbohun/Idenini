@@ -8,19 +8,15 @@ Function Write-Log {
     Add-Content -Path $LogPath -Value $LogEntry
 }
 
-# --- Helper: POST JSON with consistent error handling ---
+# --- Simple POST helper for REST JSON ---
 Function Invoke-CybrPostJson {
     param(
         [Parameter(Mandatory)][string]$Uri,
         [Parameter(Mandatory)][hashtable]$Headers,
         [Parameter(Mandatory)]$BodyObject
     )
-    $json = ($BodyObject | ConvertTo-Json -Depth 6 -Compress)
-    try {
-        return Invoke-RestMethod -Uri $Uri -Method Post -Headers $Headers -Body $json -ErrorAction Stop
-    } catch {
-        throw
-    }
+    $json = ($BodyObject | ConvertTo-Json -Depth 8 -Compress)
+    Invoke-RestMethod -Uri $Uri -Method Post -Headers $Headers -Body $json -ErrorAction Stop
 }
 
 # --- Retrieve CyberArk API Credentials from CCP ---
@@ -49,29 +45,23 @@ try {
 }
 
 # --- Prompt for Safe Name & (single-line) Description ---
-$SafeName = Read-Host "Enter the Safe Name"
+$SafeName    = Read-Host "Enter the Safe Name"
 $Description = Read-Host "Enter the Safe Description (single line, up to 200 chars)"
 if ($Description.Length -gt 200) {
     Write-Log "ℹ️ Description longer than 200 chars; truncating."
     $Description = $Description.Substring(0,200)
 }
 
-if ([string]::IsNullOrEmpty($SafeName)) {
-    Write-Log "❌ ERROR: Safe Name cannot be empty. Exiting..." "Red"
-    exit
-}
-if ([string]::IsNullOrEmpty($Description)) {
-    Write-Log "❌ ERROR: Safe Description cannot be empty. Exiting..." "Red"
-    exit
-}
+if ([string]::IsNullOrWhiteSpace($SafeName))    { Write-Log "❌ ERROR: Safe Name cannot be empty. Exiting..." "Red"; exit }
+if ([string]::IsNullOrWhiteSpace($Description)) { Write-Log "❌ ERROR: Safe Description cannot be empty. Exiting..." "Red"; exit }
 
 # --- Authentication Variables (from CCP) ---
-$IdentityTenantID = "aat4012"       # CyberArk Identity tenant ID
-$PCloudSubdomain  = "cna-prod"      # CyberArk Privilege Cloud Subdomain (PVWA base)
+$IdentityTenantID = "aat4012"      # CyberArk Identity tenant ID
+$PCloudSubdomain  = "cna-prod"     # CyberArk Privilege Cloud Subdomain (PVWA)
 $ClientID         = $response.Username
 $ClientSecret     = $response.Content
 
-if ([string]::IsNullOrEmpty($ClientID) -or [string]::IsNullOrEmpty($ClientSecret)) {
+if ([string]::IsNullOrWhiteSpace($ClientID) -or [string]::IsNullOrWhiteSpace($ClientSecret)) {
     Write-Log "ERROR: Client ID or Client Secret is missing. Exiting..."
     exit
 }
@@ -89,7 +79,7 @@ $headers_token = @{ "Content-Type" = "application/x-www-form-urlencoded" }
 try {
     $TokenResponse = Invoke-RestMethod -Uri $TokenURL -Method Post -Headers $headers_token -Body $TokenBody
     $BearerToken = [string]$TokenResponse.access_token
-    if ([string]::IsNullOrEmpty($BearerToken) -or $BearerToken.Length -lt 100) {
+    if ([string]::IsNullOrWhiteSpace($BearerToken) -or $BearerToken.Length -lt 100) {
         Write-Log "ERROR: Received an invalid token. Length: $($BearerToken.Length)"
         exit
     }
@@ -99,63 +89,13 @@ try {
     exit
 }
 
-# --- Define Headers for PVWA API Requests ---
+# --- Define Headers for PVWA REST ---
 $headers_api = @{
     "Authorization" = "Bearer $BearerToken"
     "Content-Type"  = "application/json"
 }
 
-# --- Permissions (as requested) ---
-$LimitedPermissions = @{
-    useAccounts                                = $false
-    retrieveAccounts                           = $false
-    listAccounts                               = $true
-    addAccounts                                = $false
-    updateAccountContent                       = $false
-    updateAccountProperties                    = $false
-    initiateCPMAccountManagementOperations     = $true
-    specifyNextAccountContent                  = $false
-    renameAccounts                             = $false
-    deleteAccounts                             = $false
-    unlockAccounts                             = $true
-    manageSafe                                 = $false
-    manageSafeMembers                          = $false
-    backupSafe                                 = $false
-    viewAuditLog                               = $true
-    viewSafeMembers                            = $true
-    accessWithoutConfirmation                  = $true
-    createFolders                              = $false
-    deleteFolders                              = $false
-    moveAccountsAndFolders                     = $false
-    requestsAuthorizationLevel1                = $true
-    requestsAuthorizationLevel2                = $false
-}
-$FullPermissions = @{
-    useAccounts                                = $true
-    retrieveAccounts                           = $true
-    listAccounts                               = $true
-    addAccounts                                = $true
-    updateAccountContent                       = $true
-    updateAccountProperties                    = $true
-    initiateCPMAccountManagementOperations     = $true
-    specifyNextAccountContent                  = $true
-    renameAccounts                             = $true
-    deleteAccounts                             = $true
-    unlockAccounts                             = $true
-    manageSafe                                 = $true
-    manageSafeMembers                          = $true
-    backupSafe                                 = $true
-    viewAuditLog                               = $true
-    viewSafeMembers                            = $true
-    accessWithoutConfirmation                  = $true
-    createFolders                              = $true
-    deleteFolders                              = $true
-    moveAccountsAndFolders                     = $true
-    requestsAuthorizationLevel1                = $true
-    requestsAuthorizationLevel2                = $false
-}
-
-# --- Create Safe Using API ---
+# --- Create Safe Using REST API ---
 Write-Log "🔹 Creating Safe: ${SafeName}..."
 $SafesEndpoint = "https://$PCloudSubdomain.privilegecloud.cyberark.cloud/PasswordVault/API/Safes/"
 $SafePayload = @{
@@ -166,134 +106,175 @@ $SafePayload = @{
     managingCPM           = "CNA_PASS_MANG"
     numberOfDaysRetention = 180
 }
-
 Write-Log "Creating Safe: ${SafeName} with payload: $(($SafePayload | ConvertTo-Json -Depth 3))"
 try {
     Invoke-CybrPostJson -Uri $SafesEndpoint -Headers $headers_api -BodyObject $SafePayload | Out-Null
     Write-Log "✅ Successfully created Safe: ${SafeName}."
 } catch {
-    Write-Log "❌ ERROR: Failed to create Safe: ${SafeName} - $_" "Red"
-    exit
+    Write-Log "⚠️ WARNING: Safe may already exist - $($_.Exception.Message)" "Yellow"
 }
 
-# --- Directory GUID (cna.com) for searchIn (per CyberArk guidance) ---
+# --- Permissions (lowercase keys for REST) ---
+$LimitedPermissions = @{
+    useAccounts = $false; retrieveAccounts = $false; listAccounts = $true; addAccounts = $false
+    updateAccountContent = $false; updateAccountProperties = $false
+    initiateCPMAccountManagementOperations = $true; specifyNextAccountContent = $false
+    renameAccounts = $false; deleteAccounts = $false; unlockAccounts = $true
+    manageSafe = $false; manageSafeMembers = $false; backupSafe = $false
+    viewAuditLog = $true; viewSafeMembers = $true; accessWithoutConfirmation = $true
+    createFolders = $false; deleteFolders = $false; moveAccountsAndFolders = $false
+    requestsAuthorizationLevel1 = $true; requestsAuthorizationLevel2 = $false
+}
+$FullPermissions = @{
+    useAccounts = $true; retrieveAccounts = $true; listAccounts = $true; addAccounts = $true
+    updateAccountContent = $true; updateAccountProperties = $true
+    initiateCPMAccountManagementOperations = $true; specifyNextAccountContent = $true
+    renameAccounts = $true; deleteAccounts = $true; unlockAccounts = $true
+    manageSafe = $true; manageSafeMembers = $true; backupSafe = $true
+    viewAuditLog = $true; viewSafeMembers = $true; accessWithoutConfirmation = $true
+    createFolders = $true; deleteFolders = $true; moveAccountsAndFolders = $true
+    requestsAuthorizationLevel1 = $true; requestsAuthorizationLevel2 = $false
+}
+
+# --- Helper: Convert REST-style perms -> PAS role object (PascalCase) ---
+Function Convert-ToPasRole {
+    param($perm)
+    [PSCustomObject]@{
+        UseAccounts                            = [bool]$perm.useAccounts
+        RetrieveAccounts                       = [bool]$perm.retrieveAccounts
+        ListAccounts                           = [bool]$perm.listAccounts
+        AddAccounts                            = [bool]$perm.addAccounts
+        UpdateAccountContent                   = [bool]$perm.updateAccountContent
+        UpdateAccountProperties                = [bool]$perm.updateAccountProperties
+        InitiateCPMAccountManagementOperations = [bool]$perm.initiateCPMAccountManagementOperations
+        SpecifyNextAccountContent              = [bool]$perm.specifyNextAccountContent
+        RenameAccounts                         = [bool]$perm.renameAccounts
+        DeleteAccounts                         = [bool]$perm.deleteAccounts
+        UnlockAccounts                         = [bool]$perm.unlockAccounts
+        ManageSafe                             = [bool]$perm.manageSafe
+        ManageSafeMembers                      = [bool]$perm.manageSafeMembers
+        BackupSafe                             = [bool]$perm.backupSafe
+        ViewAuditLog                           = [bool]$perm.viewAuditLog
+        ViewSafeMembers                        = [bool]$perm.viewSafeMembers
+        AccessWithoutConfirmation              = [bool]$perm.accessWithoutConfirmation
+        CreateFolders                          = [bool]$perm.createFolders
+        DeleteFolders                          = [bool]$perm.deleteFolders
+        MoveAccountsAndFolders                 = [bool]$perm.moveAccountsAndFolders
+        RequestsAuthorizationLevel1            = [bool]$perm.requestsAuthorizationLevel1
+        RequestsAuthorizationLevel2            = [bool]$perm.requestsAuthorizationLevel2
+    }
+}
+
+# --- Members endpoint (REST) ---
+$SafeNameForUrl = [System.Uri]::EscapeDataString($SafeName)
+$MembersEndpoint = "https://$PCloudSubdomain.privilegecloud.cyberark.cloud/PasswordVault/API/Safes/$SafeNameForUrl/Members/"
+
+Function Add-MemberRest {
+    param([hashtable]$Body)
+    try {
+        Invoke-CybrPostJson -Uri $MembersEndpoint -Headers $headers_api -BodyObject $Body | Out-Null
+        Write-Log "✅ Added $($Body.memberType): $($Body.memberName)."
+        return $true
+    } catch {
+        $msg = $_.Exception.Message
+        Write-Log "❌ Failed to add '$($Body.memberName)' - $msg" "Red"
+        return $false
+    }
+}
+
+# --- Directory GUID for cna.com (only used in REST fallback & CA_PCloud_Admins) ---
 $DirectoryGuid = "4ac5fb05-f776-4be5-9b7f-9ec01c737fa4"
 
-# --- Helper: Try add target AD group with several resolvers (only for target group) ---
-Function Try-AddTargetAdGroup {
-    param(
-        [Parameter(Mandatory)][string]$SafeName,
-        [Parameter(Mandatory)][string]$GroupSam,    # sAMAccountName only
-        [Parameter(Mandatory)][string]$DirectoryGuid,
-        [Parameter(Mandatory)][hashtable]$Headers,
-        [Parameter(Mandatory)]$Permissions
-    )
-    $MembersEndpoint = "https://$PCloudSubdomain.privilegecloud.cyberark.cloud/PasswordVault/API/Safes/$SafeName/Members/"
-
-    # Build candidate names to try for MemberName
-    $candidates = New-Object System.Collections.Generic.List[string]
-    # 1) sAM as entered
-    if ($GroupSam) { $candidates.Add($GroupSam) }
-
-    # 2) Try to enrich from AD (if AD module is present)
-    try {
-        if (Get-Module -ListAvailable -Name ActiveDirectory) {
-            Import-Module ActiveDirectory -ErrorAction Stop | Out-Null
-            $adGrp = Get-ADGroup -Identity $GroupSam -ErrorAction Stop -Properties mail,cn,distinguishedName,name
-            if ($adGrp) {
-                if ($adGrp.mail) { $candidates.Add($adGrp.mail) }             # mail-enabled group
-                if ($adGrp.cn)   { $candidates.Add($adGrp.cn) }
-                if ($adGrp.name) { $candidates.Add($adGrp.name) }
-                if ($adGrp.distinguishedName) { $candidates.Add($adGrp.distinguishedName) }
-                Write-Log "ℹ️ AD lookup found group; will try name variants: $($candidates -join ', ')"
-            }
-        } else {
-            Write-Log "ℹ️ AD module not found; proceeding without AD enrichment."
-        }
-    } catch {
-        Write-Log "⚠️ AD lookup failed for '$GroupSam' ($_) — proceeding with basic variants."
-    }
-
-    # Deduplicate & keep simple order
-    $candidates = [System.Linq.Enumerable]::Distinct($candidates)
-
-    foreach ($candidate in $candidates) {
-        # Skip values containing backslash (invalid for memberName per API)
-        if ($candidate -match "\\") {
-            Write-Log "ℹ️ Skipping '$candidate' (backslash not allowed in memberName)."
-            continue
-        }
-
-        $body = @{
-            memberName  = $candidate
-            searchIn    = $DirectoryGuid     # Directory GUID (NOT the directory name)
-            memberType  = "Group"
-            permissions = $Permissions
-        }
-
-        Write-Log "Adding AD Group '$candidate' (searchIn=$DirectoryGuid)..."
-        try {
-            Invoke-CybrPostJson -Uri $MembersEndpoint -Headers $Headers -BodyObject $body | Out-Null
-            Write-Log "✅ Added Group: $candidate."
-            return $true
-        } catch {
-            # If the PVWA replies with SFWS0010, log & continue to next variant
-            $msg = $_.Exception.Message
-            if ($msg -match "SFWS0010") {
-                Write-Log "❌ Failed to add '$candidate' - Member has not been defined (SFWS0010)."
-            } else {
-                Write-Log "❌ Failed to add '$candidate' - $msg"
-            }
-        }
-    }
-    return $false
-}
-
-# --- Add Safe Members ---
-
-# 1) Target AD Safe Group (sAM only prompt)
+# ----------------------- TARGET AD GROUP (psPAS pattern) -----------------------
 $TargetSam = Read-Host "Enter the AD Safe Group (sAMAccountName only, e.g., ca_bud_ecf_prod)"
 if ([string]::IsNullOrWhiteSpace($TargetSam)) {
     Write-Log "❌ ERROR: AD Safe Group cannot be empty. Exiting..." "Red"
     exit
 }
-# Try add with Directory GUID searchIn (non-SCIM approach recommended by CyberArk)
-$added = Try-AddTargetAdGroup -SafeName $SafeName -GroupSam $TargetSam -DirectoryGuid $DirectoryGuid -Headers $headers_api -Permissions $LimitedPermissions
 
-if (-not $added) {
-    Write-Log "❌ Could not add AD group '$TargetSam'."
-    Write-Log "   This typically indicates the PVWA Directory Mapping cannot resolve the group name from 'cna.com' with directory GUID $DirectoryGuid (see CyberArk guidance on using directory GUID in 'searchIn')."
+$UsedPasModule = $false
+$AddedTarget   = $false
+
+# Try psPAS pattern ONLY for the target group (as in your sample)
+if (Get-Command -Name Add-PASSafeMember -ErrorAction SilentlyContinue) {
+    try {
+        $UsedPasModule = $true
+        $rolePas = Convert-ToPasRole $LimitedPermissions
+
+        # Check existing members (module handles directory resolution)
+        $existing = @()
+        try { $existing = (Get-PASSafeMember -SafeName $SafeName -ErrorAction Stop).UserName } catch {}
+        $exists = $false
+        if ($existing) {
+            if ($existing -contains $TargetSam -or $existing -contains ("$TargetSam@cna.com")) { $exists = $true }
+        }
+
+        if ($exists) {
+            Write-Log "$TargetSam already exists, setting permissions (psPAS)..."
+            $rolePas | Set-PASSafeMember -SafeName $SafeName -MemberName $TargetSam -ErrorAction Stop
+            Write-Log "✅ Updated permissions for AD Group (psPAS): $TargetSam."
+            $AddedTarget = $true
+        } else {
+            Write-Log "Adding AD Group '$TargetSam' via psPAS Add-PASSafeMember..."
+            $rolePas | Add-PASSafeMember -SafeName $SafeName -memberType Group -MemberName $TargetSam -ErrorAction Stop
+            Write-Log "✅ Added AD Group (psPAS): $TargetSam."
+            $AddedTarget = $true
+        }
+    } catch {
+        Write-Log "⚠️ psPAS add/set failed for '$TargetSam' ($($_.Exception.Message)). Will fall back to REST." "Yellow"
+        $UsedPasModule = $true
+        $AddedTarget   = $false
+    }
+} else {
+    Write-Log "ℹ️ psPAS module not available; using REST fallback for target group."
 }
 
-# 2) Registered group (leave exactly as you asked) — Directory search
-$MembersEndpoint = "https://$PCloudSubdomain.privilegecloud.cyberark.cloud/PasswordVault/API/Safes/$SafeName/Members/"
-$registeredGroup = @{
+# REST fallback for target group (only if psPAS not used or failed)
+if (-not $AddedTarget) {
+    $bodySam = @{
+        memberName  = $TargetSam
+        memberType  = "Group"
+        searchIn    = $DirectoryGuid
+        permissions = $LimitedPermissions
+    }
+    Write-Log "Attempting AD Group add via REST with Directory GUID (MemberName='$TargetSam')..."
+    $ok = Add-MemberRest -Body $bodySam
+    if (-not $ok) {
+        $upn = "$TargetSam@cna.com"
+        $bodyUpn = @{
+            memberName  = $upn
+            memberType  = "Group"
+            searchIn    = $DirectoryGuid
+            permissions = $LimitedPermissions
+        }
+        Write-Log "Retrying via REST with UPN (MemberName='$upn')..."
+        $ok = Add-MemberRest -Body $bodyUpn
+        if (-not $ok) {
+            Write-Log "❌ Could not add AD group '$TargetSam' by REST either. Likely a Directory Mapping visibility issue for cna.com." "Red"
+        }
+    }
+}
+
+# ----------------------- OTHER MEMBERS (UNCHANGED) ----------------------------
+
+# 1) Registered tenant group (Directory search) — leave as-is
+$tenantGroupBody = @{
     memberName  = "CA_PCloud_Admins@cna.com"
-    searchIn    = $DirectoryGuid   # search in Directory (this one is known to resolve)
     memberType  = "Group"
+    searchIn    = $DirectoryGuid
     permissions = $FullPermissions
 }
 Write-Log "Adding Registered Group 'CA_PCloud_Admins@cna.com' (Directory search)..."
-try {
-    Invoke-CybrPostJson -Uri $MembersEndpoint -Headers $headers_api -BodyObject $registeredGroup | Out-Null
-    Write-Log "✅ Added Group: CA_PCloud_Admins@cna.com."
-} catch {
-    Write-Log "❌ Failed to add 'CA_PCloud_Admins@cna.com' - $($_.Exception.Message)"
-}
+$null = Add-MemberRest -Body $tenantGroupBody
 
-# 3) Vault user (no directory search)
-$vaultUser = @{
+# 2) Vault user (SearchIn = Vault) — leave as-is
+$cloudUserBody = @{
     memberName  = "cna_pas_admin@cyberark.cloud.6679"
-    searchIn    = "Vault"
     memberType  = "User"
+    searchIn    = "Vault"
     permissions = $FullPermissions
 }
 Write-Log "Adding Vault User 'cna_pas_admin@cyberark.cloud.6679' (Vault search)..."
-try {
-    Invoke-CybrPostJson -Uri $MembersEndpoint -Headers $headers_api -BodyObject $vaultUser | Out-Null
-    Write-Log "✅ Added User: cna_pas_admin@cyberark.cloud.6679."
-} catch {
-    Write-Log "❌ Failed to add 'cna_pas_admin@cyberark.cloud.6679' - $($_.Exception.Message)"
-}
+$null = Add-MemberRest -Body $cloudUserBody
 
 Write-Log "🔹 Safe member addition process completed."
