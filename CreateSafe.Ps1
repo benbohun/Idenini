@@ -23,13 +23,9 @@ Write-Log "Retrieving CyberArk API credentials from CCP via Object method..." "C
 $ccpUrl = "$CCPAddress/$location/api/Accounts?AppID=$application&Safe=$safe&Object=$object"
 try {
     $response = Invoke-RestMethod $ccpUrl -Method 'GET' -Headers $headers -UseDefaultCredentials:$windowsAuth
-    if (-not $response -or -not $response.Username -or -not $response.Content) {
-        Write-Log "ERROR: Failed to retrieve API credentials from CCP." "Red"; exit 1
-    }
+    if (-not $response -or -not $response.Username -or -not $response.Content) { Write-Log "ERROR: Failed to retrieve API credentials from CCP." "Red"; exit 1 }
     Write-Log "Successfully retrieved credentials for user: $($response.Username)" "Green"
-} catch {
-    Write-Log "ERROR: CCP credential fetch failed - $_" "Red"; exit 1
-}
+} catch { Write-Log "ERROR: CCP credential fetch failed - $_" "Red"; exit 1 }
 
 # --- Prompt for Safe Name & Description ---
 $SafeName = Read-Host "Enter the Safe Name"
@@ -46,16 +42,11 @@ function Prompt-DescriptionBox {
         $textBox = New-Object System.Windows.Forms.TextBox
         $textBox.Multiline = $false; $textBox.Width = 560; $textBox.Top = 40; $textBox.Left = 10; $textBox.MaxLength = 200; $form.Controls.Add($textBox)
         $okButton = New-Object System.Windows.Forms.Button
-        $okButton.Text = "OK"; $okButton.Width = 100; $okButton.Height = 30; $okButton.Top = 80; $okButton.Left = 360
-        $okButton.Add_Click({ $form.Tag = $textBox.Text; $form.Close() }); $form.Controls.Add($okButton)
+        $okButton.Text = "OK"; $okButton.Width = 100; $okButton.Height = 30; $okButton.Top = 80; $okButton.Left = 360; $okButton.Add_Click({ $form.Tag = $textBox.Text; $form.Close() }); $form.Controls.Add($okButton)
         $cancelButton = New-Object System.Windows.Forms.Button
-        $cancelButton.Text = "Cancel"; $cancelButton.Width = 100; $cancelButton.Height = 30; $cancelButton.Top = 80; $cancelButton.Left = 470
-        $cancelButton.Add_Click({ $form.Tag = $null; $form.Close() }); $form.Controls.Add($cancelButton)
-        [void]$form.ShowDialog(); $desc = $form.Tag; $form.Dispose()
-        if ([string]::IsNullOrWhiteSpace($desc)) { return $null } else { return $desc }
-    } catch {
-        return Read-Host "Enter Safe Description (fallback, max 200 chars)"
-    }
+        $cancelButton.Text = "Cancel"; $cancelButton.Width = 100; $cancelButton.Height = 30; $cancelButton.Top = 80; $cancelButton.Left = 470; $cancelButton.Add_Click({ $form.Tag = $null; $form.Close() }); $form.Controls.Add($cancelButton)
+        [void]$form.ShowDialog(); $desc = $form.Tag; $form.Dispose(); if ([string]::IsNullOrWhiteSpace($desc)) { return $null } else { return $desc }
+    } catch { return Read-Host "Enter Safe Description (fallback, max 200 chars)" }
 }
 $Description = Prompt-DescriptionBox
 
@@ -63,13 +54,13 @@ if ([string]::IsNullOrWhiteSpace($SafeName))    { Write-Log "❌ ERROR: Safe Nam
 if ([string]::IsNullOrWhiteSpace($Description)) { Write-Log "❌ ERROR: Safe Description cannot be empty. Exiting..."; exit }
 
 # --- Authentication Variables (from CCP) ---
-$IdentityTenantID = "aat4012"    # CyberArk Identity tenant ID
-$PCloudSubdomain  = "cna-prod"   # Privilege Cloud subdomain
+$IdentityTenantID = "aat4012"        # CyberArk Identity tenant ID (SCIM host too)
+$PCloudSubdomain  = "cna-prod"       # Privilege Cloud subdomain (PVWA APIs)
 $ClientID         = $response.Username
 $ClientSecret     = $response.Content
-if ([string]::IsNullOrWhiteSpace($ClientID) -or [string]::IsNullOrWhiteSpace($ClientSecret)) { Write-Log "ERROR: Client ID or Client Secret is missing. Exiting..."; exit }
+if ([string]::IsNullOrWhiteSpace($ClientID) -or [string]::IsNullOrWhiteSpace($ClientSecret)) { Write-Log "ERROR: Client ID/Secret missing. Exiting..."; exit }
 
-# --- Request OAuth Token ---
+# --- Request OAuth Token (Identity platform token covers PVWA & SCIM) ---
 Write-Log "Requesting initial CyberArk ISPSS token..."
 $TokenURL = "https://$IdentityTenantID.id.cyberark.cloud/oauth2/platformtoken"
 $TokenBody = @{ grant_type="client_credentials"; client_id=$ClientID; client_secret=$ClientSecret }
@@ -84,7 +75,7 @@ try {
 # --- API Headers ---
 $headers_api = @{ "Authorization" = "Bearer $BearerToken"; "Content-Type" = "application/json" }
 
-# --- Create Safe ---
+# --- Create Safe (PVWA REST) ---
 Write-Log "🔹 Creating Safe: ${SafeName}..."
 $APIEndpointSafes = "https://$PCloudSubdomain.privilegecloud.cyberark.cloud/PasswordVault/API/Safes/"
 $SafePayload = @{
@@ -96,14 +87,10 @@ $SafePayload = @{
     numberOfDaysRetention = 180
 } | ConvertTo-Json -Depth 3
 Write-Log "Creating Safe: ${SafeName} with payload: $SafePayload"
-try {
-    Invoke-RestMethod -Uri $APIEndpointSafes -Method Post -Headers $headers_api -Body $SafePayload -ErrorAction Stop | Out-Null
-    Write-Log "✅ Successfully created Safe: ${SafeName}."
-} catch {
-    Write-Log "⚠️ WARNING: Safe may already exist - $($_.Exception.Message)" "Yellow"
-}
+try { Invoke-RestMethod -Uri $APIEndpointSafes -Method Post -Headers $headers_api -Body $SafePayload -ErrorAction Stop | Out-Null; Write-Log "✅ Successfully created Safe: ${SafeName}." }
+catch { Write-Log "⚠️ WARNING: Safe may already exist - $($_.Exception.Message)" "Yellow" }
 
-# --- Permissions (exact as requested) ---
+# --- Permission sets (unchanged) ---
 $LimitedPermissions = @{
     useAccounts=$false; retrieveAccounts=$false; listAccounts=$true; addAccounts=$false
     updateAccountContent=$false; updateAccountProperties=$false
@@ -125,125 +112,203 @@ $FullPermissions = @{
     requestsAuthorizationLevel1=$true; requestsAuthorizationLevel2=$false
 }
 
-# --- Directory context for AD group ---
-$DirectoryName = "cna.com"
-$FallbackDirectoryGuid = "4ac5fb05-f776-4be5-9b7f-9ec01c737fa4"   # your known GUID
+# ---------- SCIM helpers (target AD group only) ----------
+# SCIM base(s). Try Identity first, then PVWA.
+$ScimBases = @(
+    "https://$IdentityTenantID.id.cyberark.cloud/CyberArk/scim/v2",
+    "https://$PCloudSubdomain.privilegecloud.cyberark.cloud/CyberArk/scim/v2"
+)
 
-# Attempt to resolve Directory GUID (ok if it fails; fallback used)
-$ResolvedDirectoryGuid = $null
-try {
-    $dirsEndpoint = "https://$PCloudSubdomain.privilegecloud.cyberark.cloud/PasswordVault/API/Configuration/LDAP/Directories/"
-    $dirs = Invoke-RestMethod -Uri $dirsEndpoint -Headers $headers_api -Method Get -ErrorAction Stop
-    $match = $dirs | Where-Object { $_.Name -eq $DirectoryName -or $_.DomainName -eq $DirectoryName -or $_.LDAPDomainName -eq $DirectoryName } | Select-Object -First 1
-    if ($match -and $match.Id) { $ResolvedDirectoryGuid = [string]$match.Id; Write-Log "Resolved directory '$DirectoryName' to GUID: $ResolvedDirectoryGuid" }
-} catch { Write-Log "⚠️ Failed to query Directories: $($_.Exception.Message). Using fallback GUID." "Yellow" }
-if ([string]::IsNullOrWhiteSpace($ResolvedDirectoryGuid)) { $ResolvedDirectoryGuid = $FallbackDirectoryGuid; Write-Log "Using fallback Directory GUID: $ResolvedDirectoryGuid" "Yellow" }
+function Invoke-Scim {
+    param([string]$Path, [string]$Method, $Body=$null)
+    $lastErr = $null
+    foreach ($base in $ScimBases) {
+        $url = "$base$Path"
+        try {
+            if ($Body -ne $null) {
+                $json = ($Body | ConvertTo-Json -Depth 12)
+                return Invoke-RestMethod -Uri $url -Method $Method -Headers $headers_api -Body $json -ErrorAction Stop
+            } else {
+                return Invoke-RestMethod -Uri $url -Method $Method -Headers $headers_api -ErrorAction Stop
+            }
+        } catch { $lastErr = $_ }
+    }
+    throw $lastErr
+}
 
-# --- Member inputs ---
-function Prompt-ValidADGroupSam {
-    param([string]$PromptText)
+function Get-ScimRightsFromPermissions {
+    param($perm)
+    # First try UI-friendly labels
+    $labels = @()
+    if ($perm.listAccounts)            { $labels += "List" }
+    if ($perm.viewAuditLog)            { $labels += "View audit log" }
+    if ($perm.viewSafeMembers)         { $labels += "View Safe Members" }
+    if ($perm.initiateCPMAccountManagementOperations) { $labels += "Initiate CPM change" }
+    if ($perm.unlockAccounts)          { $labels += "Unlock accounts" }
+    if ($perm.useAccounts)             { $labels += "Use accounts" }
+    if ($perm.retrieveAccounts)        { $labels += "Retrieve accounts" }
+    if ($perm.addAccounts)             { $labels += "Add" }
+    if ($perm.updateAccountContent)    { $labels += "Update content" }
+    if ($perm.updateAccountProperties) { $labels += "Update properties" }
+    if ($perm.specifyNextAccountContent){ $labels += "Specify next password" }
+    if ($perm.renameAccounts)          { $labels += "Rename accounts" }
+    if ($perm.deleteAccounts)          { $labels += "Delete accounts" }
+    if ($perm.manageSafe)              { $labels += "Manage Safe" }
+    if ($perm.manageSafeMembers)       { $labels += "Manage Safe Members" }
+    if ($perm.backupSafe)              { $labels += "Backup Safe" }
+    if ($perm.accessWithoutConfirmation){ $labels += "Access without confirmation" }
+    if ($perm.createFolders)           { $labels += "Create folders" }
+    if ($perm.deleteFolders)           { $labels += "Delete folders" }
+    if ($perm.moveAccountsAndFolders)  { $labels += "Move accounts and folders" }
+    if ($perm.requestsAuthorizationLevel1){ $labels += "Requests authorization level 1" }
+    if ($perm.requestsAuthorizationLevel2){ $labels += "Requests authorization level 2" }
+    ,$labels
+}
+
+function Get-ScimRightsLowerCamel {
+    param($perm)
+    $lc = @()
+    foreach ($k in $perm.Keys) { if ($perm[$k]) { $lc += $k } }
+    ,$lc
+}
+
+# --- Inputs for target AD group (SCIM requires DN & objectGUID) ---
+function Prompt-ValidSam { param([string]$Prompt) do { $v = Read-Host $Prompt } while ($v -notmatch '^[a-zA-Z0-9._-]+$'); return $v }
+function Prompt-ValidGuid {
+    param([string]$Prompt)
     while ($true) {
-        $group = Read-Host $PromptText
-        if ($group -match '^[a-zA-Z0-9_\-\.]+$') { return $group }
-        Write-Log "❌ Invalid format. Enter AD group sAMAccountName (e.g., ca_bud_ecf_prod)" "Red"
+        $g = Read-Host $Prompt
+        if ([string]::IsNullOrWhiteSpace($g)) { continue }
+        $g2 = $g.Trim('{}')
+        if ($g2 -match '^[0-9a-fA-F-]{32,36}$') { return $g2.ToUpper() }
+        Write-Log "❌ Invalid GUID format. Example: 3F2504E0-4F89-11D3-9A0C-0305E82C3301" "Red"
     }
 }
-$GroupName = Prompt-ValidADGroupSam -PromptText "Enter the AD Safe Group (sAMAccountName only, e.g., ca_bud_ecf_prod)"
-if ([string]::IsNullOrWhiteSpace($GroupName)) { Write-Log "❌ ERROR: Group Name cannot be empty. Exiting..."; exit }
+function Prompt-ValidDN {
+    param([string]$Prompt)
+    while ($true) {
+        $dn = Read-Host $Prompt
+        if ($dn -match '(?i)CN=.+,.*DC=.+,DC=.+') { return $dn }
+        Write-Log "❌ Please paste a valid Distinguished Name (e.g., CN=Group,OU=Groups,DC=cna,DC=com)" "Red"
+    }
+}
 
-# --- Helpers ---
-$SafeNameForUrl   = [System.Uri]::EscapeDataString($SafeName)
-$MembersEndpoint  = "https://$PCloudSubdomain.privilegecloud.cyberark.cloud/PasswordVault/API/Safes/$SafeNameForUrl/Members/"
-$UserGroupsBase   = "https://$PCloudSubdomain.privilegecloud.cyberark.cloud/PasswordVault/API/UserGroups"
+$DirectoryName = "cna.com"  # SCIM 'ldapDirectory' name
+$GroupSam      = Prompt-ValidSam -Prompt "Enter the AD Safe Group (sAMAccountName, e.g., ca_bud_ecf_prod)"
+$GroupDN       = Prompt-ValidDN  -Prompt "Paste the AD Group Distinguished Name (DN) (e.g., CN=...,OU=...,DC=cna,DC=com)"
+$GroupGUID     = Prompt-ValidGuid -Prompt "Paste the AD Group objectGUID (e.g., 3F2504E0-4F89-11D3-9A0C-0305E82C3301)"
 
+# --- Step 1: Ensure External Group exists (SCIM /Groups) ---
+function Ensure-ExternalGroup {
+    param([string]$DisplayName,[string]$LdapDN,[string]$LdapDirectory,[string]$Description="")
+    # Try to find by displayName
+    try {
+        $filter = [uri]::EscapeDataString("displayName eq `"$DisplayName`"")
+        $res = Invoke-Scim -Path "/Groups?filter=$filter" -Method "GET"
+        $items = @()
+        if ($res -is [System.Array]) { $items = $res }
+        elseif ($res.Resources)      { $items = $res.Resources }
+        elseif ($res.value)          { $items = $res.value }
+        if ($items.Count -gt 0) {
+            Write-Log "External group '$DisplayName' already exists in SCIM."; return $items[0]
+        }
+    } catch { Write-Log "ℹ️ SCIM group search failed or returned none, will attempt to create. $($_.Exception.Message)" "Yellow" }
+
+    # Create
+    $body = @{
+        displayName = $DisplayName
+        "urn:ietf:params:scim:schemas:cyberark:1.0:Group" = @{
+            location      = "\\Groups"
+            ldapFullDN    = $LdapDN
+            ldapDirectory = $LdapDirectory
+            description   = $Description
+        }
+    }
+    Write-Log "Creating external group '$DisplayName' in SCIM..."
+    $created = Invoke-Scim -Path "/Groups" -Method "POST" -Body $body
+    Write-Log "✅ External group ensured: $DisplayName"
+    return $created
+}
+
+# --- Step 2: Add Container Permission for the group (SCIM /ContainerPermissions) ---
+function Grant-ContainerPermission-ToGroup {
+    param([string]$Safe,[string]$GroupObjectGuid,$permObj)
+
+    # Attempt 1: human-friendly rights labels
+    $rights1 = Get-ScimRightsFromPermissions $permObj
+    if ($rights1.Count -eq 0) { $rights1 = @("List") } # minimal
+    $payload1 = @{
+        schemas  = @("urn:ietf:params:scim:schemas:pam:1.0:ContainerPermissions")
+        rights   = $rights1
+        container= @{ display=$Safe; name=$Safe }
+        member   = @{ value=$GroupObjectGuid; type="Group" }
+    }
+    Write-Log "Granting SCIM ContainerPermissions (labels) to group GUID=$GroupObjectGuid on safe '$Safe'..."
+    try {
+        $null = Invoke-Scim -Path "/ContainerPermissions" -Method "POST" -Body $payload1
+        Write-Log "✅ SCIM permissions applied (labels)."
+        return
+    } catch {
+        Write-Log "⚠️ Label rights failed, trying lowerCamel rights... $($_.Exception.Message)" "Yellow"
+    }
+
+    # Attempt 2: lowerCamel rights (keys)
+    $rights2 = Get-ScimRightsLowerCamel $permObj
+    if ($rights2.Count -eq 0) { $rights2 = @("listAccounts") }
+    $payload2 = @{
+        schemas  = @("urn:ietf:params:scim:schemas:pam:1.0:ContainerPermissions")
+        rights   = $rights2
+        container= @{ display=$Safe; name=$Safe }
+        member   = @{ value=$GroupObjectGuid; type="Group" }
+    }
+    try {
+        $null = Invoke-Scim -Path "/ContainerPermissions" -Method "POST" -Body $payload2
+        Write-Log "✅ SCIM permissions applied (lowerCamel)."
+        return
+    } catch {
+        Write-Log "⚠️ lowerCamel rights failed, trying minimal 'List' only... $($_.Exception.Message)" "Yellow"
+    }
+
+    # Attempt 3: minimal right to establish membership
+    $payload3 = @{
+        schemas  = @("urn:ietf:params:scim:schemas:pam:1.0:ContainerPermissions")
+        rights   = @("List")
+        container= @{ display=$Safe; name=$Safe }
+        member   = @{ value=$GroupObjectGuid; type="Group" }
+    }
+    $null = Invoke-Scim -Path "/ContainerPermissions" -Method "POST" -Body $payload3
+    Write-Log "✅ SCIM minimal permission applied (List)."
+}
+
+# Execute SCIM flow for target AD group
+try {
+    $null = Ensure-ExternalGroup -DisplayName $GroupSam -LdapDN $GroupDN -LdapDirectory $DirectoryName -Description ""
+    Grant-ContainerPermission-ToGroup -Safe $SafeName -GroupObjectGuid $GroupGUID -permObj $LimitedPermissions
+} catch {
+    Write-Log "❌ SCIM flow failed for target AD group - $($_.Exception.Message)" "Red"
+}
+
+# ---------- Add remaining members with PVWA REST (unchanged) ----------
+$SafeNameForUrl = [System.Uri]::EscapeDataString($SafeName)
+$MembersEndpoint = "https://$PCloudSubdomain.privilegecloud.cyberark.cloud/PasswordVault/API/Safes/$SafeNameForUrl/Members/"
 function Add-MemberRest {
     param([hashtable]$Body)
     $json = $Body | ConvertTo-Json -Depth 10
-    try {
-        Invoke-RestMethod -Uri $MembersEndpoint -Method Post -Headers $headers_api -Body $json -ErrorAction Stop | Out-Null
-        Write-Log "✅ Added $($Body.memberType): $($Body.memberName)."; return $true
-    } catch {
-        $err = $_.Exception
-        $msg = $null; try { $msg = $err.Response.Content.ReadAsStringAsync().Result } catch {}
-        if (-not $msg) { $msg = $_ | Out-String }
+    try { Invoke-RestMethod -Uri $MembersEndpoint -Method Post -Headers $headers_api -Body $json -ErrorAction Stop | Out-Null; Write-Log "✅ Added $($Body.memberType): $($Body.memberName)."; return $true }
+    catch {
+        $err = $_.Exception; $msg = $null; try { $msg = $err.Response.Content.ReadAsStringAsync().Result } catch {}; if (-not $msg) { $msg = $_ | Out-String }
         Write-Log "❌ Failed to add '$($Body.memberName)' - $msg" "Red"; return $false
     }
 }
 
-function Resolve-DirectoryGroupName {
-    param([string]$Sam, [string]$DomainName)
-    # Use PVWA "Get Groups" to find the Directory group name PVWA recognizes (contains search)
-    $targetSearches = @($Sam, "$Sam@$DomainName")
-    foreach ($search in $targetSearches) {
-        $q = "$UserGroupsBase?filter=" + [uri]::EscapeDataString("groupType eq Directory") + "&search=" + [uri]::EscapeDataString($search)
-        try {
-            $res = Invoke-RestMethod -Uri $q -Headers $headers_api -Method Get -ErrorAction Stop
-            # Response may be an array or have a 'value' property depending on version
-            $groups = @()
-            if ($res -is [System.Array]) { $groups = $res }
-            elseif ($res.value) { $groups = $res.value }
-            else { $groups = @($res) }
-
-            # Prefer exact (case-insensitive) matches, then a single best candidate
-            $candidates = $groups | Where-Object { $_.groupType -eq "Directory" -and $_.groupName }
-            if ($candidates.Count -gt 0) {
-                $exact = $candidates | Where-Object { $_.groupName -ieq $search } | Select-Object -First 1
-                if ($exact) { return [string]$exact.groupName }
-                # If multiple, prefer those ending with @Domain
-                $prefer = $candidates | Where-Object { $_.groupName -match "@$([Regex]::Escape($DomainName))$" } | Select-Object -First 1
-                if ($prefer) { return [string]$prefer.groupName }
-                return [string]$candidates[0].groupName
-            }
-        } catch {
-            Write-Log "⚠️ Group lookup failed for '$search' - $($_.Exception.Message)" "Yellow"
-        }
-    }
-    return $null
-}
-
-# --- 1) Target AD group: resolve group name in PVWA first, then add with SearchIn=<Directory GUID> ---
-$ResolvedGroupName = Resolve-DirectoryGroupName -Sam $GroupName -DomainName $DirectoryName
-if ($ResolvedGroupName) {
-    Write-Log "Found directory group in PVWA as '$ResolvedGroupName' (type=Directory)."
-} else {
-    Write-Log "⚠️ Directory group '$GroupName' not found via PVWA group search; will try fallbacks." "Yellow"
-}
-
-# Build try order for MemberName
-$adCandidates = @()
-if ($ResolvedGroupName) { $adCandidates += $ResolvedGroupName }
-$adCandidates += "$GroupName@$DirectoryName"
-$adCandidates += $GroupName
-$adCandidates = $adCandidates | Select-Object -Unique
-
-foreach ($mn in $adCandidates) {
-    $adGroupBody = @{
-        MemberName  = $mn
-        MemberType  = "Group"
-        SearchIn    = $ResolvedDirectoryGuid         # Directory GUID per Priv Cloud guidance
-        Permissions = $LimitedPermissions
-    }
-    Write-Log "Attempting AD group add with MemberName='$mn' and SearchIn(GUID)=$ResolvedDirectoryGuid..."
-    if (Add-MemberRest -Body $adGroupBody) { break }
-}
-
-# --- 2) CA_PCloud_Admins@cna.com (registered tenant group - unchanged) ---
-$tenantGroupBody = @{
-    memberName  = "CA_PCloud_Admins@cna.com"
-    memberType  = "Group"
-    permissions = $FullPermissions
-}
-Write-Log "Adding Registered Group 'CA_PCloud_Admins@cna.com'..."
+# 1) Tenant group (unchanged - already registered)
+$tenantGroupBody = @{ memberName="CA_PCloud_Admins@cna.com"; memberType="Group"; permissions=$FullPermissions }
+Write-Log "Adding Registered Group 'CA_PCloud_Admins@cna.com' (PVWA REST)..."
 $null = Add-MemberRest -Body $tenantGroupBody
 
-# --- 3) Vault user (unchanged; SearchIn='Vault') ---
-$cloudUserBody = @{
-    memberName  = "cna_pas_admin@cyberark.cloud.6679"
-    memberType  = "User"
-    searchIn    = "Vault"
-    permissions = $FullPermissions
-}
-Write-Log "Adding Vault User 'cna_pas_admin@cyberark.cloud.6679'..."
+# 2) Vault user (unchanged)
+$cloudUserBody = @{ memberName="cna_pas_admin@cyberark.cloud.6679"; memberType="User"; searchIn="Vault"; permissions=$FullPermissions }
+Write-Log "Adding Vault User 'cna_pas_admin@cyberark.cloud.6679' (PVWA REST)..."
 $null = Add-MemberRest -Body $cloudUserBody
 
 Write-Log "🔹 Safe member addition process completed."
