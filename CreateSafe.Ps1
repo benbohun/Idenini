@@ -47,6 +47,7 @@ try {
 # --- Prompt for Safe Name & single-line Description (<=200 chars) ---
 $SafeName    = Read-Host "Enter the Safe Name"
 $Description = Read-Host "Enter the Safe Description (single line, up to 200 chars)"
+
 if ([string]::IsNullOrWhiteSpace($SafeName))    { Write-Log "❌ ERROR: Safe Name cannot be empty. Exiting..." "Red"; exit }
 if ([string]::IsNullOrWhiteSpace($Description)) { Write-Log "❌ ERROR: Safe Description cannot be empty. Exiting..." "Red"; exit }
 if ($Description.Length -gt 200) {
@@ -95,7 +96,7 @@ $headers_api = @{
 }
 
 # --- Create Safe Using REST API ---
-Write-Log "🔹 Creating Safe: ${SafeName}..."
+Write-Log "🔹 Creating Safe: $SafeName..."
 $SafesEndpoint = "https://$PCloudSubdomain.privilegecloud.cyberark.cloud/PasswordVault/API/Safes/"
 $SafePayload = @{
     safeName              = $SafeName
@@ -105,10 +106,10 @@ $SafePayload = @{
     managingCPM           = "CNA_PASS_MANG"
     numberOfDaysRetention = 180
 }
-Write-Log "Creating Safe: ${SafeName} with payload: $(($SafePayload | ConvertTo-Json -Depth 3))"
+Write-Log "Creating Safe: $SafeName with payload: $(($SafePayload | ConvertTo-Json -Depth 3))"
 try {
     Invoke-CybrPostJson -Uri $SafesEndpoint -Headers $headers_api -BodyObject $SafePayload | Out-Null
-    Write-Log "✅ Successfully created Safe: ${SafeName}."
+    Write-Log "✅ Successfully created Safe: $SafeName."
 } catch {
     # Usually indicates Safe already exists; proceed to member handling anyway.
     Write-Log "⚠️ Safe create returned: $($_.Exception.Message). Continuing..." "Yellow"
@@ -201,14 +202,13 @@ try {
         Write-Log "Establishing PVWA session via PAPMAPIConnect..."
         PAPMAPIConnect
     } else {
-        # Fallback: assume session is already established externally
         Write-Log "ℹ️ PAPMAPIConnect not found; assuming psPAS session already established." "Yellow"
     }
 } catch {
     Write-Log "⚠️ PAPMAPIConnect failed: $($_.Exception.Message). Add/Set-PASSafeMember may fail without a session." "Yellow"
 }
 
-# --- Helper: add-or-update member via psPAS, NO -SearchIn used ---
+# --- Helper: add-or-update member via psPAS (NO -SearchIn used) ---
 Function Ensure-SafeMember {
     param(
         [Parameter(Mandatory)][string]$SafeName,
@@ -224,7 +224,7 @@ Function Ensure-SafeMember {
         Write-Log "Updating $MemberType '$MemberName' on $SafeName (psPAS)..."
         try {
             $RoleObject | Set-PASSafeMember -SafeName $SafeName -MemberName $MemberName -ErrorAction Stop | Out-Null
-            Write-Log "✅ Updated $MemberType: $MemberName."
+            Write-Log "✅ Updated $($MemberType): $($MemberName)."
         } catch {
             Write-Log "❌ Failed to update '$MemberName' - $($_.Exception.Message)" "Red"
         }
@@ -232,7 +232,7 @@ Function Ensure-SafeMember {
         Write-Log "Adding $MemberType '$MemberName' to $SafeName (psPAS)..."
         try {
             $RoleObject | Add-PASSafeMember -SafeName $SafeName -memberType $MemberType -MemberName $MemberName -ErrorAction Stop | Out-Null
-            Write-Log "✅ Added $MemberType: $MemberName."
+            Write-Log "✅ Added $($MemberType): $($MemberName)."
         } catch {
             Write-Log "❌ Failed to add '$MemberName' - $($_.Exception.Message)" "Red"
         }
