@@ -41,45 +41,68 @@ function Prompt-DescriptionBox {
     try {
         Add-Type -AssemblyName System.Windows.Forms | Out-Null
         [System.Windows.Forms.Application]::EnableVisualStyles()
+
         $form = New-Object System.Windows.Forms.Form
-        $form.Text = $Title; $form.Width = 600; $form.Height = 170; $form.StartPosition = "CenterScreen"; $form.TopMost = $true
+        $form.Text = $Title
+        $form.Width = 600
+        $form.Height = 170
+        $form.StartPosition = "CenterScreen"
+        $form.TopMost = $true
 
         $label = New-Object System.Windows.Forms.Label
-        $label.Text = $Prompt; $label.AutoSize = $true; $label.Top = 10; $label.Left = 10
+        $label.Text = $Prompt
+        $label.AutoSize = $true
+        $label.Top = 10
+        $label.Left = 10
         $form.Controls.Add($label)
 
         $textBox = New-Object System.Windows.Forms.TextBox
-        $textBox.Multiline = $false; $textBox.Width = 560; $textBox.Top = 40; $textBox.Left = 10; $textBox.MaxLength = 200
+        $textBox.Multiline = $false
+        $textBox.Width = 560
+        $textBox.Top = 40
+        $textBox.Left = 10
+        $textBox.MaxLength = 200
         $form.Controls.Add($textBox)
 
         $okButton = New-Object System.Windows.Forms.Button
-        $okButton.Text = "OK"; $okButton.Width = 100; $okButton.Height = 30; $okButton.Top = 80; $okButton.Left = 360
+        $okButton.Text = "OK"
+        $okButton.Width = 100
+        $okButton.Height = 30
+        $okButton.Top = 80
+        $okButton.Left = 360
         $okButton.Add_Click({ $form.Tag = $textBox.Text; $form.Close() })
         $form.Controls.Add($okButton)
 
         $cancelButton = New-Object System.Windows.Forms.Button
-        $cancelButton.Text = "Cancel"; $cancelButton.Width = 100; $cancelButton.Height = 30; $cancelButton.Top = 80; $cancelButton.Left = 470
+        $cancelButton.Text = "Cancel"
+        $cancelButton.Width = 100
+        $cancelButton.Height = 30
+        $cancelButton.Top = 80
+        $cancelButton.Left = 470
         $cancelButton.Add_Click({ $form.Tag = $null; $form.Close() })
         $form.Controls.Add($cancelButton)
 
         [void]$form.ShowDialog()
-        $desc = $form.Tag; $form.Dispose()
-        if ([string]::IsNullOrWhiteSpace($desc)) { return $null } else { return $desc }
+        $desc = $form.Tag
+        $form.Dispose()
+        if ([string]::IsNullOrWhiteSpace($desc)) { return $null }
+        return $desc
     } catch {
         return Read-Host "Enter Safe Description (fallback, max 200 chars)"
     }
 }
 $Description = Prompt-DescriptionBox
 
-if ([string]::IsNullOrWhiteSpace($SafeName))      { Write-Log "❌ ERROR: Safe Name cannot be empty. Exiting..."; exit }
-if ([string]::IsNullOrWhiteSpace($Description))   { Write-Log "❌ ERROR: Safe Description cannot be empty. Exiting..."; exit }
+if ([string]::IsNullOrWhiteSpace($SafeName))    { Write-Log "❌ ERROR: Safe Name cannot be empty. Exiting..."; exit }
+if ([string]::IsNullOrWhiteSpace($Description)) { Write-Log "❌ ERROR: Safe Description cannot be empty. Exiting..."; exit }
 
 # --- Authentication Variables (from CCP) ---
-$IdentityTenantID = "aat4012"      # CyberArk Identity tenant ID
-$PCloudSubdomain  = "cna-prod"     # CyberArk Privilege Cloud subdomain
+$IdentityTenantID = "aat4012"        # CyberArk Identity tenant ID
+$PCloudSubdomain  = "cna-prod"       # CyberArk Privilege Cloud Subdomain
 $ClientID         = $response.Username
 $ClientSecret     = $response.Content
-if ([string]::IsNullOrWhiteSpace($ClientID) -or [string]::IsNullOrWhiteSpace($ClientSecret)) {
+
+if ([string]::IsNullOrEmpty($ClientID) -or [string]::IsNullOrEmpty($ClientSecret)) {
     Write-Log "ERROR: Client ID or Client Secret is missing. Exiting..."
     exit
 }
@@ -87,33 +110,43 @@ if ([string]::IsNullOrWhiteSpace($ClientID) -or [string]::IsNullOrWhiteSpace($Cl
 # --- Request OAuth Token ---
 Write-Log "Requesting initial CyberArk ISPSS token..."
 $TokenURL = "https://$IdentityTenantID.id.cyberark.cloud/oauth2/platformtoken"
-$TokenBody = @{ grant_type="client_credentials"; client_id=$ClientID; client_secret=$ClientSecret }
+$TokenBody = @{
+    grant_type    = "client_credentials"
+    client_id     = $ClientID
+    client_secret = $ClientSecret
+}
 $headers_token = @{ "Content-Type" = "application/x-www-form-urlencoded" }
 
 try {
     $TokenResponse = Invoke-RestMethod -Uri $TokenURL -Method Post -Headers $headers_token -Body $TokenBody
     $BearerToken = [string]$TokenResponse.access_token
-    if ([string]::IsNullOrWhiteSpace($BearerToken) -or $BearerToken.Length -lt 100) {
-        Write-Log "ERROR: Received an invalid token. Length: $($BearerToken.Length)"; exit
+    if ([string]::IsNullOrEmpty($BearerToken) -or $BearerToken.Length -lt 100) {
+        Write-Log "ERROR: Received an invalid token. Length: $($BearerToken.Length)"
+        exit
     }
     Write-Log "✅ Authentication successful, token obtained."
 } catch {
-    Write-Log "ERROR: Failed to authenticate with CyberArk ISPSS. $_"; exit
+    Write-Log "ERROR: Failed to authenticate with CyberArk ISPSS. $_"
+    exit
 }
 
 # --- API Headers ---
-$headers_api = @{ "Authorization" = "Bearer $BearerToken"; "Content-Type" = "application/json" }
+$headers_api = @{
+    "Authorization" = "Bearer $BearerToken"
+    "Content-Type"  = "application/json"
+}
 
-# --- Create Safe ---
+# --- Create Safe Using API ---
 Write-Log "🔹 Creating Safe: ${SafeName}..."
+
 $APIEndpointSafes = "https://$PCloudSubdomain.privilegecloud.cyberark.cloud/PasswordVault/API/Safes/"
 $SafePayload = @{
-    safeName              = $SafeName
-    description           = $Description
-    olacEnabled           = $false
-    autoPurgeEnabled      = $false
-    managingCPM           = "CNA_PASS_MANG"
-    numberOfDaysRetention = 180
+    "safeName"              = $SafeName
+    "description"           = $Description
+    "olacEnabled"           = $false
+    "autoPurgeEnabled"      = $false
+    "managingCPM"           = "CNA_PASS_MANG"
+    "numberOfDaysRetention" = 180
 } | ConvertTo-Json -Depth 3
 
 Write-Log "Creating Safe: ${SafeName} with payload: $SafePayload"
@@ -126,46 +159,70 @@ try {
 
 # --- Permissions (exact) ---
 $LimitedPermissions = @{
-    useAccounts=$false; retrieveAccounts=$false; listAccounts=$true; addAccounts=$false
-    updateAccountContent=$false; updateAccountProperties=$false
-    initiateCPMAccountManagementOperations=$true; specifyNextAccountContent=$false
-    renameAccounts=$false; deleteAccounts=$false; unlockAccounts=$true
-    manageSafe=$false; manageSafeMembers=$false; backupSafe=$false
-    viewAuditLog=$true; viewSafeMembers=$true; accessWithoutConfirmation=$true
-    createFolders=$false; deleteFolders=$false; moveAccountsAndFolders=$false
-    requestsAuthorizationLevel1=$true; requestsAuthorizationLevel2=$false
+    "useAccounts" = $false
+    "retrieveAccounts" = $false
+    "listAccounts" = $true
+    "addAccounts" = $false
+    "updateAccountContent" = $false
+    "updateAccountProperties" = $false
+    "initiateCPMAccountManagementOperations" = $true
+    "specifyNextAccountContent" = $false
+    "renameAccounts" = $false
+    "deleteAccounts" = $false
+    "unlockAccounts" = $true
+    "manageSafe" = $false
+    "manageSafeMembers" = $false
+    "backupSafe" = $false
+    "viewAuditLog" = $true
+    "viewSafeMembers" = $true
+    "accessWithoutConfirmation" = $true
+    "createFolders" = $false
+    "deleteFolders" = $false
+    "moveAccountsAndFolders" = $false
+    "requestsAuthorizationLevel1" = $true
+    "requestsAuthorizationLevel2" = $false
 }
 $FullPermissions = @{
-    useAccounts=$true; retrieveAccounts=$true; listAccounts=$true; addAccounts=$true
-    updateAccountContent=$true; updateAccountProperties=$true
-    initiateCPMAccountManagementOperations=$true; specifyNextAccountContent=$true
-    renameAccounts=$true; deleteAccounts=$true; unlockAccounts=$true
-    manageSafe=$true; manageSafeMembers=$true; backupSafe=$true
-    viewAuditLog=$true; viewSafeMembers=$true; accessWithoutConfirmation=$true
-    createFolders=$true; deleteFolders=$true; moveAccountsAndFolders=$true
-    requestsAuthorizationLevel1=$true; requestsAuthorizationLevel2=$false
+    "useAccounts" = $true
+    "retrieveAccounts" = $true
+    "listAccounts" = $true
+    "addAccounts" = $true
+    "updateAccountContent" = $true
+    "updateAccountProperties" = $true
+    "initiateCPMAccountManagementOperations" = $true
+    "specifyNextAccountContent" = $true
+    "renameAccounts" = $true
+    "deleteAccounts" = $true
+    "unlockAccounts" = $true
+    "manageSafe" = $true
+    "manageSafeMembers" = $true
+    "backupSafe" = $true
+    "viewAuditLog" = $true
+    "viewSafeMembers" = $true
+    "accessWithoutConfirmation" = $true
+    "createFolders" = $true
+    "deleteFolders" = $true
+    "moveAccountsAndFolders" = $true
+    "requestsAuthorizationLevel1" = $true
+    "requestsAuthorizationLevel2" = $false
 }
 
-# --- Resolve Directory ID for 'cna.com' (Privilege Cloud docs: use Directory ID for AD searchIn) ---
+# --- Resolve Directory GUID (fallback to your known GUID if discovery fails) ---
 $DirectoryName = "cna.com"
 $FallbackDirectoryGuid = "4ac5fb05-f776-4be5-9b7f-9ec01c737fa4"
 $ResolvedDirectoryGuid = $null
 try {
-    # Per docs: /PasswordVault/API/Configuration/LDAP/Directories/ returns directories (Privilege Cloud / PAM Self-Hosted) 
-    # https://docs.cyberark.com/.../ldap_get_directories.htm
+    # Some tenants expose Directory list here; if it fails, we fall back.
     $dirsEndpoint = "https://$PCloudSubdomain.privilegecloud.cyberark.cloud/PasswordVault/API/Configuration/LDAP/Directories/"
     $dirs = Invoke-RestMethod -Uri $dirsEndpoint -Headers $headers_api -Method Get -ErrorAction Stop
-    # Try common property names
     $match = $dirs | Where-Object {
-        $_.Name -eq $DirectoryName -or
-        $_.DomainName -eq $DirectoryName -or
-        $_.LDAPDomainName -eq $DirectoryName
+        $_.Name -eq $DirectoryName -or $_.DomainName -eq $DirectoryName -or $_.LDAPDomainName -eq $DirectoryName
     } | Select-Object -First 1
     if ($match -and $match.Id) {
         $ResolvedDirectoryGuid = [string]$match.Id
         Write-Log "Resolved directory '$DirectoryName' to GUID: $ResolvedDirectoryGuid"
     } else {
-        Write-Log "⚠️ Directory '$DirectoryName' not found in API response. Will use fallback GUID." "Yellow"
+        Write-Log "⚠️ Directory '$DirectoryName' not found via API. Will use fallback GUID." "Yellow"
     }
 } catch {
     Write-Log "⚠️ Failed to query Directories: $($_.Exception.Message). Using fallback GUID." "Yellow"
@@ -175,7 +232,7 @@ if ([string]::IsNullOrWhiteSpace($ResolvedDirectoryGuid)) {
     Write-Log "Using fallback Directory GUID: $ResolvedDirectoryGuid" "Yellow"
 }
 
-# --- Member prompts ---
+# --- Member inputs ---
 function Prompt-ValidADGroupSam {
     param([string]$PromptText)
     while ($true) {
@@ -187,7 +244,7 @@ function Prompt-ValidADGroupSam {
 $GroupName = Prompt-ValidADGroupSam -PromptText "Enter the AD Safe Group (sAMAccountName only, e.g., ca_bud_ecf_prod)"
 if ([string]::IsNullOrWhiteSpace($GroupName)) { Write-Log "❌ ERROR: Group Name cannot be empty. Exiting..."; exit }
 
-# --- Helpers ---
+# --- REST helper ---
 $SafeNameForUrl = [System.Uri]::EscapeDataString($SafeName)
 $MembersEndpoint = "https://$PCloudSubdomain.privilegecloud.cyberark.cloud/PasswordVault/API/Safes/$SafeNameForUrl/Members/"
 
@@ -206,34 +263,46 @@ function Add-MemberRest {
     }
 }
 
-# --- Add target AD group (search in Directory, not Vault) ---
-$adGroupBody = @{
-    memberName     = $GroupName              # sAMAccountName
-    memberType     = "Group"
-    searchIn       = $ResolvedDirectoryGuid  # Directory ID (GUID) per Privilege Cloud requirement
-    memberLocation = @{ type="Directory"; id=$ResolvedDirectoryGuid; name=$DirectoryName }
-    permissions    = $LimitedPermissions
+# --- 1) Target AD group: try 'sam@cna.com' with GUID SearchIn (as per community example) ---
+$adGroupUpn = "$GroupName@$DirectoryName"
+$adGroupBody1 = @{
+    MemberName  = $adGroupUpn
+    MemberType  = "Group"
+    SearchIn    = $ResolvedDirectoryGuid  # GUID
+    Permissions = $LimitedPermissions
 }
-Write-Log "Adding Group '$GroupName' via REST (Directory searchIn=$ResolvedDirectoryGuid; location=$DirectoryName)..."
-$null = Add-MemberRest -Body $adGroupBody
+Write-Log "Adding AD Group '$adGroupUpn' with SearchIn GUID=$ResolvedDirectoryGuid..."
+$added = Add-MemberRest -Body $adGroupBody1
 
-# --- Add CA_PCloud_Admins@cna.com (registered tenant group) — as before (no SearchIn) ---
+# --- 2) If SFWS0010, retry with raw sAM 'sam' (still GUID SearchIn) ---
+if (-not $added) {
+    $adGroupBody2 = @{
+        MemberName  = $GroupName
+        MemberType  = "Group"
+        SearchIn    = $ResolvedDirectoryGuid
+        Permissions = $LimitedPermissions
+    }
+    Write-Log "Retrying with sAM '$GroupName' and SearchIn GUID=$ResolvedDirectoryGuid..."
+    $null = Add-MemberRest -Body $adGroupBody2
+}
+
+# --- CA_PCloud_Admins@cna.com (unchanged flow) ---
 $tenantGroupBody = @{
     memberName  = "CA_PCloud_Admins@cna.com"
     memberType  = "Group"
     permissions = $FullPermissions
 }
-Write-Log "Adding Registered Group 'CA_PCloud_Admins@cna.com' via REST..."
+Write-Log "Adding Registered Group 'CA_PCloud_Admins@cna.com'..."
 $null = Add-MemberRest -Body $tenantGroupBody
 
-# --- Add cloud vault user (SearchIn = Vault) — as before
+# --- Vault user (unchanged flow) ---
 $cloudUserBody = @{
     memberName  = "cna_pas_admin@cyberark.cloud.6679"
     memberType  = "User"
     searchIn    = "Vault"
     permissions = $FullPermissions
 }
-Write-Log "Adding Vault User 'cna_pas_admin@cyberark.cloud.6679' via REST..."
+Write-Log "Adding Vault User 'cna_pas_admin@cyberark.cloud.6679'..."
 $null = Add-MemberRest -Body $cloudUserBody
 
 Write-Log "🔹 Safe member addition process completed."
