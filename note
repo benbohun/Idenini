@@ -1,9 +1,9 @@
 <# =========================================
    CyberArk Safe Create + Member Add (psPAS)
    - Auth via CCP -> psPAS Identity header (UPCred)
-   - Safe creation first, then members
-   - Target AD group validated in specific OU
-   - No SearchIn used for member adds
+   - Always create safe (no pre-check), then add members
+   - Target AD group validated in specific OU; add as group@cna.com
+   - No -SearchIn used for member adds
    ========================================= #>
 
 # --- Logging Utility ---
@@ -16,7 +16,7 @@ Function Write-Log {
     try { Add-Content -Path $LogPath -Value $LogEntry } catch {}
 }
 
-# --- Ensure psPAS is available ---
+# --- Load psPAS ---
 try {
     Import-Module psPAS -ErrorAction Stop
     $mod = Get-Module psPAS
@@ -24,6 +24,15 @@ try {
 } catch {
     Write-Log "❌ psPAS module not found/loaded: $($_.Exception.Message)" "Red"
     exit 1
+}
+
+# --- Try to import AD module for OU validation (non-fatal if missing) ---
+$ADModuleLoaded = $false
+try {
+    Import-Module ActiveDirectory -ErrorAction Stop
+    $ADModuleLoaded = $true
+} catch {
+    Write-Log "⚠️ ActiveDirectory module not available; will still try to add group by UPN." "Yellow"
 }
 
 # --- Retrieve CyberArk API Credentials from CCP ---
@@ -54,7 +63,7 @@ try {
 # --- psPAS Authentication using CCP secret + fixed username ---
 try {
     Write-Log "Requesting CyberArk PAS authentication (psPAS Identity header)..."
-    $UPUser = 'CA_PAMDiscovery_SVC'  # per your instruction; use UPN if your tenant requires it
+    $UPUser = 'CA_PAMDiscovery_SVC'   # fixed username per your instruction
     $UPPass = ConvertTo-SecureString $response.Content -AsPlainText -Force
     $UPCred = [PSCredential]::new($UPUser, $UPPass)
 
@@ -92,76 +101,70 @@ if ($Description.Length -gt 200) {
     $Description = $Description.Substring(0,200)
 }
 
-# --- Safe creation (psPAS first, then members) ---
+# --- Create Safe (no pre-check; proceed regardless of outcome) ---
 $ManagingCPM = "CNA_PASS_MANG"
-$NumVersionRetention = 180  # keeping prior default
 try {
-    # Check if safe exists
-    $existing = Get-PASSafe -SafeName $SafeName -ErrorAction SilentlyContinue
-    if ($existing) {
-        Write-Log "ℹ️ Safe '$SafeName' already exists. Skipping create."
-    } else {
-        Write-Log "🔹 Creating Safe: ${SafeName}..."
-        Add-PASSafe -SafeName $SafeName -ManagingCPM $ManagingCPM -NumberOfVersionsRetention $NumVersionRetention -Description $Description -ErrorAction Stop
-        Write-Log "✅ Successfully created Safe: ${SafeName}."
-    }
+    Write-Log "🔹 Creating Safe: ${SafeName}..."
+    # Keep parameters minimal to avoid version binding issues
+    Add-PASSafe -SafeName $SafeName -ManagingCPM $ManagingCPM -Description $Description -ErrorAction Stop | Out-Null
+    Write-Log "✅ Successfully created Safe: ${SafeName}."
 } catch {
-    Write-Log "❌ ERROR: Failed to create or read Safe '${SafeName}' - $($_.Exception.Message)" "Red"
-    exit 1
+    # If safe already exists or any other error, log and still proceed to members
+    Write-Log "⚠️ Could not create Safe '${SafeName}': $($_.Exception.Message). Continuing to member add..." "Yellow"
 }
 
-# --- Permissions (as provided) ---
-$LimitedPermissions = @{
-    "useAccounts" = $false
-    "retrieveAccounts" = $false
-    "listAccounts" = $true
-    "addAccounts" = $false
-    "updateAccountContent" = $false
-    "updateAccountProperties" = $false
-    "initiateCPMAccountManagementOperations" = $true
-    "specifyNextAccountContent" = $false
-    "renameAccounts" = $false
-    "deleteAccounts" = $false
-    "unlockAccounts" = $true
-    "manageSafe" = $false
-    "manageSafeMembers" = $false
-    "backupSafe" = $false
-    "viewAuditLog" = $true
-    "viewSafeMembers" = $true
-    "accessWithoutConfirmation" = $true
-    "createFolders" = $false
-    "deleteFolders" = $false
-    "moveAccountsAndFolders" = $false
-    "requestsAuthorizationLevel1" = $true
-    "requestsAuthorizationLevel2" = $false
+# --- psPAS-friendly Permissions (PascalCase) ---
+$LimitedPermPAS = [PSCustomObject]@{
+    UseAccounts                            = $false
+    RetrieveAccounts                       = $false
+    ListAccounts                           = $true
+    AddAccounts                            = $false
+    UpdateAccountContent                   = $false
+    UpdateAccountProperties                = $false
+    InitiateCPMAccountManagementOperations = $true
+    SpecifyNextAccountContent              = $false
+    RenameAccounts                         = $false
+    DeleteAccounts                         = $false
+    UnlockAccounts                         = $true
+    ManageSafe                             = $false
+    ManageSafeMembers                      = $false
+    BackupSafe                             = $false
+    ViewAuditLog                           = $true
+    ViewSafeMembers                        = $true
+    AccessWithoutConfirmation              = $true
+    CreateFolders                          = $false
+    DeleteFolders                          = $false
+    MoveAccountsAndFolders                 = $false
+    RequestsAuthorizationLevel1            = $true
+    RequestsAuthorizationLevel2            = $false
 }
-$FullPermissions = @{
-    "useAccounts" = $true
-    "retrieveAccounts" = $true
-    "listAccounts" = $true
-    "addAccounts" = $true
-    "updateAccountContent" = $true
-    "updateAccountProperties" = $true
-    "initiateCPMAccountManagementOperations" = $true
-    "specifyNextAccountContent" = $true
-    "renameAccounts" = $true
-    "deleteAccounts" = $true
-    "unlockAccounts" = $true
-    "manageSafe" = $true
-    "manageSafeMembers" = $true
-    "backupSafe" = $true
-    "viewAuditLog" = $true
-    "viewSafeMembers" = $true
-    "accessWithoutConfirmation" = $true
-    "createFolders" = $true
-    "deleteFolders" = $true
-    "moveAccountsAndFolders" = $true
-    "requestsAuthorizationLevel1" = $true
-    "requestsAuthorizationLevel2" = $false
+$FullPermPAS = [PSCustomObject]@{
+    UseAccounts                            = $true
+    RetrieveAccounts                       = $true
+    ListAccounts                           = $true
+    AddAccounts                            = $true
+    UpdateAccountContent                   = $true
+    UpdateAccountProperties                = $true
+    InitiateCPMAccountManagementOperations = $true
+    SpecifyNextAccountContent              = $true
+    RenameAccounts                         = $true
+    DeleteAccounts                         = $true
+    UnlockAccounts                         = $true
+    ManageSafe                             = $true
+    ManageSafeMembers                      = $true
+    BackupSafe                             = $true
+    ViewAuditLog                           = $true
+    ViewSafeMembers                        = $true
+    AccessWithoutConfirmation              = $true
+    CreateFolders                          = $true
+    DeleteFolders                          = $true
+    MoveAccountsAndFolders                 = $true
+    RequestsAuthorizationLevel1            = $true
+    RequestsAuthorizationLevel2            = $false
 }
 
-# --- Target AD Group prompt & validation (sAM only; must exist in specific OU) ---
-$SearchBaseOU = 'OU=Groups,OU=CyberArk,DC=cna,DC=com'  # per your mapping
+# --- Target AD Group prompt & validation (in OU=Groups,OU=CyberArk,DC=cna,DC=com) ---
+$SearchBaseOU = 'OU=Groups,OU=CyberArk,DC=cna,DC=com'
 Function Read-ValidGroup {
     while ($true) {
         $g = Read-Host "Enter the AD Safe Group (sAMAccountName only, e.g., ca_bud_ecf_prod)"
@@ -169,43 +172,48 @@ Function Read-ValidGroup {
             Write-Log "❌ Group cannot be empty."
             continue
         }
-        # Basic sanity: letters, numbers, underscore & hyphen ok
         if ($g -notmatch '^[A-Za-z0-9_\-\.]+$') {
             Write-Log "❌ Invalid characters in group name. Try again."
             continue
         }
-        try {
-            # Validate in exact OU
-            $adGroup = Get-ADGroup -LDAPFilter "(|(sAMAccountName=$g)(userPrincipalName=$g@cna.com))" -SearchBase $SearchBaseOU -ErrorAction Stop
-            if ($adGroup) {
-                Write-Log ("Found AD Group in `${SearchBaseOU}: {0} (sAM={1})" -f $adGroup.Name, $adGroup.SamAccountName)
-                return $g
-            } else {
-                Write-Log "❌ Group not found under ${SearchBaseOU}. Re-enter."
+
+        if ($ADModuleLoaded) {
+            try {
+                $adGroup = Get-ADGroup -LDAPFilter "(|(sAMAccountName=$g)(userPrincipalName=$g@cna.com))" -SearchBase $SearchBaseOU -ErrorAction Stop
+                if ($adGroup) {
+                    Write-Log ("Found AD Group in {0}: {1} (sAM={2})" -f $SearchBaseOU, $adGroup.Name, $adGroup.SamAccountName)
+                    return $g
+                } else {
+                    Write-Log ("❌ Group not found under {0}. Re-enter." -f $SearchBaseOU)
+                }
+            } catch {
+                Write-Log "❌ Error searching AD for '$g' in ${SearchBaseOU}: $($_.Exception.Message)" "Red"
             }
-        } catch {
-            Write-Log "❌ Error searching AD for '$g' in ${SearchBaseOU}: $($_.Exception.Message)" "Red"
+        } else {
+            # No AD module; accept and proceed (PVWA/Directory Mapping must resolve it)
+            Write-Log "AD module not loaded, proceeding with provided group name."
+            return $g
         }
     }
 }
 $GroupSam = Read-ValidGroup
 $TargetGroupUPN = "$GroupSam@cna.com"
 
-# --- Build member set (keep admins exactly as you wanted) ---
+# --- Members (order preserved; admins unchanged) ---
 $Members = @(
-    @{ "memberName" = $TargetGroupUPN;                  "memberType" = "Group"; "permissions" = $LimitedPermissions },
-    @{ "memberName" = "CA_PCloud_Admins@cna.com";       "memberType" = "Group"; "permissions" = $FullPermissions  },
-    @{ "memberName" = "cna_pas_admin@cyberark.cloud.6679"; "memberType" = "User";  "permissions" = $FullPermissions  }
+    @{ Name = $TargetGroupUPN;                     Type = "Group"; Perm = $LimitedPermPAS }, # target AD group (Limited)
+    @{ Name = "CA_PCloud_Admins@cna.com";          Type = "Group"; Perm = $FullPermPAS    }, # keep as-is (Full)
+    @{ Name = "cna_pas_admin@cyberark.cloud.6679"; Type = "User";  Perm = $FullPermPAS    }  # keep as-is (Full)
 )
 
-# --- Function to add member via psPAS (no -SearchIn) ---
+# --- Helper: Add member via psPAS, piping permissions ---
 Function Add-MemberToSafe {
     param(
         [string]$SafeName,
         [string]$MemberName,
         [ValidateSet("Group","User","Role")]
         [string]$MemberType,
-        [hashtable]$Permissions
+        [pscustomobject]$Permissions
     )
     try {
         Write-Log "Adding ${MemberType} '${MemberName}' to ${SafeName}..."
@@ -218,9 +226,9 @@ Function Add-MemberToSafe {
     }
 }
 
-# --- Add members in order: Target Group (Limited) -> CA_PCloud_Admins (Full) -> Vault User (Full) ---
+# --- Add all members ---
 foreach ($m in $Members) {
-    [void](Add-MemberToSafe -SafeName $SafeName -MemberName $m.memberName -MemberType $m.memberType -Permissions $m.permissions)
+    [void](Add-MemberToSafe -SafeName $SafeName -MemberName $m.Name -MemberType $m.Type -Permissions $m.Perm)
 }
 
 Write-Log "🔹 Safe member addition process completed."
