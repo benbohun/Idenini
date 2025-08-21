@@ -169,7 +169,7 @@ $FullPermissions = @{
 $EncodedSafe = Encode-Safe $SafeName
 $MembersEndpoint = "https://$PCloudSubdomain.privilegecloud.cyberark.cloud/PasswordVault/API/Safes/$EncodedSafe/Members/"
 
-# 1) Target AD group: search AD in the specific OU, then add with searchIn='cna.com'
+# 1) Target AD group: search AD in the specific OU
 Import-Module ActiveDirectory -ErrorAction SilentlyContinue | Out-Null
 $GroupSam = Read-Host "Enter the AD Safe Group (sAMAccountName only, e.g., ca_bud_ecf_prod)"
 if ([string]::IsNullOrWhiteSpace($GroupSam)) {
@@ -187,20 +187,21 @@ try {
     exit
 }
 
-# Helper to add group via REST (Directory search)
+# Helper to add group via REST with specific searchIn
 function Add-GroupViaREST {
     param(
         [string]$MemberName,   # sAM or UPN
+        [string]$SearchIn,     # e.g., "cnaroot.com", "Directory", "Vault"
         [hashtable]$Perms
     )
     $body = @{
         "memberName" = $MemberName
         "memberType" = "Group"
-        "searchIn"   = "cna.com"             # IMPORTANT: use domain name, not 'Directory'
+        "searchIn"   = $SearchIn
         "permissions"= $Perms
     } | ConvertTo-Json -Depth 5
 
-    Write-Log "Adding Group: ${MemberName} to ${SafeName} (SearchIn=cna.com)..."
+    Write-Log "Adding Group: ${MemberName} to ${SafeName} (SearchIn=${SearchIn})..."
     try {
         $null = Invoke-RestMethod -Uri $MembersEndpoint -Method Post -Headers $headers_api -Body $body -ErrorAction Stop
         Write-Log "✅ Added Group: ${MemberName}." "Green"
@@ -212,17 +213,23 @@ function Add-GroupViaREST {
     }
 }
 
-# Add target AD group with LimitedPermissions
+# Add target AD group with LimitedPermissions using cnaroot.com
 $added = $false
-$added = Add-GroupViaREST -MemberName $GroupSam -Perms $LimitedPermissions
+$added = Add-GroupViaREST -MemberName $GroupSam -SearchIn "cnaroot.com" -Perms $LimitedPermissions
 if (-not $added) {
-    # Retry with UPN
-    $upn = "$GroupSam@cna.com"
-    Write-Log "Retrying add with UPN '${upn}' (SearchIn=cna.com)..."
-    $added = Add-GroupViaREST -MemberName $upn -Perms $LimitedPermissions
+    # Retry with UPN at cnaroot.com
+    $upnRoot = "$GroupSam@cnaroot.com"
+    Write-Log "Retrying add with UPN '${upnRoot}' (SearchIn=cnaroot.com)..."
+    $added = Add-GroupViaREST -MemberName $upnRoot -SearchIn "cnaroot.com" -Perms $LimitedPermissions
 }
 if (-not $added) {
-    Write-Log "❌ Could not add AD group '${GroupSam}'. This typically indicates PVWA Directory Mapping cannot resolve the group from 'cna.com'. Please verify mapping includes '${SearchBaseOU}'." "Red"
+    # Fallback: try legacy UPN @cna.com still via cnaroot.com directory search
+    $upnCna = "$GroupSam@cna.com"
+    Write-Log "Retrying add with UPN '${upnCna}' (SearchIn=cnaroot.com)..."
+    $added = Add-GroupViaREST -MemberName $upnCna -SearchIn "cnaroot.com" -Perms $LimitedPermissions
+}
+if (-not $added) {
+    Write-Log "❌ Could not add AD group '${GroupSam}'. This typically indicates PVWA Directory Mapping cannot resolve the group from 'cnaroot.com'. Please verify mapping includes '${SearchBaseOU}'." "Red"
 }
 
 # 2) Keep existing full-permission members exactly as before
