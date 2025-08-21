@@ -33,9 +33,10 @@ try {
     exit 1
 }
 
-# --- Prompt for Safe Name & Description (single line up to ~200 chars) ---
+# --- Prompt for Safe Name & Description ---
 $SafeName = Read-Host "Enter the Safe Name"
-$Description = Read-Host "Enter the Safe Description (single line, up to ~200 chars)"
+$Description = Read-Host "Enter the Safe Description (single line, up to 200 chars)"
+if ($Description.Length -gt 200) { $Description = $Description.Substring(0,200) }
 
 if ([string]::IsNullOrEmpty($SafeName)) {
     Write-Log "❌ ERROR: Safe Name cannot be empty. Exiting..." "Red"
@@ -88,6 +89,9 @@ $headers_api = @{
     "Content-Type"  = "application/json"
 }
 
+# Helper to URL-encode safe for REST paths
+function Encode-Safe([string]$name){ return [System.Uri]::EscapeDataString($name) }
+
 # --- Create Safe Using API ---
 Write-Log "🔹 Creating Safe: ${SafeName}..."
 
@@ -111,132 +115,142 @@ try {
     exit
 }
 
-# ----------------------------
-# PERMISSIONS DEFINITIONS
-# (unchanged from your requirement)
-# ----------------------------
+# --- Permissions (as requested) ---
 $LimitedPermissions = @{
-    "useAccounts"                             = $false
-    "retrieveAccounts"                        = $false
-    "listAccounts"                            = $true
-    "addAccounts"                             = $false
-    "updateAccountContent"                    = $false
-    "updateAccountProperties"                 = $false
-    "initiateCPMAccountManagementOperations"  = $true
-    "specifyNextAccountContent"               = $false
-    "renameAccounts"                          = $false
-    "deleteAccounts"                          = $false
-    "unlockAccounts"                          = $true
-    "manageSafe"                              = $false
-    "manageSafeMembers"                       = $false
-    "backupSafe"                              = $false
-    "viewAuditLog"                            = $true
-    "viewSafeMembers"                         = $true
-    "accessWithoutConfirmation"               = $true
-    "createFolders"                           = $false
-    "deleteFolders"                           = $false
-    "moveAccountsAndFolders"                  = $false
-    "requestsAuthorizationLevel1"             = $true
-    "requestsAuthorizationLevel2"             = $false
+    "useAccounts" = $false
+    "retrieveAccounts" = $false
+    "listAccounts" = $true
+    "addAccounts" = $false
+    "updateAccountContent" = $false
+    "updateAccountProperties" = $false
+    "initiateCPMAccountManagementOperations" = $true
+    "specifyNextAccountContent" = $false
+    "renameAccounts" = $false
+    "deleteAccounts" = $false
+    "unlockAccounts" = $true
+    "manageSafe" = $false
+    "manageSafeMembers" = $false
+    "backupSafe" = $false
+    "viewAuditLog" = $true
+    "viewSafeMembers" = $true
+    "accessWithoutConfirmation" = $true
+    "createFolders" = $false
+    "deleteFolders" = $false
+    "moveAccountsAndFolders" = $false
+    "requestsAuthorizationLevel1" = $true
+    "requestsAuthorizationLevel2" = $false
 }
 $FullPermissions = @{
-    "useAccounts"                             = $true
-    "retrieveAccounts"                        = $true
-    "listAccounts"                            = $true
-    "addAccounts"                             = $true
-    "updateAccountContent"                    = $true
-    "updateAccountProperties"                 = $true
-    "initiateCPMAccountManagementOperations"  = $true
-    "specifyNextAccountContent"               = $true
-    "renameAccounts"                          = $true
-    "deleteAccounts"                          = $true
-    "unlockAccounts"                          = $true
-    "manageSafe"                              = $true
-    "manageSafeMembers"                       = $true
-    "backupSafe"                              = $true
-    "viewAuditLog"                            = $true
-    "viewSafeMembers"                         = $true
-    "accessWithoutConfirmation"               = $true
-    "createFolders"                           = $true
-    "deleteFolders"                           = $true
-    "moveAccountsAndFolders"                  = $true
-    "requestsAuthorizationLevel1"             = $true
-    "requestsAuthorizationLevel2"             = $false
+    "useAccounts" = $true
+    "retrieveAccounts" = $true
+    "listAccounts" = $true
+    "addAccounts" = $true
+    "updateAccountContent" = $true
+    "updateAccountProperties" = $true
+    "initiateCPMAccountManagementOperations" = $true
+    "specifyNextAccountContent" = $true
+    "renameAccounts" = $true
+    "deleteAccounts" = $true
+    "unlockAccounts" = $true
+    "manageSafe" = $true
+    "manageSafeMembers" = $true
+    "backupSafe" = $true
+    "viewAuditLog" = $true
+    "viewSafeMembers" = $true
+    "accessWithoutConfirmation" = $true
+    "createFolders" = $true
+    "deleteFolders" = $true
+    "moveAccountsAndFolders" = $true
+    "requestsAuthorizationLevel1" = $true
+    "requestsAuthorizationLevel2" = $false
 }
 
-# --- Helper: REST Add Member (kept for Admins as before) ---
-Function Invoke-AddSafeMemberRest {
+# --- Add Safe Members (fixed flow) ---
+$EncodedSafe = Encode-Safe $SafeName
+$MembersEndpoint = "https://$PCloudSubdomain.privilegecloud.cyberark.cloud/PasswordVault/API/Safes/$EncodedSafe/Members/"
+
+# 1) Target AD group: search AD in the specific OU, then add with searchIn='cna.com'
+Import-Module ActiveDirectory -ErrorAction SilentlyContinue | Out-Null
+$GroupSam = Read-Host "Enter the AD Safe Group (sAMAccountName only, e.g., ca_bud_ecf_prod)"
+if ([string]::IsNullOrWhiteSpace($GroupSam)) {
+    Write-Log "❌ ERROR: AD Safe Group sAMAccountName cannot be empty. Exiting..." "Red"
+    exit
+}
+
+# Validate the group exists in the requested SearchBase
+$SearchBaseOU = 'OU=Groups,OU=CyberArk,DC=cna,DC=com'
+try {
+    $adGroup = Get-ADGroup -LDAPFilter "(sAMAccountName=$GroupSam)" -SearchBase $SearchBaseOU -ErrorAction Stop
+    Write-Log "Found AD Group in $SearchBaseOU: $($adGroup.Name) (sAM=$($adGroup.sAMAccountName))" "Green"
+} catch {
+    Write-Log "❌ ERROR: Could not find sAMAccountName '$GroupSam' under $SearchBaseOU. Exiting..." "Red"
+    exit
+}
+
+# Try add with sAM first, then with UPN
+function Add-GroupViaREST {
     param(
-        [Parameter(Mandatory=$true)] [string]$SafeName,
-        [Parameter(Mandatory=$true)] [ValidateSet("User","Group","Role")] [string]$MemberType,
-        [Parameter(Mandatory=$true)] [string]$MemberName,
-        [Parameter(Mandatory=$true)] $Permissions,
-        [ValidateSet("Vault","Directory")] [string]$SearchIn = "Vault"
+        [string]$MemberName,   # sAM or UPN
+        [hashtable]$Perms
     )
-    $Endpoint = "https://$PCloudSubdomain.privilegecloud.cyberark.cloud/PasswordVault/API/Safes/$SafeName/Members/"
-    $Body = @{
-        memberName  = $MemberName
-        memberType  = $MemberType
-        permissions = $Permissions
-        searchIn    = $SearchIn
-    } | ConvertTo-Json -Depth 4
+    $body = @{
+        "memberName" = $MemberName
+        "memberType" = "Group"
+        "searchIn"   = "cna.com"             # IMPORTANT: use domain name, not 'Directory'
+        "permissions"= $Perms
+    } | ConvertTo-Json -Depth 5
+
+    Write-Log "Adding Group: ${MemberName} to ${SafeName} (SearchIn=cna.com)..."
     try {
-        Write-Log "Adding ${MemberType}: ${MemberName} to ${SafeName} (SearchIn=${SearchIn})..."
-        Invoke-RestMethod -Uri $Endpoint -Method Post -Headers $headers_api -Body $Body -ErrorAction Stop | Out-Null
-        Write-Log "✅ Added ${MemberType}: ${MemberName}."
+        $null = Invoke-RestMethod -Uri $MembersEndpoint -Method Post -Headers $headers_api -Body $body -ErrorAction Stop
+        Write-Log "✅ Added Group: ${MemberName}." "Green"
         return $true
     } catch {
-        Write-Log "❌ Failed to add '${MemberName}' - $($_.Exception.Message)" "Red"
+        $msg = $_.Exception.Message
+        Write-Log "❌ Failed to add '${MemberName}' - $msg" "Red"
         return $false
     }
 }
 
-# --- Only modify logic for the TARGET AD GROUP ---
-# Ask for sAMAccountName (no @domain), validate it exists in the specific OU, then add as Directory Group (no GUIDs)
-Import-Module ActiveDirectory -ErrorAction SilentlyContinue | Out-Null
+# Add target AD group with LimitedPermissions
+$added = $false
+$added = Add-GroupViaREST -MemberName $GroupSam -Perms $LimitedPermissions
+if (-not $added) {
+    # Retry with UPN
+    $upn = "$GroupSam@cna.com"
+    Write-Log "Retrying add with UPN '${upn}' (SearchIn=cna.com)..."
+    $added = Add-GroupViaREST -MemberName $upn -Perms $LimitedPermissions
+}
+if (-not $added) {
+    Write-Log "❌ Could not add AD group '${GroupSam}'. This typically indicates PVWA Directory Mapping cannot resolve the group from 'cna.com'. Please verify mapping includes '$SearchBaseOU'." "Red"
+}
 
-$TargetSam = $null
-do {
-    $TargetSam = Read-Host "Enter the AD Safe Group (sAMAccountName only, e.g., ca_bud_ecf_prod)"
-    if ([string]::IsNullOrWhiteSpace($TargetSam)) {
-        Write-Log "❌ AD Safe Group (sAMAccountName) is required." "Red"
-        continue
-    }
+# 2) Keep existing full-permission members exactly as before
+$AdminMembers = @(
+    @{ memberName = "CA_PCloud_Admins@cna.com";            memberType = "Group"; permissions = $FullPermissions; searchIn = "Directory" },
+    @{ memberName = "cna_pas_admin@cyberark.cloud.6679";   memberType = "User";  permissions = $FullPermissions; searchIn = "Vault" }
+)
 
-    $SearchBase = "OU=Groups,OU=CyberArk,DC=cna,DC=com"
+foreach ($m in $AdminMembers) {
+    $MemberName = $m.memberName
+    $MemberType = $m.memberType
+    $SearchIn   = $m.searchIn
+    $Perms      = $m.permissions
+
+    $body = @{
+        "memberName" = $MemberName
+        "memberType" = $MemberType
+        "searchIn"   = $SearchIn
+        "permissions"= $Perms
+    } | ConvertTo-Json -Depth 5
+
+    Write-Log "Adding ${MemberType}: ${MemberName} to ${SafeName} (SearchIn=${SearchIn})..."
     try {
-        $adGroup = Get-ADGroup -LDAPFilter "(sAMAccountName=$TargetSam)" -SearchBase $SearchBase -Properties distinguishedName -ErrorAction Stop
+        $null = Invoke-RestMethod -Uri $MembersEndpoint -Method Post -Headers $headers_api -Body $body -ErrorAction Stop
+        Write-Log "✅ Added ${MemberType}: ${MemberName}." "Green"
     } catch {
-        Write-Log "⚠️ Could not query Active Directory or group not found in $SearchBase — $_" "Yellow"
-        $adGroup = $null
-    }
-
-    if (-not $adGroup) {
-        Write-Log "❌ '$TargetSam' not found under $SearchBase. Please re-enter the sAMAccountName." "Red"
+        Write-Log "❌ Failed to add ${MemberType}: ${MemberName} - $($_.Exception.Message)" "Red"
     }
 }
-until ($adGroup)
-
-# We found the group in the required OU — add it as a Directory group using UPN-style name
-$TargetUPN = "$TargetSam@cna.com"
-Write-Log "Adding AD Group '$TargetUPN' as Safe member (Directory search, no GUID)..."
-
-# Try REST using SearchIn='Directory' (NO GUIDS)
-$addedTarget = Invoke-AddSafeMemberRest -SafeName $SafeName -MemberType Group -MemberName $TargetUPN -Permissions $LimitedPermissions -SearchIn Directory
-
-if (-not $addedTarget) {
-    # Fallback to sAM (still Directory)
-    Write-Log "Retrying add with sAMAccountName '$TargetSam' (Directory search)..."
-    $addedTarget = Invoke-AddSafeMemberRest -SafeName $SafeName -MemberType Group -MemberName $TargetSam -Permissions $LimitedPermissions -SearchIn Directory
-    if (-not $addedTarget) {
-        Write-Log "❌ Could not add AD group '$TargetSam' as Safe member. This typically indicates Directory Mapping cannot resolve the group from cna.com within PVWA. Please verify the Directory mapping includes the '$($adGroup.DistinguishedName)' path." "Red"
-    }
-}
-
-# --- Keep your existing Admin members EXACTLY as before (no changes here) ---
-# NOTE: Per your instruction, we are not altering the logic for these; they remain REST adds.
-#       If you do NOT want to touch existing admins at all, comment the two calls below.
-$null = Invoke-AddSafeMemberRest -SafeName $SafeName -MemberType Group -MemberName "CA_PCloud_Admins@cna.com" -Permissions $FullPermissions -SearchIn Directory
-$null = Invoke-AddSafeMemberRest -SafeName $SafeName -MemberType User  -MemberName "cna_pas_admin@cyberark.cloud.6679" -Permissions $FullPermissions -SearchIn Vault
 
 Write-Log "🔹 Safe member addition process completed."
