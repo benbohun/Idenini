@@ -8,7 +8,7 @@ Function Write-Log {
     Add-Content -Path $LogPath -Value $LogEntry
 }
 
-# --- Simple POST helper for REST JSON ---
+# Helper for JSON POSTs
 Function Invoke-CybrPostJson {
     param(
         [Parameter(Mandatory)][string]$Uri,
@@ -44,20 +44,19 @@ try {
     exit 1
 }
 
-# --- Prompt for Safe Name & (single-line) Description ---
+# --- Prompt for Safe Name & single-line Description (<=200 chars) ---
 $SafeName    = Read-Host "Enter the Safe Name"
 $Description = Read-Host "Enter the Safe Description (single line, up to 200 chars)"
+if ([string]::IsNullOrWhiteSpace($SafeName))    { Write-Log "❌ ERROR: Safe Name cannot be empty. Exiting..." "Red"; exit }
+if ([string]::IsNullOrWhiteSpace($Description)) { Write-Log "❌ ERROR: Safe Description cannot be empty. Exiting..." "Red"; exit }
 if ($Description.Length -gt 200) {
     Write-Log "ℹ️ Description longer than 200 chars; truncating."
     $Description = $Description.Substring(0,200)
 }
 
-if ([string]::IsNullOrWhiteSpace($SafeName))    { Write-Log "❌ ERROR: Safe Name cannot be empty. Exiting..." "Red"; exit }
-if ([string]::IsNullOrWhiteSpace($Description)) { Write-Log "❌ ERROR: Safe Description cannot be empty. Exiting..." "Red"; exit }
-
 # --- Authentication Variables (from CCP) ---
 $IdentityTenantID = "aat4012"      # CyberArk Identity tenant ID
-$PCloudSubdomain  = "cna-prod"     # CyberArk Privilege Cloud Subdomain (PVWA)
+$PCloudSubdomain  = "cna-prod"     # PVWA subdomain
 $ClientID         = $response.Username
 $ClientSecret     = $response.Content
 
@@ -111,170 +110,8 @@ try {
     Invoke-CybrPostJson -Uri $SafesEndpoint -Headers $headers_api -BodyObject $SafePayload | Out-Null
     Write-Log "✅ Successfully created Safe: ${SafeName}."
 } catch {
-    Write-Log "⚠️ WARNING: Safe may already exist - $($_.Exception.Message)" "Yellow"
+    # Usually indicates Safe already exists; proceed to member handling anyway.
+    Write-Log "⚠️ Safe create returned: $($_.Exception.Message). Continuing..." "Yellow"
 }
 
-# --- Permissions (lowercase keys for REST) ---
-$LimitedPermissions = @{
-    useAccounts = $false; retrieveAccounts = $false; listAccounts = $true; addAccounts = $false
-    updateAccountContent = $false; updateAccountProperties = $false
-    initiateCPMAccountManagementOperations = $true; specifyNextAccountContent = $false
-    renameAccounts = $false; deleteAccounts = $false; unlockAccounts = $true
-    manageSafe = $false; manageSafeMembers = $false; backupSafe = $false
-    viewAuditLog = $true; viewSafeMembers = $true; accessWithoutConfirmation = $true
-    createFolders = $false; deleteFolders = $false; moveAccountsAndFolders = $false
-    requestsAuthorizationLevel1 = $true; requestsAuthorizationLevel2 = $false
-}
-$FullPermissions = @{
-    useAccounts = $true; retrieveAccounts = $true; listAccounts = $true; addAccounts = $true
-    updateAccountContent = $true; updateAccountProperties = $true
-    initiateCPMAccountManagementOperations = $true; specifyNextAccountContent = $true
-    renameAccounts = $true; deleteAccounts = $true; unlockAccounts = $true
-    manageSafe = $true; manageSafeMembers = $true; backupSafe = $true
-    viewAuditLog = $true; viewSafeMembers = $true; accessWithoutConfirmation = $true
-    createFolders = $true; deleteFolders = $true; moveAccountsAndFolders = $true
-    requestsAuthorizationLevel1 = $true; requestsAuthorizationLevel2 = $false
-}
-
-# --- Helper: Convert REST-style perms -> PAS role object (PascalCase) ---
-Function Convert-ToPasRole {
-    param($perm)
-    [PSCustomObject]@{
-        UseAccounts                            = [bool]$perm.useAccounts
-        RetrieveAccounts                       = [bool]$perm.retrieveAccounts
-        ListAccounts                           = [bool]$perm.listAccounts
-        AddAccounts                            = [bool]$perm.addAccounts
-        UpdateAccountContent                   = [bool]$perm.updateAccountContent
-        UpdateAccountProperties                = [bool]$perm.updateAccountProperties
-        InitiateCPMAccountManagementOperations = [bool]$perm.initiateCPMAccountManagementOperations
-        SpecifyNextAccountContent              = [bool]$perm.specifyNextAccountContent
-        RenameAccounts                         = [bool]$perm.renameAccounts
-        DeleteAccounts                         = [bool]$perm.deleteAccounts
-        UnlockAccounts                         = [bool]$perm.unlockAccounts
-        ManageSafe                             = [bool]$perm.manageSafe
-        ManageSafeMembers                      = [bool]$perm.manageSafeMembers
-        BackupSafe                             = [bool]$perm.backupSafe
-        ViewAuditLog                           = [bool]$perm.viewAuditLog
-        ViewSafeMembers                        = [bool]$perm.viewSafeMembers
-        AccessWithoutConfirmation              = [bool]$perm.accessWithoutConfirmation
-        CreateFolders                          = [bool]$perm.createFolders
-        DeleteFolders                          = [bool]$perm.deleteFolders
-        MoveAccountsAndFolders                 = [bool]$perm.moveAccountsAndFolders
-        RequestsAuthorizationLevel1            = [bool]$perm.requestsAuthorizationLevel1
-        RequestsAuthorizationLevel2            = [bool]$perm.requestsAuthorizationLevel2
-    }
-}
-
-# --- Members endpoint (REST) ---
-$SafeNameForUrl = [System.Uri]::EscapeDataString($SafeName)
-$MembersEndpoint = "https://$PCloudSubdomain.privilegecloud.cyberark.cloud/PasswordVault/API/Safes/$SafeNameForUrl/Members/"
-
-Function Add-MemberRest {
-    param([hashtable]$Body)
-    try {
-        Invoke-CybrPostJson -Uri $MembersEndpoint -Headers $headers_api -BodyObject $Body | Out-Null
-        Write-Log "✅ Added $($Body.memberType): $($Body.memberName)."
-        return $true
-    } catch {
-        $msg = $_.Exception.Message
-        Write-Log "❌ Failed to add '$($Body.memberName)' - $msg" "Red"
-        return $false
-    }
-}
-
-# --- Directory GUID for cna.com (only used in REST fallback & CA_PCloud_Admins) ---
-$DirectoryGuid = "4ac5fb05-f776-4be5-9b7f-9ec01c737fa4"
-
-# ----------------------- TARGET AD GROUP (psPAS pattern) -----------------------
-$TargetSam = Read-Host "Enter the AD Safe Group (sAMAccountName only, e.g., ca_bud_ecf_prod)"
-if ([string]::IsNullOrWhiteSpace($TargetSam)) {
-    Write-Log "❌ ERROR: AD Safe Group cannot be empty. Exiting..." "Red"
-    exit
-}
-
-$UsedPasModule = $false
-$AddedTarget   = $false
-
-# Try psPAS pattern ONLY for the target group (as in your sample)
-if (Get-Command -Name Add-PASSafeMember -ErrorAction SilentlyContinue) {
-    try {
-        $UsedPasModule = $true
-        $rolePas = Convert-ToPasRole $LimitedPermissions
-
-        # Check existing members (module handles directory resolution)
-        $existing = @()
-        try { $existing = (Get-PASSafeMember -SafeName $SafeName -ErrorAction Stop).UserName } catch {}
-        $exists = $false
-        if ($existing) {
-            if ($existing -contains $TargetSam -or $existing -contains ("$TargetSam@cna.com")) { $exists = $true }
-        }
-
-        if ($exists) {
-            Write-Log "$TargetSam already exists, setting permissions (psPAS)..."
-            $rolePas | Set-PASSafeMember -SafeName $SafeName -MemberName $TargetSam -ErrorAction Stop
-            Write-Log "✅ Updated permissions for AD Group (psPAS): $TargetSam."
-            $AddedTarget = $true
-        } else {
-            Write-Log "Adding AD Group '$TargetSam' via psPAS Add-PASSafeMember..."
-            $rolePas | Add-PASSafeMember -SafeName $SafeName -memberType Group -MemberName $TargetSam -ErrorAction Stop
-            Write-Log "✅ Added AD Group (psPAS): $TargetSam."
-            $AddedTarget = $true
-        }
-    } catch {
-        Write-Log "⚠️ psPAS add/set failed for '$TargetSam' ($($_.Exception.Message)). Will fall back to REST." "Yellow"
-        $UsedPasModule = $true
-        $AddedTarget   = $false
-    }
-} else {
-    Write-Log "ℹ️ psPAS module not available; using REST fallback for target group."
-}
-
-# REST fallback for target group (only if psPAS not used or failed)
-if (-not $AddedTarget) {
-    $bodySam = @{
-        memberName  = $TargetSam
-        memberType  = "Group"
-        searchIn    = $DirectoryGuid
-        permissions = $LimitedPermissions
-    }
-    Write-Log "Attempting AD Group add via REST with Directory GUID (MemberName='$TargetSam')..."
-    $ok = Add-MemberRest -Body $bodySam
-    if (-not $ok) {
-        $upn = "$TargetSam@cna.com"
-        $bodyUpn = @{
-            memberName  = $upn
-            memberType  = "Group"
-            searchIn    = $DirectoryGuid
-            permissions = $LimitedPermissions
-        }
-        Write-Log "Retrying via REST with UPN (MemberName='$upn')..."
-        $ok = Add-MemberRest -Body $bodyUpn
-        if (-not $ok) {
-            Write-Log "❌ Could not add AD group '$TargetSam' by REST either. Likely a Directory Mapping visibility issue for cna.com." "Red"
-        }
-    }
-}
-
-# ----------------------- OTHER MEMBERS (UNCHANGED) ----------------------------
-
-# 1) Registered tenant group (Directory search) — leave as-is
-$tenantGroupBody = @{
-    memberName  = "CA_PCloud_Admins@cna.com"
-    memberType  = "Group"
-    searchIn    = $DirectoryGuid
-    permissions = $FullPermissions
-}
-Write-Log "Adding Registered Group 'CA_PCloud_Admins@cna.com' (Directory search)..."
-$null = Add-MemberRest -Body $tenantGroupBody
-
-# 2) Vault user (SearchIn = Vault) — leave as-is
-$cloudUserBody = @{
-    memberName  = "cna_pas_admin@cyberark.cloud.6679"
-    memberType  = "User"
-    searchIn    = "Vault"
-    permissions = $FullPermissions
-}
-Write-Log "Adding Vault User 'cna_pas_admin@cyberark.cloud.6679' (Vault search)..."
-$null = Add-MemberRest -Body $cloudUserBody
-
-Write-Log "🔹 Safe member addition process completed."
+# --- Permissio
