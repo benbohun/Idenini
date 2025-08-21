@@ -152,29 +152,67 @@ $FullPermissions = @{
     requestsAuthorizationLevel1=$true; requestsAuthorizationLevel2=$false
 }
 
-# ------------------- Add Members -------------------
+# ------------------- Members to Add -------------------
 $APIEndpointMembers = "https://$PCloudSubdomain.privilegecloud.cyberark.cloud/PasswordVault/API/Safes/$SafeName/Members/"
 $Members = @(
-    @{ memberName = $PrimaryADGroup; memberType = "Group"; searchIn = $DirectoryGUID; permissions = $LimitedPermissions },
-    @{ memberName = "CA_PCloud_Admins@cna.com"; memberType = "Group"; searchIn = $DirectoryGUID; permissions = $FullPermissions },
-    @{ memberName = "cna_pas_admin@cyberark.cloud.6679"; memberType = "User"; searchIn = "Vault"; permissions = $FullPermissions }
+    @{ memberName = $PrimaryADGroup;               memberType = "Group"; searchIn = $DirectoryGUID; permissions = $LimitedPermissions },
+    @{ memberName = "CA_PCloud_Admins@cna.com";    memberType = "Group"; searchIn = $DirectoryGUID; permissions = $FullPermissions },
+    @{ memberName = "cna_pas_admin@cyberark.cloud.6679"; memberType = "User";  searchIn = "Vault";        permissions = $FullPermissions }
 )
 
+# ------------------- Add with smart retry for SFWS0010 -------------------
 foreach ($Member in $Members) {
-    $jsonBody = @{
-        MemberName   = $Member.memberName
-        MemberType   = $Member.memberType
-        SearchIn     = $Member.searchIn
-        Permissions  = $Member.permissions
-    } | ConvertTo-Json -Depth 6
+    # Build initial body
+    $makeBody = {
+        param($m)
+        @{
+            MemberName  = $m.memberName
+            MemberType  = $m.memberType
+            SearchIn    = $m.searchIn
+            Permissions = $m.permissions
+        } | ConvertTo-Json -Depth 6
+    }
 
+    $jsonBody = & $makeBody $Member
     Write-Log "Adding $($Member.memberType): $($Member.memberName) (searchIn=$($Member.searchIn)) to Safe: $SafeName..."
+
+    $didRetry = $false
     try {
         Invoke-RestMethod -Uri $APIEndpointMembers -Method Post -Headers $headers_api -Body $jsonBody -ErrorAction Stop | Out-Null
         Write-Log "✅ Successfully added $($Member.memberType): $($Member.memberName) to $SafeName."
     } catch {
-        $errBody = $null; try { $errBody = $_.Exception.Response.Content.ReadAsStringAsync().Result } catch {}
+        # Read error body if available
+        $errBody = $null
+        try { $errBody = $_.Exception.Response.Content.ReadAsStringAsync().Result } catch {}
         if (-not $errBody) { $errBody = $_ | Out-String }
+
+        # If this is a Directory GUID Group and we got 'not defined', retry once with sAM (strip @domain)
+        $isDirGroup    = ($Member.memberType -eq "Group" -and $Member.searchIn -match '^[0-9a-fA-F-]{32,36}$')
+        $isNotDefined  = ($errBody -match '"ErrorCode"\s*:\s*"SFWS0010"')
+        $looksLikeUpn  = ($Member.memberName -match '^[^@]+@[^@]+\.[^@]+$')
+
+        if ($isDirGroup -and $isNotDefined -and $looksLikeUpn -and -not $didRetry) {
+            $didRetry = $true
+            $samOnly = $Member.memberName.Split('@')[0]
+            Write-Log "ℹ️ Directory lookup failed for '$($Member.memberName)'. Retrying with sAMAccountName '$samOnly'..." "Yellow"
+
+            $retryMember = $Member.PSObject.Copy()
+            $retryMember.memberName = $samOnly
+
+            $jsonBodyRetry = & $makeBody $retryMember
+            try {
+                Invoke-RestMethod -Uri $APIEndpointMembers -Method Post -Headers $headers_api -Body $jsonBodyRetry -ErrorAction Stop | Out-Null
+                Write-Log "✅ Retry succeeded: added Group '$samOnly' to $SafeName."
+                continue
+            } catch {
+                $retryErr = $null
+                try { $retryErr = $_.Exception.Response.Content.ReadAsStringAsync().Result } catch {}
+                if (-not $retryErr) { $retryErr = $_ | Out-String }
+                Write-Log "❌ Retry failed for '$samOnly' - $retryErr" "Red"
+            }
+        }
+
+        # Final failure
         Write-Log "❌ ERROR: Failed to add $($Member.memberType): $($Member.memberName) to $SafeName - $errBody" "Red"
     }
 }
