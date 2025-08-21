@@ -165,99 +165,68 @@ $FullPermissions = @{
     "requestsAuthorizationLevel2" = $false
 }
 
-# --- Add Safe Members (target AD group via AD OU search; keep admins unchanged) ---
+# --- Members endpoint ---
 $EncodedSafe = Encode-Safe $SafeName
 $MembersEndpoint = "https://$PCloudSubdomain.privilegecloud.cyberark.cloud/PasswordVault/API/Safes/$EncodedSafe/Members/"
 
-# 1) Target AD group: search AD in the specific OU
-Import-Module ActiveDirectory -ErrorAction SilentlyContinue | Out-Null
-$GroupSam = Read-Host "Enter the AD Safe Group (sAMAccountName only, e.g., ca_bud_ecf_prod)"
-if ([string]::IsNullOrWhiteSpace($GroupSam)) {
-    Write-Log "❌ ERROR: AD Safe Group sAMAccountName cannot be empty. Exiting..." "Red"
-    exit
-}
-
-# Validate the group exists in the requested SearchBase
-$SearchBaseOU = 'OU=Groups,OU=CyberArk,DC=cna,DC=com'
-try {
-    $adGroup = Get-ADGroup -LDAPFilter "(sAMAccountName=$GroupSam)" -SearchBase $SearchBaseOU -ErrorAction Stop
-    Write-Log "Found AD Group in ${SearchBaseOU}: $($adGroup.Name) (sAM=$($adGroup.sAMAccountName))" "Green"
-} catch {
-    Write-Log "❌ ERROR: Could not find sAMAccountName '$GroupSam' under ${SearchBaseOU}. Exiting..." "Red"
-    exit
-}
-
-# Helper to add group via REST with specific searchIn
-function Add-GroupViaREST {
+function Add-SafeMemberREST {
     param(
-        [string]$MemberName,   # sAM or UPN
-        [string]$SearchIn,     # e.g., "cnaroot.com", "Directory", "Vault"
-        [hashtable]$Perms
+        [Parameter(Mandatory)] [string]$MemberName,
+        [Parameter(Mandatory)] [ValidateSet("User","Group")] [string]$MemberType,
+        [Parameter(Mandatory)] [ValidateSet("Vault","Directory")] [string]$SearchIn,
+        [Parameter(Mandatory)] [hashtable]$Permissions
     )
-    $body = @{
-        "memberName" = $MemberName
-        "memberType" = "Group"
-        "searchIn"   = $SearchIn
-        "permissions"= $Perms
-    } | ConvertTo-Json -Depth 5
-
-    Write-Log "Adding Group: ${MemberName} to ${SafeName} (SearchIn=${SearchIn})..."
-    try {
-        $null = Invoke-RestMethod -Uri $MembersEndpoint -Method Post -Headers $headers_api -Body $body -ErrorAction Stop
-        Write-Log "✅ Added Group: ${MemberName}." "Green"
-        return $true
-    } catch {
-        $msg = $_.Exception.Message
-        Write-Log "❌ Failed to add '${MemberName}' - $msg" "Red"
-        return $false
-    }
-}
-
-# Add target AD group with LimitedPermissions using cnaroot.com
-$added = $false
-$added = Add-GroupViaREST -MemberName $GroupSam -SearchIn "cnaroot.com" -Perms $LimitedPermissions
-if (-not $added) {
-    # Retry with UPN at cnaroot.com
-    $upnRoot = "$GroupSam@cnaroot.com"
-    Write-Log "Retrying add with UPN '${upnRoot}' (SearchIn=cnaroot.com)..."
-    $added = Add-GroupViaREST -MemberName $upnRoot -SearchIn "cnaroot.com" -Perms $LimitedPermissions
-}
-if (-not $added) {
-    # Fallback: try legacy UPN @cna.com still via cnaroot.com directory search
-    $upnCna = "$GroupSam@cna.com"
-    Write-Log "Retrying add with UPN '${upnCna}' (SearchIn=cnaroot.com)..."
-    $added = Add-GroupViaREST -MemberName $upnCna -SearchIn "cnaroot.com" -Perms $LimitedPermissions
-}
-if (-not $added) {
-    Write-Log "❌ Could not add AD group '${GroupSam}'. This typically indicates PVWA Directory Mapping cannot resolve the group from 'cnaroot.com'. Please verify mapping includes '${SearchBaseOU}'." "Red"
-}
-
-# 2) Keep existing full-permission members exactly as before
-$AdminMembers = @(
-    @{ memberName = "CA_PCloud_Admins@cna.com";          memberType = "Group"; permissions = $FullPermissions; searchIn = "Directory" },
-    @{ memberName = "cna_pas_admin@cyberark.cloud.6679"; memberType = "User";  permissions = $FullPermissions; searchIn = "Vault" }
-)
-
-foreach ($m in $AdminMembers) {
-    $MemberName = $m.memberName
-    $MemberType = $m.memberType
-    $SearchIn   = $m.searchIn
-    $Perms      = $m.permissions
-
     $body = @{
         "memberName" = $MemberName
         "memberType" = $MemberType
         "searchIn"   = $SearchIn
-        "permissions"= $Perms
+        "permissions"= $Permissions
     } | ConvertTo-Json -Depth 5
 
     Write-Log "Adding ${MemberType}: ${MemberName} to ${SafeName} (SearchIn=${SearchIn})..."
     try {
         $null = Invoke-RestMethod -Uri $MembersEndpoint -Method Post -Headers $headers_api -Body $body -ErrorAction Stop
         Write-Log "✅ Added ${MemberType}: ${MemberName}." "Green"
+        return $true
     } catch {
         Write-Log "❌ Failed to add ${MemberType}: ${MemberName} - $($_.Exception.Message)" "Red"
+        return $false
     }
 }
+
+# --- Target AD Group (Directory search like admin) ---
+# Require a valid sAMAccountName and retry logic with UPN & sAM
+while ($true) {
+    $GroupSam = Read-Host "Enter the AD Safe Group (sAMAccountName only, e.g., ca_bud_ecf_prod)"
+    if ([string]::IsNullOrWhiteSpace($GroupSam)) {
+        Write-Log "❌ ERROR: AD Safe Group sAMAccountName cannot be empty. Please re-enter..." "Red"
+        continue
+    }
+    if ($GroupSam -notmatch '^[A-Za-z0-9._-]+$') {
+        Write-Log "❌ ERROR: Group must be sAMAccountName (letters, numbers, dot, dash, underscore). Please re-enter..." "Red"
+        continue
+    }
+    break
+}
+
+# Try UPN first (Directory), then sAM (Directory)
+$targetAdded = $false
+$GroupUPN = "$GroupSam@cna.com"
+
+Write-Log "Adding AD Group '${GroupUPN}' as Safe member (Directory search)..."
+$targetAdded = Add-SafeMemberREST -MemberName $GroupUPN -MemberType "Group" -SearchIn "Directory" -Permissions $LimitedPermissions
+if (-not $targetAdded) {
+    Write-Log "Retrying with sAMAccountName '${GroupSam}' (Directory search)..."
+    $targetAdded = Add-SafeMemberREST -MemberName $GroupSam -MemberType "Group" -SearchIn "Directory" -Permissions $LimitedPermissions
+}
+if (-not $targetAdded) {
+    Write-Log "❌ Could not add AD group '${GroupSam}'. This typically indicates PVWA Directory Mapping cannot resolve the group from cna.com. Verify that the mapping includes the OU where the group lives." "Red"
+}
+
+# --- Existing Admins (unchanged) ---
+# 1) Tenant-registered group with Directory search
+$null = Add-SafeMemberREST -MemberName "CA_PCloud_Admins@cna.com" -MemberType "Group" -SearchIn "Directory" -Permissions $FullPermissions
+# 2) Vault user with Vault search
+$null = Add-SafeMemberREST -MemberName "cna_pas_admin@cyberark.cloud.6679" -MemberType "User" -SearchIn "Vault" -Permissions $FullPermissions
 
 Write-Log "🔹 Safe member addition process completed."
