@@ -1,20 +1,3 @@
-Create Safe and Add Default Permission
- 
-Safe Create And Default Membership Permission
- 
-Steps A (Create Safe)
-1. Logon to server Host, Navigate to C:\OnboardScript
-2. Click file and run powershell as an administrator
-3. Run .\Autoonboardingscript.ps12 script
-4. Enter New Safe Name
-5. Enter New Safe Description
-6. Wait for safename to provision...
-7. Enter group name (in full): e.g. CA_CYBERARKADMINS@domain.com
-8. Safe Provisioning Completed
-9: Review logs E:\accountonboarding.txt
-
-:::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
-
 # --- Logging Utility ---
 $LogPath = "E:\Installation Media\Script\OnboardScript\accountonboarding.txt"
 Function Write-Log {
@@ -26,11 +9,11 @@ Function Write-Log {
 }
 
 # --- Retrieve CyberArk API Credentials from CCP ---
-$CCPAddress = "https://hostname.domain.com"
+$CCPAddress = "https://vskau1p1231.cna.com"
 $location   = "AIMWebService"
 $application= "PAMDiscovery"
-$safe       = "XXX"
-$object     = "XXXXX"
+$safe       = "CA_PCloud_Admins"
+$object     = "cna-prod.cyberark.cloud-cnarestbot@cyberark.cloud.6679"
 
 $headers = New-Object "System.Collections.Generic.Dictionary[[String],[String]]"
 $headers.Add("Content-Type", "application/json")
@@ -64,8 +47,8 @@ if ([string]::IsNullOrEmpty($Description)) {
 }
 
 # --- Authentication Variables (from CCP) ---
-$IdentityTenantID = "aawxxxx"        # CyberArk Identity tenant ID
-$PCloudSubdomain  = "pcloudsubdomain"   # CyberArk Privilege Cloud Subdomain
+$IdentityTenantID = "aat4012"        # CyberArk Identity tenant ID
+$PCloudSubdomain  = "cna-prod"   # CyberArk Privilege Cloud Subdomain
 $ClientID         = $response.Username
 $ClientSecret     = $response.Content
 
@@ -114,7 +97,7 @@ $SafePayload = @{
     "description"               = $Description
     "olacEnabled"               = $false  # Default value
     "autoPurgeEnabled"          = $false  # Default value
-    "managingCPM"               = "CPM"  # Default CPM
+    "managingCPM"               = "CNA_PASS_MANG"  # Default CPM
     "numberOfDaysRetention"     = 180  # Default retention policy
 } | ConvertTo-Json -Depth 3
 
@@ -187,9 +170,9 @@ $FullPermissions = @{
 }
 $Members = @(
     @{ "memberName" = $GroupName; "memberType" = "Group"; "permissions" = $LimitedPermissions },
-    @{ "memberName" = "Admin Account Group"; "memberType" = "Group"; "permissions" = $FullPermissions },
-    @{ "memberName" = "Breakglass Identity Account"; "memberType" = "User"; "permissions" = $FullPermissions },
-    @{ "memberName" = "Automation identity account"; "memberType" = "User"; "permissions" = $FullPermissions }
+    @{ "memberName" = "CA_PCloud_Admins@cna.com"; "memberType" = "Group"; "permissions" = $FullPermissions },
+    @{ "memberName" = "cna_pas_admin@cyberark.cloud.6679"; "memberType" = "User"; "permissions" = $FullPermissions },
+    @{ "memberName" = "safe_automation@cyberark.cloud.6679"; "memberType" = "User"; "permissions" = $FullPermissions }
 )
 foreach ($Member in $Members) {
     $MemberName = $Member.memberName
@@ -214,4 +197,3 @@ foreach ($Member in $Members) {
 }
 
 Write-Log "🔹 Safe member addition process completed."
-
