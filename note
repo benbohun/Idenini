@@ -1,11 +1,10 @@
-<# ==========================================================
- CyberArk Safe Provision – psPAS session via Identity header
- - Auth: Get-IdentityHeader -psPASFormat + Use-PASSession -BaseURI
- - NO OAuth bearer tokens
- - Create Safe -> Add members
- - Target AD group added via Directory (UPN then sAM)
- - Admin members unchanged
-========================================================== #>
+<# =========================================
+   CyberArk Safe Create + Member Add (psPAS)
+   - Auth via CCP -> psPAS Identity header (UPCred)
+   - Safe creation first, then members
+   - Target AD group validated in specific OU
+   - No SearchIn used for member adds
+   ========================================= #>
 
 # --- Logging Utility ---
 $LogPath = "E:\Installation Media\Script\OnboardScript\accountonboarding.txt"
@@ -13,90 +12,105 @@ Function Write-Log {
     param([string]$Message, [string]$Color = "White")
     $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $LogEntry = "$Timestamp - $Message"
-    Write-Host $LogEntry -ForegroundColor $Color
-    try { Add-Content -Path $LogPath -Value $LogEntry -ErrorAction SilentlyContinue } catch {}
+    try { Write-Host $LogEntry -ForegroundColor $Color } catch { Write-Host $LogEntry }
+    try { Add-Content -Path $LogPath -Value $LogEntry } catch {}
 }
 
-$ErrorActionPreference = 'Stop'
-try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
-
-# --- Ensure psPAS is loaded (no Set-PASServer requirement) ---
+# --- Ensure psPAS is available ---
 try {
-    $mod = Get-Module psPAS -ListAvailable | Sort-Object Version -Descending | Select-Object -First 1
-    if (-not $mod) { Write-Log "❌ psPAS module not found. Install it: Install-Module psPAS -Scope AllUsers" "Red"; exit 1 }
-    Import-Module psPAS -Force
-    $ver = (Get-Module psPAS).Version.ToString()
-    Write-Log "psPAS loaded (v$ver)." "Green"
-
-    foreach ($cmd in 'Get-IdentityHeader','Use-PASSession','Get-PASSession','Add-PASSafe','Add-PASSafeMember','Get-PASSafeMember','Close-PASSession') {
-        if (-not (Get-Command $cmd -ErrorAction SilentlyContinue)) {
-            Write-Log "❌ Required psPAS command missing: $cmd. Please Update-Module psPAS." "Red"
-            exit 1
-        }
-    }
+    Import-Module psPAS -ErrorAction Stop
+    $mod = Get-Module psPAS
+    Write-Log "psPAS loaded ($($mod.Version))."
 } catch {
-    Write-Log "❌ psPAS not ready: $($_.Exception.Message)" "Red"; exit 1
+    Write-Log "❌ psPAS module not found/loaded: $($_.Exception.Message)" "Red"
+    exit 1
 }
 
-# --- Retrieve CyberArk API Credentials from CCP (User/Pass) ---
+# --- Retrieve CyberArk API Credentials from CCP ---
 $CCPAddress = "https://vskau1p1231.cna.com"
 $location   = "AIMWebService"
 $application= "PAMDiscovery"
 $safe       = "CA_PCloud_Admins"
-$object     = "cna-prod.cyberark.cloud-cnarestbot@cyberark.cloud.6679"  # account with username/password
+$object     = "cna-prod.cyberark.cloud-cnarestbot@cyberark.cloud.6679"
 
-$headers = @{ "Content-Type" = "application/json" }
+$headers = New-Object "System.Collections.Generic.Dictionary[[String],[String]]"
+$headers.Add("Content-Type", "application/json")
 $windowsAuth = $false
 
-Write-Log "Retrieving CyberArk API credentials from CCP via Object method..." "Cyan"
+Write-Log "Retrieving CyberArk API credentials from CCP via Object method..."
 $ccpUrl = "$CCPAddress/$location/api/Accounts?AppID=$application&Safe=$safe&Object=$object"
 try {
     $response = Invoke-RestMethod $ccpUrl -Method 'GET' -Headers $headers -UseDefaultCredentials:$windowsAuth
-    if (-not $response -or -not $response.Username -or -not $response.Content) {
-        Write-Log "❌ ERROR: Failed to retrieve credentials from CCP." "Red"; exit 1
+    if (-not $response -or -not $response.Content) {
+        Write-Log "❌ ERROR: Failed to retrieve API credentials from CCP." "Red"
+        exit 1
     }
-    Write-Log "Successfully retrieved credentials for user: $($response.Username)" "Green"
+    Write-Log "Successfully retrieved credentials for user: $($response.Username)"
 } catch {
-    Write-Log "❌ ERROR: CCP credential fetch failed - $($_.Exception.Message)" "Red"; exit 1
+    Write-Log "❌ ERROR: CCP credential fetch failed - $_" "Red"
+    exit 1
 }
 
-# --- Build PSCredential from CCP secret ---
+# --- psPAS Authentication using CCP secret + fixed username ---
 try {
-    $SecurePwd = ConvertTo-SecureString $response.Content -AsPlainText -Force
-    $UPCred    = New-Object System.Management.Automation.PSCredential($response.Username, $SecurePwd)
-} catch {
-    Write-Log "❌ ERROR: Could not build PSCredential from CCP response - $($_.Exception.Message)" "Red"; exit 1
-}
+    Write-Log "Requesting CyberArk PAS authentication (psPAS Identity header)..."
+    $UPUser = 'CA_PAMDiscovery_SVC'  # per your instruction; use UPN if your tenant requires it
+    $UPPass = ConvertTo-SecureString $response.Content -AsPlainText -Force
+    $UPCred = [PSCredential]::new($UPUser, $UPPass)
 
-# --- psPAS Session via Identity header (NO Set-PASServer; NO OAuth) ---
-$PVWA_BaseURI      = "https://cna-prod.privilegecloud.cyberark.cloud/PasswordVault/"
-$IdentityTenantURL = "aat4012.id.cyberark.cloud"
-$PCloudSubdomain   = "cna-prod"
+    # Build Identity header for Privilege Cloud & register session
+    $header = Get-IdentityHeader `
+        -IdentityTenantURL "aat4012.id.cyberark.cloud" `
+        -psPASFormat `
+        -PCloudSubdomain "cna-prod" `
+        -UPCreds $UPCred
 
-try {
-    Write-Log "Requesting CyberArk PAS authentication (psPAS Identity header)..." "Cyan"
-    $header = Get-IdentityHeader -IdentityTenantURL $IdentityTenantURL -psPASFormat -PCloudSubdomain $PCloudSubdomain -UPCreds $UPCred
-    # In psPAS v6.4.x, set BaseURI here (we are NOT using Set-PASServer)
-    Use-PASSession -Headers $header -BaseURI $PVWA_BaseURI
+    Use-PASSession $header
 
     $session = Get-PASSession
-    if ($session) {
-        Write-Log "✅ Authentication successful, PAS session established." "Green"
-    } else {
-        Write-Log "❌ Authentication failed. Exiting script." "Red"; exit 1
-    }
+    if (-not $session) { throw "psPAS session not established" }
+    Write-Log "✅ Authentication successful, PAS session established."
 } catch {
-    Write-Log "❌ Failed to authenticate via psPAS Identity header: $($_.Exception.Message)" "Red"; exit 1
+    Write-Log "❌ Failed to authenticate via psPAS Identity header: $($_.Exception.Message)" "Red"
+    exit 1
 }
 
-# --- Prompt for Safe Name & Description (single line, <=200 chars) ---
-$SafeName    = Read-Host "Enter the Safe Name"
-$Description = Read-Host "Enter the Safe Description (single line, up to 200 chars)"
-if ([string]::IsNullOrWhiteSpace($SafeName))    { Write-Log "❌ Safe Name cannot be empty." "Red"; exit 1 }
-if ([string]::IsNullOrWhiteSpace($Description)) { Write-Log "❌ Safe Description cannot be empty." "Red"; exit 1 }
-if ($Description.Length -gt 200) { $Description = $Description.Substring(0,200) }
+# --- Prompt for Safe Name & Description (single line up to 200 chars) ---
+$SafeName = Read-Host "Enter the Safe Name"
+$DescriptionRaw = Read-Host "Enter the Safe Description (single line, up to 200 chars)"
+if ([string]::IsNullOrWhiteSpace($SafeName)) {
+    Write-Log "❌ ERROR: Safe Name cannot be empty. Exiting..." "Red"
+    exit 1
+}
+if ([string]::IsNullOrWhiteSpace($DescriptionRaw)) {
+    Write-Log "❌ ERROR: Safe Description cannot be empty. Exiting..." "Red"
+    exit 1
+}
+$Description = $DescriptionRaw.Trim()
+if ($Description.Length -gt 200) {
+    Write-Log "ℹ️ Safe Description >200 chars, auto-truncating."
+    $Description = $Description.Substring(0,200)
+}
 
-# --- Permission Sets (your required values) ---
+# --- Safe creation (psPAS first, then members) ---
+$ManagingCPM = "CNA_PASS_MANG"
+$NumVersionRetention = 180  # keeping prior default
+try {
+    # Check if safe exists
+    $existing = Get-PASSafe -SafeName $SafeName -ErrorAction SilentlyContinue
+    if ($existing) {
+        Write-Log "ℹ️ Safe '$SafeName' already exists. Skipping create."
+    } else {
+        Write-Log "🔹 Creating Safe: ${SafeName}..."
+        Add-PASSafe -SafeName $SafeName -ManagingCPM $ManagingCPM -NumberOfVersionsRetention $NumVersionRetention -Description $Description -ErrorAction Stop
+        Write-Log "✅ Successfully created Safe: ${SafeName}."
+    }
+} catch {
+    Write-Log "❌ ERROR: Failed to create or read Safe '${SafeName}' - $($_.Exception.Message)" "Red"
+    exit 1
+}
+
+# --- Permissions (as provided) ---
 $LimitedPermissions = @{
     "useAccounts" = $false
     "retrieveAccounts" = $false
@@ -146,121 +160,67 @@ $FullPermissions = @{
     "requestsAuthorizationLevel2" = $false
 }
 
-# Helper: derive RequestsAuthorizationLevel
-function Get-RequestsLevel { param($Perms)
-    if ($Perms.requestsAuthorizationLevel2) { 2 }
-    elseif ($Perms.requestsAuthorizationLevel1) { 1 }
-    else { 0 }
-}
-# Helper: map hashtable -> psPAS splat (only $true flags + RequestsAuthorizationLevel)
-function Build-PASPermSplat { param($Perms)
-    $s = @{}
-    foreach ($k in $Perms.Keys) {
-        switch ($k.ToLower()) {
-            'useaccounts'                            { if ($Perms[$k]) { $s.UseAccounts = $true } }
-            'retrieveaccounts'                       { if ($Perms[$k]) { $s.RetrieveAccounts = $true } }
-            'listaccounts'                           { if ($Perms[$k]) { $s.ListAccounts = $true } }
-            'addaccounts'                            { if ($Perms[$k]) { $s.AddAccounts = $true } }
-            'updateaccountcontent'                   { if ($Perms[$k]) { $s.UpdateAccountContent = $true } }
-            'updateaccountproperties'                { if ($Perms[$k]) { $s.UpdateAccountProperties = $true } }
-            'initiatecpmaccountmanagementoperations' { if ($Perms[$k]) { $s.InitiateCPMAccountManagementOperations = $true } }
-            'specifynextaccountcontent'              { if ($Perms[$k]) { $s.SpecifyNextAccountContent = $true } }
-            'renameaccounts'                         { if ($Perms[$k]) { $s.RenameAccounts = $true } }
-            'deleteaccounts'                         { if ($Perms[$k]) { $s.DeleteAccounts = $true } }
-            'unlockaccounts'                         { if ($Perms[$k]) { $s.UnlockAccounts = $true } }
-            'managesafe'                             { if ($Perms[$k]) { $s.ManageSafe = $true } }
-            'managesafemembers'                      { if ($Perms[$k]) { $s.ManageSafeMembers = $true } }
-            'backupsafe'                             { if ($Perms[$k]) { $s.BackupSafe = $true } }
-            'viewauditlog'                           { if ($Perms[$k]) { $s.ViewAuditLog = $true } }
-            'viewsafemembers'                        { if ($Perms[$k]) { $s.ViewSafeMembers = $true } }
-            'accesswithoutconfirmation'              { if ($Perms[$k]) { $s.AccessWithoutConfirmation = $true } }
-            'createfolders'                          { if ($Perms[$k]) { $s.CreateFolders = $true } }
-            'deletefolders'                          { if ($Perms[$k]) { $s.DeleteFolders = $true } }
-            'moveaccountsandfolders'                 { if ($Perms[$k]) { $s.MoveAccountsAndFolders = $true } }
+# --- Target AD Group prompt & validation (sAM only; must exist in specific OU) ---
+$SearchBaseOU = 'OU=Groups,OU=CyberArk,DC=cna,DC=com'  # per your mapping
+Function Read-ValidGroup {
+    while ($true) {
+        $g = Read-Host "Enter the AD Safe Group (sAMAccountName only, e.g., ca_bud_ecf_prod)"
+        if ([string]::IsNullOrWhiteSpace($g)) {
+            Write-Log "❌ Group cannot be empty."
+            continue
+        }
+        # Basic sanity: letters, numbers, underscore & hyphen ok
+        if ($g -notmatch '^[A-Za-z0-9_\-\.]+$') {
+            Write-Log "❌ Invalid characters in group name. Try again."
+            continue
+        }
+        try {
+            # Validate in exact OU
+            $adGroup = Get-ADGroup -LDAPFilter "(|(sAMAccountName=$g)(userPrincipalName=$g@cna.com))" -SearchBase $SearchBaseOU -ErrorAction Stop
+            if ($adGroup) {
+                Write-Log ("Found AD Group in `${SearchBaseOU}: {0} (sAM={1})" -f $adGroup.Name, $adGroup.SamAccountName)
+                return $g
+            } else {
+                Write-Log "❌ Group not found under ${SearchBaseOU}. Re-enter."
+            }
+        } catch {
+            Write-Log "❌ Error searching AD for '$g' in ${SearchBaseOU}: $($_.Exception.Message)" "Red"
         }
     }
-    $lvl = Get-RequestsLevel -Perms $Perms
-    if ($lvl -gt 0) { $s.RequestsAuthorizationLevel = $lvl }
-    return $s
 }
+$GroupSam = Read-ValidGroup
+$TargetGroupUPN = "$GroupSam@cna.com"
 
-# --- Create Safe first ---
-$ManagingCPM    = "CNA_PASS_MANG"
-$VersionsRet    = 7
-try {
-    Write-Log "🔹 Creating Safe '${SafeName}'..." "Cyan"
-    Add-PASSafe -SafeName $SafeName -ManagingCPM $ManagingCPM -NumberOfVersionsRetention $VersionsRet -Description $Description | Out-Null
-    Write-Log "✅ Successfully created Safe: ${SafeName}." "Green"
-} catch {
-    if ($_.Exception.Message -match 'already exists') {
-        Write-Log "ℹ️ Safe '${SafeName}' already exists. Continuing..." "Yellow"
-    } else {
-        Write-Log "❌ ERROR: Failed to create Safe '${SafeName}' - $($_.Exception.Message)" "Red"
-        try { Close-PASSession | Out-Null } catch {}
-        exit 1
-    }
-}
+# --- Build member set (keep admins exactly as you wanted) ---
+$Members = @(
+    @{ "memberName" = $TargetGroupUPN;                  "memberType" = "Group"; "permissions" = $LimitedPermissions },
+    @{ "memberName" = "CA_PCloud_Admins@cna.com";       "memberType" = "Group"; "permissions" = $FullPermissions  },
+    @{ "memberName" = "cna_pas_admin@cyberark.cloud.6679"; "memberType" = "User";  "permissions" = $FullPermissions  }
+)
 
-# --- Member add helper (psPAS only) ---
-function Try-Add-Member {
+# --- Function to add member via psPAS (no -SearchIn) ---
+Function Add-MemberToSafe {
     param(
-        [Parameter(Mandatory)] [string] $SafeName,
-        [Parameter(Mandatory)] [ValidateSet('User','Group','Role')] [string] $MemberType,
-        [Parameter(Mandatory)] [string] $MemberName,
-        [Parameter(Mandatory)] [ValidateSet('Directory','Vault')] [string] $SearchIn,
-        [Parameter(Mandatory)] $Perms
+        [string]$SafeName,
+        [string]$MemberName,
+        [ValidateSet("Group","User","Role")]
+        [string]$MemberType,
+        [hashtable]$Permissions
     )
-    $permSplat = Build-PASPermSplat -Perms $Perms
     try {
-        Write-Log "Adding ${MemberType} '${MemberName}' to ${SafeName} (SearchIn=${SearchIn})..." "Cyan"
-        $params = @{
-            SafeName   = $SafeName
-            MemberType = $MemberType
-            MemberName = $MemberName
-            SearchIn   = $SearchIn
-            ErrorAction= 'Stop'
-        } + $permSplat
-        Add-PASSafeMember @params | Out-Null
-        Write-Log "✅ Added ${MemberType}: ${MemberName}." "Green"
+        Write-Log "Adding ${MemberType} '${MemberName}' to ${SafeName}..."
+        $Permissions | Add-PASSafeMember -SafeName $SafeName -MemberType $MemberType -MemberName $MemberName -ErrorAction Stop | Out-Null
+        Write-Log "✅ Added ${MemberType}: ${MemberName}."
         return $true
     } catch {
-        $msg = $_.Exception.Message
-        if ($msg -match 'already exists') {
-            Write-Log "ℹ️ ${MemberType} '${MemberName}' already a member. Skipping." "Yellow"
-            return $true
-        } else {
-            Write-Log "❌ Failed to add '${MemberName}' - $msg" "Red"
-            return $false
-        }
+        Write-Log "❌ Failed to add '${MemberName}' - $($_.Exception.Message)" "Red"
+        return $false
     }
 }
 
-function Add-TargetADGroup {
-    param([string]$SafeName, [string]$SamName)
-    $upn = "$SamName@cna.com"
-    Write-Log "Adding AD Group '${upn}' as Safe member (Directory)..." "Cyan"
-    if (Try-Add-Member -SafeName $SafeName -MemberType Group -MemberName $upn -SearchIn Directory -Perms $LimitedPermissions) { return }
-    Write-Log "Retrying with sAM '${SamName}' (Directory)..." "Yellow"
-    Try-Add-Member -SafeName $SafeName -MemberType Group -MemberName $SamName -SearchIn Directory -Perms $LimitedPermissions | Out-Null
+# --- Add members in order: Target Group (Limited) -> CA_PCloud_Admins (Full) -> Vault User (Full) ---
+foreach ($m in $Members) {
+    [void](Add-MemberToSafe -SafeName $SafeName -MemberName $m.memberName -MemberType $m.memberType -Permissions $m.permissions)
 }
 
-# --- Prompt: target AD group (sAM only) ---
-do {
-    $GroupSam = Read-Host "Enter the AD Safe Group (sAMAccountName only, e.g., ca_bud_ecf_prod)"
-    if ([string]::IsNullOrWhiteSpace($GroupSam)) { Write-Log "❌ Group sAMAccountName cannot be empty." "Red" }
-} until (-not [string]::IsNullOrWhiteSpace($GroupSam))
-
-# --- Add Members (admins unchanged) ---
-# 1) Target AD group (Directory) with Limited perms
-Add-TargetADGroup -SafeName $SafeName -SamName $GroupSam
-
-# 2) Registered Admin Group (Directory) with Full perms (UNCHANGED)
-Try-Add-Member -SafeName $SafeName -MemberType Group -MemberName "CA_PCloud_Admins@cna.com" -SearchIn Directory -Perms $FullPermissions | Out-Null
-
-# 3) Admin Vault User (Vault) with Full perms (UNCHANGED)
-Try-Add-Member -SafeName $SafeName -MemberType User -MemberName "cna_pas_admin@cyberark.cloud.6679" -SearchIn Vault -Perms $FullPermissions | Out-Null
-
-Write-Log "🔹 Safe member addition process completed." "Cyan"
-
-# --- Logoff psPAS session ---
-try { Close-PASSession | Out-Null } catch {}
+Write-Log "🔹 Safe member addition process completed."
