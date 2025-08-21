@@ -114,4 +114,164 @@ try {
     Write-Log "⚠️ Safe create returned: $($_.Exception.Message). Continuing..." "Yellow"
 }
 
-# --- Permissio
+# --- Permissions (AFTER safe creation, per your pattern) ---
+$LimitedPermissions = @{
+    useAccounts = $false
+    retrieveAccounts = $false
+    listAccounts = $true
+    addAccounts = $false
+    updateAccountContent = $false
+    updateAccountProperties = $false
+    initiateCPMAccountManagementOperations = $true
+    specifyNextAccountContent = $false
+    renameAccounts = $false
+    deleteAccounts = $false
+    unlockAccounts = $true
+    manageSafe = $false
+    manageSafeMembers = $false
+    backupSafe = $false
+    viewAuditLog = $true
+    viewSafeMembers = $true
+    accessWithoutConfirmation = $true
+    createFolders = $false
+    deleteFolders = $false
+    moveAccountsAndFolders = $false
+    requestsAuthorizationLevel1 = $true
+    requestsAuthorizationLevel2 = $false
+}
+$FullPermissions = @{
+    useAccounts = $true
+    retrieveAccounts = $true
+    listAccounts = $true
+    addAccounts = $true
+    updateAccountContent = $true
+    updateAccountProperties = $true
+    initiateCPMAccountManagementOperations = $true
+    specifyNextAccountContent = $true
+    renameAccounts = $true
+    deleteAccounts = $true
+    unlockAccounts = $true
+    manageSafe = $true
+    manageSafeMembers = $true
+    backupSafe = $true
+    viewAuditLog = $true
+    viewSafeMembers = $true
+    accessWithoutConfirmation = $true
+    createFolders = $true
+    deleteFolders = $true
+    moveAccountsAndFolders = $true
+    requestsAuthorizationLevel1 = $true
+    requestsAuthorizationLevel2 = $false
+}
+
+# Convert REST-style -> psPAS role object with PascalCase, for Add/Set-PASSafeMember
+Function Convert-ToPasRole {
+    param($perm)
+    [PSCustomObject]@{
+        UseAccounts                            = [bool]$perm.useAccounts
+        RetrieveAccounts                       = [bool]$perm.retrieveAccounts
+        ListAccounts                           = [bool]$perm.listAccounts
+        AddAccounts                            = [bool]$perm.addAccounts
+        UpdateAccountContent                   = [bool]$perm.updateAccountContent
+        UpdateAccountProperties                = [bool]$perm.updateAccountProperties
+        InitiateCPMAccountManagementOperations = [bool]$perm.initiateCPMAccountManagementOperations
+        SpecifyNextAccountContent              = [bool]$perm.specifyNextAccountContent
+        RenameAccounts                         = [bool]$perm.renameAccounts
+        DeleteAccounts                         = [bool]$perm.deleteAccounts
+        UnlockAccounts                         = [bool]$perm.unlockAccounts
+        ManageSafe                             = [bool]$perm.manageSafe
+        ManageSafeMembers                      = [bool]$perm.manageSafeMembers
+        BackupSafe                             = [bool]$perm.backupSafe
+        ViewAuditLog                           = [bool]$perm.viewAuditLog
+        ViewSafeMembers                        = [bool]$perm.viewSafeMembers
+        AccessWithoutConfirmation              = [bool]$perm.accessWithoutConfirmation
+        CreateFolders                          = [bool]$perm.createFolders
+        DeleteFolders                          = [bool]$perm.deleteFolders
+        MoveAccountsAndFolders                 = [bool]$perm.moveAccountsAndFolders
+        RequestsAuthorizationLevel1            = [bool]$perm.requestsAuthorizationLevel1
+        RequestsAuthorizationLevel2            = [bool]$perm.requestsAuthorizationLevel2
+    }
+}
+$LimitedRole = Convert-ToPasRole $LimitedPermissions
+$FullRole    = Convert-ToPasRole $FullPermissions
+
+# --- Ensure psPAS session (prefer your PAPMAPIConnect helper) ---
+try {
+    if (Get-Command -Name PAPMAPIConnect -ErrorAction SilentlyContinue) {
+        Write-Log "Establishing PVWA session via PAPMAPIConnect..."
+        PAPMAPIConnect
+    } else {
+        # Fallback: assume session is already established externally
+        Write-Log "ℹ️ PAPMAPIConnect not found; assuming psPAS session already established." "Yellow"
+    }
+} catch {
+    Write-Log "⚠️ PAPMAPIConnect failed: $($_.Exception.Message). Add/Set-PASSafeMember may fail without a session." "Yellow"
+}
+
+# --- Helper: add-or-update member via psPAS, NO -SearchIn used ---
+Function Ensure-SafeMember {
+    param(
+        [Parameter(Mandatory)][string]$SafeName,
+        [Parameter(Mandatory)][ValidateSet('User','Group','Role')]$MemberType,
+        [Parameter(Mandatory)][string]$MemberName,
+        [Parameter(Mandatory)]$RoleObject
+    )
+    try {
+        $existing = (Get-PASSafeMember -SafeName $SafeName -ErrorAction SilentlyContinue).Username
+    } catch { $existing = @() }
+
+    if ($existing -and ($existing -contains $MemberName)) {
+        Write-Log "Updating $MemberType '$MemberName' on $SafeName (psPAS)..."
+        try {
+            $RoleObject | Set-PASSafeMember -SafeName $SafeName -MemberName $MemberName -ErrorAction Stop | Out-Null
+            Write-Log "✅ Updated $MemberType: $MemberName."
+        } catch {
+            Write-Log "❌ Failed to update '$MemberName' - $($_.Exception.Message)" "Red"
+        }
+    } else {
+        Write-Log "Adding $MemberType '$MemberName' to $SafeName (psPAS)..."
+        try {
+            $RoleObject | Add-PASSafeMember -SafeName $SafeName -memberType $MemberType -MemberName $MemberName -ErrorAction Stop | Out-Null
+            Write-Log "✅ Added $MemberType: $MemberName."
+        } catch {
+            Write-Log "❌ Failed to add '$MemberName' - $($_.Exception.Message)" "Red"
+        }
+    }
+}
+
+# --- Target AD group: validate in specific OU, then add with NO -SearchIn ---
+$SearchBaseOU = "OU=Groups,OU=CyberArk,DC=cna,DC=com"
+$TargetSam = $null
+$ADReady = $true
+if (-not (Get-Command Get-ADGroup -ErrorAction SilentlyContinue)) {
+    Write-Log "⚠️ RSAT AD module not found. Cannot validate group in AD; proceeding without AD check." "Yellow"
+    $ADReady = $false
+}
+do {
+    $TargetSam = Read-Host "Enter the AD Safe Group (sAMAccountName only, e.g., ca_bud_ecf_prod)"
+    if ([string]::IsNullOrWhiteSpace($TargetSam)) {
+        Write-Log "❌ Group name cannot be empty. Please re-enter." "Red"
+        $TargetSam = $null
+        continue
+    }
+    if ($ADReady) {
+        try {
+            $adGroup = Get-ADGroup -LDAPFilter "(sAMAccountName=$TargetSam)" -SearchBase $SearchBaseOU -ErrorAction Stop
+        } catch { $adGroup = $null }
+        if (-not $adGroup) {
+            Write-Log "❌ '$TargetSam' not found under $SearchBaseOU. Please re-enter." "Red"
+            $TargetSam = $null
+        }
+    }
+} while (-not $TargetSam)
+
+# Format as UPN per your preference (no DOMAIN\GroupName)
+$TargetUPN = "$TargetSam@cna.com"
+Write-Log "Adding AD Group '$TargetUPN' via psPAS Add-PASSafeMember..."
+Ensure-SafeMember -SafeName $SafeName -MemberType Group -MemberName $TargetUPN -RoleObject $LimitedRole
+
+# --- Other full-permission members (unchanged) ---
+Ensure-SafeMember -SafeName $SafeName -MemberType Group -MemberName "CA_PCloud_Admins@cna.com" -RoleObject $FullRole
+Ensure-SafeMember -SafeName $SafeName -MemberType User  -MemberName "cna_pas_admin@cyberark.cloud.6679" -RoleObject $FullRole
+
+Write-Log "🔹 Safe member addition process completed."
