@@ -20,17 +20,6 @@ Function Write-Log {
     try { Add-Content -Path $LogPath -Value $LogEntry } catch {}
 }
 
-# --- Console "box" helper (for fallback dialog text) ---
-Function Show-Box {
-    param([string]$Title, [string]$BodyLine1 = "", [string]$BodyLine2 = "")
-    $line = ('=' * 72)
-    Write-Host $line -ForegroundColor DarkGray
-    if ($Title)    { Write-Host ("[ " + $Title + " ]") -ForegroundColor Gray }
-    if ($BodyLine1){ Write-Host $BodyLine1 -ForegroundColor Gray }
-    if ($BodyLine2){ Write-Host $BodyLine2 -ForegroundColor Gray }
-    Write-Host $line -ForegroundColor DarkGray
-}
-
 # --- Load psPAS ---
 try {
     Import-Module psPAS -Force -ErrorAction Stop
@@ -58,7 +47,7 @@ $safeCCP    = "CA_PCloud_Admins"
 $headers    = @{ "Content-Type" = "application/json" }
 $windowsAuth = $false
 
-# --- Helper: start a PAS session from CCP creds using the SAME psPAS Identity method ---
+# --- Helper: start a PAS session from CCP creds using psPAS Identity method ---
 Function Start-PASSessionFromCCP {
     param(
         [Parameter(Mandatory)] [string]$ObjectName,   # e.g. cna.com-CA_PAMDiscovery_SVC
@@ -94,10 +83,10 @@ Function Start-PASSessionFromCCP {
         throw
     }
 
-    return $resp   # return CCP record (may be useful later)
+    return $resp
 }
 
-# --- Permissions (psPAS-friendly) ---
+# --- Permissions (Limited) ---
 $LimitedPermPAS = [PSCustomObject]@{
     UseAccounts                            = $false
     RetrieveAccounts                       = $false
@@ -119,30 +108,6 @@ $LimitedPermPAS = [PSCustomObject]@{
     CreateFolders                          = $false
     DeleteFolders                          = $false
     MoveAccountsAndFolders                 = $false
-    RequestsAuthorizationLevel1            = $true
-    RequestsAuthorizationLevel2            = $false
-}
-$FullPermPAS = [PSCustomObject]@{
-    UseAccounts                            = $true
-    RetrieveAccounts                       = $true
-    ListAccounts                           = $true
-    AddAccounts                            = $true
-    UpdateAccountContent                   = $true
-    UpdateAccountProperties                = $true
-    InitiateCPMAccountManagementOperations = $true
-    SpecifyNextAccountContent              = $true
-    RenameAccounts                         = $true
-    DeleteAccounts                         = $true
-    UnlockAccounts                         = $true
-    ManageSafe                             = $true
-    ManageSafeMembers                      = $true
-    BackupSafe                             = $true
-    ViewAuditLog                           = $true
-    ViewSafeMembers                        = $true
-    AccessWithoutConfirmation              = $true
-    CreateFolders                          = $true
-    DeleteFolders                          = $true
-    MoveAccountsAndFolders                 = $true
     RequestsAuthorizationLevel1            = $true
     RequestsAuthorizationLevel2            = $false
 }
@@ -195,105 +160,34 @@ Function Add-MemberToSafe {
 }
 
 # =========================
-# FIRST SESSION (DISCOVERY)
+# SESSION (ADD GROUP TO EXISTING SAFE)
 # =========================
-# Login (psPAS) using CCP creds of CA_PAMDiscovery_SVC
-$response1 = $null
+# Login via CCP as CA_PAMDiscovery_SVC
+$response = $null
 try {
-    $response1 = Start-PASSessionFromCCP -ObjectName "cna.com-CA_PAMDiscovery_SVC" -UPUser "CA_PAMDiscovery_SVC"
+    $response = Start-PASSessionFromCCP -ObjectName "cna.com-CA_PAMDiscovery_SVC" -UPUser "CA_PAMDiscovery_SVC"
 } catch { exit 1 }
 
-# Prompt for Safe Name
-$SafeName = Read-Host "Enter the Safe Name"
+# Prompt Safe name and verify it exists
+$SafeName = Read-Host "Enter the existing Safe Name"
+if ([string]::IsNullOrWhiteSpace($SafeName)) { Write-Log "❌ ERROR: Safe Name cannot be empty. Exiting..." "Red"; exit 1 }
 
-# GUI InputBox for description; fallback to Read-Host
-$DescriptionRaw = $null
 try {
-    Add-Type -AssemblyName Microsoft.VisualBasic -ErrorAction Stop
-    $DescriptionRaw = [Microsoft.VisualBasic.Interaction]::InputBox(
-        "Paste a single-line description for the Safe (max 200 chars).",
-        "Safe Description",
-        ""
-    )
+    $safeObj = Get-PASSafe -SafeName $SafeName -ErrorAction Stop
+    if (-not $safeObj) { throw "Safe not found" }
+    Write-Log ("✅ Safe '{0}' found." -f $SafeName) "Green"
 } catch {
-    Show-Box -Title "Safe Description" `
-        -BodyLine1 "Paste a single-line description for the Safe (max 200 characters)." `
-        -BodyLine2 "Example: 'Service accounts for AppX PROD'."
-    $DescriptionRaw = Read-Host "Enter the Safe Description (single line, up to 200 chars)"
+    Write-Log ("❌ ERROR: Safe '{0}' does not exist or cannot be read: {1}" -f $SafeName, $_.Exception.Message) "Red"
+    try { Close-PASSession | Out-Null } catch {}
+    exit 1
 }
 
-if ([string]::IsNullOrWhiteSpace($SafeName))       { Write-Log "❌ ERROR: Safe Name cannot be empty. Exiting..." "Red"; exit 1 }
-if ([string]::IsNullOrWhiteSpace($DescriptionRaw)) { Write-Log "❌ ERROR: Safe Description cannot be empty. Exiting..." "Red"; exit 1 }
-
-$Description = $DescriptionRaw.Trim()
-if ($Description.Length -gt 200) {
-    Write-Log "ℹ️ Safe Description >200 chars, auto-truncating."
-    $Description = $Description.Substring(0,200)
-}
-
-# Create Safe (always)
-$ManagingCPM = "CNA_PASS_MANG"
-try {
-    Write-Log ("🔹 Creating Safe: {0}..." -f $SafeName)
-    Add-PASSafe -SafeName $SafeName -ManagingCPM $ManagingCPM -Description $Description -NumberOfVersionsRetention 180 -ErrorAction Stop | Out-Null
-    Write-Log ("✅ Successfully created Safe: {0}." -f $SafeName) "Green"
-} catch {
-    Write-Log ("⚠️ Could not create Safe '{0}': {1}. Continuing to member add..." -f $SafeName, $_.Exception.Message) "Yellow"
-}
-
-# Read target AD group & add members
+# Prompt for Group sAM and validate (then add as UPN)
 $GroupSam       = Read-ValidGroup
 $TargetGroupUPN = "$GroupSam@cna.com"
 
-$MembersToAdd = @(
-    @{ Name = $TargetGroupUPN;                     Type = "Group"; Perm = $LimitedPermPAS }, # target AD group (Limited)
-    @{ Name = "CA_PCloud_Admins@cna.com";          Type = "Group"; Perm = $FullPermPAS    }, # Full
-    @{ Name = "cna_pas_admin@cyberark.cloud.6679"; Type = "User";  Perm = $FullPermPAS    }, # Full
-    @{ Name = "cnarestbot@cyberark.cloud.6679";    Type = "User";  Perm = $FullPermPAS    }  # Full
-)
+# Add group with LimitedPermPAS
+[void](Add-MemberToSafe -SafeName $SafeName -MemberName $TargetGroupUPN -MemberType "Group" -Permissions $LimitedPermPAS)
 
-foreach ($m in $MembersToAdd) {
-    [void](Add-MemberToSafe -SafeName $SafeName -MemberName $m.Name -MemberType $m.Type -Permissions $m.Perm)
-}
-Write-Log "✅ Safe member addition process completed." "Green"
-
-# Close FIRST session
-try { Close-PASSession | Out-Null; Write-Log "✅ PAS session closed (CA_PAMDiscovery_SVC)." "Green" } catch {}
-
-# =========================
-# SECOND SESSION (SAME USER, psPAS)
-# =========================
-$response2 = $null
-try {
-    $response2 = Start-PASSessionFromCCP -ObjectName "cna.com-CA_PAMDiscovery_SVC" -UPUser "CA_PAMDiscovery_SVC"
-} catch { exit 1 }
-
-# (Optional visibility) List members before removal
-try {
-    $members = Get-PASSafeMember -SafeName $SafeName -ErrorAction Stop
-    foreach ($m in $members) {
-        $n = $null; $t = $null
-        if ($m.PSObject.Properties.Name -contains 'MemberName') { $n = "$($m.MemberName)" }
-        elseif ($m.PSObject.Properties.Name -contains 'UserName') { $n = "$($m.UserName)" }
-        elseif ($m.PSObject.Properties.Name -contains 'Username') { $n = "$($m.Username)" }
-        if ($m.PSObject.Properties.Name -contains 'MemberType') { $t = "$($m.MemberType)" }
-        Write-Log ("🔎 Member found: Name='{0}', Type='{1}'" -f $n, $t) "Gray"
-    }
-} catch {
-    Write-Log ("ℹ️ Could not list members before removal: {0}" -f $_.Exception.Message) "Yellow"
-}
-
-# Remove the discovery user (self) using psPAS only - WITH @cna.com
-$memberToRemove = 'CA_PAMDiscovery_SVC@cna.com'
-try {
-    Write-Log ("Attempting removal via psPAS: Remove-PASSafeMember -SafeName {0} -MemberName {1}" -f $SafeName, $memberToRemove)
-    Remove-PASSafeMember -SafeName $SafeName -MemberName $memberToRemove -ErrorAction Stop | Out-Null
-    Write-Log ("✅ Removed '{0}' from Safe '{1}' via psPAS." -f $memberToRemove, $SafeName) "Green"
-} catch {
-    Write-Log ("❌ Could not remove '{0}' via psPAS: {1}" -f $memberToRemove, $_.Exception.Message) "Red"
-}
-
-# Close SECOND session
-try { Close-PASSession | Out-Null; Write-Log "✅ PAS session closed (second session, CA_PAMDiscovery_SVC)." "Green" } catch {}
-
-Write-Log "✅ Completed Safe creation, member additions, second login (same user), and discovery principal cleanup." "Green"
+# Close session
+try { Close-PASSession | Out-Null; Write-Log "✅ PAS session closed." "Green" } catch {}
