@@ -1,25 +1,27 @@
 # --- Allow this process to load unsigned modules & unblock psPAS files (no prompts) ---
 try { Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force -ErrorAction Stop } catch {}
- 
+
 $psPASDirs = @(
   "$env:ProgramFiles\WindowsPowerShell\Modules\psPAS\6.4.85",
   "$HOME\Documents\WindowsPowerShell\Modules\psPAS\6.4.85"
 ) | Where-Object { Test-Path $_ }
- 
+
 foreach ($dir in $psPASDirs) {
   Get-ChildItem -Path $dir -Recurse -File | Unblock-File -ErrorAction SilentlyContinue
 }
- 
+
 Import-Module psPAS -Force
+
 <# =========================================
    CyberArk Safe Create + Member Add (psPAS)
    - Auth via CCP -> psPAS Identity header (UPCred)
-   - Always create safe (no pre-check), then add members
-   - Target AD group validated in specific OU; add as group@cna.com
+   - Always create safe, then add members
+   - Target AD group validated in OU=Groups,OU=CyberArk,DC=cna,DC=com; add as group@cna.com
    - No -SearchIn used for member adds
-   - Default NumberOfVersionsRetention = 180
+   - NumberOfVersionsRetention = 180
+   - After completion: remove CA_PAMDiscovery_SVC from Safe & end session
    ========================================= #>
-   
+
 # --- Logging Utility ---
 $LogPath = "E:\Installation Media\Script\OnboardScript\accountonboarding.txt"
 Function Write-Log {
@@ -30,7 +32,7 @@ Function Write-Log {
     try { Add-Content -Path $LogPath -Value $LogEntry } catch {}
 }
 
-# Small helper to draw a simple "box" in console
+# Simple console "box"
 Function Show-Box {
     param([string]$Title, [string]$BodyLine1 = "", [string]$BodyLine2 = "")
     $line = ('=' * 72)
@@ -51,7 +53,7 @@ try {
     exit 1
 }
 
-# --- Try to import AD module for OU validation (non-fatal if missing) ---
+# --- (Optional) AD module for OU validation (non-fatal) ---
 $ADModuleLoaded = $false
 try {
     Import-Module ActiveDirectory -ErrorAction Stop
@@ -65,7 +67,7 @@ $CCPAddress = "https://vskau1p1231.cna.com"
 $location   = "AIMWebService"
 $application= "PAMDiscovery"
 $safe       = "CA_PCloud_Admins"
-# ✅ Updated object name per your request:
+# Object name per your request:
 $object     = "cna.com-CA_PAMDiscovery_SVC"
 
 $headers = New-Object "System.Collections.Generic.Dictionary[[String],[String]]"
@@ -80,7 +82,7 @@ try {
         Write-Log "❌ ERROR: Failed to retrieve API credentials from CCP." "Red"
         exit 1
     }
-    Write-Log "Successfully retrieved credentials for user: $($response.Username)" "Green"
+    Write-Log "✅ Successfully retrieved credentials for user: $($response.Username)" "Green"
 } catch {
     Write-Log "❌ ERROR: CCP credential fetch failed - $_" "Red"
     exit 1
@@ -89,11 +91,10 @@ try {
 # --- psPAS Authentication using CCP secret + fixed username ---
 try {
     Write-Log "Requesting CyberArk PAS authentication (psPAS Identity header)..."
-    $UPUser = 'CA_PAMDiscovery_SVC'   # fixed username per your instruction
+    $UPUser = 'CA_PAMDiscovery_SVC'   # fixed username
     $UPPass = ConvertTo-SecureString $response.Content -AsPlainText -Force
     $UPCred = [PSCredential]::new($UPUser, $UPPass)
 
-    # Build Identity header for Privilege Cloud & register session
     $header = Get-IdentityHeader `
         -IdentityTenantURL "aat4012.id.cyberark.cloud" `
         -psPASFormat `
@@ -110,40 +111,52 @@ try {
     exit 1
 }
 
-# --- Prompt for Safe Name & Description (single line up to 200 chars) ---
+# --- Prompt for Safe Name ---
 $SafeName = Read-Host "Enter the Safe Name"
-Show-Box -Title "Safe Description" `
-        -BodyLine1 "Paste a single-line description for the Safe (max 200 characters)." `
-        -BodyLine2 "Example: 'Service accounts for AppX PROD'."
-$DescriptionRaw = Read-Host "Enter the Safe Description (single line, up to 200 chars)"
-
 if ([string]::IsNullOrWhiteSpace($SafeName)) {
     Write-Log "❌ ERROR: Safe Name cannot be empty. Exiting..." "Red"
-    exit 1
+    goto Cleanup
 }
-if ([string]::IsNullOrWhiteSpace($DescriptionRaw)) {
+
+# --- Safe Description via DIALOG (with console fallback) ---
+$Description = $null
+try {
+    Add-Type -AssemblyName Microsoft.VisualBasic -ErrorAction Stop
+    Show-Box -Title "Safe Description" -BodyLine1 "A dialog box will open. Paste a single-line description (max 200 chars)."
+    $Description = [Microsoft.VisualBasic.Interaction]::InputBox(
+        "Paste a single-line description for the Safe (max 200 characters).",
+        "Safe Description",
+        ""
+    )
+} catch {
+    # Fallback to console if UI not available
+    Show-Box -Title "Safe Description (Console Fallback)" `
+        -BodyLine1 "Paste a single-line description for the Safe (max 200 chars)." `
+        -BodyLine2 "Example: 'Service accounts for AppX PROD'."
+    $Description = Read-Host "Enter the Safe Description"
+}
+
+if ([string]::IsNullOrWhiteSpace($Description)) {
     Write-Log "❌ ERROR: Safe Description cannot be empty. Exiting..." "Red"
-    exit 1
+    goto Cleanup
 }
-$Description = $DescriptionRaw.Trim()
+$Description = $Description.Trim()
 if ($Description.Length -gt 200) {
     Write-Log "ℹ️ Safe Description >200 chars, auto-truncating."
     $Description = $Description.Substring(0,200)
 }
 
-# --- Create Safe (no pre-check; proceed regardless of outcome) ---
+# --- Create Safe (always try; continue if exists) ---
 $ManagingCPM = "CNA_PASS_MANG"
 try {
-    Write-Log "🔹 Creating Safe: ${SafeName}..."
-    # ✅ Set NumberOfVersionsRetention to 180 as requested
+    Write-Log "Creating Safe: ${SafeName}..."
     Add-PASSafe -SafeName $SafeName -ManagingCPM $ManagingCPM -Description $Description -NumberOfVersionsRetention 180 -ErrorAction Stop | Out-Null
     Write-Log "✅ Successfully created Safe: ${SafeName}." "Green"
 } catch {
-    # If safe already exists or other error, log and proceed to members
     Write-Log "⚠️ Could not create Safe '${SafeName}': $($_.Exception.Message). Continuing to member add..." "Yellow"
 }
 
-# --- psPAS-friendly Permissions (PascalCase) ---
+# --- psPAS-friendly Permissions ---
 $LimitedPermPAS = [PSCustomObject]@{
     UseAccounts                            = $false
     RetrieveAccounts                       = $false
@@ -193,7 +206,7 @@ $FullPermPAS = [PSCustomObject]@{
     RequestsAuthorizationLevel2            = $false
 }
 
-# --- Target AD Group prompt & validation (in OU=Groups,OU=CyberArk,DC=cna,DC=com) ---
+# --- Target AD Group prompt & validation (OU=Groups,OU=CyberArk,DC=cna,DC=com) ---
 $SearchBaseOU = 'OU=Groups,OU=CyberArk,DC=cna,DC=com'
 Function Read-ValidGroup {
     while ($true) {
@@ -211,16 +224,15 @@ Function Read-ValidGroup {
             try {
                 $adGroup = Get-ADGroup -LDAPFilter "(|(sAMAccountName=$g)(userPrincipalName=$g@cna.com))" -SearchBase $SearchBaseOU -ErrorAction Stop
                 if ($adGroup) {
-                    Write-Log ("✅ Found AD Group in {0}: {1} (sAM={2})" -f ${SearchBaseOU}, $adGroup.Name, $adGroup.SamAccountName) "Green"
+                    Write-Log ("✅ Found AD Group in {0}: {1} (sAM={2})" -f $SearchBaseOU, $adGroup.Name, $adGroup.SamAccountName) "Green"
                     return $g
                 } else {
-                    Write-Log ("❌ Group not found under {0}. Re-enter." -f ${SearchBaseOU}) "Red"
+                    Write-Log ("❌ Group not found under {0}. Re-enter." -f $SearchBaseOU) "Red"
                 }
             } catch {
-                Write-Log "❌ Error searching AD for '$g' in ${SearchBaseOU}: $($_.Exception.Message)" "Red"
+                Write-Log ("❌ Error searching AD for '{0}' in {1}: {2}" -f $g, $SearchBaseOU, $_.Exception.Message) "Red"
             }
         } else {
-            # No AD module; accept and proceed (PVWA/Directory Mapping must resolve it)
             Write-Log "⚠️ AD module not loaded, proceeding with provided group name (will add as UPN)." "Yellow"
             return $g
         }
@@ -229,14 +241,14 @@ Function Read-ValidGroup {
 $GroupSam = Read-ValidGroup
 $TargetGroupUPN = "$GroupSam@cna.com"
 
-# --- Members (order preserved; admins unchanged) ---
+# --- Members (admins unchanged) ---
 $Members = @(
-    @{ Name = $TargetGroupUPN;                     Type = "Group"; Perm = $LimitedPermPAS }, # target AD group (Limited)
-    @{ Name = "CA_PCloud_Admins@cna.com";          Type = "Group"; Perm = $FullPermPAS    }, # keep as-is (Full)
-    @{ Name = "cna_pas_admin@cyberark.cloud.6679"; Type = "User";  Perm = $FullPermPAS    }  # keep as-is (Full)
+    @{ Name = $TargetGroupUPN;                     Type = "Group"; Perm = $LimitedPermPAS }, # Target AD group (Limited)
+    @{ Name = "CA_PCloud_Admins@cna.com";          Type = "Group"; Perm = $FullPermPAS    }, # Registered group (Full)
+    @{ Name = "cna_pas_admin@cyberark.cloud.6679"; Type = "User";  Perm = $FullPermPAS    }  # Vault user (Full)
 )
 
-# --- Helper: Add member via psPAS, piping permissions ---
+# Helper: Add member
 Function Add-MemberToSafe {
     param(
         [string]$SafeName,
@@ -262,3 +274,31 @@ foreach ($m in $Members) {
 }
 
 Write-Log "✅ Safe member addition process completed." "Green"
+
+# ---------------------------
+# Cleanup: remove CA_PAMDiscovery_SVC from Safe & end session
+# ---------------------------
+:Cleanup
+
+# Attempt to remove CA_PAMDiscovery_SVC (AD user) from the Safe, if present
+if ($SafeName) {
+    foreach ($candidate in @("CA_PAMDiscovery_SVC@cna.com","CA_PAMDiscovery_SVC")) {
+        try {
+            Write-Log "Attempting to remove user '$candidate' from Safe '$SafeName'..."
+            Remove-PASSafeMember -SafeName $SafeName -MemberName $candidate -MemberType User -Confirm:$false -ErrorAction Stop | Out-Null
+            Write-Log "✅ Removed user '$candidate' from Safe '$SafeName'." "Green"
+            break
+        } catch {
+            # If not a member, just continue silently
+            Write-Log "ℹ️ '$candidate' not removed (likely not a member): $($_.Exception.Message)" "Yellow"
+        }
+    }
+}
+
+# Close psPAS session
+try {
+    Close-PASSession -ErrorAction Stop
+    Write-Log "✅ Session closed." "Green"
+} catch {
+    Write-Log "ℹ️ Session close encountered an issue: $($_.Exception.Message)" "Yellow"
+}
