@@ -20,7 +20,7 @@ Function Write-Log {
     try { Add-Content -Path $LogPath -Value $LogEntry } catch {}
 }
 
-# --- Console "box" helper (for nice prompts) ---
+# --- Console "box" helper (for dialog text) ---
 Function Show-Box {
     param([string]$Title, [string]$BodyLine1 = "", [string]$BodyLine2 = "")
     $line = ('=' * 72)
@@ -115,7 +115,7 @@ try {
     $DescriptionRaw = Read-Host "Enter the Safe Description (single line, up to 200 chars)"
 }
 
-if ([string]::IsNullOrWhiteSpace($SafeName))      { Write-Log "❌ ERROR: Safe Name cannot be empty. Exiting..." "Red"; exit 1 }
+if ([string]::IsNullOrWhiteSpace($SafeName))       { Write-Log "❌ ERROR: Safe Name cannot be empty. Exiting..." "Red"; exit 1 }
 if ([string]::IsNullOrWhiteSpace($DescriptionRaw)) { Write-Log "❌ ERROR: Safe Description cannot be empty. Exiting..." "Red"; exit 1 }
 
 $Description = $DescriptionRaw.Trim()
@@ -284,21 +284,81 @@ try {
 }
 
 # =========================================
-# 6) REST removal of Discovery principal: discover exact MemberName (prefer Group) -> DELETE
+# 6) REST removal of Discovery principal: resolve exact Safe member name -> DELETE
+#     IMPORTANT: Use the *plain* member name (no @domain, no DOMAIN\) for DELETE
 # =========================================
+
 # Helper: get first non-empty property value by list
 Function Get-FirstPropertyValue {
     param($obj, [string[]]$Names)
     foreach ($n in $Names) {
         if ($null -ne $obj.$n -and "$($obj.$n)".Length -gt 0) { return "$($obj.$n)" }
-        # also check case-insensitively
         $p = $obj.PSObject.Properties | Where-Object { $_.Name -ieq $n } | Select-Object -First 1
         if ($p -and $null -ne $p.Value -and "$($p.Value)".Length -gt 0) { return "$($p.Value)" }
     }
     return $null
 }
 
-# Obtain Identity token for REST (client credentials from CCP)
+# Helper: list members via REST
+Function Get-SafeMembersREST {
+    param([string]$SafeName, [hashtable]$Headers, [string]$Base)
+    $safeUrlId = [uri]::EscapeDataString($SafeName)
+    $url = "$Base/API/Safes/$safeUrlId/Members"
+    try {
+        $r = Invoke-RestMethod -Uri $url -Headers $Headers -Method Get -ErrorAction Stop
+        if ($r -is [System.Collections.IEnumerable] -and -not ($r -is [string])) { return @($r) }
+        if ($r.value)    { return @($r.value) }
+        if ($r.members)  { return @($r.members) }
+        if ($r.Members)  { return @($r.Members) }
+        return @()
+    } catch {
+        Write-Log ("ℹ️ REST member listing failed: {0}" -f $_.Exception.Message) "Yellow"
+        return @()
+    }
+}
+
+# Normalize members to {Name, Type}
+Function Normalize-MemberItems {
+    param([Object[]]$Items)
+    $out = @()
+    foreach ($it in $Items) {
+        $name = Get-FirstPropertyValue -obj $it -Names @("MemberName","Username","name","userName","UserName")
+        $type = Get-FirstPropertyValue -obj $it -Names @("MemberType","type","UserType")
+        if (-not $type -and $it.PSObject.Properties.Name -contains "Permissions") { $type = "User" }
+        if ($name) { $out += [pscustomobject]@{ Name = $name; Type = $type } }
+    }
+    return $out
+}
+
+# Strip any @domain or DOMAIN\ prefix
+Function Strip-Principal {
+    param([string]$Name)
+    if (-not $Name) { return $Name }
+    $n = $Name
+    if ($n -match '\\')   { $n = ($n -split '\\')[-1] }
+    if ($n -match '@')    { $n = ($n -split '@')[0] }
+    return $n
+}
+
+# Prefer the entry whose *stripped* name equals CA_PAMDiscovery_SVC; prefer Group type
+Function Select-DiscoveryMember {
+    param([Object[]]$NormItems)
+    if (-not $NormItems -or $NormItems.Count -eq 0) { return $null }
+    $withStripped = $NormItems | ForEach-Object {
+        [pscustomobject]@{
+            RawName  = $_.Name
+            Type     = $_.Type
+            Stripped = Strip-Principal -Name $_.Name
+        }
+    }
+    $matches = $withStripped | Where-Object { $_.Stripped -ieq 'CA_PAMDiscovery_SVC' }
+    if (-not $matches -or $matches.Count -eq 0) { return $null }
+    $grp = $matches | Where-Object { $_.Type -match 'Group' } | Select-Object -First 1
+    if ($grp) { return $grp }
+    return $matches | Select-Object -First 1
+}
+
+# Identity token for REST (client credentials from CCP)
 $IdentityTenantID = "aat4012"
 $ClientID         = $response2.Username
 $ClientSecret     = $response2.Content
@@ -327,66 +387,16 @@ $headers_api = if ($BearerToken) {
     }
 } else { @{} }
 
-# Helper: list members via REST
-Function Get-SafeMembersREST {
-    param([string]$SafeName, [hashtable]$Headers, [string]$Base)
-    $safeUrlId = [uri]::EscapeDataString($SafeName)
-    $url = "$Base/API/Safes/$safeUrlId/Members"
-    try {
-        $r = Invoke-RestMethod -Uri $url -Headers $Headers -Method Get -ErrorAction Stop
-        if ($r -is [System.Collections.IEnumerable] -and -not ($r -is [string])) { return @($r) }
-        if ($r.value)    { return @($r.value) }
-        if ($r.members)  { return @($r.members) }
-        if ($r.Members)  { return @($r.Members) }
-        return @()
-    } catch {
-        Write-Log ("ℹ️ REST member listing failed: {0}" -f $_.Exception.Message) "Yellow"
-        return @()
-    }
-}
-
-# Normalize members to {Name, Type}
-Function Normalize-MemberItems {
-    param([Object[]]$Items)
-    $out = @()
-    foreach ($it in $Items) {
-        $name = Get-FirstPropertyValue -obj $it -Names @("MemberName","Username","name","userName","UserName")
-        $type = Get-FirstPropertyValue -obj $it -Names @("MemberType","type","UserType")
-        if (-not $type -and $it.PSObject.Properties.Name -contains "Permissions") {
-            $type = "User"
-        }
-        if ($name) {
-            $out += [pscustomobject]@{ Name = $name; Type = $type }
-        }
-    }
-    return $out
-}
-
-# Prefer the Group that matches CA_PAMDiscovery_SVC, else any matching
-Function Select-DiscoveryMember {
-    param([Object[]]$NormItems)
-    if (-not $NormItems -or $NormItems.Count -eq 0) { return $null }
-    $matches = $NormItems | Where-Object { $_.Name -match 'CA_PAMDiscovery_SVC' }
-    if (-not $matches -or $matches.Count -eq 0) { return $null }
-    $grp = $matches | Where-Object { $_.Type -match 'Group' } | Select-Object -First 1
-    if ($grp) { return $grp }
-    return $matches | Select-Object -First 1
-}
-
-# 6a) Discover members
+# Discover members
 $norm = @()
 if ($BearerToken) {
     $restMembers = Get-SafeMembersREST -SafeName $SafeName -Headers $headers_api -Base $PVWABase
     if ($restMembers) { $norm = Normalize-MemberItems -Items $restMembers }
 }
-
-# 6b) Fallback to psPAS list if needed
 if (-not $norm -or $norm.Count -eq 0) {
     try {
         $ps = Get-PASSafeMember -SafeName $SafeName -ErrorAction Stop
-        if ($ps) {
-            $norm = Normalize-MemberItems -Items $ps
-        }
+        if ($ps) { $norm = Normalize-MemberItems -Items $ps }
     } catch {
         Write-Log ("ℹ️ psPAS member listing failed: {0}" -f $_.Exception.Message) "Yellow"
     }
@@ -394,34 +404,36 @@ if (-not $norm -or $norm.Count -eq 0) {
 
 $target = Select-DiscoveryMember -NormItems $norm
 
-if ($target -and $target.Name) {
-    $safeUrlId   = [uri]::EscapeDataString($SafeName)
-    $memberPath  = [uri]::EscapeDataString($target.Name)
-    $deleteUrl   = "$PVWABase/API/Safes/$safeUrlId/Members/$memberPath/"
+if ($target -and $target.RawName) {
+    # Use *stripped* name (no @domain, no DOMAIN\) per your requirement
+    $nameForDelete = Strip-Principal -Name $target.RawName
+    $safeUrlId     = [uri]::EscapeDataString($SafeName)
+    $memberPath    = [uri]::EscapeDataString($nameForDelete)
+    $deleteUrl     = "$PVWABase/API/Safes/$safeUrlId/Members/$memberPath/"
 
-    Write-Log ("Attempting DELETE (resolved '{0}', Type='{1}'): {2}" -f $target.Name, $target.Type, $deleteUrl)
+    Write-Log ("Attempting DELETE (resolved '{0}' -> '{1}', Type='{2}'): {3}" -f $target.RawName, $nameForDelete, $target.Type, $deleteUrl)
 
     $deleted = $false
     if ($BearerToken) {
         try {
             Invoke-RestMethod -Uri $deleteUrl -Headers $headers_api -Method Delete -ErrorAction Stop | Out-Null
-            Write-Log ("✅ Removed '{0}' from Safe '{1}' via documented REST endpoint." -f $target.Name, $SafeName) "Green"
+            Write-Log ("✅ Removed '{0}' from Safe '{1}' via documented REST endpoint." -f $nameForDelete, $SafeName) "Green"
             $deleted = $true
         } catch {
-            Write-Log ("ℹ️ DELETE failed for '{0}': {1}" -f $target.Name, $_.Exception.Message) "Yellow"
+            Write-Log ("ℹ️ DELETE failed for '{0}': {1}" -f $nameForDelete, $_.Exception.Message) "Yellow"
         }
     }
 
     if (-not $deleted) {
         try {
-            Remove-PASSafeMember -SafeName $SafeName -MemberName $target.Name -ErrorAction Stop | Out-Null
-            Write-Log ("✅ Removed '{0}' from Safe '{1}' via psPAS fallback." -f $target.Name, $SafeName) "Green"
+            Remove-PASSafeMember -SafeName $SafeName -MemberName $nameForDelete -ErrorAction Stop | Out-Null
+            Write-Log ("✅ Removed '{0}' from Safe '{1}' via psPAS fallback." -f $nameForDelete, $SafeName) "Green"
         } catch {
-            Write-Log ("❌ Could not remove '{0}' (REST & psPAS failed). Check PVWA for exact display name/type." -f $target.Name) "Red"
+            Write-Log ("❌ Could not remove '{0}' (REST & psPAS failed). Check PVWA Members for the exact display name/type." -f $nameForDelete) "Red"
         }
     }
 } else {
-    Write-Log "ℹ️ Could not resolve exact member name for 'CA_PAMDiscovery_SVC'. It may not be a member of this Safe." "Yellow"
+    Write-Log "ℹ️ Could not resolve exact member for 'CA_PAMDiscovery_SVC'. It may not be a current member of this Safe." "Yellow"
 }
 
 # =========================================
