@@ -115,8 +115,8 @@ try {
     $DescriptionRaw = Read-Host "Enter the Safe Description (single line, up to 200 chars)"
 }
 
-if ([string]::IsNullOrWhiteSpace($SafeName))     { Write-Log "❌ ERROR: Safe Name cannot be empty. Exiting..." "Red"; exit 1 }
-if ([string]::IsNullOrWhiteSpace($DescriptionRaw)){ Write-Log "❌ ERROR: Safe Description cannot be empty. Exiting..." "Red"; exit 1 }
+if ([string]::IsNullOrWhiteSpace($SafeName))      { Write-Log "❌ ERROR: Safe Name cannot be empty. Exiting..." "Red"; exit 1 }
+if ([string]::IsNullOrWhiteSpace($DescriptionRaw)) { Write-Log "❌ ERROR: Safe Description cannot be empty. Exiting..." "Red"; exit 1 }
 
 $Description = $DescriptionRaw.Trim()
 if ($Description.Length -gt 200) {
@@ -130,7 +130,7 @@ try {
     Add-PASSafe -SafeName $SafeName -ManagingCPM $ManagingCPM -Description $Description -NumberOfVersionsRetention 180 -ErrorAction Stop | Out-Null
     Write-Log "✅ Successfully created Safe: ${SafeName}." "Green"
 } catch {
-    Write-Log "⚠️ Could not create Safe '${SafeName}': $($_.Exception.Message). Continuing to member add..." "Yellow"
+    Write-Log ("⚠️ Could not create Safe '{0}': {1}. Continuing to member add..." -f $SafeName, $_.Exception.Message) "Yellow"
 }
 
 # =========================================
@@ -203,7 +203,8 @@ Function Read-ValidGroup {
                     Write-Log ("❌ Group not found under {0}. Re-enter." -f $SearchBaseOU) "Red"
                 }
             } catch {
-                Write-Log "❌ Error searching AD for '$g' in $SearchBaseOU: $($_.Exception.Message)" "Red"
+                # FIXED: Use format operator to avoid $Var: parsing issue
+                Write-Log ("❌ Error searching AD for '{0}' in {1}: {2}" -f $g, $SearchBaseOU, $_.Exception.Message) "Red"
             }
         } else {
             Write-Log "⚠️ AD module not loaded, proceeding with provided group name (will add as UPN)." "Yellow"
@@ -235,7 +236,7 @@ Function Add-MemberToSafe {
         Write-Log "✅ Added ${MemberType}: ${MemberName}." "Green"
         return $true
     } catch {
-        Write-Log "❌ Failed to add '${MemberName}' - $($_.Exception.Message)" "Red"
+        Write-Log ("❌ Failed to add '{0}' - {1}" -f $MemberName, $_.Exception.Message) "Red"
         return $false
     }
 }
@@ -249,8 +250,7 @@ Write-Log "✅ Safe member addition process completed." "Green"
 try { Close-PASSession | Out-Null; Write-Log "✅ PAS session closed (CA_PAMDiscovery_SVC)." "Green" } catch {}
 
 # =========================================
-# 5) START a NEW psPAS session as cnarestbot (explicitly), THEN remove discovery user
-#    (Primary removal path = psPAS; REST used as fallback)
+# 5) START a NEW psPAS session as cnarestbot (explicit), THEN remove discovery user
 # =========================================
 Write-Log "Retrieving CyberArk API credentials from CCP (cnarestbot)..."
 $object2 = "cna-prod.cyberark.cloud-cnarestbot@cyberark.cloud.6679"
@@ -264,7 +264,7 @@ try {
     exit 1
 }
 
-# --- Start psPAS session as cnarestbot (so "second session is started" before removal) ---
+# --- Start psPAS session as cnarestbot ---
 try {
     Write-Log "Requesting CyberArk PAS authentication (psPAS Identity header) as cnarestbot..."
     $UPUser2 = 'cnarestbot@cyberark.cloud.6679'
@@ -292,11 +292,11 @@ Function Remove-Discovery-With-psPAS {
     try {
         $members = Get-PASSafeMember -SafeName $Safe -ErrorAction Stop
     } catch {
-        Write-Log "❌ Failed to list members via psPAS: $($_.Exception.Message)" "Red"
+        Write-Log ("❌ Failed to list members via psPAS: {0}" -f $_.Exception.Message) "Red"
         return $false
     }
 
-    if (-not $members) { Write-Log "ℹ️ No members returned via psPAS for '$Safe'." "Yellow"; return $false }
+    if (-not $members) { Write-Log "ℹ️ No members returned via psPAS." "Yellow"; return $false }
 
     $targets = $members | Where-Object {
         $_.Username -imatch '^CA_PAMDiscovery_SVC(@.+)?$' -or $_.Username -ieq 'CNA\CA_PAMDiscovery_SVC' -or $_.Username -ieq 'CA_PAMDiscovery_SVC'
@@ -309,14 +309,13 @@ Function Remove-Discovery-With-psPAS {
 
     $ok = $false
     foreach ($name in $targets) {
-        Write-Log "Attempting to remove '$name' from Safe '$Safe' (psPAS)..."
+        Write-Log ("Attempting to remove '{0}' from Safe '{1}' (psPAS)..." -f $name, $Safe)
         try {
-            # Remove-PASSafeMember syntax: -SafeName -MemberName  (no -MemberType)
             Remove-PASSafeMember -SafeName $Safe -MemberName $name -ErrorAction Stop
-            Write-Log "✅ Removed '$name' via psPAS." "Green"
+            Write-Log ("✅ Removed '{0}' via psPAS." -f $name) "Green"
             $ok = $true
         } catch {
-            Write-Log "ℹ️ Could not remove '$name' via psPAS: $($_.Exception.Message)" "Yellow"
+            Write-Log ("ℹ️ Could not remove '{0}' via psPAS: {1}" -f $name, $_.Exception.Message) "Yellow"
         }
     }
     return $ok
@@ -327,7 +326,6 @@ $removed = Remove-Discovery-With-psPAS -Safe $SafeName
 
 # --- REST fallback only if psPAS path didn’t remove anything ---
 if (-not $removed) {
-    # Identity OAuth2 client_credentials token for REST calls
     $IdentityTenantID = "aat4012"
     $ClientID         = $response2.Username
     $ClientSecret     = $response2.Content
@@ -337,6 +335,7 @@ if (-not $removed) {
     $TokenBody    = @{ grant_type = "client_credentials"; client_id = $ClientID; client_secret = $ClientSecret }
     $headersToken = @{ "Content-Type" = "application/x-www-form-urlencoded" }
 
+    $BearerToken = $null
     try {
         $TokenResponse = Invoke-RestMethod -Uri $TokenURL -Method Post -Headers $headersToken -Body $TokenBody
         $BearerToken   = [string]$TokenResponse.access_token
@@ -345,7 +344,7 @@ if (-not $removed) {
         }
         Write-Log "✅ REST token obtained (cnarestbot)." "Green"
     } catch {
-        Write-Log "❌ Failed to get REST token (cnarestbot): $($_.Exception.Message)" "Red"
+        Write-Log ("❌ Failed to get REST token (cnarestbot): {0}" -f $_.Exception.Message) "Red"
     }
 
     if ($BearerToken) {
@@ -387,16 +386,16 @@ if (-not $removed) {
             $url = "$PVWABase/$seg/Safes/$([uri]::EscapeDataString($Safe))/Members/$encName"
             try {
               Invoke-RestMethod -Uri $url -Headers $headers_api -Method Delete -ErrorAction Stop | Out-Null
-              Write-Log "✅ Removed '$ExactName' from Safe '$Safe' via REST (/$seg)." "Green"
+              Write-Log ("✅ Removed '{0}' from Safe '{1}' via REST (/{2})." -f $ExactName, $Safe, $seg) "Green"
               return $true
             } catch {
-              Write-Log "ℹ️ DELETE $url failed for '$ExactName': $($_.Exception.Message)" "Yellow"
+              Write-Log ("ℹ️ DELETE {0} failed for '{1}': {2}" -f $url, $ExactName, $_.Exception.Message) "Yellow"
             }
           }
           return $false
         }
 
-        Write-Log "Enumerating members of Safe '$SafeName' (REST fallback)..."
+        Write-Log ("Enumerating members of Safe '{0}' (REST fallback)..." -f $SafeName)
         $membersREST = Get-SafeMembersREST -Safe $SafeName
         if (-not $membersREST -or $membersREST.Count -eq 0) {
           Write-Log "❌ No members returned via REST. Aborting removal." "Red"
