@@ -185,7 +185,6 @@ $FullPermPAS = [PSCustomObject]@{
     RequestsAuthorizationLevel2            = $false
 }
 
-# Optional AD validation inside the SearchBase OU
 $SearchBaseOU = 'OU=Groups,OU=CyberArk,DC=cna,DC=com'
 Function Read-ValidGroup {
     while ($true) {
@@ -285,10 +284,9 @@ try {
 
 # =========================================
 # 6) REST removal of Discovery principal: resolve exact Safe member name -> DELETE
-#     IMPORTANT: Use the *plain* member name (no @domain, no DOMAIN\) for DELETE
 # =========================================
 
-# Helper: get first non-empty property value by list
+# Helpers
 Function Get-FirstPropertyValue {
     param($obj, [string[]]$Names)
     foreach ($n in $Names) {
@@ -298,8 +296,6 @@ Function Get-FirstPropertyValue {
     }
     return $null
 }
-
-# Helper: list members via REST
 Function Get-SafeMembersREST {
     param([string]$SafeName, [hashtable]$Headers, [string]$Base)
     $safeUrlId = [uri]::EscapeDataString($SafeName)
@@ -316,8 +312,6 @@ Function Get-SafeMembersREST {
         return @()
     }
 }
-
-# Normalize members to {Name, Type}
 Function Normalize-MemberItems {
     param([Object[]]$Items)
     $out = @()
@@ -329,8 +323,6 @@ Function Normalize-MemberItems {
     }
     return $out
 }
-
-# Strip any @domain or DOMAIN\ prefix
 Function Strip-Principal {
     param([string]$Name)
     if (-not $Name) { return $Name }
@@ -339,8 +331,6 @@ Function Strip-Principal {
     if ($n -match '@')    { $n = ($n -split '@')[0] }
     return $n
 }
-
-# Prefer the entry whose *stripped* name equals CA_PAMDiscovery_SVC; prefer Group type
 Function Select-DiscoveryMember {
     param([Object[]]$NormItems)
     if (-not $NormItems -or $NormItems.Count -eq 0) { return $null }
@@ -358,7 +348,7 @@ Function Select-DiscoveryMember {
     return $matches | Select-Object -First 1
 }
 
-# Identity token for REST (client credentials from CCP)
+# Get Identity token for REST
 $IdentityTenantID = "aat4012"
 $ClientID         = $response2.Username
 $ClientSecret     = $response2.Content
@@ -387,7 +377,7 @@ $headers_api = if ($BearerToken) {
     }
 } else { @{} }
 
-# Discover members
+# Discover members (REST then psPAS)
 $norm = @()
 if ($BearerToken) {
     $restMembers = Get-SafeMembersREST -SafeName $SafeName -Headers $headers_api -Base $PVWABase
@@ -405,32 +395,53 @@ if (-not $norm -or $norm.Count -eq 0) {
 $target = Select-DiscoveryMember -NormItems $norm
 
 if ($target -and $target.RawName) {
-    # Use *stripped* name (no @domain, no DOMAIN\) per your requirement
-    $nameForDelete = Strip-Principal -Name $target.RawName
-    $safeUrlId     = [uri]::EscapeDataString($SafeName)
-    $memberPath    = [uri]::EscapeDataString($nameForDelete)
-    $deleteUrl     = "$PVWABase/API/Safes/$safeUrlId/Members/$memberPath/"
+    $safeUrlId = [uri]::EscapeDataString($SafeName)
 
-    Write-Log ("Attempting DELETE (resolved '{0}' -> '{1}', Type='{2}'): {3}" -f $target.RawName, $nameForDelete, $target.Type, $deleteUrl)
+    # Build deletion name variants in **recommended order**
+    $raw          = $target.RawName                # as returned by PVWA/psPAS
+    $stripped     = Strip-Principal -Name $raw     # sAM only
+    $domainForm   = ("CNA\{0}" -f $stripped)       # DOMAIN\name
+
+    # We will try each variant with both unencoded and encoded path usage
+    $variants = @($raw, $stripped, $domainForm) |
+                Where-Object { $_ -and $_.Trim().Length -gt 0 } |
+                Select-Object -Unique
 
     $deleted = $false
-    if ($BearerToken) {
-        try {
-            Invoke-RestMethod -Uri $deleteUrl -Headers $headers_api -Method Delete -ErrorAction Stop | Out-Null
-            Write-Log ("✅ Removed '{0}' from Safe '{1}' via documented REST endpoint." -f $nameForDelete, $SafeName) "Green"
-            $deleted = $true
-        } catch {
-            Write-Log ("ℹ️ DELETE failed for '{0}': {1}" -f $nameForDelete, $_.Exception.Message) "Yellow"
+    foreach ($name in $variants) {
+        foreach ($useEncoded in $true,$false) {
+            $path = if ($useEncoded) { [uri]::EscapeDataString($name) } else { $name }
+            # Per doc: add trailing '/' when name contains a dot
+            $url = "$PVWABase/API/Safes/$safeUrlId/Members/$path/"
+            if ($name -notmatch '\.' -and -not $url.EndsWith('/')) { $url += '/' } # always ensuring trailing slash anyway
+
+            Write-Log ("Attempting DELETE (variant='{0}', encoded={1}): {2}" -f $name, $useEncoded, $url)
+            $ok = $false
+            if ($BearerToken) {
+                try {
+                    Invoke-RestMethod -Uri $url -Headers $headers_api -Method Delete -ErrorAction Stop | Out-Null
+                    Write-Log ("✅ Removed '{0}' from Safe '{1}' via REST." -f $name, $SafeName) "Green"
+                    $ok = $true
+                } catch {
+                    Write-Log ("ℹ️ DELETE failed for '{0}': {1}" -f $name, $_.Exception.Message) "Yellow"
+                }
+            }
+            if (-not $ok) {
+                try {
+                    Remove-PASSafeMember -SafeName $SafeName -MemberName $name -ErrorAction Stop | Out-Null
+                    Write-Log ("✅ Removed '{0}' from Safe '{1}' via psPAS fallback." -f $name, $SafeName) "Green"
+                    $ok = $true
+                } catch {
+                    # no log here; we log after both fail
+                }
+            }
+            if ($ok) { $deleted = $true; break }
         }
+        if ($deleted) { break }
     }
 
     if (-not $deleted) {
-        try {
-            Remove-PASSafeMember -SafeName $SafeName -MemberName $nameForDelete -ErrorAction Stop | Out-Null
-            Write-Log ("✅ Removed '{0}' from Safe '{1}' via psPAS fallback." -f $nameForDelete, $SafeName) "Green"
-        } catch {
-            Write-Log ("❌ Could not remove '{0}' (REST & psPAS failed). Check PVWA Members for the exact display name/type." -f $nameForDelete) "Red"
-        }
+        Write-Log ("❌ Could not remove '{0}' (all REST & psPAS variants failed). Check PVWA > Safe Members for the exact display name." -f $raw) "Red"
     }
 } else {
     Write-Log "ℹ️ Could not resolve exact member for 'CA_PAMDiscovery_SVC'. It may not be a current member of this Safe." "Yellow"
