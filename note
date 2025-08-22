@@ -14,12 +14,23 @@ Import-Module psPAS -Force
 
 <# =========================================
    CyberArk Safe Create + Member Add (psPAS)
-   - Auth via CCP -> psPAS Identity header (UPCred)
-   - Always create safe, then add members
-   - Target AD group validated in OU=Groups,OU=CyberArk,DC=cna,DC=com; add as group@cna.com
-   - No -SearchIn used for member adds
-   - NumberOfVersionsRetention = 180
-   - After completion: remove CA_PAMDiscovery_SVC from Safe & end session
+   Phase 1:
+     - Auth via CCP (CA_PAMDiscovery_SVC) -> psPAS Identity header
+     - Create safe (no pre-check), add members:
+        * <target AD group>@cna.com (Limited)
+        * CA_PCloud_Admins@cna.com (Full)
+        * cna_pas_admin@cyberark.cloud.6679 (Full)
+        * cnarestbot@cyberark.cloud.6679 (Full)  <-- added
+     - End session
+   Phase 2:
+     - Re-auth with CCP creds for object:
+       "cna-prod.cyberark.cloud-cnarestbot@cyberark.cloud.6679"
+     - Remove CA_PAMDiscovery_SVC from the Safe
+     - End session
+   Notes:
+     - No -SearchIn used
+     - NumberOfVersionsRetention = 180
+     - Safe description via dialog (console fallback)
    ========================================= #>
 
 # --- Logging Utility ---
@@ -62,37 +73,37 @@ try {
     Write-Log "⚠️ ActiveDirectory module not available; will still try to add group by UPN." "Yellow"
 }
 
-# --- Retrieve CyberArk API Credentials from CCP ---
+# ========== PHASE 1: Auth as CA_PAMDiscovery_SVC, Create Safe, Add Members ==========
+# --- Retrieve CyberArk API Credentials from CCP (Discovery SVC) ---
 $CCPAddress = "https://vskau1p1231.cna.com"
 $location   = "AIMWebService"
 $application= "PAMDiscovery"
-$safe       = "CA_PCloud_Admins"
-# Object name per your request:
-$object     = "cna.com-CA_PAMDiscovery_SVC"
+$safeAdmin  = "CA_PCloud_Admins"
+$objectSVC  = "cna.com-CA_PAMDiscovery_SVC"  # per your request
 
 $headers = New-Object "System.Collections.Generic.Dictionary[[String],[String]]"
 $headers.Add("Content-Type", "application/json")
 $windowsAuth = $false
 
-Write-Log "Retrieving CyberArk API credentials from CCP via Object method..."
-$ccpUrl = "$CCPAddress/$location/api/Accounts?AppID=$application&Safe=$safe&Object=$object"
+Write-Log "Retrieving CyberArk API credentials from CCP via Object method (CA_PAMDiscovery_SVC)..."
+$ccpUrlSVC = "$CCPAddress/$location/api/Accounts?AppID=$application&Safe=$safeAdmin&Object=$objectSVC"
 try {
-    $response = Invoke-RestMethod $ccpUrl -Method 'GET' -Headers $headers -UseDefaultCredentials:$windowsAuth
-    if (-not $response -or -not $response.Content) {
-        Write-Log "❌ ERROR: Failed to retrieve API credentials from CCP." "Red"
+    $respSVC = Invoke-RestMethod $ccpUrlSVC -Method 'GET' -Headers $headers -UseDefaultCredentials:$windowsAuth
+    if (-not $respSVC -or -not $respSVC.Content) {
+        Write-Log "❌ ERROR: Failed to retrieve API credentials from CCP for CA_PAMDiscovery_SVC." "Red"
         exit 1
     }
-    Write-Log "✅ Successfully retrieved credentials for user: $($response.Username)" "Green"
+    Write-Log "✅ Successfully retrieved credentials for user: $($respSVC.Username)" "Green"
 } catch {
-    Write-Log "❌ ERROR: CCP credential fetch failed - $_" "Red"
+    Write-Log "❌ ERROR: CCP credential fetch failed (SVC) - $_" "Red"
     exit 1
 }
 
-# --- psPAS Authentication using CCP secret + fixed username ---
+# --- psPAS Authentication using CCP secret + fixed username (SVC) ---
 try {
-    Write-Log "Requesting CyberArk PAS authentication (psPAS Identity header)..."
-    $UPUser = 'CA_PAMDiscovery_SVC'   # fixed username
-    $UPPass = ConvertTo-SecureString $response.Content -AsPlainText -Force
+    Write-Log "Requesting CyberArk PAS authentication (psPAS Identity header) as CA_PAMDiscovery_SVC..."
+    $UPUser = 'CA_PAMDiscovery_SVC'
+    $UPPass = ConvertTo-SecureString $respSVC.Content -AsPlainText -Force
     $UPCred = [PSCredential]::new($UPUser, $UPPass)
 
     $header = Get-IdentityHeader `
@@ -105,9 +116,9 @@ try {
 
     $session = Get-PASSession
     if (-not $session) { throw "psPAS session not established" }
-    Write-Log "✅ Authentication successful, PAS session established." "Green"
+    Write-Log "✅ Authentication successful, PAS session established (SVC)." "Green"
 } catch {
-    Write-Log "❌ Failed to authenticate via psPAS Identity header: $($_.Exception.Message)" "Red"
+    Write-Log "❌ Failed to authenticate via psPAS Identity header (SVC): $($_.Exception.Message)" "Red"
     exit 1
 }
 
@@ -115,7 +126,9 @@ try {
 $SafeName = Read-Host "Enter the Safe Name"
 if ([string]::IsNullOrWhiteSpace($SafeName)) {
     Write-Log "❌ ERROR: Safe Name cannot be empty. Exiting..." "Red"
-    goto Cleanup
+    # End SVC session before exit
+    try { Close-PASSession -ErrorAction Stop; Write-Log "✅ Session closed." "Green" } catch {}
+    exit 1
 }
 
 # --- Safe Description via DIALOG (with console fallback) ---
@@ -129,16 +142,15 @@ try {
         ""
     )
 } catch {
-    # Fallback to console if UI not available
     Show-Box -Title "Safe Description (Console Fallback)" `
         -BodyLine1 "Paste a single-line description for the Safe (max 200 chars)." `
         -BodyLine2 "Example: 'Service accounts for AppX PROD'."
     $Description = Read-Host "Enter the Safe Description"
 }
-
 if ([string]::IsNullOrWhiteSpace($Description)) {
     Write-Log "❌ ERROR: Safe Description cannot be empty. Exiting..." "Red"
-    goto Cleanup
+    try { Close-PASSession -ErrorAction Stop; Write-Log "✅ Session closed." "Green" } catch {}
+    exit 1
 }
 $Description = $Description.Trim()
 if ($Description.Length -gt 200) {
@@ -241,11 +253,12 @@ Function Read-ValidGroup {
 $GroupSam = Read-ValidGroup
 $TargetGroupUPN = "$GroupSam@cna.com"
 
-# --- Members (admins unchanged) ---
+# --- Members (admins unchanged + cnarestbot added with Full) ---
 $Members = @(
     @{ Name = $TargetGroupUPN;                     Type = "Group"; Perm = $LimitedPermPAS }, # Target AD group (Limited)
     @{ Name = "CA_PCloud_Admins@cna.com";          Type = "Group"; Perm = $FullPermPAS    }, # Registered group (Full)
-    @{ Name = "cna_pas_admin@cyberark.cloud.6679"; Type = "User";  Perm = $FullPermPAS    }  # Vault user (Full)
+    @{ Name = "cna_pas_admin@cyberark.cloud.6679"; Type = "User";  Perm = $FullPermPAS    }, # Vault user (Full)
+    @{ Name = "cnarestbot@cyberark.cloud.6679";    Type = "User";  Perm = $FullPermPAS    }  # <-- Added as admin (Full)
 )
 
 # Helper: Add member
@@ -268,34 +281,78 @@ Function Add-MemberToSafe {
     }
 }
 
-# --- Add all members ---
+# --- Add all members (Phase 1) ---
 foreach ($m in $Members) {
     [void](Add-MemberToSafe -SafeName $SafeName -MemberName $m.Name -MemberType $m.Type -Permissions $m.Perm)
 }
 
 Write-Log "✅ Safe member addition process completed." "Green"
 
-# ---------------------------
-# Cleanup: remove CA_PAMDiscovery_SVC from Safe & end session
-# ---------------------------
-:Cleanup
+# --- End Phase 1 session cleanly ---
+try {
+    Close-PASSession -ErrorAction Stop
+    Write-Log "✅ Session closed." "Green"
+} catch {
+    Write-Log "ℹ️ Session close encountered an issue: $($_.Exception.Message)" "Yellow"
+}
 
-# Attempt to remove CA_PAMDiscovery_SVC (AD user) from the Safe, if present
-if ($SafeName) {
-    foreach ($candidate in @("CA_PAMDiscovery_SVC@cna.com","CA_PAMDiscovery_SVC")) {
-        try {
-            Write-Log "Attempting to remove user '$candidate' from Safe '$SafeName'..."
-            Remove-PASSafeMember -SafeName $SafeName -MemberName $candidate -MemberType User -Confirm:$false -ErrorAction Stop | Out-Null
-            Write-Log "✅ Removed user '$candidate' from Safe '$SafeName'." "Green"
-            break
-        } catch {
-            # If not a member, just continue silently
-            Write-Log "ℹ️ '$candidate' not removed (likely not a member): $($_.Exception.Message)" "Yellow"
-        }
+# ========== PHASE 2: Re-auth as cnarestbot (via CCP), remove CA_PAMDiscovery_SVC ==========
+
+# --- Retrieve CyberArk API Credentials from CCP (cnarestbot) ---
+# Uses the object name you specified
+$objectBot = "cna-prod.cyberark.cloud-cnarestbot@cyberark.cloud.6679"
+
+Write-Log "Retrieving CyberArk API credentials from CCP via Object method (cnarestbot)..."
+$ccpUrlBot = "$CCPAddress/$location/api/Accounts?AppID=$application&Safe=$safeAdmin&Object=$objectBot"
+try {
+    $respBot = Invoke-RestMethod $ccpUrlBot -Method 'GET' -Headers $headers -UseDefaultCredentials:$windowsAuth
+    if (-not $respBot -or -not $respBot.Content) {
+        Write-Log "❌ ERROR: Failed to retrieve API credentials from CCP for cnarestbot." "Red"
+        exit 1
+    }
+    Write-Log "✅ Successfully retrieved credentials for user: $($respBot.Username)" "Green"
+} catch {
+    Write-Log "❌ ERROR: CCP credential fetch failed (cnarestbot) - $_" "Red"
+    exit 1
+}
+
+# --- psPAS Authentication using CCP secret + identity UPN (cnarestbot) ---
+try {
+    Write-Log "Requesting CyberArk PAS authentication (psPAS Identity header) as cnarestbot..."
+    $UPUser2 = 'cnarestbot@cyberark.cloud.6679'
+    $UPPass2 = ConvertTo-SecureString $respBot.Content -AsPlainText -Force
+    $UPCred2 = [PSCredential]::new($UPUser2, $UPPass2)
+
+    $header2 = Get-IdentityHeader `
+        -IdentityTenantURL "aat4012.id.cyberark.cloud" `
+        -psPASFormat `
+        -PCloudSubdomain "cna-prod" `
+        -UPCreds $UPCred2
+
+    Use-PASSession $header2
+
+    $session2 = Get-PASSession
+    if (-not $session2) { throw "psPAS session not established" }
+    Write-Log "✅ Authentication successful, PAS session established (cnarestbot)." "Green"
+} catch {
+    Write-Log "❌ Failed to authenticate via psPAS Identity header (cnarestbot): $($_.Exception.Message)" "Red"
+    exit 1
+}
+
+# --- Remove CA_PAMDiscovery_SVC from the Safe ---
+foreach ($candidate in @("CA_PAMDiscovery_SVC@cna.com","CA_PAMDiscovery_SVC")) {
+    try {
+        Write-Log "Attempting to remove user '$candidate' from Safe '$SafeName'..."
+        # NOTE: psPAS Remove-PASSafeMember does NOT take -MemberType. Just name + safe.
+        Remove-PASSafeMember -SafeName $SafeName -MemberName $candidate -Confirm:$false -ErrorAction Stop | Out-Null
+        Write-Log "✅ Removed user '$candidate' from Safe '$SafeName'." "Green"
+        break
+    } catch {
+        Write-Log "ℹ️ '$candidate' not removed (likely not a member): $($_.Exception.Message)" "Yellow"
     }
 }
 
-# Close psPAS session
+# --- End Phase 2 session cleanly ---
 try {
     Close-PASSession -ErrorAction Stop
     Write-Log "✅ Session closed." "Green"
