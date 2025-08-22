@@ -201,3 +201,226 @@ Function Read-ValidGroup {
                     return $g
                 } else {
                     Write-Log ("❌ Group not found under {0}. Re-enter." -f $SearchBaseOU) "Red"
+                }
+            } catch {
+                Write-Log "❌ Error searching AD for '$g' in $SearchBaseOU: $($_.Exception.Message)" "Red"
+            }
+        } else {
+            Write-Log "⚠️ AD module not loaded, proceeding with provided group name (will add as UPN)." "Yellow"
+            return $g
+        }
+    }
+}
+$GroupSam       = Read-ValidGroup
+$TargetGroupUPN = "$GroupSam@cna.com"
+
+$MembersToAdd = @(
+    @{ Name = $TargetGroupUPN;                     Type = "Group"; Perm = $LimitedPermPAS }, # target AD group (Limited)
+    @{ Name = "CA_PCloud_Admins@cna.com";          Type = "Group"; Perm = $FullPermPAS    }, # Full
+    @{ Name = "cna_pas_admin@cyberark.cloud.6679"; Type = "User";  Perm = $FullPermPAS    }, # Full
+    @{ Name = "cnarestbot@cyberark.cloud.6679";    Type = "User";  Perm = $FullPermPAS    }  # Full
+)
+
+Function Add-MemberToSafe {
+    param(
+        [string]$SafeName,
+        [string]$MemberName,
+        [ValidateSet("Group","User","Role")]
+        [string]$MemberType,
+        [pscustomobject]$Permissions
+    )
+    try {
+        Write-Log "Adding ${MemberType} '${MemberName}' to ${SafeName}..."
+        $Permissions | Add-PASSafeMember -SafeName $SafeName -MemberType $MemberType -MemberName $MemberName -ErrorAction Stop | Out-Null
+        Write-Log "✅ Added ${MemberType}: ${MemberName}." "Green"
+        return $true
+    } catch {
+        Write-Log "❌ Failed to add '${MemberName}' - $($_.Exception.Message)" "Red"
+        return $false
+    }
+}
+
+foreach ($m in $MembersToAdd) { [void](Add-MemberToSafe -SafeName $SafeName -MemberName $m.Name -MemberType $m.Type -Permissions $m.Perm) }
+Write-Log "✅ Safe member addition process completed." "Green"
+
+# =========================================
+# 4) End FIRST psPAS session (discovery user)
+# =========================================
+try { Close-PASSession | Out-Null; Write-Log "✅ PAS session closed (CA_PAMDiscovery_SVC)." "Green" } catch {}
+
+# =========================================
+# 5) START a NEW psPAS session as cnarestbot (explicitly), THEN remove discovery user
+#    (Primary removal path = psPAS; REST used as fallback)
+# =========================================
+Write-Log "Retrieving CyberArk API credentials from CCP (cnarestbot)..."
+$object2 = "cna-prod.cyberark.cloud-cnarestbot@cyberark.cloud.6679"
+$ccpUrl2 = "$CCPAddress/$location/api/Accounts?AppID=$application&Safe=$safeCCP&Object=$object2"
+try {
+    $response2 = Invoke-RestMethod $ccpUrl2 -Method 'GET' -Headers $headers -UseDefaultCredentials:$windowsAuth
+    if (-not $response2 -or -not $response2.Content) { throw "Empty CCP response for cnarestbot" }
+    Write-Log "✅ Successfully retrieved credentials for user: $($response2.Username)" "Green"
+} catch {
+    Write-Log "❌ ERROR: CCP credential fetch (cnarestbot) failed - $_" "Red"
+    exit 1
+}
+
+# --- Start psPAS session as cnarestbot (so "second session is started" before removal) ---
+try {
+    Write-Log "Requesting CyberArk PAS authentication (psPAS Identity header) as cnarestbot..."
+    $UPUser2 = 'cnarestbot@cyberark.cloud.6679'
+    $UPPass2 = ConvertTo-SecureString $response2.Content -AsPlainText -Force
+    $UPCred2 = [PSCredential]::new($UPUser2, $UPPass2)
+
+    $header2 = Get-IdentityHeader `
+        -IdentityTenantURL "aat4012.id.cyberark.cloud" `
+        -psPASFormat `
+        -PCloudSubdomain "cna-prod" `
+        -UPCreds $UPCred2
+
+    Use-PASSession $header2
+    if (-not (Get-PASSession)) { throw "psPAS session not established (cnarestbot)" }
+    Write-Log "✅ Authentication successful, PAS session established (cnarestbot)." "Green"
+} catch {
+    Write-Log "❌ Failed to authenticate (psPAS) as cnarestbot: $($_.Exception.Message)" "Red"
+    exit 1
+}
+
+# --- Helper: enumerate via psPAS & remove via psPAS ---
+Function Remove-Discovery-With-psPAS {
+    param([string]$Safe)
+
+    try {
+        $members = Get-PASSafeMember -SafeName $Safe -ErrorAction Stop
+    } catch {
+        Write-Log "❌ Failed to list members via psPAS: $($_.Exception.Message)" "Red"
+        return $false
+    }
+
+    if (-not $members) { Write-Log "ℹ️ No members returned via psPAS for '$Safe'." "Yellow"; return $false }
+
+    $targets = $members | Where-Object {
+        $_.Username -imatch '^CA_PAMDiscovery_SVC(@.+)?$' -or $_.Username -ieq 'CNA\CA_PAMDiscovery_SVC' -or $_.Username -ieq 'CA_PAMDiscovery_SVC'
+    } | Select-Object -ExpandProperty Username -Unique
+
+    if (-not $targets -or $targets.Count -eq 0) {
+        Write-Log "ℹ️ No member matching 'CA_PAMDiscovery_SVC' variants found via psPAS." "Yellow"
+        return $false
+    }
+
+    $ok = $false
+    foreach ($name in $targets) {
+        Write-Log "Attempting to remove '$name' from Safe '$Safe' (psPAS)..."
+        try {
+            # Remove-PASSafeMember syntax: -SafeName -MemberName  (no -MemberType)
+            Remove-PASSafeMember -SafeName $Safe -MemberName $name -ErrorAction Stop
+            Write-Log "✅ Removed '$name' via psPAS." "Green"
+            $ok = $true
+        } catch {
+            Write-Log "ℹ️ Could not remove '$name' via psPAS: $($_.Exception.Message)" "Yellow"
+        }
+    }
+    return $ok
+}
+
+# Primary removal try (psPAS)
+$removed = Remove-Discovery-With-psPAS -Safe $SafeName
+
+# --- REST fallback only if psPAS path didn’t remove anything ---
+if (-not $removed) {
+    # Identity OAuth2 client_credentials token for REST calls
+    $IdentityTenantID = "aat4012"
+    $ClientID         = $response2.Username
+    $ClientSecret     = $response2.Content
+
+    Write-Log "Requesting Identity (client_credentials) token for REST fallback (cnarestbot)..."
+    $TokenURL     = "https://$IdentityTenantID.id.cyberark.cloud/oauth2/platformtoken"
+    $TokenBody    = @{ grant_type = "client_credentials"; client_id = $ClientID; client_secret = $ClientSecret }
+    $headersToken = @{ "Content-Type" = "application/x-www-form-urlencoded" }
+
+    try {
+        $TokenResponse = Invoke-RestMethod -Uri $TokenURL -Method Post -Headers $headersToken -Body $TokenBody
+        $BearerToken   = [string]$TokenResponse.access_token
+        if ([string]::IsNullOrEmpty($BearerToken) -or $BearerToken.Length -lt 50) {
+            throw "Invalid token length: $($BearerToken.Length)"
+        }
+        Write-Log "✅ REST token obtained (cnarestbot)." "Green"
+    } catch {
+        Write-Log "❌ Failed to get REST token (cnarestbot): $($_.Exception.Message)" "Red"
+    }
+
+    if ($BearerToken) {
+        $PVWABase = "https://cna-prod.privilegecloud.cyberark.cloud/PasswordVault"
+        $headers_api = @{
+          "Authorization" = "Bearer $BearerToken"
+          "Content-Type"  = "application/json"
+          "Accept"        = "application/json"
+        }
+
+        Function Get-SafeMembersREST {
+          param([string]$Safe)
+          $members = @()
+          foreach ($seg in @("api","API")) {
+            $url = "$PVWABase/$seg/Safes/$([uri]::EscapeDataString($Safe))/Members?limit=1000&offset=0"
+            try {
+              $resp = Invoke-RestMethod -Uri $url -Headers $headers_api -Method Get -ErrorAction Stop
+              if ($resp -and $resp.members)         { $members = $resp.members }
+              elseif ($resp -and $resp.Members)     { $members = $resp.Members }
+              elseif ($resp -is [System.Collections.IEnumerable]) { $members = $resp }
+              if ($members -and $members.Count -gt 0) { return ,$members }
+            } catch { }
+          }
+          return ,$members
+        }
+
+        Function Get-MemberDisplayName {
+          param($m)
+          foreach ($k in "memberName","MemberName","userName","UserName","Username","name","displayName") {
+            if ($m.PSObject.Properties.Name -contains $k -and $m.$k) { return [string]$m.$k }
+          }
+          return $null
+        }
+
+        Function Remove-SafeMemberREST {
+          param([string]$Safe, [string]$ExactName)
+          $encName = [uri]::EscapeDataString($ExactName)
+          foreach ($seg in @("api","API")) {
+            $url = "$PVWABase/$seg/Safes/$([uri]::EscapeDataString($Safe))/Members/$encName"
+            try {
+              Invoke-RestMethod -Uri $url -Headers $headers_api -Method Delete -ErrorAction Stop | Out-Null
+              Write-Log "✅ Removed '$ExactName' from Safe '$Safe' via REST (/$seg)." "Green"
+              return $true
+            } catch {
+              Write-Log "ℹ️ DELETE $url failed for '$ExactName': $($_.Exception.Message)" "Yellow"
+            }
+          }
+          return $false
+        }
+
+        Write-Log "Enumerating members of Safe '$SafeName' (REST fallback)..."
+        $membersREST = Get-SafeMembersREST -Safe $SafeName
+        if (-not $membersREST -or $membersREST.Count -eq 0) {
+          Write-Log "❌ No members returned via REST. Aborting removal." "Red"
+        } else {
+          $targetsREST = @()
+          foreach ($m in $membersREST) {
+            $n = Get-MemberDisplayName $m
+            if ($n -and ($n -imatch '^CA_PAMDiscovery_SVC(@.+)?$' -or $n -ieq 'CNA\CA_PAMDiscovery_SVC' -or $n -ieq 'CA_PAMDiscovery_SVC')) {
+              $targetsREST += $n
+            }
+          }
+          $targetsREST = $targetsREST | Select-Object -Unique
+          if (-not $targetsREST -or $targetsREST.Count -eq 0) {
+            Write-Log "ℹ️ No member matching 'CA_PAMDiscovery_SVC' variants found via REST." "Yellow"
+          } else {
+            foreach ($name in $targetsREST) { [void](Remove-SafeMemberREST -Safe $SafeName -ExactName $name) }
+          }
+        }
+    }
+}
+
+# =========================================
+# 6) Close the SECOND psPAS session (cnarestbot) & end
+# =========================================
+try { Close-PASSession | Out-Null; Write-Log "✅ PAS session closed (cnarestbot)." "Green" } catch {}
+
+Write-Log "✅ Completed Safe creation, member additions, second session start, and discovery user cleanup." "Green"
