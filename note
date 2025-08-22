@@ -1,4 +1,4 @@
-# --- Allow this process to load unsigned modules & unblock psPAS files (no prompts) ---
+# --- Allow this process to load unsigned modules & unblock psPAS files (silent) ---
 try { Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force -ErrorAction Stop } catch {}
 
 $psPASDirs = @(
@@ -7,30 +7,8 @@ $psPASDirs = @(
 ) | Where-Object { Test-Path $_ }
 
 foreach ($dir in $psPASDirs) {
-  Get-ChildItem -Path $dir -Recurse -File | Unblock-File -ErrorAction SilentlyContinue
+  try { Get-ChildItem -Path $dir -Recurse -File | Unblock-File -ErrorAction SilentlyContinue } catch {}
 }
-
-Import-Module psPAS -Force
-
-<# =========================================
-   CyberArk Safe Create + Member Add (psPAS) + Cleanup (REST)
-   Phase 1:
-     - Auth via CCP (CA_PAMDiscovery_SVC) -> psPAS Identity header
-     - Create safe (no pre-check), add members:
-        * <target AD group>@cna.com (Limited)
-        * CA_PCloud_Admins@cna.com (Full)
-        * cna_pas_admin@cyberark.cloud.6679 (Full)
-        * cnarestbot@cyberark.cloud.6679 (Full)
-     - Close psPAS session
-   Phase 2:
-     - CCP creds for object: "cna-prod.cyberark.cloud-cnarestbot@cyberark.cloud.6679"
-     - OAuth client_credentials to https://aat4012.id.cyberark.cloud/oauth2/platformtoken
-     - REST DELETE Safe member 'CA_PAMDiscovery_SVC' (try UPN + sAM)
-   Notes:
-     - No -SearchIn used
-     - NumberOfVersionsRetention = 180
-     - Safe description via dialog (console fallback)
-   ========================================= #>
 
 # --- Logging Utility ---
 $LogPath = "E:\Installation Media\Script\OnboardScript\accountonboarding.txt"
@@ -42,7 +20,7 @@ Function Write-Log {
     try { Add-Content -Path $LogPath -Value $LogEntry } catch {}
 }
 
-# Simple console "box"
+# Small helper to draw a simple "box" in console
 Function Show-Box {
     param([string]$Title, [string]$BodyLine1 = "", [string]$BodyLine2 = "")
     $line = ('=' * 72)
@@ -55,7 +33,7 @@ Function Show-Box {
 
 # --- Load psPAS ---
 try {
-    Import-Module psPAS -ErrorAction Stop
+    Import-Module psPAS -Force -ErrorAction Stop
     $mod = Get-Module psPAS
     Write-Log "psPAS loaded ($($mod.Version))." "Green"
 } catch {
@@ -63,7 +41,7 @@ try {
     exit 1
 }
 
-# --- (Optional) AD module for OU validation (non-fatal) ---
+# --- Try to import AD module for OU validation (non-fatal if missing) ---
 $ADModuleLoaded = $false
 try {
     Import-Module ActiveDirectory -ErrorAction Stop
@@ -72,36 +50,32 @@ try {
     Write-Log "⚠️ ActiveDirectory module not available; will still try to add group by UPN." "Yellow"
 }
 
-# ========== PHASE 1: Auth as CA_PAMDiscovery_SVC, Create Safe, Add Members ==========
-# --- CCP for Discovery SVC ---
+# --- Retrieve CyberArk API Credentials from CCP (for CA_PAMDiscovery_SVC) ---
 $CCPAddress = "https://vskau1p1231.cna.com"
 $location   = "AIMWebService"
 $application= "PAMDiscovery"
-$safeAdmin  = "CA_PCloud_Admins"
-$objectSVC  = "cna.com-CA_PAMDiscovery_SVC"  # per your request
+$safeCCP    = "CA_PCloud_Admins"
+$object     = "cna.com-CA_PAMDiscovery_SVC"   # per your request
 
 $headers = @{ "Content-Type" = "application/json" }
 $windowsAuth = $false
 
-Write-Log "Retrieving CyberArk API credentials from CCP via Object method (CA_PAMDiscovery_SVC)..."
-$ccpUrlSVC = "$CCPAddress/$location/api/Accounts?AppID=$application&Safe=$safeAdmin&Object=$objectSVC"
+Write-Log "Retrieving CyberArk API credentials from CCP via Object method..."
+$ccpUrl = "$CCPAddress/$location/api/Accounts?AppID=$application&Safe=$safeCCP&Object=$object"
 try {
-    $respSVC = Invoke-RestMethod $ccpUrlSVC -Method 'GET' -Headers $headers -UseDefaultCredentials:$windowsAuth
-    if (-not $respSVC -or -not $respSVC.Content) {
-        Write-Log "❌ ERROR: Failed to retrieve API credentials from CCP for CA_PAMDiscovery_SVC." "Red"
-        exit 1
-    }
-    Write-Log "✅ Successfully retrieved credentials for user: $($respSVC.Username)" "Green"
+    $response = Invoke-RestMethod $ccpUrl -Method 'GET' -Headers $headers -UseDefaultCredentials:$windowsAuth
+    if (-not $response -or -not $response.Content) { throw "Empty CCP response" }
+    Write-Log "Successfully retrieved credentials for user: $($response.Username)" "Green"
 } catch {
-    Write-Log "❌ ERROR: CCP credential fetch failed (SVC) - $_" "Red"
+    Write-Log "❌ ERROR: CCP credential fetch failed - $_" "Red"
     exit 1
 }
 
-# --- psPAS Authentication using CCP secret + fixed username (SVC) ---
+# --- psPAS Authentication using CCP secret + fixed username (CA_PAMDiscovery_SVC) ---
 try {
-    Write-Log "Requesting CyberArk PAS authentication (psPAS Identity header) as CA_PAMDiscovery_SVC..."
+    Write-Log "Requesting CyberArk PAS authentication (psPAS Identity header)..."
     $UPUser = 'CA_PAMDiscovery_SVC'
-    $UPPass = ConvertTo-SecureString $respSVC.Content -AsPlainText -Force
+    $UPPass = ConvertTo-SecureString $response.Content -AsPlainText -Force
     $UPCred = [PSCredential]::new($UPUser, $UPPass)
 
     $header = Get-IdentityHeader `
@@ -114,94 +88,118 @@ try {
 
     $session = Get-PASSession
     if (-not $session) { throw "psPAS session not established" }
-    Write-Log "✅ Authentication successful, PAS session established (SVC)." "Green"
+    Write-Log "✅ Authentication successful, PAS session established." "Green"
 } catch {
-    Write-Log "❌ Failed to authenticate via psPAS Identity header (SVC): $($_.Exception.Message)" "Red"
+    Write-Log "❌ Failed to authenticate via psPAS Identity header: $($_.Exception.Message)" "Red"
     exit 1
 }
 
-# --- Prompt for Safe Name ---
+# --- Prompt for Safe Name & Description (single line up to 200 chars) ---
 $SafeName = Read-Host "Enter the Safe Name"
+Show-Box -Title "Safe Description" `
+        -BodyLine1 "Paste a single-line description for the Safe (max 200 characters)." `
+        -BodyLine2 "Example: 'Service accounts for AppX PROD'."
+$DescriptionRaw = Read-Host "Enter the Safe Description (single line, up to 200 chars)"
+
 if ([string]::IsNullOrWhiteSpace($SafeName)) {
     Write-Log "❌ ERROR: Safe Name cannot be empty. Exiting..." "Red"
-    try { Close-PASSession -ErrorAction Stop; Write-Log "✅ Session closed." "Green" } catch {}
     exit 1
 }
-
-# --- Safe Description via DIALOG (with console fallback) ---
-$Description = $null
-try {
-    Add-Type -AssemblyName Microsoft.VisualBasic -ErrorAction Stop
-    Show-Box -Title "Safe Description" -BodyLine1 "A dialog box will open. Paste a single-line description (max 200 chars)."
-    $Description = [Microsoft.VisualBasic.Interaction]::InputBox(
-        "Paste a single-line description for the Safe (max 200 characters).",
-        "Safe Description",
-        ""
-    )
-} catch {
-    Show-Box -Title "Safe Description (Console Fallback)" `
-        -BodyLine1 "Paste a single-line description for the Safe (max 200 chars)." `
-        -BodyLine2 "Example: 'Service accounts for AppX PROD'."
-    $Description = Read-Host "Enter the Safe Description"
-}
-if ([string]::IsNullOrWhiteSpace($Description)) {
+if ([string]::IsNullOrWhiteSpace($DescriptionRaw)) {
     Write-Log "❌ ERROR: Safe Description cannot be empty. Exiting..." "Red"
-    try { Close-PASSession -ErrorAction Stop; Write-Log "✅ Session closed." "Green" } catch {}
     exit 1
 }
-$Description = $Description.Trim()
+$Description = $DescriptionRaw.Trim()
 if ($Description.Length -gt 200) {
     Write-Log "ℹ️ Safe Description >200 chars, auto-truncating."
     $Description = $Description.Substring(0,200)
 }
 
-# --- Create Safe (always try; continue if exists) ---
+# --- Create Safe (always attempt; continue if already exists) ---
 $ManagingCPM = "CNA_PASS_MANG"
 try {
-    Write-Log "Creating Safe: ${SafeName}..."
+    Write-Log "🔹 Creating Safe: ${SafeName}..."
     Add-PASSafe -SafeName $SafeName -ManagingCPM $ManagingCPM -Description $Description -NumberOfVersionsRetention 180 -ErrorAction Stop | Out-Null
     Write-Log "✅ Successfully created Safe: ${SafeName}." "Green"
 } catch {
     Write-Log "⚠️ Could not create Safe '${SafeName}': $($_.Exception.Message). Continuing to member add..." "Yellow"
 }
 
-# --- psPAS-friendly Permissions ---
+# --- Permissions ---
 $LimitedPermPAS = [PSCustomObject]@{
-    UseAccounts=$false; RetrieveAccounts=$false; ListAccounts=$true; AddAccounts=$false
-    UpdateAccountContent=$false; UpdateAccountProperties=$false; InitiateCPMAccountManagementOperations=$true
-    SpecifyNextAccountContent=$false; RenameAccounts=$false; DeleteAccounts=$false; UnlockAccounts=$true
-    ManageSafe=$false; ManageSafeMembers=$false; BackupSafe=$false; ViewAuditLog=$true; ViewSafeMembers=$true
-    AccessWithoutConfirmation=$true; CreateFolders=$false; DeleteFolders=$false; MoveAccountsAndFolders=$false
-    RequestsAuthorizationLevel1=$true; RequestsAuthorizationLevel2=$false
+    UseAccounts                            = $false
+    RetrieveAccounts                       = $false
+    ListAccounts                           = $true
+    AddAccounts                            = $false
+    UpdateAccountContent                   = $false
+    UpdateAccountProperties                = $false
+    InitiateCPMAccountManagementOperations = $true
+    SpecifyNextAccountContent              = $false
+    RenameAccounts                         = $false
+    DeleteAccounts                         = $false
+    UnlockAccounts                         = $true
+    ManageSafe                             = $false
+    ManageSafeMembers                      = $false
+    BackupSafe                             = $false
+    ViewAuditLog                           = $true
+    ViewSafeMembers                        = $true
+    AccessWithoutConfirmation              = $true
+    CreateFolders                          = $false
+    DeleteFolders                          = $false
+    MoveAccountsAndFolders                 = $false
+    RequestsAuthorizationLevel1            = $true
+    RequestsAuthorizationLevel2            = $false
 }
 $FullPermPAS = [PSCustomObject]@{
-    UseAccounts=$true; RetrieveAccounts=$true; ListAccounts=$true; AddAccounts=$true
-    UpdateAccountContent=$true; UpdateAccountProperties=$true; InitiateCPMAccountManagementOperations=$true
-    SpecifyNextAccountContent=$true; RenameAccounts=$true; DeleteAccounts=$true; UnlockAccounts=$true
-    ManageSafe=$true; ManageSafeMembers=$true; BackupSafe=$true; ViewAuditLog=$true; ViewSafeMembers=$true
-    AccessWithoutConfirmation=$true; CreateFolders=$true; DeleteFolders=$true; MoveAccountsAndFolders=$true
-    RequestsAuthorizationLevel1=$true; RequestsAuthorizationLevel2=$false
+    UseAccounts                            = $true
+    RetrieveAccounts                       = $true
+    ListAccounts                           = $true
+    AddAccounts                            = $true
+    UpdateAccountContent                   = $true
+    UpdateAccountProperties                = $true
+    InitiateCPMAccountManagementOperations = $true
+    SpecifyNextAccountContent              = $true
+    RenameAccounts                         = $true
+    DeleteAccounts                         = $true
+    UnlockAccounts                         = $true
+    ManageSafe                             = $true
+    ManageSafeMembers                      = $true
+    BackupSafe                             = $true
+    ViewAuditLog                           = $true
+    ViewSafeMembers                        = $true
+    AccessWithoutConfirmation              = $true
+    CreateFolders                          = $true
+    DeleteFolders                          = $true
+    MoveAccountsAndFolders                 = $true
+    RequestsAuthorizationLevel1            = $true
+    RequestsAuthorizationLevel2            = $false
 }
 
-# --- Target AD Group prompt & validation (OU=Groups,OU=CyberArk,DC=cna,DC=com) ---
+# --- Target AD Group prompt & validation (in OU=Groups,OU=CyberArk,DC=cna,DC=com) ---
 $SearchBaseOU = 'OU=Groups,OU=CyberArk,DC=cna,DC=com'
 Function Read-ValidGroup {
     while ($true) {
         $g = Read-Host "Enter the AD Safe Group (sAMAccountName only, e.g., ca_xxx_xxx_prod)"
-        if ([string]::IsNullOrWhiteSpace($g)) { Write-Log "❌ Group cannot be empty." "Red"; continue }
-        if ($g -notmatch '^[A-Za-z0-9_\-\.]+$') { Write-Log "❌ Invalid characters in group name. Try again." "Red"; continue }
+        if ([string]::IsNullOrWhiteSpace($g)) {
+            Write-Log "❌ Group cannot be empty." "Red"
+            continue
+        }
+        if ($g -notmatch '^[A-Za-z0-9_\-\.]+$') {
+            Write-Log "❌ Invalid characters in group name. Try again." "Red"
+            continue
+        }
 
         if ($ADModuleLoaded) {
             try {
                 $adGroup = Get-ADGroup -LDAPFilter "(|(sAMAccountName=$g)(userPrincipalName=$g@cna.com))" -SearchBase $SearchBaseOU -ErrorAction Stop
                 if ($adGroup) {
-                    Write-Log ("✅ Found AD Group in {0}: {1} (sAM={2})" -f $SearchBaseOU, $adGroup.Name, $adGroup.SamAccountName) "Green"
+                    Write-Log ("✅ Found AD Group in {0}: {1} (sAM={2})" -f ${SearchBaseOU}, $adGroup.Name, $adGroup.SamAccountName) "Green"
                     return $g
                 } else {
-                    Write-Log ("❌ Group not found under {0}. Re-enter." -f $SearchBaseOU) "Red"
+                    Write-Log ("❌ Group not found under {0}. Re-enter." -f ${SearchBaseOU}) "Red"
                 }
             } catch {
-                Write-Log ("❌ Error searching AD for '{0}' in {1}: {2}" -f $g, $SearchBaseOU, $_.Exception.Message) "Red"
+                Write-Log "❌ Error searching AD for '$g' in ${SearchBaseOU}: $($_.Exception.Message)" "Red"
             }
         } else {
             Write-Log "⚠️ AD module not loaded, proceeding with provided group name (will add as UPN)." "Yellow"
@@ -212,15 +210,15 @@ Function Read-ValidGroup {
 $GroupSam = Read-ValidGroup
 $TargetGroupUPN = "$GroupSam@cna.com"
 
-# --- Members (admins unchanged + cnarestbot added with Full) ---
+# --- Members (admins unchanged, plus cnarestbot admin) ---
 $Members = @(
-    @{ Name = $TargetGroupUPN;                     Type = "Group"; Perm = $LimitedPermPAS }, # Target AD group (Limited)
-    @{ Name = "CA_PCloud_Admins@cna.com";          Type = "Group"; Perm = $FullPermPAS    }, # Registered group (Full)
-    @{ Name = "cna_pas_admin@cyberark.cloud.6679"; Type = "User";  Perm = $FullPermPAS    }, # Vault user (Full)
-    @{ Name = "cnarestbot@cyberark.cloud.6679";    Type = "User";  Perm = $FullPermPAS    }  # Added admin (Full)
+    @{ Name = $TargetGroupUPN;                     Type = "Group"; Perm = $LimitedPermPAS }, # target AD group (Limited)
+    @{ Name = "CA_PCloud_Admins@cna.com";          Type = "Group"; Perm = $FullPermPAS    }, # Full
+    @{ Name = "cna_pas_admin@cyberark.cloud.6679"; Type = "User";  Perm = $FullPermPAS    }, # Full
+    @{ Name = "cnarestbot@cyberark.cloud.6679";    Type = "User";  Perm = $FullPermPAS    }  # Full (new)
 )
 
-# Helper: Add member
+# --- Helper: Add member via psPAS, piping permissions ---
 Function Add-MemberToSafe {
     param(
         [string]$SafeName,
@@ -240,64 +238,50 @@ Function Add-MemberToSafe {
     }
 }
 
-# --- Add all members (Phase 1) ---
+# --- Add all members ---
 foreach ($m in $Members) {
     [void](Add-MemberToSafe -SafeName $SafeName -MemberName $m.Name -MemberType $m.Type -Permissions $m.Perm)
 }
 
-Write-Log "✅ Safe member addition process completed." "Green"
+# --- Close psPAS session ---
+try { Close-PASSession | Out-Null; Write-Log "✅ Session closed." "Green" } catch {}
 
-# --- End Phase 1 session cleanly ---
+# ===================================================================
+# Re-auth as cnarestbot (client credentials via CCP) & remove discovery user
+# ===================================================================
+
+# --- Retrieve credentials for cnarestbot from CCP ---
+$object2 = "cna-prod.cyberark.cloud-cnarestbot@cyberark.cloud.6679"
+Write-Log "Retrieving CyberArk API credentials from CCP (cnarestbot)..."
+$ccpUrl2 = "$CCPAddress/$location/api/Accounts?AppID=$application&Safe=$safeCCP&Object=$object2"
 try {
-    Close-PASSession -ErrorAction Stop
-    Write-Log "✅ Session closed." "Green"
+    $response2 = Invoke-RestMethod $ccpUrl2 -Method 'GET' -Headers $headers -UseDefaultCredentials:$windowsAuth
+    if (-not $response2 -or -not $response2.Content) { throw "Empty CCP response for cnarestbot" }
+    Write-Log "✅ Successfully retrieved credentials for user: $($response2.Username)" "Green"
 } catch {
-    Write-Log "ℹ️ Session close encountered an issue: $($_.Exception.Message)" "Yellow"
-}
-
-# ========== PHASE 2: OAuth (platformtoken) with cnarestbot, remove CA_PAMDiscovery_SVC ==========
-# PVWA base
-$PVWA = "https://cna-prod.privilegecloud.cyberark.cloud"
-
-# CCP for cnarestbot (client credentials)
-$objectBot = "cna-prod.cyberark.cloud-cnarestbot@cyberark.cloud.6679"
-Write-Log "Retrieving CyberArk API credentials from CCP via Object method (cnarestbot)..."
-$ccpUrlBot = "$CCPAddress/$location/api/Accounts?AppID=$application&Safe=$safeAdmin&Object=$objectBot"
-try {
-    $respBot = Invoke-RestMethod $ccpUrlBot -Method 'GET' -Headers $headers -UseDefaultCredentials:$windowsAuth
-    if (-not $respBot -or -not $respBot.Content) {
-        Write-Log "❌ ERROR: Failed to retrieve API credentials from CCP for cnarestbot." "Red"
-        exit 1
-    }
-    Write-Log "✅ Successfully retrieved credentials for user: $($respBot.Username)" "Green"
-} catch {
-    Write-Log "❌ ERROR: CCP credential fetch failed (cnarestbot) - $_" "Red"
+    Write-Log "❌ ERROR: CCP credential fetch (cnarestbot) failed - $_" "Red"
     exit 1
 }
 
-# ---- Identity OAuth client_credentials ----
+# --- Identity OAuth2 client_credentials (platformtoken) ---
 $IdentityTenantID = "aat4012"
-$ClientID         = $respBot.Username
-$ClientSecret     = $respBot.Content
+$ClientID         = $response2.Username
+$ClientSecret     = $response2.Content
 
 if ([string]::IsNullOrEmpty($ClientID) -or [string]::IsNullOrEmpty($ClientSecret)) {
-    Write-Log "❌ ERROR: Client ID or Client Secret is missing. Exiting..." "Red"
-    exit
+    Write-Log "❌ ERROR: Client ID or Secret missing for cnarestbot. Exiting..." "Red"
+    exit 1
 }
 
-Write-Log "Requesting initial CyberArk ISPSS token..."
-$TokenURL = "https://$IdentityTenantID.id.cyberark.cloud/oauth2/platformtoken"
-$TokenBody = @{
-    grant_type    = "client_credentials"
-    client_id     = $ClientID
-    client_secret = $ClientSecret
-}
-$headers_token = @{ "Content-Type" = "application/x-www-form-urlencoded" }
+Write-Log "Requesting initial CyberArk ISPSS token (client credentials)..."
+$TokenURL     = "https://$IdentityTenantID.id.cyberark.cloud/oauth2/platformtoken"
+$TokenBody    = @{ grant_type = "client_credentials"; client_id = $ClientID; client_secret = $ClientSecret }
+$headersToken = @{ "Content-Type" = "application/x-www-form-urlencoded" }
 
 try {
-    $TokenResponse = Invoke-RestMethod -Uri $TokenURL -Method Post -Headers $headers_token -Body $TokenBody
-    $BearerToken = [string]$TokenResponse.access_token
-    if ([string]::IsNullOrEmpty($BearerToken) -or $BearerToken.Length -lt 100) {
+    $TokenResponse = Invoke-RestMethod -Uri $TokenURL -Method Post -Headers $headersToken -Body $TokenBody
+    $BearerToken   = [string]$TokenResponse.access_token
+    if ([string]::IsNullOrEmpty($BearerToken) -or $BearerToken.Length -lt 50) {
         Write-Log "❌ ERROR: Received an invalid token. Length: $($BearerToken.Length)" "Red"
         exit
     }
@@ -307,56 +291,91 @@ try {
     exit
 }
 
-# REST headers
+# --- Define REST removal helpers (list members -> find exact name -> delete) ---
+$PVWABase = "https://cna-prod.privilegecloud.cyberark.cloud/PasswordVault"
 $headers_api = @{
-    "Authorization" = "Bearer $BearerToken"
-    "Content-Type"  = "application/json"
+  "Authorization" = "Bearer $BearerToken"
+  "Content-Type"  = "application/json"
 }
 
-# Helper: Remove safe member via REST (tries /api and /API, UPN/sAM)
-Function Remove-SafeMemberREST {
-    param(
-        [string]$BaseUrl,
-        [string]$SafeName,
-        [string]$MemberName,
-        [hashtable]$Headers
-    )
-
-    $encodedMember = [System.Uri]::EscapeDataString($MemberName)
-    $encodedSafe   = [System.Uri]::EscapeDataString($SafeName)
-
-    $paths = @(
-        "/PasswordVault/api/Safes/$encodedSafe/Members/$encodedMember",
-        "/PasswordVault/API/Safes/$encodedSafe/Members/$encodedMember"
-    )
-
-    foreach ($p in $paths) {
-        $url = "$BaseUrl$p"
-        try {
-            Invoke-RestMethod -Uri $url -Method Delete -Headers $Headers -ErrorAction Stop | Out-Null
-            Write-Log "✅ Removed user '$MemberName' from Safe '$SafeName' via $p." "Green"
-            return $true
-        } catch {
-            $msg = $_.Exception.Message
-            # 404 -> not found/ not a member; other errors log & continue
-            Write-Log "ℹ️ DELETE $p failed for '$MemberName': $msg" "Yellow"
-        }
+Function Get-SafeMembers {
+  param([string]$Safe)
+  $members = @()
+  foreach ($seg in @("api","API")) {
+    $url = "$PVWABase/$seg/Safes/$([uri]::EscapeDataString($Safe))/Members?limit=1000&offset=0"
+    try {
+      $resp = Invoke-RestMethod -Uri $url -Headers $headers_api -Method Get -ErrorAction Stop
+      if ($null -ne $resp) {
+        if ($resp.members) { $members = $resp.members }
+        elseif ($resp -is [System.Collections.IEnumerable]) { $members = $resp }
+        if ($members.Count -gt 0) { break }
+      }
+    } catch {
+      # try next path case
     }
-    return $false
+  }
+  return $members
 }
 
-# Try removing SVC by UPN first, then sAM
-$removed = $false
-foreach ($candidate in @("CA_PAMDiscovery_SVC@cna.com","CA_PAMDiscovery_SVC")) {
-    Write-Log "Attempting to remove user '$candidate' from Safe '$SafeName'..."
-    if (Remove-SafeMemberREST -BaseUrl $PVWA -SafeName $SafeName -MemberName $candidate -Headers $headers_api) {
-        $removed = $true
-        break
+Function Get-MemberDisplayName {
+  param($m)
+  foreach ($k in "memberName","MemberName","userName","UserName","Username","name","displayName") {
+    if ($m.PSObject.Properties.Name -contains $k -and $m.$k) { return [string]$m.$k }
+  }
+  return $null
+}
+
+Function Find-DiscoveryUserNames {
+  param([array]$Members)
+  $targets = @(
+    'CA_PAMDiscovery_SVC',
+    'CA_PAMDiscovery_SVC@cna.com',
+    'CNA\CA_PAMDiscovery_SVC'
+  )
+  $hits = New-Object System.Collections.Generic.List[string]
+  foreach ($m in $Members) {
+    $disp = Get-MemberDisplayName $m
+    if ([string]::IsNullOrWhiteSpace($disp)) { continue }
+    foreach ($t in $targets) {
+      if ($disp -ieq $t) { $hits.Add($disp); break }
+      if ($disp -imatch '^CA_PAMDiscovery_SVC(@.+)?$') { $hits.Add($disp); break }
+      if ($disp -ieq 'CNA\CA_PAMDiscovery_SVC') { $hits.Add($disp); break }
     }
+  }
+  return ($hits | Select-Object -Unique)
 }
 
-if (-not $removed) {
-    Write-Log "ℹ️ Could not remove 'CA_PAMDiscovery_SVC' (may not be a member or mapping differs). Check PVWA > Safe Members for exact name." "Yellow"
+Function Remove-SafeMemberByExactName {
+  param([string]$Safe, [string]$ExactName)
+  $encName = [uri]::EscapeDataString($ExactName)
+  foreach ($seg in @("api","API")) {
+    $url = "$PVWABase/$seg/Safes/$([uri]::EscapeDataString($Safe))/Members/$encName"
+    try {
+      Invoke-RestMethod -Uri $url -Headers $headers_api -Method Delete -ErrorAction Stop | Out-Null
+      Write-Log "✅ Removed '$ExactName' from Safe '$Safe' (path '/$seg')." "Green"
+      return $true
+    } catch {
+      Write-Log "ℹ️ DELETE $url failed for '$ExactName': $($_.Exception.Message)" "Yellow"
+    }
+  }
+  return $false
 }
 
-Write-Log "✅ Script completed." "Green"
+# --- Perform removal of discovery user on the created Safe ---
+Write-Log "Enumerating members of Safe '$SafeName'..."
+$members = Get-SafeMembers -Safe $SafeName
+if (-not $members -or $members.Count -eq 0) {
+  Write-Log "❌ No members returned (check token scope or Safe name). Aborting removal." "Red"
+} else {
+  $targets = Find-DiscoveryUserNames -Members $members
+  if ($targets.Count -eq 0) {
+    Write-Log "ℹ️ No member matching 'CA_PAMDiscovery_SVC' variants found. Current stored names:" "Yellow"
+    foreach ($m in $members) { Write-Log (" - " + (Get-MemberDisplayName $m)) }
+  } else {
+    foreach ($name in $targets) {
+      [void](Remove-SafeMemberByExactName -Safe $SafeName -ExactName $name)
+    }
+  }
+}
+
+Write-Log "✅ Completed Safe creation, member additions, and discovery user cleanup." "Green"
