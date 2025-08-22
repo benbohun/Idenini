@@ -203,7 +203,6 @@ Function Read-ValidGroup {
                     Write-Log ("❌ Group not found under {0}. Re-enter." -f $SearchBaseOU) "Red"
                 }
             } catch {
-                # FIXED: Use format operator to avoid $Var: parsing issue
                 Write-Log ("❌ Error searching AD for '{0}' in {1}: {2}" -f $g, $SearchBaseOU, $_.Exception.Message) "Red"
             }
         } else {
@@ -250,7 +249,7 @@ Write-Log "✅ Safe member addition process completed." "Green"
 try { Close-PASSession | Out-Null; Write-Log "✅ PAS session closed (CA_PAMDiscovery_SVC)." "Green" } catch {}
 
 # =========================================
-# 5) START a NEW psPAS session as cnarestbot (explicit), THEN remove discovery user
+# 5) START a NEW psPAS session as cnarestbot (explicit)
 # =========================================
 Write-Log "Retrieving CyberArk API credentials from CCP (cnarestbot)..."
 $object2 = "cna-prod.cyberark.cloud-cnarestbot@cyberark.cloud.6679"
@@ -264,7 +263,6 @@ try {
     exit 1
 }
 
-# --- Start psPAS session as cnarestbot ---
 try {
     Write-Log "Requesting CyberArk PAS authentication (psPAS Identity header) as cnarestbot..."
     $UPUser2 = 'cnarestbot@cyberark.cloud.6679'
@@ -285,141 +283,60 @@ try {
     exit 1
 }
 
-# --- Helper: enumerate via psPAS & remove via psPAS ---
-Function Remove-Discovery-With-psPAS {
-    param([string]$Safe)
+# =========================================
+# 6) REST removal of Discovery user using documented endpoint
+#     https://<subdomain>.privilegecloud.cyberark.cloud/PasswordVault/API/Safes/{SafeUrlId}/Members/{MemberName}/
+# =========================================
+# Obtain Identity token for REST (client credentials from CCP)
+$IdentityTenantID = "aat4012"
+$ClientID         = $response2.Username
+$ClientSecret     = $response2.Content
 
-    try {
-        $members = Get-PASSafeMember -SafeName $Safe -ErrorAction Stop
-    } catch {
-        Write-Log ("❌ Failed to list members via psPAS: {0}" -f $_.Exception.Message) "Red"
-        return $false
-    }
+Write-Log "Requesting Identity (client_credentials) token for REST deletes (cnarestbot)..."
+$TokenURL     = "https://$IdentityTenantID.id.cyberark.cloud/oauth2/platformtoken"
+$TokenBody    = @{ grant_type = "client_credentials"; client_id = $ClientID; client_secret = $ClientSecret }
+$headersToken = @{ "Content-Type" = "application/x-www-form-urlencoded" }
 
-    if (-not $members) { Write-Log "ℹ️ No members returned via psPAS." "Yellow"; return $false }
-
-    $targets = $members | Where-Object {
-        $_.Username -imatch '^CA_PAMDiscovery_SVC(@.+)?$' -or $_.Username -ieq 'CNA\CA_PAMDiscovery_SVC' -or $_.Username -ieq 'CA_PAMDiscovery_SVC'
-    } | Select-Object -ExpandProperty Username -Unique
-
-    if (-not $targets -or $targets.Count -eq 0) {
-        Write-Log "ℹ️ No member matching 'CA_PAMDiscovery_SVC' variants found via psPAS." "Yellow"
-        return $false
-    }
-
-    $ok = $false
-    foreach ($name in $targets) {
-        Write-Log ("Attempting to remove '{0}' from Safe '{1}' (psPAS)..." -f $name, $Safe)
-        try {
-            Remove-PASSafeMember -SafeName $Safe -MemberName $name -ErrorAction Stop
-            Write-Log ("✅ Removed '{0}' via psPAS." -f $name) "Green"
-            $ok = $true
-        } catch {
-            Write-Log ("ℹ️ Could not remove '{0}' via psPAS: {1}" -f $name, $_.Exception.Message) "Yellow"
-        }
-    }
-    return $ok
+$BearerToken = $null
+try {
+    $TokenResponse = Invoke-RestMethod -Uri $TokenURL -Method Post -Headers $headersToken -Body $TokenBody
+    $BearerToken   = [string]$TokenResponse.access_token
+    if ([string]::IsNullOrEmpty($BearerToken) -or $BearerToken.Length -lt 50) { throw "Invalid token length: $($BearerToken.Length)" }
+    Write-Log "✅ REST token obtained (cnarestbot)." "Green"
+} catch {
+    Write-Log ("❌ Failed to get REST token (cnarestbot): {0}" -f $_.Exception.Message) "Red"
 }
 
-# Primary removal try (psPAS)
-$removed = Remove-Discovery-With-psPAS -Safe $SafeName
-
-# --- REST fallback only if psPAS path didn’t remove anything ---
-if (-not $removed) {
-    $IdentityTenantID = "aat4012"
-    $ClientID         = $response2.Username
-    $ClientSecret     = $response2.Content
-
-    Write-Log "Requesting Identity (client_credentials) token for REST fallback (cnarestbot)..."
-    $TokenURL     = "https://$IdentityTenantID.id.cyberark.cloud/oauth2/platformtoken"
-    $TokenBody    = @{ grant_type = "client_credentials"; client_id = $ClientID; client_secret = $ClientSecret }
-    $headersToken = @{ "Content-Type" = "application/x-www-form-urlencoded" }
-
-    $BearerToken = $null
-    try {
-        $TokenResponse = Invoke-RestMethod -Uri $TokenURL -Method Post -Headers $headersToken -Body $TokenBody
-        $BearerToken   = [string]$TokenResponse.access_token
-        if ([string]::IsNullOrEmpty($BearerToken) -or $BearerToken.Length -lt 50) {
-            throw "Invalid token length: $($BearerToken.Length)"
-        }
-        Write-Log "✅ REST token obtained (cnarestbot)." "Green"
-    } catch {
-        Write-Log ("❌ Failed to get REST token (cnarestbot): {0}" -f $_.Exception.Message) "Red"
+if ($BearerToken) {
+    $PVWABase    = "https://cna-prod.privilegecloud.cyberark.cloud/PasswordVault"
+    $headers_api = @{
+      "Authorization" = "Bearer $BearerToken"
+      "Content-Type"  = "application/json"
+      "Accept"        = "application/json"
     }
 
-    if ($BearerToken) {
-        $PVWABase = "https://cna-prod.privilegecloud.cyberark.cloud/PasswordVault"
-        $headers_api = @{
-          "Authorization" = "Bearer $BearerToken"
-          "Content-Type"  = "application/json"
-          "Accept"        = "application/json"
-        }
+    # Try common member-name variants directly with the documented DELETE endpoint
+    $safeUrlId  = [uri]::EscapeDataString($SafeName)
+    $candidates = @('CA_PAMDiscovery_SVC@cna.com','CA_PAMDiscovery_SVC','CNA\CA_PAMDiscovery_SVC')
 
-        Function Get-SafeMembersREST {
-          param([string]$Safe)
-          $members = @()
-          foreach ($seg in @("api","API")) {
-            $url = "$PVWABase/$seg/Safes/$([uri]::EscapeDataString($Safe))/Members?limit=1000&offset=0"
-            try {
-              $resp = Invoke-RestMethod -Uri $url -Headers $headers_api -Method Get -ErrorAction Stop
-              if ($resp -and $resp.members)         { $members = $resp.members }
-              elseif ($resp -and $resp.Members)     { $members = $resp.Members }
-              elseif ($resp -is [System.Collections.IEnumerable]) { $members = $resp }
-              if ($members -and $members.Count -gt 0) { return ,$members }
-            } catch { }
-          }
-          return ,$members
-        }
+    foreach ($name in $candidates) {
+        $memberPath = [uri]::EscapeDataString($name)
+        $url = "$PVWABase/API/Safes/$safeUrlId/Members/$memberPath/"
+        Write-Log ("Attempting DELETE: {0}" -f $url)
 
-        Function Get-MemberDisplayName {
-          param($m)
-          foreach ($k in "memberName","MemberName","userName","UserName","Username","name","displayName") {
-            if ($m.PSObject.Properties.Name -contains $k -and $m.$k) { return [string]$m.$k }
-          }
-          return $null
-        }
-
-        Function Remove-SafeMemberREST {
-          param([string]$Safe, [string]$ExactName)
-          $encName = [uri]::EscapeDataString($ExactName)
-          foreach ($seg in @("api","API")) {
-            $url = "$PVWABase/$seg/Safes/$([uri]::EscapeDataString($Safe))/Members/$encName"
-            try {
-              Invoke-RestMethod -Uri $url -Headers $headers_api -Method Delete -ErrorAction Stop | Out-Null
-              Write-Log ("✅ Removed '{0}' from Safe '{1}' via REST (/{2})." -f $ExactName, $Safe, $seg) "Green"
-              return $true
-            } catch {
-              Write-Log ("ℹ️ DELETE {0} failed for '{1}': {2}" -f $url, $ExactName, $_.Exception.Message) "Yellow"
-            }
-          }
-          return $false
-        }
-
-        Write-Log ("Enumerating members of Safe '{0}' (REST fallback)..." -f $SafeName)
-        $membersREST = Get-SafeMembersREST -Safe $SafeName
-        if (-not $membersREST -or $membersREST.Count -eq 0) {
-          Write-Log "❌ No members returned via REST. Aborting removal." "Red"
-        } else {
-          $targetsREST = @()
-          foreach ($m in $membersREST) {
-            $n = Get-MemberDisplayName $m
-            if ($n -and ($n -imatch '^CA_PAMDiscovery_SVC(@.+)?$' -or $n -ieq 'CNA\CA_PAMDiscovery_SVC' -or $n -ieq 'CA_PAMDiscovery_SVC')) {
-              $targetsREST += $n
-            }
-          }
-          $targetsREST = $targetsREST | Select-Object -Unique
-          if (-not $targetsREST -or $targetsREST.Count -eq 0) {
-            Write-Log "ℹ️ No member matching 'CA_PAMDiscovery_SVC' variants found via REST." "Yellow"
-          } else {
-            foreach ($name in $targetsREST) { [void](Remove-SafeMemberREST -Safe $SafeName -ExactName $name) }
-          }
+        try {
+            Invoke-RestMethod -Uri $url -Headers $headers_api -Method Delete -ErrorAction Stop | Out-Null
+            Write-Log ("✅ Removed '{0}' from Safe '{1}' via documented REST endpoint." -f $name, $SafeName) "Green"
+            break
+        } catch {
+            Write-Log ("ℹ️ DELETE failed for '{0}': {1}" -f $name, $_.Exception.Message) "Yellow"
         }
     }
 }
 
 # =========================================
-# 6) Close the SECOND psPAS session (cnarestbot) & end
+# 7) Close the SECOND psPAS session (cnarestbot) & end
 # =========================================
 try { Close-PASSession | Out-Null; Write-Log "✅ PAS session closed (cnarestbot)." "Green" } catch {}
 
-Write-Log "✅ Completed Safe creation, member additions, second session start, and discovery user cleanup." "Green"
+Write-Log "✅ Completed Safe creation, member additions, second session start, and discovery user cleanup via DELETE API." "Green"
