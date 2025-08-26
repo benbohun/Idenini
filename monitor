@@ -1,205 +1,47 @@
-<# PSM 1858 Connectivity Monitor
-   - On failure: custom events
-       41858 = TCP timeout/port failure
-       41859 = DNS resolution failure
-       41860 = Connectivity recovered
-   - Log rotates at 50 MB, archives to ZIP, and purges archives older than 4 days
-#>
-
-param(
-    [string]$Target = "vault-cna-prod.privilegecloud.cyberark.cloud",
-    [int]$Port = 1858,
-    [int]$IntervalSeconds = 10,
-    [string]$LogName = "PSMConnectivity",
-    [string]$EventSource = "PSMConnectivityMonitor",
-    [string]$TextLog = "C:\script\PSM_Port1858_Test.log",
-    [int]$ArchiveRetentionDays = 4
-)
-
-# --- Prep ---------------------------------------------------------------------
-$logDir = Split-Path -Path $TextLog -Parent
-if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
-
-# Archive directory
-$ArchiveDir = Join-Path $logDir "Archive"
-if (-not (Test-Path $ArchiveDir)) { New-Item -ItemType Directory -Path $ArchiveDir -Force | Out-Null }
-
-# Event source/log
-if (-not [System.Diagnostics.EventLog]::SourceExists($EventSource)) {
-    try { New-EventLog -LogName $LogName -Source $EventSource } catch { }
-}
-if (-not (Get-EventLog -List | Where-Object {$_.LogDisplayName -eq $LogName -or $_.Log -eq $LogName})) {
-    $LogName = "Application"
-}
-
-function Write-Log($msg) {
-    $ts   = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $line = "$ts - $msg"
-
-    # --- Purge old archives (> retention days) --------------------------------
-    try {
-        $cutoff = (Get-Date).AddDays(-$ArchiveRetentionDays)
-        Get-ChildItem -Path $ArchiveDir -File -ErrorAction SilentlyContinue |
-            Where-Object { $_.LastWriteTime -lt $cutoff } |
-            ForEach-Object {
-                try { Remove-Item $_.FullName -Force -ErrorAction Stop } catch {}
-            }
-    } catch {}
-
-    # --- Rotation + Archive at 50 MB -----------------------------------------
-    if (Test-Path $TextLog) {
-        $sizeMB = (Get-Item $TextLog).Length / 1MB
-        if ($sizeMB -ge 50) {
-            try {
-                $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
-                $base  = [System.IO.Path]::GetFileNameWithoutExtension($TextLog)
-                $rotatedName = "$base`_$stamp.log"
-                $rotatedPath = Join-Path $logDir $rotatedName
-                $zipPath     = Join-Path $ArchiveDir ("$base`_$stamp.zip")
-
-                # Copy active log to a timestamped file
-                Copy-Item -Path $TextLog -Destination $rotatedPath -Force
-
-                # Compress to ZIP; if fails, keep the rotated .log in Archive
-                try {
-                    if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
-                    Compress-Archive -Path $rotatedPath -DestinationPath $zipPath -Force
-                    Remove-Item $rotatedPath -Force
-                } catch {
-                    Move-Item -Path $rotatedPath -Destination $ArchiveDir -Force
-                }
-
-                # Truncate/recreate the active log
-                Clear-Content -Path $TextLog -ErrorAction SilentlyContinue
-                if (-not (Test-Path $TextLog)) {
-                    New-Item -Path $TextLog -ItemType File -Force | Out-Null
-                }
-
-                Write-Host "$ts - Log file reached 50MB. Archived to: $zipPath"
-            } catch {
-                Write-Host "$ts - Log rotation error: $($_.Exception.Message)"
-            }
-        }
-    } else {
-        # Ensure the file exists
-        New-Item -Path $TextLog -ItemType File -Force | Out-Null
-    }
-
-    # Write the current line
-    Add-Content -Path $TextLog -Value $line
-    Write-Host $line
-}
-
-function Write-Event($eventId, $entryType, $message) {
-    try {
-        Write-EventLog -LogName $LogName -Source $EventSource -EventId $eventId -EntryType $entryType -Message $message
-    } catch {
-        Write-Log "EVENTWRITEFAIL: ID=$eventId TYPE=$entryType MSG=$message ERR=$($_.Exception.Message)"
-    }
-}
-
-# --- Monitor Loop -------------------------------------------------------------
-$lastState = "Unknown"  # Up | Down(DNS) | Down(TCP) | Unknown
-
-while ($true) {
-    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-
-    # 1) DNS check
-    $dnsOk = $false
-    $resolvedAddrs = @()
-    try {
-        $resolved = Resolve-DnsName -Name $Target -ErrorAction Stop
-        $resolvedAddrs = $resolved | Where-Object {$_.IPAddress} | Select-Object -ExpandProperty IPAddress
-        if ($resolvedAddrs.Count -gt 0) { $dnsOk = $true }
-    } catch {
-        $dnsOk = $false
-    }
-
-    if (-not $dnsOk) {
-        $msg = "DNS failure: Could not resolve host '$Target' (Port $Port)."
-        Write-Log "TcpTestSucceeded: False | $msg"
-        if ($lastState -ne "Down(DNS)") {
-            Write-Event -eventId 41859 -entryType Error -message $msg
-            $lastState = "Down(DNS)"
-        }
-        Start-Sleep -Seconds $IntervalSeconds
-        continue
-    }
-
-    # 2) TCP check
-    $ok = $false
-    try {
-        $tnc = Test-NetConnection -ComputerName $Target -Port $Port -WarningAction SilentlyContinue -InformationLevel Detailed
-        $ok = [bool]$tnc.TcpTestSucceeded
-    } catch {
-        $ok = $false
-    }
-
-    if ($ok) {
-        Write-Log "TcpTestSucceeded: True | Resolved: $($resolvedAddrs -join ', ')"
-        if ($lastState -like "Down(*)" -or $lastState -eq "Unknown") {
-            Write-Event -eventId 41860 -entryType Information -message "Connectivity recovered to $($Target):$Port. Resolved IP(s): $($resolvedAddrs -join ', ')"
-        }
-        $lastState = "Up"
-    } else {
-        $msg = "TCP failure: $($Target):$Port not reachable (DNS OK: $($resolvedAddrs -join ', '))."
-        Write-Log "TcpTestSucceeded: False | $msg"
-        if ($lastState -ne "Down(TCP)") {
-            Write-Event -eventId 41858 -entryType Error -message $msg
-            $lastState = "Down(TCP)"
-        }
-    }
-
-    Start-Sleep -Seconds $IntervalSeconds
-}
-
-
-::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
-
-
-
-
-
-# === CONFIG ===
+# ==== CONFIG ====
+$TaskFolder = "\CyberArkMonitor"
 $TaskName   = "PSM 1858 Connectivity Monitor"
-$TaskPath   = "\CyberArk"   # Task Scheduler folder
-$ScriptPath = "C:\Scripts\PSM-1858-Monitor.ps1"
+$ScriptPath = "C:\script\PSM-1858-Monitor.ps1"
 
-# Optional parameters to pass to your script (edit as needed)
-$Target          = "vault-cna-prod.privilegecloud.cyberark.cloud"
-$Port            = 1858
-$IntervalSeconds = 5
-$LogName         = "PSMConnectivity"
-$EventSource     = "PSMConnectivityMonitor"
-$TextLog         = "C:\Temp\PSM_Port1858_Test.log"
+# Script parameters (edit as needed)
+$Target              = "vault-cna-prod.privilegecloud.cyberark.cloud"
+$Port                = 1858
+$IntervalSeconds     = 10
+$LogName             = "PSMConnectivity"
+$EventSource         = "PSMConnectivityMonitor"
+$TextLog             = "C:\script\PSM_Port1858_Test.log"
+$ArchiveRetentionDays= 4
 
-# === PREP ===
-# Ensure script folder exists and the script is unblocked
-$null = New-Item -ItemType Directory -Path (Split-Path $ScriptPath) -Force
-if (Test-Path $ScriptPath) { Unblock-File $ScriptPath }
+# ==== PREP ====
+# Ensure script exists and is unblocked
+if (!(Test-Path $ScriptPath)) { throw "Script not found: $ScriptPath" }
+Unblock-File $ScriptPath
 
-# Create a task folder if it doesn't exist
+# Create task folder if missing
 try {
-    $ts = New-ScheduledTask -ErrorAction Stop  # dummy to load module
-    $null = Register-ScheduledTask -TaskName ".__dummy__" -Action (New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c exit 0") -Trigger (New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1)) -Principal (New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount) -TaskPath $TaskPath -ErrorAction Stop
-    Unregister-ScheduledTask -TaskName ".__dummy__" -TaskPath $TaskPath -Confirm:$false
+    $null = Get-ScheduledTask -TaskPath $TaskFolder -TaskName "*" -ErrorAction Stop
 } catch {
-    # If folder exists, the dummy registration will fail harmlessly; ignore
-    $null = $null
+    # Create a dummy task to force the folder's creation, then remove it
+    $dummyAction = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c exit 0"
+    $dummyTrig   = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddMinutes(5))
+    $dummyPrin   = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount
+    Register-ScheduledTask -TaskName ".__create_folder__" -TaskPath $TaskFolder -Action $dummyAction -Trigger $dummyTrig -Principal $dummyPrin -ErrorAction SilentlyContinue | Out-Null
+    Unregister-ScheduledTask -TaskName ".__create_folder__" -TaskPath $TaskFolder -Confirm:$false -ErrorAction SilentlyContinue
 }
 
-# Build the action command line (hidden window, bypass policy)
+# Build the PowerShell action (hidden, bypass policy)
 $argList = @(
     '-NoProfile',
-    '-WindowStyle', 'Hidden',
-    '-ExecutionPolicy', 'Bypass',
+    '-WindowStyle','Hidden',
+    '-ExecutionPolicy','Bypass',
     '-File', ('"{0}"' -f $ScriptPath),
     '-Target', ('"{0}"' -f $Target),
     '-Port', $Port,
     '-IntervalSeconds', $IntervalSeconds,
     '-LogName', ('"{0}"' -f $LogName),
     '-EventSource', ('"{0}"' -f $EventSource),
-    '-TextLog', ('"{0}"' -f $TextLog)
+    '-TextLog', ('"{0}"' -f $TextLog),
+    '-ArchiveRetentionDays', $ArchiveRetentionDays
 ) -join ' '
 
 $action    = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $argList
@@ -212,14 +54,15 @@ $settings  = New-ScheduledTaskSettingsSet `
     -Hidden `
     -RestartCount 5 `
     -RestartInterval (New-TimeSpan -Minutes 1) `
-    -ExecutionTimeLimit (New-TimeSpan -Hours 0)  # no time limit
+    -ExecutionTimeLimit (New-TimeSpan -Hours 0)   # no time limit
 
-# Register (replace if it already exists)
-if (Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction SilentlyContinue) {
-    Unregister-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -Confirm:$false
+# Replace if exists
+if (Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskFolder -ErrorAction SilentlyContinue) {
+    Unregister-ScheduledTask -TaskName $TaskName -TaskPath $TaskFolder -Confirm:$false
 }
-Register-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -Action $action -Trigger $trigger -Principal $principal -Settings $settings
 
-Write-Host "Scheduled Task '$TaskPath$TaskName' created."
+Register-ScheduledTask -TaskName $TaskName -TaskPath $TaskFolder -Action $action -Trigger $trigger -Principal $principal -Settings $settings
+Write-Host "Scheduled Task '$TaskFolder$TaskName' created."
 
-::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+# Start it now (optional)
+Start-ScheduledTask -TaskName $TaskName -TaskPath $TaskFolder
