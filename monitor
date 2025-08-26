@@ -1,0 +1,125 @@
+<# PSM 1858 Connectivity Monitor
+   - Loops continuously
+   - On failure: writes custom event to "PSMConnectivity" log with Event IDs:
+       41858 = TCP timeout/port failure
+       41859 = DNS resolution failure
+       41860 = Connectivity recovered
+#>
+
+param(
+    [string]$Target = "vault-cna-prod.privilegecloud.cyberark.cloud",
+    [int]$Port = 1858,
+    [int]$IntervalSeconds = 5,
+    [string]$LogName = "PSMConnectivity",
+    [string]$EventSource = "PSMConnectivityMonitor",
+    [string]$TextLog = "C:\Temp\PSM_Port1858_Test.log"
+)
+
+# --- Prep ---------------------------------------------------------------------
+# Ensure log folder
+$logDir = Split-Path -Path $TextLog -Parent
+if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
+
+# Create custom event log/source if needed (run once as admin)
+if (-not [System.Diagnostics.EventLog]::SourceExists($EventSource)) {
+    try { New-EventLog -LogName $LogName -Source $EventSource } catch { }
+}
+if (-not (Get-EventLog -List | Where-Object {$_.LogDisplayName -eq $LogName -or $_.Log -eq $LogName})) {
+    # If the custom log wasn't created, fall back to Application
+    $LogName = "Application"
+}
+
+function Write-Log($msg) {
+    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $line = "$ts - $msg"
+    Add-Content -Path $TextLog -Value $line
+    Write-Host $line
+}
+
+function Write-Event($eventId, $entryType, $message) {
+    try {
+        Write-EventLog -LogName $LogName -Source $EventSource -EventId $eventId -EntryType $entryType -Message $message
+    } catch {
+        # If source/log not registered due to permissions, at least capture to file
+        Write-Log "EVENTWRITEFAIL: ID=$eventId TYPE=$entryType MSG=$message ERR=$($_.Exception.Message)"
+    }
+}
+
+# --- Monitor Loop -------------------------------------------------------------
+$lastState = "Unknown"  # "Up" | "Down(DNS)" | "Down(TCP)" | "Unknown"
+
+while ($true) {
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+
+    # 1) DNS check first
+    $dnsOk = $false
+    $resolvedAddrs = @()
+    try {
+        $resolved = Resolve-DnsName -Name $Target -ErrorAction Stop
+        $resolvedAddrs = $resolved | Where-Object {$_.IPAddress} | Select-Object -ExpandProperty IPAddress
+        if ($resolvedAddrs.Count -gt 0) { $dnsOk = $true }
+    } catch {
+        $dnsOk = $false
+    }
+
+    if (-not $dnsOk) {
+        $msg = "DNS failure: Could not resolve host '$Target' (Port $Port)."
+        Write-Log "TcpTestSucceeded: False | $msg"
+        if ($lastState -ne "Down(DNS)") {
+            Write-Event -eventId 41859 -entryType Error -message $msg
+            $lastState = "Down(DNS)"
+        }
+        Start-Sleep -Seconds $IntervalSeconds
+        continue
+    }
+
+    # 2) TCP check
+    $ok = $false
+    try {
+        $tnc = Test-NetConnection -ComputerName $Target -Port $Port -WarningAction SilentlyContinue -InformationLevel Detailed
+        $ok = [bool]$tnc.TcpTestSucceeded
+    } catch {
+        $ok = $false
+    }
+
+    if ($ok) {
+        Write-Log "TcpTestSucceeded: True | Resolved: $($resolvedAddrs -join ', ')"
+        if ($lastState -like "Down(*)" -or $lastState -eq "Unknown") {
+            Write-Event -eventId 41860 -entryType Information -message "Connectivity recovered to $Target:$Port. Resolved IP(s): $($resolvedAddrs -join ', ')"
+        }
+        $lastState = "Up"
+    } else {
+        $msg = "TCP failure: $Target:$Port not reachable (DNS OK: $($resolvedAddrs -join ', '))."
+        Write-Log "TcpTestSucceeded: False | $msg"
+        if ($lastState -ne "Down(TCP)") {
+            Write-Event -eventId 41858 -entryType Error -message $msg
+            $lastState = "Down(TCP)"
+        }
+    }
+
+    Start-Sleep -Seconds $IntervalSeconds
+}
+::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+
+
+
+
+
+# Create folder and set execution policy if needed
+New-Item -ItemType Directory -Path C:\Scripts -Force | Out-Null
+
+# (Optional) Unblock the script if downloaded
+Unblock-File C:\Scripts\PSM-1858-Monitor.ps1
+
+# Run as SYSTEM at startup, hidden window
+$action   = New-ScheduledTaskAction -Execute "powershell.exe" `
+            -Argument '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "C:\Scripts\PSM-1858-Monitor.ps1"'
+$trigger  = New-ScheduledTaskTrigger -AtStartup
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -MultipleInstances IgnoreNew `
+            -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+$principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+
+Register-ScheduledTask -TaskName "PSM 1858 Connectivity Monitor" `
+    -Action $action -Trigger $trigger -Settings $settings -Principal $principal
+
+::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
