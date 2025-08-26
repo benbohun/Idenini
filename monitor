@@ -4,6 +4,7 @@
        41858 = TCP timeout/port failure
        41859 = DNS resolution failure
        41860 = Connectivity recovered
+   - Logs to C:\Temp\PSM_Port1858_Test.log (auto-deletes if >50 MB)
 #>
 
 param(
@@ -16,7 +17,7 @@ param(
 )
 
 # --- Prep ---------------------------------------------------------------------
-# Ensure log folder
+# Ensure log folder exists
 $logDir = Split-Path -Path $TextLog -Parent
 if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
 
@@ -30,8 +31,19 @@ if (-not (Get-EventLog -List | Where-Object {$_.LogDisplayName -eq $LogName -or 
 }
 
 function Write-Log($msg) {
-    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $ts   = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $line = "$ts - $msg"
+
+    # Check log file size (delete if >=50MB)
+    if (Test-Path $TextLog) {
+        $sizeMB = (Get-Item $TextLog).Length / 1MB
+        if ($sizeMB -ge 50) {
+            Remove-Item $TextLog -Force
+            New-Item -Path $TextLog -ItemType File -Force | Out-Null
+            Write-Host "$ts - Log file exceeded 50MB. Old file deleted and recreated."
+        }
+    }
+
     Add-Content -Path $TextLog -Value $line
     Write-Host $line
 }
@@ -40,7 +52,6 @@ function Write-Event($eventId, $entryType, $message) {
     try {
         Write-EventLog -LogName $LogName -Source $EventSource -EventId $eventId -EntryType $entryType -Message $message
     } catch {
-        # If source/log not registered due to permissions, at least capture to file
         Write-Log "EVENTWRITEFAIL: ID=$eventId TYPE=$entryType MSG=$message ERR=$($_.Exception.Message)"
     }
 }
@@ -51,7 +62,7 @@ $lastState = "Unknown"  # "Up" | "Down(DNS)" | "Down(TCP)" | "Unknown"
 while ($true) {
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 
-    # 1) DNS check first
+    # 1) DNS check
     $dnsOk = $false
     $resolvedAddrs = @()
     try {
@@ -99,27 +110,73 @@ while ($true) {
 
     Start-Sleep -Seconds $IntervalSeconds
 }
+
 ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
 
 
 
 
 
-# Create folder and set execution policy if needed
-New-Item -ItemType Directory -Path C:\Scripts -Force | Out-Null
+# === CONFIG ===
+$TaskName   = "PSM 1858 Connectivity Monitor"
+$TaskPath   = "\CyberArk"   # Task Scheduler folder
+$ScriptPath = "C:\Scripts\PSM-1858-Monitor.ps1"
 
-# (Optional) Unblock the script if downloaded
-Unblock-File C:\Scripts\PSM-1858-Monitor.ps1
+# Optional parameters to pass to your script (edit as needed)
+$Target          = "vault-cna-prod.privilegecloud.cyberark.cloud"
+$Port            = 1858
+$IntervalSeconds = 5
+$LogName         = "PSMConnectivity"
+$EventSource     = "PSMConnectivityMonitor"
+$TextLog         = "C:\Temp\PSM_Port1858_Test.log"
 
-# Run as SYSTEM at startup, hidden window
-$action   = New-ScheduledTaskAction -Execute "powershell.exe" `
-            -Argument '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "C:\Scripts\PSM-1858-Monitor.ps1"'
-$trigger  = New-ScheduledTaskTrigger -AtStartup
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -MultipleInstances IgnoreNew `
-            -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
-$principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+# === PREP ===
+# Ensure script folder exists and the script is unblocked
+$null = New-Item -ItemType Directory -Path (Split-Path $ScriptPath) -Force
+if (Test-Path $ScriptPath) { Unblock-File $ScriptPath }
 
-Register-ScheduledTask -TaskName "PSM 1858 Connectivity Monitor" `
-    -Action $action -Trigger $trigger -Settings $settings -Principal $principal
+# Create a task folder if it doesn't exist
+try {
+    $ts = New-ScheduledTask -ErrorAction Stop  # dummy to load module
+    $null = Register-ScheduledTask -TaskName ".__dummy__" -Action (New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c exit 0") -Trigger (New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1)) -Principal (New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount) -TaskPath $TaskPath -ErrorAction Stop
+    Unregister-ScheduledTask -TaskName ".__dummy__" -TaskPath $TaskPath -Confirm:$false
+} catch {
+    # If folder exists, the dummy registration will fail harmlessly; ignore
+    $null = $null
+}
+
+# Build the action command line (hidden window, bypass policy)
+$argList = @(
+    '-NoProfile',
+    '-WindowStyle', 'Hidden',
+    '-ExecutionPolicy', 'Bypass',
+    '-File', ('"{0}"' -f $ScriptPath),
+    '-Target', ('"{0}"' -f $Target),
+    '-Port', $Port,
+    '-IntervalSeconds', $IntervalSeconds,
+    '-LogName', ('"{0}"' -f $LogName),
+    '-EventSource', ('"{0}"' -f $EventSource),
+    '-TextLog', ('"{0}"' -f $TextLog)
+) -join ' '
+
+$action    = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $argList
+$trigger   = New-ScheduledTaskTrigger -AtStartup
+$principal = New-ScheduledTaskPrincipal -UserId 'NT AUTHORITY\SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+$settings  = New-ScheduledTaskSettingsSet `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries `
+    -MultipleInstances IgnoreNew `
+    -Hidden `
+    -RestartCount 5 `
+    -RestartInterval (New-TimeSpan -Minutes 1) `
+    -ExecutionTimeLimit (New-TimeSpan -Hours 0)  # no time limit
+
+# Register (replace if it already exists)
+if (Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction SilentlyContinue) {
+    Unregister-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -Confirm:$false
+}
+Register-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -Action $action -Trigger $trigger -Principal $principal -Settings $settings
+
+Write-Host "Scheduled Task '$TaskPath$TaskName' created."
 
 ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
