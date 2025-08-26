@@ -3,7 +3,7 @@
        41858 = TCP timeout/port failure
        41859 = DNS resolution failure
        41860 = Connectivity recovered
-   - Log rotates at 50 MB
+   - Log rotates at 50 MB, archives to ZIP, and purges archives older than 4 days
 #>
 
 param(
@@ -12,13 +12,19 @@ param(
     [int]$IntervalSeconds = 10,
     [string]$LogName = "PSMConnectivity",
     [string]$EventSource = "PSMConnectivityMonitor",
-    [string]$TextLog = "C:\script\PSM_Port1858_Test.log"
+    [string]$TextLog = "C:\script\PSM_Port1858_Test.log",
+    [int]$ArchiveRetentionDays = 4
 )
 
 # --- Prep ---------------------------------------------------------------------
 $logDir = Split-Path -Path $TextLog -Parent
 if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
 
+# Archive directory
+$ArchiveDir = Join-Path $logDir "Archive"
+if (-not (Test-Path $ArchiveDir)) { New-Item -ItemType Directory -Path $ArchiveDir -Force | Out-Null }
+
+# Event source/log
 if (-not [System.Diagnostics.EventLog]::SourceExists($EventSource)) {
     try { New-EventLog -LogName $LogName -Source $EventSource } catch { }
 }
@@ -30,15 +36,56 @@ function Write-Log($msg) {
     $ts   = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $line = "$ts - $msg"
 
+    # --- Purge old archives (> retention days) --------------------------------
+    try {
+        $cutoff = (Get-Date).AddDays(-$ArchiveRetentionDays)
+        Get-ChildItem -Path $ArchiveDir -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTime -lt $cutoff } |
+            ForEach-Object {
+                try { Remove-Item $_.FullName -Force -ErrorAction Stop } catch {}
+            }
+    } catch {}
+
+    # --- Rotation + Archive at 50 MB -----------------------------------------
     if (Test-Path $TextLog) {
         $sizeMB = (Get-Item $TextLog).Length / 1MB
         if ($sizeMB -ge 50) {
-            Remove-Item $TextLog -Force
-            New-Item -Path $TextLog -ItemType File -Force | Out-Null
-            Write-Host "$ts - Log file exceeded 50MB. Old file deleted and recreated."
+            try {
+                $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
+                $base  = [System.IO.Path]::GetFileNameWithoutExtension($TextLog)
+                $rotatedName = "$base`_$stamp.log"
+                $rotatedPath = Join-Path $logDir $rotatedName
+                $zipPath     = Join-Path $ArchiveDir ("$base`_$stamp.zip")
+
+                # Copy active log to a timestamped file
+                Copy-Item -Path $TextLog -Destination $rotatedPath -Force
+
+                # Compress to ZIP; if fails, keep the rotated .log in Archive
+                try {
+                    if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+                    Compress-Archive -Path $rotatedPath -DestinationPath $zipPath -Force
+                    Remove-Item $rotatedPath -Force
+                } catch {
+                    Move-Item -Path $rotatedPath -Destination $ArchiveDir -Force
+                }
+
+                # Truncate/recreate the active log
+                Clear-Content -Path $TextLog -ErrorAction SilentlyContinue
+                if (-not (Test-Path $TextLog)) {
+                    New-Item -Path $TextLog -ItemType File -Force | Out-Null
+                }
+
+                Write-Host "$ts - Log file reached 50MB. Archived to: $zipPath"
+            } catch {
+                Write-Host "$ts - Log rotation error: $($_.Exception.Message)"
+            }
         }
+    } else {
+        # Ensure the file exists
+        New-Item -Path $TextLog -ItemType File -Force | Out-Null
     }
 
+    # Write the current line
     Add-Content -Path $TextLog -Value $line
     Write-Host $line
 }
@@ -105,6 +152,7 @@ while ($true) {
 
     Start-Sleep -Seconds $IntervalSeconds
 }
+
 
 ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
 
