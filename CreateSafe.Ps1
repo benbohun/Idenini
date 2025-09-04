@@ -231,11 +231,11 @@ if ($Description.Length -gt 200) {
     $Description = $Description.Substring(0,200)
 }
 
-# Create Safe (always)
+# Create Safe (updated: using NumberOfDaysRetention = 120)
 $ManagingCPM = "CNA_PASS_MANG"
 try {
     Write-Log ("🔹 Creating Safe: {0}..." -f $SafeName)
-    Add-PASSafe -SafeName $SafeName -ManagingCPM $ManagingCPM -Description $Description -NumberOfVersionsRetention 180 -ErrorAction Stop | Out-Null
+    Add-PASSafe -SafeName $SafeName -ManagingCPM $ManagingCPM -Description $Description -NumberOfDaysRetention 120 -ErrorAction Stop | Out-Null
     Write-Log ("✅ Successfully created Safe: {0}." -f $SafeName) "Green"
 } catch {
     Write-Log ("⚠️ Could not create Safe '{0}': {1}. Continuing to member add..." -f $SafeName, $_.Exception.Message) "Yellow"
