@@ -1,193 +1,83 @@
-# --- Allow this process to load unsigned modules & unblock psPAS files (silent) ---
-try { Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force -ErrorAction Stop } catch {}
+# ============================================
+# CCP -> psPAS (no prompts) -> Export Safes Report
+# ============================================
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$ErrorActionPreference = 'Stop'
+$ProgressPreference    = 'SilentlyContinue'
 
-$psPASDirs = @(
-  "$env:ProgramFiles\WindowsPowerShell\Modules\psPAS\6.4.85",
-  "$HOME\Documents\WindowsPowerShell\Modules\psPAS\6.4.85"
-) | Where-Object { Test-Path $_ }
+# --- psPAS ---
+Import-Module psPAS -Force
 
-foreach ($dir in $psPASDirs) {
-  try { Get-ChildItem -Path $dir -Recurse -File | Unblock-File -ErrorAction SilentlyContinue } catch {}
+# --- Minimal logger (no secrets) ---
+function Log([string]$m,[ConsoleColor]$c='White'){
+  $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+  Write-Host "$ts - $m" -ForegroundColor $c
 }
 
-# --- Logging Utility ---
-$LogPath = "E:\Installation Media\Script\OnboardScript\accountonboarding.txt"
-Function Write-Log {
-    param([string]$Message, [string]$Color = "White")
-    $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $LogEntry = "$Timestamp - $Message"
-    try { Write-Host $LogEntry -ForegroundColor $Color } catch { Write-Host $LogEntry }
-    try { Add-Content -Path $LogPath -Value $LogEntry } catch {}
-}
+# --- CCP / Identity config (adjust if needed) ---
+$CCPAddress    = "https://vskau1p1231.cna.com"
+$location      = "AIMWebService"
+$application   = "PAMDiscovery"
+$safeCCP       = "CA_PCloud_Admins"
+$windowsAuth   = $false
+$headers       = @{ 'Content-Type' = 'application/json' }
 
-# --- Load psPAS ---
-try {
-    Import-Module psPAS -Force -ErrorAction Stop
-    $mod = Get-Module psPAS
-    Write-Log ("psPAS loaded ({0})." -f $mod.Version) "Green"
-} catch {
-    Write-Log ("❌ psPAS module not found/loaded: {0}" -f $_.Exception.Message) "Red"
-    exit 1
-}
+$IdentityTenantURL = "aat4012.id.cyberark.cloud"
+$PCloudSubdomain   = "cna-prod"
 
-# --- Try to import AD module for OU validation (non-fatal if missing) ---
-$ADModuleLoaded = $false
-try {
-    Import-Module ActiveDirectory -ErrorAction Stop
-    $ADModuleLoaded = $true
-} catch {
-    Write-Log "⚠️ ActiveDirectory module not available; will still try to add group by UPN." "Yellow"
-}
+# --- Export path ---
+$exportPath = "E:\Installation Media\RemovePendingAccount\PSSafes.csv"
 
-# --- CCP parameters (shared) ---
-$CCPAddress = "https://vskau1p1231.cna.com"
-$location   = "AIMWebService"
-$application= "PAMDiscovery"
-$safeCCP    = "CA_PCloud_Admins"
-$headers    = @{ "Content-Type" = "application/json" }
-$windowsAuth = $false
-
-# --- Helper: start a PAS session from CCP creds using psPAS Identity method ---
-Function Start-PASSessionFromCCP {
+# --- Login helper: start PAS session using CCP creds (Object method only) ---
+function Start-PASSessionFromCCP {
     param(
-        [Parameter(Mandatory)] [string]$ObjectName,   # e.g. cna.com-CA_PAMDiscovery_SVC
-        [Parameter(Mandatory)] [string]$UPUser        # e.g. CA_PAMDiscovery_SVC
+        [Parameter(Mandatory)] [string]$ObjectName,  # e.g., cna.com-CA_PAMDiscovery_SVC
+        [Parameter(Mandatory)] [string]$UPUser       # e.g., CA_PAMDiscovery_SVC
     )
     $ccpUrl = "$CCPAddress/$location/api/Accounts?AppID=$application&Safe=$safeCCP&Object=$ObjectName"
-    Write-Log ("Retrieving CyberArk API credentials from CCP ({0}) via Object method..." -f $UPUser)
-    try {
-        $resp = Invoke-RestMethod $ccpUrl -Method 'GET' -Headers $headers -UseDefaultCredentials:$windowsAuth
-        if (-not $resp -or -not $resp.Content) { throw "Empty CCP response" }
-        Write-Log ("✅ Successfully retrieved credentials for user: {0}" -f $resp.Username) "Green"
-    } catch {
-        Write-Log ("❌ ERROR: CCP credential fetch failed - {0}" -f $_) "Red"
-        throw
+    Log "Retrieving CCP credential for '$UPUser' via Object..." Cyan
+    $resp = Invoke-RestMethod -Uri $ccpUrl -Method GET -Headers $headers -UseDefaultCredentials:$windowsAuth
+    if (-not $resp -or -not $resp.Content -or -not $resp.Username) {
+        throw "CCP response missing Content/Username."
     }
+    Log "CCP returned username for service principal." Green
 
-    try {
-        Write-Log ("Requesting CyberArk PAS authentication (psPAS Identity header) as {0}..." -f $UPUser)
-        $UPPass = ConvertTo-SecureString $resp.Content -AsPlainText -Force
-        $UPCred = [PSCredential]::new($UPUser, $UPPass)
+    # Build PSCredential (do not print secrets)
+    $sec = ConvertTo-SecureString -String $resp.Content -AsPlainText -Force
+    $upc = [PSCredential]::new($UPUser, $sec)
 
-        $header = Get-IdentityHeader `
-            -IdentityTenantURL "aat4012.id.cyberark.cloud" `
-            -psPASFormat `
-            -PCloudSubdomain "cna-prod" `
-            -UPCreds $UPCred
+    Log "Requesting Identity header for '$IdentityTenantURL' (subdomain '$PCloudSubdomain')." Cyan
+    $hdr = Get-IdentityHeader -IdentityTenantURL $IdentityTenantURL -psPASFormat -PCloudSubdomain $PCloudSubdomain -UPCreds $upc
+    Use-PASSession $hdr
+    if (-not (Get-PASSession)) { throw "psPAS session not established." }
+    Log "PAS session established (no prompts)." Green
 
-        Use-PASSession $header
-        if (-not (Get-PASSession)) { throw "psPAS session not established" }
-        Write-Log ("✅ Authentication successful, PAS session established ({0})." -f $UPUser) "Green"
-    } catch {
-        Write-Log ("❌ Failed to authenticate via psPAS Identity header: {0}" -f $_.Exception.Message) "Red"
-        throw
-    }
-
-    return $resp
+    # Minimize plaintext exposure
+    $resp.Content = $null
+    return $true
 }
 
-# --- Permissions (Limited) ---
-$LimitedPermPAS = [PSCustomObject]@{
-    UseAccounts                            = $false
-    RetrieveAccounts                       = $false
-    ListAccounts                           = $true
-    AddAccounts                            = $false
-    UpdateAccountContent                   = $false
-    UpdateAccountProperties                = $false
-    InitiateCPMAccountManagementOperations = $true
-    SpecifyNextAccountContent              = $false
-    RenameAccounts                         = $false
-    DeleteAccounts                         = $false
-    UnlockAccounts                         = $true
-    ManageSafe                             = $false
-    ManageSafeMembers                      = $false
-    BackupSafe                             = $false
-    ViewAuditLog                           = $true
-    ViewSafeMembers                        = $true
-    AccessWithoutConfirmation              = $true
-    CreateFolders                          = $false
-    DeleteFolders                          = $false
-    MoveAccountsAndFolders                 = $false
-    RequestsAuthorizationLevel1            = $true
-    RequestsAuthorizationLevel2            = $false
-}
+# --- Authenticate (service: CA_PAMDiscovery_SVC) ---
+Start-PASSessionFromCCP -ObjectName "cna.com-CA_PAMDiscovery_SVC" -UPUser "CA_PAMDiscovery_SVC" | Out-Null
 
-# --- AD Group validation helper ---
-$SearchBaseOU = 'OU=Groups,OU=CyberArk,DC=cna,DC=com'
-Function Read-ValidGroup {
-    while ($true) {
-        $g = Read-Host "Enter the AD Safe Group (sAMAccountName only, e.g., ca_xxx_xxx_prod)"
-        if ([string]::IsNullOrWhiteSpace($g)) { Write-Log "❌ Group cannot be empty." "Red"; continue }
-        if ($g -notmatch '^[A-Za-z0-9_\-\.]+$') { Write-Log "❌ Invalid characters in group name. Try again." "Red"; continue }
+# --- Retrieve safes & export selected fields ---
+Log "Retrieving safes..." Yellow
+$PSSafes = Get-PASSafe -ErrorAction Stop
 
-        if ($ADModuleLoaded) {
-            try {
-                $adGroup = Get-ADGroup -LDAPFilter "(|(sAMAccountName=$g)(userPrincipalName=$g@cna.com))" -SearchBase $SearchBaseOU -ErrorAction Stop
-                if ($adGroup) {
-                    Write-Log ("✅ Found AD Group in {0}: {1} (sAM={2})" -f $SearchBaseOU, $adGroup.Name, $adGroup.SamAccountName) "Green"
-                    return $g
-                } else {
-                    Write-Log ("❌ Group not found under {0}. Re-enter." -f $SearchBaseOU) "Red"
-                }
-            } catch {
-                Write-Log ("❌ Error searching AD for '{0}' in {1}: {2}" -f $g, $SearchBaseOU, $_.Exception.Message) "Red"
-            }
-        } else {
-            Write-Log "⚠️ AD module not loaded, proceeding with provided group name (will add as UPN)." "Yellow"
-            return $g
-        }
-    }
-}
+# Ensure export directory exists
+$dir = Split-Path -Path $exportPath -Parent
+if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
 
-# --- Member add helper (psPAS) ---
-Function Add-MemberToSafe {
-    param(
-        [string]$SafeName,
-        [string]$MemberName,
-        [ValidateSet("Group","User","Role")]
-        [string]$MemberType,
-        [pscustomobject]$Permissions
-    )
-    try {
-        Write-Log ("Adding {0} '{1}' to {2}..." -f $MemberType, $MemberName, $SafeName)
-        $Permissions | Add-PASSafeMember -SafeName $SafeName -MemberType $MemberType -MemberName $MemberName -ErrorAction Stop | Out-Null
-        Write-Log ("✅ Added {0}: {1}." -f $MemberType, $MemberName) "Green"
-        return $true
-    } catch {
-        Write-Log ("❌ Failed to add '{0}' - {1}" -f $MemberName, $_.Exception.Message) "Red"
-        return $false
-    }
-}
+Log "Exporting report to: $exportPath" Yellow
+$PSSafes | Select-Object `
+    safeUrlId, safeName, safeNumber, description, location, `
+    @{Name="creator_id";   Expression = { $_.creator.id }}, `
+    @{Name="creator_name"; Expression = { $_.creator.name }}, `
+    olacEnabled, managingCPM, numberOfVersionsRetention, numberOfDaysRetention, `
+    autoPurgeEnabled, creationTime, lastModificationTime, isExpiredMember |
+Export-Csv -Path $exportPath -NoTypeInformation -Encoding UTF8
 
-# =========================
-# SESSION (ADD GROUP TO EXISTING SAFE)
-# =========================
-# Login via CCP as CA_PAMDiscovery_SVC
-$response = $null
-try {
-    $response = Start-PASSessionFromCCP -ObjectName "cna.com-CA_PAMDiscovery_SVC" -UPUser "CA_PAMDiscovery_SVC"
-} catch { exit 1 }
+Log "Done. Safes report exported." Green
 
-# Prompt Safe name and verify it exists
-$SafeName = Read-Host "Enter the existing Safe Name"
-if ([string]::IsNullOrWhiteSpace($SafeName)) { Write-Log "❌ ERROR: Safe Name cannot be empty. Exiting..." "Red"; exit 1 }
-
-try {
-    $safeObj = Get-PASSafe -SafeName $SafeName -ErrorAction Stop
-    if (-not $safeObj) { throw "Safe not found" }
-    Write-Log ("✅ Safe '{0}' found." -f $SafeName) "Green"
-} catch {
-    Write-Log ("❌ ERROR: Safe '{0}' does not exist or cannot be read: {1}" -f $SafeName, $_.Exception.Message) "Red"
-    try { Close-PASSession | Out-Null } catch {}
-    exit 1
-}
-
-# Prompt for Group sAM and validate (then add as UPN)
-$GroupSam       = Read-ValidGroup
-$TargetGroupUPN = "$GroupSam@cna.com"
-
-# Add group with LimitedPermPAS
-[void](Add-MemberToSafe -SafeName $SafeName -MemberName $TargetGroupUPN -MemberType "Group" -Permissions $LimitedPermPAS)
-
-# Close session
-try { Close-PASSession | Out-Null; Write-Log "✅ PAS session closed." "Green" } catch {}
+# Optional: close session
+try { Close-PASSession | Out-Null } catch {}
