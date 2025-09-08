@@ -1,91 +1,45 @@
-# ============================================
-# CCP -> psPAS (no prompts) -> Update safes: NumberOfDaysRetention = 120
-# ============================================
+# Force PowerShell to use TLS 1.2 for secure connections
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-$ErrorActionPreference = 'Stop'
-$ProgressPreference    = 'SilentlyContinue'
 
-# --- psPAS ---
-Import-Module psPAS -Force
+# Prompt user for CyberArk credentials
+$cred = Get-Credential
+$Username = $cred.UserName
+$Password = $cred.GetNetworkCredential().Password
 
-# --- Minimal logger (no secrets) ---
-function Log([string]$m,[ConsoleColor]$c='White'){
-  $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-  Write-Host "$ts - $m" -ForegroundColor $c
+# Define CyberArk Privilege Cloud API URLs (Using alliantcredit subdomain)
+$Subdomain = "alliantcredit"
+$BaseURL = "https://$Subdomain.privilegecloud.cyberark.com/PasswordVault/API"
+
+# Authentication URL
+$AuthURL = "$BaseURL/auth/Cyberark/Logon/"
+
+# Authenticate and get session token
+try {
+    $AuthResponse = Invoke-RestMethod -Uri $AuthURL -Method POST -Body (@{ username=$Username; password=$Password } | ConvertTo-Json) -ContentType "application/json"
+    $AuthToken = $AuthResponse
+    Write-Host "Authentication successful!" -ForegroundColor Green
+} catch {
+    Write-Host "Authentication failed: $_" -ForegroundColor Red
+    exit
 }
 
-# --- Paths ---
-$csvFilePath = "E:\Installation Media\RemovePendingAccount\UpdateSafesParameters.csv"  # CSV must contain at least: safeName
-$opLogFile   = "E:\Installation Media\RemovePendingAccount\UpdateLog.txt"
-New-Item -ItemType File -Force -Path $opLogFile | Out-Null
-
-# --- CCP / Identity config (same login logic) ---
-$CCPAddress    = "https://vskau1p1231.cna.com"
-$location      = "AIMWebService"
-$application   = "PAMDiscovery"
-$safeCCP       = "CA_PCloud_Admins"
-$windowsAuth   = $false
-$headers       = @{ 'Content-Type' = 'application/json' }
-
-$IdentityTenantURL = "aat4012.id.cyberark.cloud"
-$PCloudSubdomain   = "cna-prod"
-
-# --- Login helper: start PAS session using CCP creds (Object method only) ---
-function Start-PASSessionFromCCP {
-    param(
-        [Parameter(Mandatory)] [string]$ObjectName,  # e.g., cna.com-CA_PAMDiscovery_SVC
-        [Parameter(Mandatory)] [string]$UPUser       # e.g., CA_PAMDiscovery_SVC
-    )
-    $ccpUrl = "$CCPAddress/$location/api/Accounts?AppID=$application&Safe=$safeCCP&Object=$ObjectName"
-    Log "Retrieving CCP credential for '$UPUser' via Object..." Cyan
-    $resp = Invoke-RestMethod -Uri $ccpUrl -Method GET -Headers $headers -UseDefaultCredentials:$windowsAuth
-    if (-not $resp -or -not $resp.Content -or -not $resp.Username) {
-        throw "CCP response missing Content/Username."
-    }
-    # Build PSCredential (do not print secrets)
-    $sec = ConvertTo-SecureString -String $resp.Content -AsPlainText -Force
-    $upc = [PSCredential]::new($UPUser, $sec)
-
-    Log "Requesting Identity header for '$IdentityTenantURL' (subdomain '$PCloudSubdomain')." Cyan
-    $hdr = Get-IdentityHeader -IdentityTenantURL $IdentityTenantURL -psPASFormat -PCloudSubdomain $PCloudSubdomain -UPCreds $upc
-    Use-PASSession $hdr
-    if (-not (Get-PASSession)) { throw "psPAS session not established." }
-    Log "PAS session established (no prompts)." Green
-
-    # Minimize plaintext exposure
-    $resp.Content = $null
-    return $true
+# Set Authorization Header
+$Headers = @{
+    Authorization = $AuthToken
+    "Content-Type" = "application/json"
 }
 
-# --- Authenticate (service: CA_PAMDiscovery_SVC) ---
-Start-PASSessionFromCCP -ObjectName "cna.com-CA_PAMDiscovery_SVC" -UPUser "CA_PAMDiscovery_SVC" | Out-Null
+# DELETE all discovered accounts using the correct API URL
+$DeleteAllDiscoveredAccountsURL = "$BaseURL/DiscoveredAccounts/"
 
-# --- Import CSV ---
-if (-not (Test-Path $csvFilePath)) { throw "CSV not found: $csvFilePath" }
-Log "Loading CSV: $csvFilePath" Yellow
-$rows = Import-Csv -Path $csvFilePath
-
-# --- Update ONLY NumberOfDaysRetention to 120 for each Safe ---
-foreach ($row in $rows) {
-    try {
-        $safeName = $row.safeName
-        if ([string]::IsNullOrWhiteSpace($safeName)) { throw "SafeName is required." }
-
-        Log "Updating NumberOfDaysRetention=120 for Safe '$safeName'..." Cyan
-        Set-PASSafe -SafeName $safeName -NumberOfDaysRetention 120 -ErrorAction Stop
-
-        $msg = "[SUCCESS] '$safeName' -> NumberOfDaysRetention set to 120."
-        Add-Content -Path $opLogFile -Value $msg
-        Write-Host $msg -ForegroundColor Green
-    } catch {
-        $err = "[ERROR] '$($row.safeName)': $($_.Exception.Message)"
-        Add-Content -Path $opLogFile -Value $err
-        Write-Host $err -ForegroundColor Red
-        continue
-    }
+try {
+    Invoke-RestMethod -Uri $DeleteAllDiscoveredAccountsURL -Method DELETE -Headers $Headers
+    Write-Host "All discovered accounts deleted successfully!" -ForegroundColor Green
+} catch {
+    Write-Host "Failed to delete discovered accounts. Error: $_" -ForegroundColor Red
 }
 
-Log "Completed updates. See log: $opLogFile" Green
-
-# Optional: close session
-try { Close-PASSession | Out-Null } catch {}
+# Log off session
+$LogoffURL = "$BaseURL/auth/Logoff"
+Invoke-RestMethod -Uri $LogoffURL -Method POST -Headers $Headers | Out-Null
+Write-Host "Logged out successfully." -ForegroundColor Cyan
