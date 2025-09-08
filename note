@@ -1,134 +1,95 @@
 # ============================================
-# Export Discovered Accounts to CSV (Privilege Cloud)
-# Reuses your login logic; saves CSV + JSON
+# Export Discovered Accounts to CSV (psPAS + Privilege Cloud)
 # ============================================
 
-# Force PowerShell to use TLS 1.2 for secure connections
+# Use TLS 1.2
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-# Prompt user for CyberArk credentials
-$cred = Get-Credential
-$Username = $cred.UserName
-$Password = $cred.GetNetworkCredential().Password
-
-# Define CyberArk Privilege Cloud API URLs (Using alliantcredit subdomain)
-$Subdomain = "alliantcredit"
-$BaseURL   = "https://$Subdomain.privilegecloud.cyberark.com/PasswordVault/API"
-
-# Authentication URL
-$AuthURL = "$BaseURL/auth/Cyberark/Logon/"
-
-# Authenticate and get session token
+# Ensure psPAS is available
 try {
-    $AuthResponse = Invoke-RestMethod -Uri $AuthURL -Method POST -Body (@{ username=$Username; password=$Password } | ConvertTo-Json) -ContentType "application/json"
-    $AuthToken = $AuthResponse
-    Write-Host "Authentication successful!" -ForegroundColor Green
+    if (-not (Get-Module -ListAvailable -Name psPAS)) {
+        Write-Host "psPAS not found. Installing to CurrentUser..." -ForegroundColor Yellow
+        Install-Module psPAS -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+    }
+    Import-Module psPAS -ErrorAction Stop
+} catch {
+    Write-Host "Failed to install/import psPAS: $_" -ForegroundColor Red
+    exit 1
+}
+
+# Try to use IdentityCommand (for Identity-based auth to ISPSS) if present
+$HasIdentityCmd = $false
+try {
+    if (Get-Module -ListAvailable -Name IdentityCommand) {
+        Import-Module IdentityCommand -ErrorAction Stop
+        $HasIdentityCmd = $true
+    }
+} catch {}
+
+# Prompt for credentials
+$Cred = Get-Credential -Message "Enter your CyberArk user (Identity user or local PVWA user)"
+
+# Tenant / URLs
+$TenantSubdomain = "alliantcredit"
+$PrivilegeCloudBase = "https://$TenantSubdomain.privilegecloud.cyberark.cloud"
+
+# Authenticate: Prefer Identity Shared Services; fall back to direct PVWA auth if Identity module isn't available
+try {
+    if ($HasIdentityCmd) {
+        # Identity user auth to Privilege Cloud Shared Services
+        New-PASSession -TenantSubdomain $TenantSubdomain -Credential $Cred -IdentityUser | Out-Null
+        Write-Host "Authenticated via Identity Shared Services." -ForegroundColor Green
+    } else {
+        # Direct CyberArk (PVWA) auth
+        New-PASSession -Credential $Cred -BaseURI $PrivilegeCloudBase -type CyberArk | Out-Null
+        Write-Host "Authenticated directly to PVWA." -ForegroundColor Green
+    }
 } catch {
     Write-Host "Authentication failed: $_" -ForegroundColor Red
     exit 1
 }
 
-# Set Authorization Header
-$Headers = @{
-    Authorization = $AuthToken
-    "Content-Type" = "application/json"
-}
-
-# -------- Parameters / Output Paths --------
-$PageSize   = 200    # tune as needed (Max allowed by API, if lower adjust accordingly)
-$Offset     = 0
-$AllItems   = @()
-
-$OutDir     = Join-Path $env:USERPROFILE "Documents\CyberArkReports"
+# Output paths
+$OutDir   = Join-Path $env:USERPROFILE "Documents\CyberArkReports"
 if (-not (Test-Path $OutDir)) { New-Item -ItemType Directory -Path $OutDir | Out-Null }
+$Stamp    = (Get-Date).ToString("yyyyMMdd_HHmmss")
+$CsvPath  = Join-Path $OutDir "DiscoveredAccounts_psPAS_$Stamp.csv"
+$JsonPath = Join-Path $OutDir "DiscoveredAccounts_psPAS_$Stamp.json"
 
-$Stamp      = (Get-Date).ToString("yyyyMMdd_HHmmss")
-$CsvPath    = Join-Path $OutDir "DiscoveredAccounts_$Stamp.csv"
-$JsonPath   = Join-Path $OutDir "DiscoveredAccounts_$Stamp.json"
-
-# -------- Helper: Robust extraction of list payloads --------
-function Get-DiscoveredAccountsPage {
-    param(
-        [int]$limit,
-        [int]$offset
-    )
-
-    $url = "$BaseURL/DiscoveredAccounts?limit=$limit&offset=$offset"
-
-    try {
-        $resp = Invoke-RestMethod -Uri $url -Method GET -Headers $Headers
-    } catch {
-        throw "Failed to GET discovered accounts (offset=$offset, limit=$limit): $_"
-    }
-
-    # Handle common shapes:
-    # 1) { DiscoveredAccounts: [...] , Total: N }
-    # 2) plain array [...]
-    # 3) { value: [...], count: N } (just in case)
-    if ($resp -is [System.Array]) {
-        return ,@($resp)  # already an array
-    } elseif ($resp.PSObject.Properties.Match("DiscoveredAccounts")) {
-        return ,@($resp.DiscoveredAccounts)
-    } elseif ($resp.PSObject.Properties.Match("value")) {
-        return ,@($resp.value)
-    } else {
-        # Fallback: try to treat response as a single record
-        return ,@($resp)
-    }
+# Pull discovered accounts (Pending list) - up to 1000 per call
+# If you routinely exceed 1000, run additional calls with search filters or segment by platformType.
+try {
+    $Discovered = Get-PASDiscoveredAccount -limit 1000
+} catch {
+    Write-Host "Failed to retrieve discovered accounts: $_" -ForegroundColor Red
+    Close-PASSession | Out-Null
+    exit 1
 }
 
-# -------- Pull all pages --------
-Write-Host "Fetching discovered accounts..." -ForegroundColor Cyan
-while ($true) {
-    $page = Get-DiscoveredAccountsPage -limit $PageSize -offset $Offset
-
-    if (-not $page -or $page.Count -eq 0) {
-        break
-    }
-
-    $AllItems += $page
-    Write-Host ("Fetched {0} (total so far: {1})" -f $page.Count, $AllItems.Count)
-
-    if ($page.Count -lt $PageSize) {
-        break  # last page
-    }
-
-    $Offset += $PageSize
-}
-
-if ($AllItems.Count -eq 0) {
-    Write-Host "No discovered accounts found." -ForegroundColor Yellow
+if (-not $Discovered -or $Discovered.Count -eq 0) {
+    Write-Host "No discovered accounts returned. Check permissions (Vault Admins) and that discovery has results." -ForegroundColor Yellow
 } else {
-    # -------- Save a raw JSON snapshot for auditing --------
-    $AllItems | ConvertTo-Json -Depth 6 | Out-File -Encoding UTF8 $JsonPath
+    # Save raw JSON for auditing
+    $Discovered | ConvertTo-Json -Depth 6 | Out-File -FilePath $JsonPath -Encoding UTF8
 
-    # -------- Choose common/likely properties for a clean CSV --------
-    # The script selects only those that actually exist on the objects.
+    # Pick common properties if they exist; otherwise export everything (flattened)
     $preferredProps = @(
-        'id',
-        'accountName','userName','logonName',
-        'address','ip','dnsName','machineName','domainName',
-        'platformType','platformId','osType','operatingSystem',
-        'serviceName','port','protocol',
-        'status','verificationStatus','managed','accountCategory',
-        'discoveredOn','lastLogonTime','lastVerifiedTime','discoveredBy','source'
+        'id','platformType','userName','address','domainName','machineName',
+        'privileged','AccountEnabled','discoveryDate','osType','serviceName',
+        'ip','dnsName'
     )
 
-    # Figure out which props exist based on the first item
-    $first = $AllItems | Select-Object -First 1
+    $first = $Discovered | Select-Object -First 1
     $available = foreach ($p in $preferredProps) {
         if ($first.PSObject.Properties.Match($p)) { $p }
     }
-    if (-not $available -or $available.Count -eq 0) {
-        # If no preferred props are present, fall back to exporting everything PowerShell can flatten
-        Write-Host "Preferred columns not found—exporting a flattened view of all properties." -ForegroundColor Yellow
-        # Flatten first level only
-        $AllItems | ConvertTo-Csv -NoTypeInformation | Out-File -Encoding UTF8 $CsvPath
+
+    if ($available.Count -gt 0) {
+        $Discovered | Select-Object -Property $available |
+            Export-Csv -NoTypeInformation -Encoding UTF8 -Path $CsvPath
     } else {
-        # Project available preferred columns and export
-        $AllItems |
-            Select-Object -Property $available |
-            Export-Csv -Path $CsvPath -NoTypeInformation -Encoding UTF8
+        # Fallback: dump everything PowerShell can flatten
+        $Discovered | ConvertTo-Csv -NoTypeInformation | Out-File -Encoding UTF8 $CsvPath
     }
 
     Write-Host "Export complete." -ForegroundColor Green
@@ -136,11 +97,5 @@ if ($AllItems.Count -eq 0) {
     Write-Host "JSON: $JsonPath" -ForegroundColor DarkGray
 }
 
-# -------- Log off session --------
-try {
-    $LogoffURL = "$BaseURL/auth/Logoff"
-    Invoke-RestMethod -Uri $LogoffURL -Method POST -Headers $Headers | Out-Null
-    Write-Host "Logged out successfully." -ForegroundColor Cyan
-} catch {
-    Write-Host "Logoff call failed (continuing): $_" -ForegroundColor Yellow
-}
+# Log off / close session
+try { Close-PASSession | Out-Null } catch {}
