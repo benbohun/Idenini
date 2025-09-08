@@ -1,3 +1,8 @@
+# ============================================
+# Export Discovered Accounts to CSV (Privilege Cloud)
+# Reuses your login logic; saves CSV + JSON
+# ============================================
+
 # Force PowerShell to use TLS 1.2 for secure connections
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
@@ -8,7 +13,7 @@ $Password = $cred.GetNetworkCredential().Password
 
 # Define CyberArk Privilege Cloud API URLs (Using alliantcredit subdomain)
 $Subdomain = "alliantcredit"
-$BaseURL = "https://$Subdomain.privilegecloud.cyberark.com/PasswordVault/API"
+$BaseURL   = "https://$Subdomain.privilegecloud.cyberark.com/PasswordVault/API"
 
 # Authentication URL
 $AuthURL = "$BaseURL/auth/Cyberark/Logon/"
@@ -20,7 +25,7 @@ try {
     Write-Host "Authentication successful!" -ForegroundColor Green
 } catch {
     Write-Host "Authentication failed: $_" -ForegroundColor Red
-    exit
+    exit 1
 }
 
 # Set Authorization Header
@@ -29,17 +34,113 @@ $Headers = @{
     "Content-Type" = "application/json"
 }
 
-# DELETE all discovered accounts using the correct API URL
-$DeleteAllDiscoveredAccountsURL = "$BaseURL/DiscoveredAccounts/"
+# -------- Parameters / Output Paths --------
+$PageSize   = 200    # tune as needed (Max allowed by API, if lower adjust accordingly)
+$Offset     = 0
+$AllItems   = @()
 
-try {
-    Invoke-RestMethod -Uri $DeleteAllDiscoveredAccountsURL -Method DELETE -Headers $Headers
-    Write-Host "All discovered accounts deleted successfully!" -ForegroundColor Green
-} catch {
-    Write-Host "Failed to delete discovered accounts. Error: $_" -ForegroundColor Red
+$OutDir     = Join-Path $env:USERPROFILE "Documents\CyberArkReports"
+if (-not (Test-Path $OutDir)) { New-Item -ItemType Directory -Path $OutDir | Out-Null }
+
+$Stamp      = (Get-Date).ToString("yyyyMMdd_HHmmss")
+$CsvPath    = Join-Path $OutDir "DiscoveredAccounts_$Stamp.csv"
+$JsonPath   = Join-Path $OutDir "DiscoveredAccounts_$Stamp.json"
+
+# -------- Helper: Robust extraction of list payloads --------
+function Get-DiscoveredAccountsPage {
+    param(
+        [int]$limit,
+        [int]$offset
+    )
+
+    $url = "$BaseURL/DiscoveredAccounts?limit=$limit&offset=$offset"
+
+    try {
+        $resp = Invoke-RestMethod -Uri $url -Method GET -Headers $Headers
+    } catch {
+        throw "Failed to GET discovered accounts (offset=$offset, limit=$limit): $_"
+    }
+
+    # Handle common shapes:
+    # 1) { DiscoveredAccounts: [...] , Total: N }
+    # 2) plain array [...]
+    # 3) { value: [...], count: N } (just in case)
+    if ($resp -is [System.Array]) {
+        return ,@($resp)  # already an array
+    } elseif ($resp.PSObject.Properties.Match("DiscoveredAccounts")) {
+        return ,@($resp.DiscoveredAccounts)
+    } elseif ($resp.PSObject.Properties.Match("value")) {
+        return ,@($resp.value)
+    } else {
+        # Fallback: try to treat response as a single record
+        return ,@($resp)
+    }
 }
 
-# Log off session
-$LogoffURL = "$BaseURL/auth/Logoff"
-Invoke-RestMethod -Uri $LogoffURL -Method POST -Headers $Headers | Out-Null
-Write-Host "Logged out successfully." -ForegroundColor Cyan
+# -------- Pull all pages --------
+Write-Host "Fetching discovered accounts..." -ForegroundColor Cyan
+while ($true) {
+    $page = Get-DiscoveredAccountsPage -limit $PageSize -offset $Offset
+
+    if (-not $page -or $page.Count -eq 0) {
+        break
+    }
+
+    $AllItems += $page
+    Write-Host ("Fetched {0} (total so far: {1})" -f $page.Count, $AllItems.Count)
+
+    if ($page.Count -lt $PageSize) {
+        break  # last page
+    }
+
+    $Offset += $PageSize
+}
+
+if ($AllItems.Count -eq 0) {
+    Write-Host "No discovered accounts found." -ForegroundColor Yellow
+} else {
+    # -------- Save a raw JSON snapshot for auditing --------
+    $AllItems | ConvertTo-Json -Depth 6 | Out-File -Encoding UTF8 $JsonPath
+
+    # -------- Choose common/likely properties for a clean CSV --------
+    # The script selects only those that actually exist on the objects.
+    $preferredProps = @(
+        'id',
+        'accountName','userName','logonName',
+        'address','ip','dnsName','machineName','domainName',
+        'platformType','platformId','osType','operatingSystem',
+        'serviceName','port','protocol',
+        'status','verificationStatus','managed','accountCategory',
+        'discoveredOn','lastLogonTime','lastVerifiedTime','discoveredBy','source'
+    )
+
+    # Figure out which props exist based on the first item
+    $first = $AllItems | Select-Object -First 1
+    $available = foreach ($p in $preferredProps) {
+        if ($first.PSObject.Properties.Match($p)) { $p }
+    }
+    if (-not $available -or $available.Count -eq 0) {
+        # If no preferred props are present, fall back to exporting everything PowerShell can flatten
+        Write-Host "Preferred columns not found—exporting a flattened view of all properties." -ForegroundColor Yellow
+        # Flatten first level only
+        $AllItems | ConvertTo-Csv -NoTypeInformation | Out-File -Encoding UTF8 $CsvPath
+    } else {
+        # Project available preferred columns and export
+        $AllItems |
+            Select-Object -Property $available |
+            Export-Csv -Path $CsvPath -NoTypeInformation -Encoding UTF8
+    }
+
+    Write-Host "Export complete." -ForegroundColor Green
+    Write-Host "CSV:  $CsvPath" -ForegroundColor Green
+    Write-Host "JSON: $JsonPath" -ForegroundColor DarkGray
+}
+
+# -------- Log off session --------
+try {
+    $LogoffURL = "$BaseURL/auth/Logoff"
+    Invoke-RestMethod -Uri $LogoffURL -Method POST -Headers $Headers | Out-Null
+    Write-Host "Logged out successfully." -ForegroundColor Cyan
+} catch {
+    Write-Host "Logoff call failed (continuing): $_" -ForegroundColor Yellow
+}
