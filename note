@@ -1,27 +1,193 @@
-PS I:\Script\AccountDiscovery> I:\Script\AccountDiscovery\Exportreport.ps1
-At I:\Script\AccountDiscovery\Exportreport.ps1:95 char:38
-+                 (Get-Prop $_ 'type') ?? (Get-Prop $_ 'dependencyType' ...
-+                                      ~~
-Unexpected token '??' in expression or statement.
-At I:\Script\AccountDiscovery\Exportreport.ps1:100 char:53
-+             $depTypes = (Get-Prop $depArray 'type') ?? (Get-Prop $dep ...
-+                                                     ~~
-Unexpected token '??' in expression or statement.
-At I:\Script\AccountDiscovery\Exportreport.ps1:107 char:14
-+              ?? (Get-Prop $item 'discoveredOn') `
-+              ~~
-Unexpected token '??' in expression or statement.
-At I:\Script\AccountDiscovery\Exportreport.ps1:126 char:61
-+ ...            userName         = (Get-Prop $item 'userName')  ?? (Get-Pr ...
-+                                                                ~~
-Unexpected token '??' in expression or statement.
-At I:\Script\AccountDiscovery\Exportreport.ps1:126 char:59
-+             userName         = (Get-Prop $item 'userName')  ?? (Get-P ...
-+                                                           ~
-The hash literal was incomplete.
-At I:\Script\AccountDiscovery\Exportreport.ps1:151 char:1
-+ }
-+ ~
-Unexpected token '}' in expression or statement.
-    + CategoryInfo          : ParserError: (:) [], ParentContainsErrorRecordException
-    + FullyQualifiedErrorId : UnexpectedToken
+# ============================================
+# Discovered Accounts Export (with Dependencies & Age)
+# Compatible with Windows PowerShell 5.1 (no '??')
+# ============================================
+
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+# Ensure psPAS is available
+try {
+    if (-not (Get-Module -ListAvailable -Name psPAS)) {
+        Write-Host "psPAS not found. Installing to CurrentUser..." -ForegroundColor Yellow
+        Install-Module psPAS -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+    }
+    Import-Module psPAS -ErrorAction Stop
+} catch {
+    Write-Host "Failed to install/import psPAS: $_" -ForegroundColor Red
+    exit 1
+}
+
+# ---- CONFIG (Privilege Cloud Standard -> *.cyberark.com) ----
+$PVWA_BaseURI = "https://alliantcredit.privilegecloud.cyberark.com"  # Standard tenant (not *.cloud)
+$AuthType     = "CyberArk"
+
+# ---- Helpers (PS 5.1-safe) ----
+function Get-Prop {
+    param(
+        [Parameter(Mandatory=$true)]$Object,
+        [Parameter(Mandatory=$true)][string]$Name
+    )
+    if ($null -eq $Object) { return $null }
+    $p = $Object.PSObject.Properties | Where-Object { $_.Name -ieq $Name } | Select-Object -First 1
+    if ($p) { return $p.Value } else { return $null }
+}
+
+function Coalesce {
+    param([Parameter(ValueFromRemainingArguments=$true)]$values)
+    foreach ($v in $values) {
+        if ($null -ne $v -and $v -ne "") { return $v }
+    }
+    return $null
+}
+
+function Get-FirstExistingProperty {
+    param(
+        [Parameter(Mandatory=$true)]$Object,
+        [Parameter(Mandatory=$true)][string[]]$Names
+    )
+    foreach ($n in $Names) {
+        $v = Get-Prop -Object $Object -Name $n
+        if ($null -ne $v -and $v -ne "") { return $v }
+    }
+    return $null
+}
+
+# Extract dependencies array & summary (works for different payload shapes)
+function Get-DependencySummary {
+    param([Parameter(Mandatory=$true)]$DetailsObject)
+
+    if ($null -eq $DetailsObject) {
+        return @{ Count = 0; Types = $null }
+    }
+
+    $depArray = $null
+    foreach ($candidate in @('dependencies','Dependencies','discoveredDependencies','DiscoveredDependencies')) {
+        $v = Get-Prop -Object $DetailsObject -Name $candidate
+        if ($null -ne $v) { $depArray = $v; break }
+    }
+
+    if ($null -eq $depArray) {
+        return @{ Count = 0; Types = $null }
+    }
+
+    # Normalize to array
+    if ($depArray -isnot [System.Collections.IEnumerable] -or $depArray -is [string]) {
+        $depArray = @($depArray)
+    }
+
+    $types = @()
+    foreach ($d in $depArray) {
+        $t = Get-FirstExistingProperty -Object $d -Names @('type','dependencyType','name','resourceName')
+        if ($t) { $types += $t }
+    }
+
+    $types = $types | Where-Object { $_ } | Sort-Object -Unique
+    return @{
+        Count = @($depArray).Count
+        Types = if ($types.Count -gt 0) { ($types -join '; ') } else { $null }
+    }
+}
+
+# ---- Authenticate to PVWA (Standard) ----
+$Cred = Get-Credential -Message "Enter your CyberArk PVWA user ($AuthType)"
+try {
+    New-PASSession -Credential $Cred -BaseURI $PVWA_BaseURI -type $AuthType | Out-Null
+    Write-Host "Authenticated to PVWA (Standard) as $($Cred.UserName)" -ForegroundColor Green
+} catch {
+    Write-Host "Authentication failed: $_" -ForegroundColor Red
+    exit 1
+}
+
+# ---- Output paths ----
+$OutDir   = Join-Path $env:USERPROFILE "Documents\CyberArkReports"
+if (-not (Test-Path $OutDir)) { New-Item -ItemType Directory -Path $OutDir | Out-Null }
+$Stamp    = (Get-Date).ToString("yyyyMMdd_HHmmss")
+$CsvPath  = Join-Path $OutDir "DiscoveredAccounts_withDeps_$Stamp.csv"
+$JsonPath = Join-Path $OutDir "DiscoveredAccounts_withDeps_$Stamp.json"
+
+# ---- Pull list (up to 1000) ----
+try {
+    $List = Get-PASDiscoveredAccount -Limit 1000   # list view (Pending accounts)
+} catch {
+    Write-Host "Failed to retrieve discovered accounts: $_" -ForegroundColor Red
+    try { Close-PASSession | Out-Null } catch {}
+    exit 1
+}
+
+if (-not $List -or $List.Count -eq 0) {
+    Write-Host "No discovered accounts returned. Verify permissions (Vault Admins) & discovery results." -ForegroundColor Yellow
+} else {
+    $enriched = New-Object System.Collections.ArrayList
+
+    foreach ($item in $List) {
+        $id = Get-Prop -Object $item -Name 'id'
+        $details = $null
+        if ($id) {
+            try {
+                $details = Get-PASDiscoveredAccount -Id $id
+            } catch {
+                # proceed without details
+            }
+        }
+
+        # Dependencies
+        $depInfo = Get-DependencySummary -DetailsObject $details
+
+        # Discovery timestamp for Age calc
+        $disc = Coalesce `
+            (Get-Prop -Object $item -Name 'discoveryDate') `
+            (Get-Prop -Object $item -Name 'discoveredOn') `
+            (Get-Prop -Object $item -Name 'discoveredDate') `
+            (Get-Prop -Object $details -Name 'discoveryDate') `
+            (Get-Prop -Object $details -Name 'discoveredOn')
+
+        $discDT = $null
+        if ($disc) { [void][DateTime]::TryParse($disc, [ref]$discDT) }
+        $ageDays = $null
+        if ($discDT) {
+            $ageDays = [math]::Floor((New-TimeSpan -Start $discDT -End (Get-Date)).TotalDays)
+        }
+
+        # Build row (use tolerant getters instead of '??')
+        $userName = Coalesce `
+            (Get-Prop -Object $item -Name 'userName') `
+            (Get-Prop -Object $item -Name 'accountName') `
+            (Get-Prop -Object $item -Name 'logonName')
+
+        $address  = Coalesce `
+            (Get-Prop -Object $item -Name 'address') `
+            (Get-Prop -Object $item -Name 'dnsName') `
+            (Get-Prop -Object $item -Name 'ip')
+
+        $row = [PSCustomObject]@{
+            id                 = $id
+            platformType       = Get-Prop -Object $item -Name 'platformType'
+            userName           = $userName
+            address            = $address
+            domainName         = Get-Prop -Object $item -Name 'domainName'
+            machineName        = Get-Prop -Object $item -Name 'machineName'
+            privileged         = Get-Prop -Object $item -Name 'privileged'
+            AccountEnabled     = Get-Prop -Object $item -Name 'AccountEnabled'
+            discoveryDate      = $discDT
+            AgeDays            = $ageDays
+            DependenciesCount  = $depInfo.Count
+            DependencyTypes    = $depInfo.Types
+            verificationStatus = Get-Prop -Object $item -Name 'verificationStatus'
+            osType             = Coalesce (Get-Prop -Object $item -Name 'osType') (Get-Prop -Object $item -Name 'operatingSystem')
+            serviceName        = Get-Prop -Object $item -Name 'serviceName'
+        }
+
+        [void]$enriched.Add($row)
+    }
+
+    # Save raw JSON + CSV
+    $enriched | ConvertTo-Json -Depth 6 | Out-File -FilePath $JsonPath -Encoding UTF8
+    $enriched | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $CsvPath
+
+    Write-Host "Export complete."
+    Write-Host "CSV:  $CsvPath" -ForegroundColor Green
+    Write-Host "JSON: $JsonPath" -ForegroundColor DarkGray
+}
+
+# ---- Close session ----
+try { Close-PASSession | Out-Null } catch {}
