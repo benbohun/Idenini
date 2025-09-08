@@ -1,154 +1,27 @@
-# ============================================
-# Discovered Accounts Export with Dependencies & Age (psPAS + Standard PVWA)
-# ============================================
-
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-
-# Ensure psPAS is available
-try {
-    if (-not (Get-Module -ListAvailable -Name psPAS)) {
-        Write-Host "psPAS not found. Installing to CurrentUser..." -ForegroundColor Yellow
-        Install-Module psPAS -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
-    }
-    Import-Module psPAS -ErrorAction Stop
-} catch {
-    Write-Host "Failed to install/import psPAS: $_" -ForegroundColor Red
-    exit 1
-}
-
-# ---- CONFIG (Privilege Cloud Standard -> *.cyberark.com) ----
-$PVWA_BaseURI = "https://alliantcredit.privilegecloud.cyberark.com"  # Standard tenant (not *.cloud)
-$AuthType     = "CyberArk"
-
-# Prompt for credentials
-$Cred = Get-Credential -Message "Enter your CyberArk PVWA user ($AuthType)"
-
-# ---- Authenticate to PVWA (Standard) ----
-try {
-    New-PASSession -Credential $Cred -BaseURI $PVWA_BaseURI -type $AuthType | Out-Null
-    Write-Host "Authenticated to PVWA (Standard) as $($Cred.UserName)" -ForegroundColor Green
-} catch {
-    Write-Host "Authentication failed: $_" -ForegroundColor Red
-    exit 1
-}
-
-# ---- Output paths ----
-$OutDir   = Join-Path $env:USERPROFILE "Documents\CyberArkReports"
-if (-not (Test-Path $OutDir)) { New-Item -ItemType Directory -Path $OutDir | Out-Null }
-$Stamp    = (Get-Date).ToString("yyyyMMdd_HHmmss")
-$CsvPath  = Join-Path $OutDir "DiscoveredAccounts_withDeps_$Stamp.csv"
-$JsonPath = Join-Path $OutDir "DiscoveredAccounts_withDeps_$Stamp.json"
-
-# ---- Helper: case-insensitive property getter ----
-function Get-Prop {
-    param(
-        [Parameter(Mandatory)]$Object,
-        [Parameter(Mandatory)][string]$Name
-    )
-    $p = $Object.PSObject.Properties | Where-Object { $_.Name -ieq $Name } | Select-Object -First 1
-    if ($p) { $p.Value } else { $null }
-}
-
-# ---- Pull list (up to 1000) ----
-try {
-    $List = Get-PASDiscoveredAccount -Limit 1000   # list view
-} catch {
-    Write-Host "Failed to retrieve discovered accounts: $_" -ForegroundColor Red
-    try { Close-PASSession | Out-Null } catch {}
-    exit 1
-}
-
-if (-not $List -or $List.Count -eq 0) {
-    Write-Host "No discovered accounts returned. Verify permissions (Vault Admins) & discovery results." -ForegroundColor Yellow
-} else {
-    $enriched = @()
-
-    foreach ($item in $List) {
-        $id = Get-Prop $item 'id'
-        $details = $null
-        $depCount = $null
-        $depTypes = $null
-
-        # Try to enrich with dependencies via details endpoint
-        if ($id) {
-            try {
-                # psPAS supports details by providing -Id
-                $details = Get-PASDiscoveredAccount -Id $id
-            } catch {
-                # continue without details
-            }
-        }
-
-        # Dependencies: try common shapes: dependencies / Dependencies / discoveredDependencies
-        $depArray = $null
-        foreach ($candidate in @('dependencies','Dependencies','discoveredDependencies','DiscoveredDependencies')) {
-            if ($details) {
-                $v = Get-Prop $details $candidate
-                if ($v) { $depArray = $v; break }
-            }
-        }
-        if ($depArray -is [System.Array]) {
-            $depCount = $depArray.Count
-            # Optional: collect a simple type/name summary
-            $depTypes = ($depArray | ForEach-Object {
-                # try 'type' or 'dependencyType' or 'name'
-                (Get-Prop $_ 'type') ?? (Get-Prop $_ 'dependencyType') ?? (Get-Prop $_ 'name')
-            } | Where-Object { $_ } | Sort-Object -Unique) -join '; '
-        } elseif ($depArray) {
-            # single object
-            $depCount = 1
-            $depTypes = (Get-Prop $depArray 'type') ?? (Get-Prop $depArray 'dependencyType') ?? (Get-Prop $depArray 'name')
-        } else {
-            $depCount = 0
-        }
-
-        # Discovery timestamp for Age calc: try several likely fields
-        $disc = (Get-Prop $item 'discoveryDate') `
-             ?? (Get-Prop $item 'discoveredOn') `
-             ?? (Get-Prop $item 'discoveredDate') `
-             ?? (Get-Prop $details 'discoveryDate') `
-             ?? (Get-Prop $details 'discoveredOn')
-
-        $discDT = $null
-        if ($disc) {
-            # attempt parse in multiple formats
-            [DateTime]::TryParse($disc, [ref]$discDT) | Out-Null
-        }
-        $ageDays = $null
-        if ($discDT) {
-            $ageDays = [math]::Floor((New-TimeSpan -Start $discDT -End (Get-Date)).TotalDays)
-        }
-
-        # Build clean row (choose stable/likely fields, tolerate missing ones)
-        $row = [PSCustomObject]@{
-            id               = $id
-            platformType     = (Get-Prop $item 'platformType')
-            userName         = (Get-Prop $item 'userName')  ?? (Get-Prop $item 'accountName') ?? (Get-Prop $item 'logonName')
-            address          = (Get-Prop $item 'address')   ?? (Get-Prop $item 'dnsName')     ?? (Get-Prop $item 'ip')
-            domainName       = (Get-Prop $item 'domainName')
-            machineName      = (Get-Prop $item 'machineName')
-            privileged       = (Get-Prop $item 'privileged')
-            AccountEnabled   = (Get-Prop $item 'AccountEnabled')
-            discoveryDate    = $discDT
-            AgeDays          = $ageDays
-            DependenciesCount= $depCount
-            DependencyTypes  = $depTypes
-            verificationStatus = (Get-Prop $item 'verificationStatus')
-            osType           = (Get-Prop $item 'osType')    ?? (Get-Prop $item 'operatingSystem')
-            serviceName      = (Get-Prop $item 'serviceName')
-        }
-
-        $enriched += $row
-    }
-
-    # Save raw JSON + CSV
-    $enriched | ConvertTo-Json -Depth 6 | Out-File -FilePath $JsonPath -Encoding UTF8
-    $enriched | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $CsvPath
-
-    Write-Host "Export complete."
-    Write-Host "CSV:  $CsvPath" -ForegroundColor Green
-    Write-Host "JSON: $JsonPath" -ForegroundColor DarkGray
-}
-
-# ---- Close session ----
-try { Close-PASSession | Out-Null } catch {}
+PS I:\Script\AccountDiscovery> I:\Script\AccountDiscovery\Exportreport.ps1
+At I:\Script\AccountDiscovery\Exportreport.ps1:95 char:38
++                 (Get-Prop $_ 'type') ?? (Get-Prop $_ 'dependencyType' ...
++                                      ~~
+Unexpected token '??' in expression or statement.
+At I:\Script\AccountDiscovery\Exportreport.ps1:100 char:53
++             $depTypes = (Get-Prop $depArray 'type') ?? (Get-Prop $dep ...
++                                                     ~~
+Unexpected token '??' in expression or statement.
+At I:\Script\AccountDiscovery\Exportreport.ps1:107 char:14
++              ?? (Get-Prop $item 'discoveredOn') `
++              ~~
+Unexpected token '??' in expression or statement.
+At I:\Script\AccountDiscovery\Exportreport.ps1:126 char:61
++ ...            userName         = (Get-Prop $item 'userName')  ?? (Get-Pr ...
++                                                                ~~
+Unexpected token '??' in expression or statement.
+At I:\Script\AccountDiscovery\Exportreport.ps1:126 char:59
++             userName         = (Get-Prop $item 'userName')  ?? (Get-P ...
++                                                           ~
+The hash literal was incomplete.
+At I:\Script\AccountDiscovery\Exportreport.ps1:151 char:1
++ }
++ ~
+Unexpected token '}' in expression or statement.
+    + CategoryInfo          : ParserError: (:) [], ParentContainsErrorRecordException
+    + FullyQualifiedErrorId : UnexpectedToken
