@@ -1,3 +1,296 @@
-🛠 Adding missing member to IND_nflores_900424: identity-privilege-integration-user$ (User, full permissions)
-2025-09-16 14:32:58 | ❌ ERROR: Failed adding identity-privilege-integration-user$ to IND_nflores_900424 - A parameter cannot be found that matches p
-arameter name 'Permissions'.
+<#
+.SYNOPSIS
+  Safe member audit + enforcement for identity-privilege-integration-user$
+
+.DESCRIPTION
+  - Builds a membership report for all safes.
+  - For safes starting with IND_ or APP_, ensures the user
+    'identity-privilege-integration-user$' (MemberType=User) exists with full permissions.
+  - Tolerant check for existing member (trims whitespace and allows UPN-style suffixes).
+  - Logs steps and exports:
+      * I:\Script\REPORTS\csv\SafeMembersReport.csv      (full membership)
+      * I:\Script\REPORTS\csv\SafeMembers_Added_*.csv    (only additions, if any)
+
+.PARAMETER DryRun
+  If supplied, no changes are made; actions are logged as "would add".
+#>
+
+param(
+  [switch]$DryRun
+)
+
+# =========================
+# Config
+# =========================
+$LogFile        = "SafeMemberAudit.log"
+$CsvFilePath    = "I:\Script\REPORTS\csv\SafeMembersReport.csv"
+$PVWAURL        = "https://alliantcredit.privilegecloud.cyberark.com"
+$TargetMember   = "identity-privilege-integration-user$"
+$TargetPrefixes = '^IND_|^APP_'   # Safes must start with IND_ or APP_
+$Stopwatch      = [System.Diagnostics.Stopwatch]::StartNew()
+
+# =========================
+# Helpers
+# =========================
+function Write-Log {
+    param ([string]$Message)
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $entry = "$timestamp | $Message"
+    Add-Content -Path $LogFile -Value $entry
+    Write-Host $entry
+}
+
+# Return a hashtable representing full permissions.
+# Keys match the *switch names* on older psPAS versions.
+function Get-FullSafePermissions {
+    @{
+        UseAccounts                              = $true
+        RetrieveAccounts                         = $true
+        ListAccounts                             = $true
+        AddAccounts                              = $true
+        UpdateAccountContent                     = $true
+        UpdateAccountProperties                  = $true
+        InitiateCPMAccountManagementOperations   = $true
+        SpecifyNextAccountContent                = $true
+        RenameAccounts                           = $true
+        DeleteAccounts                           = $true
+        UnlockAccounts                           = $true
+        ManageSafe                               = $true
+        ManageSafeMembers                        = $true
+        BackupSafe                               = $true
+        ViewAuditLog                             = $true
+        ViewSafeMembers                          = $true
+        AccessWithoutConfirmation                = $true
+        CreateFolders                            = $true
+        DeleteFolders                            = $true
+        MoveAccountsAndFolders                   = $true
+        RequestsAuthorizationLevel1              = $true
+        RequestsAuthorizationLevel2              = $true
+    }
+}
+
+# Build a tolerant matcher for existing names:
+# e.g., "identity-privilege-integration-user$" OR "identity-privilege-integration-user$@tenant"
+$TargetRegex = '^' + [regex]::Escape($TargetMember) + '($|@)'
+
+# Ensure psPAS is available
+try {
+    Import-Module psPAS -ErrorAction Stop
+    $psPASVersion = (Get-Module psPAS).Version
+    Write-Log "🔧 psPAS loaded (v$psPASVersion)."
+} catch {
+    Write-Log "❌ psPAS module not found or failed to import: $_"
+    exit 1
+}
+
+# Start transcript (best-effort)
+try { Start-Transcript -Path ($LogFile -replace '\.log$','.transcript.log') -Append | Out-Null } catch {}
+
+# =========================
+# Auth
+# =========================
+$Cred = Get-Credential -Message "Enter CyberArk (PVWA/Privilege Cloud) credentials"
+try {
+    New-PASSession -Credential $Cred -BaseURI $PVWAURL -ErrorAction Stop | Out-Null
+    Write-Log "✅ Connected to CyberArk Privilege Cloud."
+} catch {
+    Write-Log "❌ Authentication failed: $_"
+    try { Stop-Transcript | Out-Null } catch {}
+    exit 1
+}
+
+# =========================
+# Get safes
+# =========================
+try {
+    $Safes = Get-PASSafe -ErrorAction Stop
+    if (-not $Safes) { $Safes = @() }
+    Write-Log "📦 Retrieved $($Safes.Count) safes."
+} catch {
+    Write-Log "❌ Failed to retrieve safes: $_"
+    try { Close-PASSession | Out-Null } catch {}
+    try { Stop-Transcript | Out-Null } catch {}
+    exit 1
+}
+
+# =========================
+# Detect how Add-PASSafeMember accepts permissions
+# =========================
+$AddMemberCmd = Get-Command Add-PASSafeMember -ErrorAction SilentlyContinue
+$SupportsBundledPermissions = $false
+if ($AddMemberCmd) {
+    $SupportsBundledPermissions = $AddMemberCmd.Parameters.ContainsKey('Permissions')
+}
+Write-Log ("🔎 Add-PASSafeMember supports bundled -Permissions: " + ($SupportsBundledPermissions ? 'Yes' : 'No (will splat switches)'))
+
+# =========================
+# Process safes
+# =========================
+$SafeMembersReport = @()
+$AddedMembers      = @()
+
+$Total = [math]::Max(1, $Safes.Count)
+for ($i=0; $i -lt $Safes.Count; $i++) {
+    $SafeObj  = $Safes[$i]
+    $SafeName = $SafeObj.safeName
+
+    Write-Progress -Activity "Scanning safes & enforcing member" `
+                   -Status "Processing: $SafeName" `
+                   -PercentComplete ([int](($i+1)/$Total*100))
+
+    # Only enforce on safes that start with IND_ or APP_
+    if ($SafeName -notmatch $TargetPrefixes) {
+        Write-Log "➖ Skipping (prefix mismatch): $SafeName"
+        continue
+    }
+
+    Write-Log "🔹 Retrieving members for Safe: $SafeName"
+    try {
+        $SafeMembers = Get-PASSafeMember -SafeName $SafeName -ErrorAction Stop
+    } catch {
+        Write-Log "❌ ERROR: Failed to retrieve members for Safe: $SafeName - $_"
+        continue
+    }
+
+    if (-not $SafeMembers) { $SafeMembers = @() }
+
+    # Build report rows
+    foreach ($Member in $SafeMembers) {
+        $p = $Member.Permissions
+        $SafeMembersReport += [PSCustomObject]@{
+            SafeName                                 = $SafeName
+            Member                                   = $Member.MemberName
+            MemberType                               = $Member.MemberType
+            UseAccounts                              = $p.useAccounts
+            RetrieveAccounts                         = $p.retrieveAccounts
+            ListAccounts                             = $p.listAccounts
+            AddAccounts                              = $p.addAccounts
+            UpdateAccountContent                     = $p.updateAccountContent
+            UpdateAccountProperties                  = $p.updateAccountProperties
+            InitiateCPMAccountManagementOperations   = $p.initiateCPMAccountManagementOperations
+            SpecifyNextAccountContent                = $p.specifyNextAccountContent
+            RenameAccounts                           = $p.renameAccounts
+            DeleteAccounts                           = $p.deleteAccounts
+            UnlockAccounts                           = $p.unlockAccounts
+            ManageSafe                               = $p.manageSafe
+            ManageSafeMembers                        = $p.manageSafeMembers
+            BackupSafe                               = $p.backupSafe
+            ViewAuditLog                             = $p.viewAuditLog
+            ViewSafeMembers                          = $p.viewSafeMembers
+            AccessWithoutConfirmation                = $p.accessWithoutConfirmation
+            CreateFolders                            = $p.createFolders
+            DeleteFolders                            = $p.deleteFolders
+            MoveAccountsAndFolders                   = $p.moveAccountsAndFolders
+            RequestsAuthorizationLevel1              = $p.requestsAuthorizationLevel1
+            RequestsAuthorizationLevel2              = $p.requestsAuthorizationLevel2
+        }
+    }
+
+    # -------------------------
+    # Tolerant existence check
+    # -------------------------
+    $exists = $false
+    foreach ($m in $SafeMembers) {
+        $n = ($m.MemberName -as [string]).Trim()
+        if ([string]::IsNullOrWhiteSpace($n)) { continue }
+        if ([regex]::IsMatch($n, $TargetRegex, 'IgnoreCase')) { $exists = $true; break }
+    }
+
+    if ($exists) {
+        Write-Log "✅ Member already present on ${SafeName}: $TargetMember"
+        continue
+    }
+
+    $perm = Get-FullSafePermissions
+
+    if ($DryRun) {
+        Write-Log "🧪 DRY-RUN: Would add $TargetMember (User) with full permissions to ${SafeName}"
+        $AddedMembers += [PSCustomObject]@{ SafeName = $SafeName; MemberAdded = $TargetMember; Mode='DryRun'; When = (Get-Date) }
+        continue
+    }
+
+    Write-Log "🛠 Adding missing member to ${SafeName}: $TargetMember (User, full permissions)"
+    try {
+        if ($SupportsBundledPermissions) {
+            # Newer psPAS: accepts a -Permissions hashtable
+            Add-PASSafeMember -SafeName $SafeName `
+                              -MemberName $TargetMember `
+                              -MemberType User `
+                              -Permissions @{
+                                  useAccounts                              = $perm.UseAccounts
+                                  retrieveAccounts                         = $perm.RetrieveAccounts
+                                  listAccounts                             = $perm.ListAccounts
+                                  addAccounts                              = $perm.AddAccounts
+                                  updateAccountContent                     = $perm.UpdateAccountContent
+                                  updateAccountProperties                  = $perm.UpdateAccountProperties
+                                  initiateCPMAccountManagementOperations   = $perm.InitiateCPMAccountManagementOperations
+                                  specifyNextAccountContent                = $perm.SpecifyNextAccountContent
+                                  renameAccounts                           = $perm.RenameAccounts
+                                  deleteAccounts                           = $perm.DeleteAccounts
+                                  unlockAccounts                           = $perm.UnlockAccounts
+                                  manageSafe                               = $perm.ManageSafe
+                                  manageSafeMembers                        = $perm.ManageSafeMembers
+                                  backupSafe                               = $perm.BackupSafe
+                                  viewAuditLog                             = $perm.ViewAuditLog
+                                  viewSafeMembers                          = $perm.ViewSafeMembers
+                                  accessWithoutConfirmation                = $perm.AccessWithoutConfirmation
+                                  createFolders                            = $perm.CreateFolders
+                                  deleteFolders                            = $perm.DeleteFolders
+                                  moveAccountsAndFolders                   = $perm.MoveAccountsAndFolders
+                                  requestsAuthorizationLevel1              = $perm.RequestsAuthorizationLevel1
+                                  requestsAuthorizationLevel2              = $perm.RequestsAuthorizationLevel2
+                              } `
+                              -ErrorAction Stop | Out-Null
+        } else {
+            # Older psPAS: splat each permission switch individually
+            $permSwitches = @{}
+            foreach ($k in $perm.Keys) {
+                if ($perm[$k]) { $permSwitches[$k] = $true }
+            }
+            Add-PASSafeMember -SafeName $SafeName `
+                              -MemberName $TargetMember `
+                              -MemberType User `
+                              @permSwitches `
+                              -ErrorAction Stop | Out-Null
+        }
+
+        Write-Log "✅ Added $TargetMember with full permissions to ${SafeName}"
+        $AddedMembers += [PSCustomObject]@{ SafeName = $SafeName; MemberAdded = $TargetMember; Mode='Applied'; When = (Get-Date) }
+    } catch {
+        Write-Log "❌ ERROR: Failed adding $TargetMember to ${SafeName} - $_"
+    }
+}
+
+# =========================
+# Export report(s)
+# =========================
+try {
+    $dir = Split-Path $CsvFilePath -Parent
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+
+    $SafeMembersReport | Export-Csv -Path $CsvFilePath -NoTypeInformation -Encoding UTF8
+    Write-Log "✅ Safe Member Report exported: $CsvFilePath"
+} catch {
+    Write-Log "❌ Failed to export Safe Member Report: $_"
+}
+
+if ($AddedMembers.Count -gt 0) {
+    $AddedSummaryPath = "I:\Script\REPORTS\csv\SafeMembers_Added_$((Get-Date).ToString('yyyyMMdd_HHmmss')).csv"
+    try {
+        $AddedMembers | Export-Csv -Path $AddedSummaryPath -NoTypeInformation -Encoding UTF8
+        Write-Log "📄 Summary of added members exported: $AddedSummaryPath"
+    } catch {
+        Write-Log "❌ Failed to export summary of added members: $_"
+    }
+} else {
+    Write-Log "ℹ️ No additions were necessary (all matching safes already contained $TargetMember)."
+}
+
+# =========================
+# Cleanup
+# =========================
+try { Close-PASSession | Out-Null } catch {}
+$Stopwatch.Stop()
+Write-Log "🔹 Completed in $([int]$Stopwatch.Elapsed.TotalSeconds)s. $(if($DryRun){'Mode: DRY-RUN'}else{'Changes applied.'})"
+
+try { Stop-Transcript | Out-Null } catch {}
