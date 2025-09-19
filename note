@@ -1,135 +1,145 @@
-# ============================
-# Script A: Generate CSR + Private Key (exportable)
-#           EKUs: Client & Server Authentication
-#           Template: "CNA CyberArk Project"
-# ============================
+<#
+.SYNOPSIS
+  Prompt-driven installer: imports a PFX into the local Windows cert store (no ACL changes).
 
-$ErrorActionPreference = 'Stop'
+.DESCRIPTION
+  - Prompts for PFX path and passphrase.
+  - Imports into Cert:\LocalMachine\My (or CurrentUser\My).
+  - Idempotent: skips if same thumbprint already exists (unless -Force).
+  - Optional FriendlyName & delete-after-import.
+  - Logs to C:\ProgramData\CertDeploy\logs\
 
-# ---- Prompts ----
-$CN   = Read-Host "CN (e.g. sqlserver.cna.com)"
-$SANs = Read-Host "Optional: extra SANs (comma-separated) or blank"
+#>
 
-# ---- Config ----
-$UseLocalMachine = $false        # $false = CurrentUser\My (no admin), $true = LocalMachine\My (run as Admin)
-$keyBits         = 2048          # use 3072/4096 if policy requires
+[CmdletBinding(SupportsShouldProcess=$true)]
+param(
+  [ValidateSet('LocalMachine','CurrentUser')]
+  [string]$StoreLocation = 'LocalMachine',
 
-# Subject fields (edit for your org)
-$OU='IAM-CyberArk CCP'; $O='CNA FINANCIAL CORPORATION'; $L='Chicago'; $ST='Illinois'; $C='US'
+  [string]$StoreName = 'My',
 
-# Provider (broad compatibility; CSP)
-$ProviderName = 'Microsoft Enhanced RSA and AES Cryptographic Provider'
-$ProviderType = 24  # PROV_RSA_AES
+  [string]$FriendlyName,
 
-# AD CS Template (used during submission)
-$TemplateName = 'CNA CyberArk Project'   # <-- per your request
+  [switch]$Exportable,   # default: not exportable
+  [switch]$DeletePfx,
+  [switch]$Force
+)
 
-# ---- Paths / names ----
-$TempRoot = 'C:\Temp'
-if (!(Test-Path $TempRoot)) { New-Item -ItemType Directory -Path $TempRoot | Out-Null }
+# ----------------------------
+# Prompt for inputs
+# ----------------------------
+function Prompt-ForPfxPath {
+  for ($i=1; $i -le 5; $i++) {
+    $path = Read-Host "Enter full path to the .pfx file (e.g., C:\Certs\site.pfx or \\server\share\site.pfx)"
+    if ([string]::IsNullOrWhiteSpace($path)) { Write-Host "Path cannot be empty." -ForegroundColor Yellow; continue }
+    try {
+      $resolved = (Resolve-Path $path -ErrorAction Stop).Path
+      if (Test-Path $resolved) { return $resolved }
+    } catch { }
+    Write-Host "File not found. Please try again." -ForegroundColor Yellow
+  }
+  throw "PFX path was not provided or not found after multiple attempts."
+}
 
-$SafeCN   = ($CN -replace '[^\w\.-]','_')
-$Stamp    = Get-Date -Format 'yyyyMMdd_HHmmss'
-$BaseDir  = Join-Path $TempRoot "CyberArk_CCP_${SafeCN}_$Stamp"
-[IO.Directory]::CreateDirectory($BaseDir) | Out-Null
+function Prompt-ForPfxPassphrase {
+  $sec = Read-Host "Enter PFX passphrase" -AsSecureString
+  if (-not $sec) { throw "Passphrase was not provided." }
+  return $sec
+}
 
-$ReqInf    = Join-Path $BaseDir 'csr.inf'
-$CsrPath   = Join-Path $BaseDir 'client.csr'
-$MetaPath  = Join-Path $BaseDir 'metadata.txt'
+$pfxPath = Prompt-ForPfxPath
+$pfxPassword = Prompt-ForPfxPassphrase
 
-$MachineKeySet  = if ($UseLocalMachine) { 'TRUE' } else { 'FALSE' }
-$CertreqContext = if ($UseLocalMachine) { '' }    else { '-user' }
-$StorePath      = if ($UseLocalMachine) { 'Cert:\LocalMachine\My' } else { 'Cert:\CurrentUser\My' }
+# ----------------------------
+# Logging
+# ----------------------------
+$logRoot = 'C:\ProgramData\CertDeploy\logs'
+New-Item -ItemType Directory -Path $logRoot -Force | Out-Null
+$Global:LogFile = Join-Path $logRoot ("Install-Pfx_{0}.log" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
 
-$KeyContainer = "CCP_${SafeCN}_$Stamp"
-$Subject      = "CN=$CN, OU=$OU, O=$O, L=$L, S=$ST, C=$C"
+function Write-Log {
+  param([string]$Message, [ValidateSet('INFO','WARN','ERROR')] [string]$Level='INFO')
+  $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+  $line = "$ts | $Level | $Message"
+  Write-Host $line
+  Add-Content -Path $Global:LogFile -Value $line
+}
 
-# SANs (always include CN)
-$sanList = @($CN)
-if ($SANs) { $sanList += ($SANs -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
-$sanText = 'dns=' + ($sanList -join '&dns=')
+Write-Log "Starting PFX install"
+Write-Log "PfxPath=$pfxPath | Store=$StoreLocation\$StoreName | Exportable=$($Exportable.IsPresent) | DeletePfx=$($DeletePfx.IsPresent)"
 
-# ---- Build INF (single-quoted here-string; placeholders replaced)
-# Adds EKUs for BOTH:
-#   - Server Authentication: 1.3.6.1.5.5.7.3.1
-#   - Client Authentication: 1.3.6.1.5.5.7.3.2
-# KeyUsage 0xA0 = digitalSignature + keyEncipherment
-$csrInf = @'
-[Version]
-Signature="$Windows NT$"
+# Resolve store path
+$storePath = "Cert:\{0}\{1}" -f $StoreLocation, $StoreName
 
-[NewRequest]
-Subject = "{SUBJECT}"
-KeySpec = 1
-KeyLength = {KEYBITS}
-Exportable = TRUE
-MachineKeySet = {MACHINEKEYSET}
-SMIME = FALSE
-PrivateKeyArchive = FALSE
-UserProtected = FALSE
-UseExistingKeySet = FALSE
-ProviderName = "{PROVIDERNAME}"
-ProviderType = {PROVIDERTYPE}
-RequestType = PKCS10
-KeyUsage = 0xa0
-KeyContainer = "{KEYCONTAINER}"
+# ----------------------------
+# Inspect PFX to get thumbprint (for idempotence)
+# ----------------------------
+try {
+  $pfxBytes = [System.IO.File]::ReadAllBytes($pfxPath)
+  $tmpCert  = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2
+  $flags = [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::PersistKeySet
+  if ($StoreLocation -eq 'LocalMachine') { $flags = $flags -bor [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::MachineKeySet }
+  if ($Exportable) { $flags = $flags -bor [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable }
+  $tmpCert.Import($pfxBytes, $pfxPassword, $flags)
+  $incomingThumb = $tmpCert.Thumbprint.ToUpperInvariant()
+  Write-Log "Incoming PFX Subject: $($tmpCert.Subject) | Thumbprint: $incomingThumb"
+} catch {
+  Write-Log "Unable to read/import PFX for inspection: $($_.Exception.Message)" "ERROR"
+  throw
+}
 
-[Extensions]
-; Subject Alternative Name (SAN)
-2.5.29.17 = "{text}"
-_continue_ = "{SANTEXT}"
+# ----------------------------
+# Skip if already present (unless -Force)
+# ----------------------------
+$current = Get-ChildItem -Path $storePath -ErrorAction SilentlyContinue | Where-Object { $_.Thumbprint -eq $incomingThumb }
+if ($current -and -not $Force) {
+  Write-Log "Certificate already present in $storePath (Thumbprint=$incomingThumb). Skipping import."
+  if ($FriendlyName -and $current.FriendlyName -ne $FriendlyName) {
+    try { $current.FriendlyName = $FriendlyName; Write-Log "Updated FriendlyName to '$FriendlyName'." }
+    catch { Write-Log "Failed to set FriendlyName: $($_.Exception.Message)" "WARN" }
+  }
+  if ($DeletePfx) {
+    try { Remove-Item -Path $pfxPath -Force; Write-Log "Deleted PFX at $pfxPath" }
+    catch { Write-Log "Failed to delete PFX: $($_.Exception.Message)" "WARN" }
+  }
+  Write-Log "Done."
+  return
+}
 
-; Enhanced Key Usage (EKU): Server + Client Auth
-2.5.29.37 = "{text}"
-_continue_ = "1.3.6.1.5.5.7.3.1,1.3.6.1.5.5.7.3.2"
-'@
+# ----------------------------
+# Import the PFX
+# ----------------------------
+try {
+  $importParams = @{
+    FilePath          = $pfxPath
+    CertStoreLocation = $storePath
+    Password          = $pfxPassword
+  }
+  if ($Exportable) { $importParams['Exportable'] = $true }
 
-$csrInf = $csrInf.Replace('{SUBJECT}',$Subject).
-                  Replace('{KEYBITS}',$keyBits).
-                  Replace('{MACHINEKEYSET}',$MachineKeySet).
-                  Replace('{PROVIDERNAME}',$ProviderName).
-                  Replace('{PROVIDERTYPE}',$ProviderType).
-                  Replace('{KEYCONTAINER}',$KeyContainer).
-                  Replace('{SANTEXT}',$sanText)
+  if ($PSCmdlet.ShouldProcess("$storePath","Import PFX $pfxPath")) {
+    $imported = Import-PfxCertificate @importParams
+    if (-not $imported) { throw "Import-PfxCertificate returned no object." }
+    Write-Log "Imported certificate to $storePath : Thumbprint=$($imported.Thumbprint)"
+  }
+} catch {
+  Write-Log "PFX import failed: $($_.Exception.Message)" "ERROR"
+  throw
+}
 
-[IO.File]::WriteAllText($ReqInf, $csrInf, [Text.Encoding]::ASCII)
+# Refresh handle to new cert
+$cert = Get-ChildItem -Path $storePath | Where-Object { $_.Thumbprint -eq $incomingThumb } | Select-Object -First 1
 
-# ---- Create CSR (and generate the key in the store)
-& certreq $CertreqContext -new "`"$ReqInf`"" "`"$CsrPath`"" | Out-Null
-if (!(Test-Path $CsrPath)) { throw "CSR was not created. See $ReqInf for details." }
+# Set Friendly Name (optional)
+if ($FriendlyName) {
+  try { $cert.FriendlyName = $FriendlyName; Write-Log "Set FriendlyName='$FriendlyName'" }
+  catch { Write-Log "Failed to set FriendlyName: $($_.Exception.Message)" "WARN" }
+}
 
-# ---- Metadata for later step
-$meta = @"
-== CSR Generated ==
-Template:     $TemplateName
-CN:           $CN
-Subject:      $Subject
-SANs:         $($sanList -join ', ')
-EKUs:         Server Authentication (1.3.6.1.5.5.7.3.1), Client Authentication (1.3.6.1.5.5.7.3.2)
-CSR path:     $CsrPath
-Store:        $StorePath
-KeyContainer: $KeyContainer
-Provider:     $ProviderName (Type $ProviderType)
-"@
-[IO.File]::WriteAllText($MetaPath, $meta, [Text.Encoding]::UTF8)
+# Delete PFX after successful import (optional)
+if ($DeletePfx) {
+  try { Remove-Item -Path $pfxPath -Force; Write-Log "Deleted PFX at $pfxPath" }
+  catch { Write-Log "Failed to delete PFX: $($_.Exception.Message)" "WARN" }
+}
 
-Write-Host "✅ CSR created: $CsrPath"
-Write-Host "   (Private key is in: $StorePath ; KeyContainer: $KeyContainer)"
-Write-Host "ℹ️  Metadata: $MetaPath"
-Write-Host ""
-
-# ---- OPTIONAL: Submit CSR directly to AD CS with the specified template
-#    1) Set your CA config as 'CAHost\CAName' (certsrv.msc → right-click CA → Properties → name)
-#    2) Uncomment the block to submit.
-# $CAConfig = Read-Host "Optional: specify your AD CS config (e.g., CAHOST01\Corp-RootCA). Leave blank to skip"
-# if ($CAConfig) {
-#     Write-Host "Submitting CSR to $CAConfig with template '$TemplateName'..."
-#     $CertOut = Join-Path $BaseDir "issued.cer"
-#     certreq -submit -config "$CAConfig" -attrib "CertificateTemplate:$TemplateName" "`"$CsrPath`"" "`"$CertOut`""
-#     if (Test-Path $CertOut) {
-#         Write-Host "🎉 Certificate issued: $CertOut"
-#         Write-Host "   You can complete the request with: certreq -accept `"$CertOut`""
-#     } else {
-#         Write-Warning "Submission complete, but no file saved. The request may be pending approval."
-#     }
-# }
+Write-Log "Completed successfully."
