@@ -1,7 +1,211 @@
-PS I:\Script\AccountDiscovery> I:\Script\REPORTS\Remove-AppBreakGlass-Duplicates.ps1
-[OK] Authenticated to https://alliantcredit.privilegecloud.cyberark.com (CyberArk).
-[*] Searching accounts for usernames: bg_CAADMIN, lcl_nseo_ops
-[*] Found 136 matching accounts for 'bg_CAADMIN'
-[*] Found 133 matching accounts for 'lcl_nseo_ops'
-[OK] Rule not met anywhere (no APP entries with matching NET on same address).
-[OK] Logged off.
+<# 
+Prunes APP_NetSecEngOps_BreakGlass_Remote when a matching NET_CiscoIOS
+exists for the *same* endpoint & username.
+
+"Same endpoint" is evaluated by:
+  1) exact address match (case-insensitive)
+  2) host-only match (strip domain: 'host.domain' -> 'host')
+  3) resolved IPv4 match (tries DNS; best-effort)
+
+Interactive confirm per duplicate before deletion.
+
+Requires: Install-Module psPAS ; PowerShell 5.1+
+#>
+
+[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact='High')]
+param(
+  [string]$BaseURI = "https://alliantcredit.privilegecloud.cyberark.com",
+  [ValidateSet('CyberArk','LDAP','RADIUS','Windows','SAML','Shared')]
+  [string]$AuthType = 'CyberArk',
+
+  [string[]]$TargetUsernames = @('bg_CAADMIN','lcl_nseo_ops'),
+
+  [string]$PlatformApp = 'APP_NetSecEngOps_BreakGlass_Remote',
+  [string]$PlatformNet = 'NET_CiscoIOS',
+
+  [switch]$IPv4Only,            # consider duplicates only when address looks like IPv4
+  [int]$DnsTimeoutMs = 750,      # per-name DNS budget; keep low for speed
+  [switch]$DisableDnsResolution  # skip DNS resolution if your network blocks it
+)
+
+Import-Module psPAS -ErrorAction Stop
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+function Write-Info($m){ Write-Host "[*] $m" -ForegroundColor Cyan }
+function Write-Ok($m){ Write-Host "[OK] $m" -ForegroundColor Green }
+function Write-Warn($m){ Write-Host "[!] $m" -ForegroundColor Yellow }
+function Write-Err($m){ Write-Host "[X] $m" -ForegroundColor Red }
+
+# --- helpers ---
+$ipv4Regex = '^(?:\d{1,3}\.){3}\d{1,3}$'
+
+function Get-HostOnly([string]$addr){
+  if ([string]::IsNullOrWhiteSpace($addr)) { return $null }
+  $a = $addr.Trim().ToLower()
+  if ($a -match $ipv4Regex) { return $a } # IP already
+  if ($a.Contains('.')) { return $a.Split('.')[0] }
+  return $a
+}
+
+function Try-ResolveIPv4([string]$name){
+  if ([string]::IsNullOrWhiteSpace($name)) { return $null }
+  if ($name -match $ipv4Regex) { return $name }
+  try {
+    $ct = New-Object System.Threading.CancellationTokenSource($DnsTimeoutMs)
+    $task = [System.Net.Dns]::GetHostAddressesAsync($name)
+    $task.Wait($ct.Token)
+    $ip = $task.Result | Where-Object { $_.AddressFamily -eq 'InterNetwork' } | Select-Object -First 1
+    if ($ip) { return $ip.IPAddressToString }
+  } catch { }
+  return $null
+}
+
+function New-NormAddressRecord($addr){
+  if ([string]::IsNullOrWhiteSpace($addr)) { return [pscustomobject]@{Raw=$null; Lower=$null; Host=$null; IP=$null} }
+  $lower = $addr.Trim().ToLower()
+  [pscustomobject]@{
+    Raw   = $addr
+    Lower = $lower
+    Host  = Get-HostOnly $lower
+    IP    = if ($DisableDnsResolution) { $null } else { Try-ResolveIPv4 $lower }
+  }
+}
+
+# Decide if two addresses refer to the "same" target
+function Test-SameAddress($a, $b, [switch]$preferIPMatch){
+  if ($null -eq $a -or $null -eq $b) { return $false }
+  if ($a.Lower -and $a.Lower -eq $b.Lower) { return $true }
+  if ($a.Host  -and $b.Host  -and $a.Host  -eq $b.Host) { return $true }
+  if ($preferIPMatch){
+    if ($a.IP -and $b.IP -and $a.IP -eq $b.IP) { return $true }
+  } else {
+    if ($a.IP -and $b.IP -and $a.IP -eq $b.IP) { return $true }
+  }
+  return $false
+}
+
+# --- session ---
+$cred = Get-Credential -Message "Enter your CyberArk ($AuthType) credential"
+try {
+  New-PASSession -Credential $cred -BaseURI $BaseURI -Type $AuthType | Out-Null
+  Write-Ok "Authenticated to $BaseURI ($AuthType)."
+} catch {
+  Write-Err "Authentication failed: $($_.Exception.Message)"; return
+}
+
+try {
+  Write-Info "Searching accounts for usernames: $($TargetUsernames -join ', ')"
+
+  $all = @()
+  foreach ($u in $TargetUsernames) {
+    $page = Get-PASAccount -Search $u -searchType contains -ErrorAction SilentlyContinue
+    $matches = $page | Where-Object {
+      $_.userName -eq $u -and $_.address -and $_.platformId -and
+      ($_.platformId -in @($PlatformApp,$PlatformNet))
+    }
+    if ($matches){
+      Write-Info ("Found {0} platform-relevant accounts for '{1}'" -f $matches.Count, $u)
+      $all += $matches
+    } else {
+      Write-Warn "No platform-relevant accounts for '$u'"
+    }
+  }
+
+  if (-not $all){ Write-Ok "No matching accounts found. Nothing to do."; return }
+
+  # Pre-compute normalized address fields for smarter comparison
+  $enriched = $all | ForEach-Object {
+    $norm = New-NormAddressRecord $_.address
+    [pscustomobject]@{
+      id         = $_.id
+      name       = $_.name
+      userName   = $_.userName
+      safeName   = $_.safeName
+      platformId = $_.platformId
+      address    = $_.address
+      addrLower  = $norm.Lower
+      addrHost   = $norm.Host
+      addrIP     = $norm.IP
+    }
+  }
+
+  if ($IPv4Only){
+    $enriched = $enriched | Where-Object { $_.addrLower -match $ipv4Regex }
+    Write-Info ("IPv4Only enabled; {0} accounts remain after IPv4 filter" -f ($enriched | Measure-Object).Count)
+    if (-not $enriched){ Write-Ok "No IPv4 addresses found among candidates. Exiting."; return }
+  }
+
+  # Group by username, then try to find pairs by "same endpoint"
+  $toDelete = @()
+  foreach ($u in $TargetUsernames) {
+    $mine = $enriched | Where-Object { $_.userName -eq $u }
+    if (-not $mine){ continue }
+
+    # For each APP, see if a matching NET exists on "same" address by any normalization
+    $apps = $mine | Where-Object { $_.platformId -eq $PlatformApp }
+    foreach ($app in $apps) {
+      # candidates NET by username
+      $nets = $mine | Where-Object { $_.platformId -eq $PlatformNet }
+      $match = $null
+      foreach ($n in $nets) {
+        if (Test-SameAddress (
+              (New-NormAddressRecord $app.address),
+              (New-NormAddressRecord $n.address),
+              $true # prefer IP when available
+            )) { $match = $n; break }
+      }
+      if ($match) {
+        # queue the APP for deletion; keep the NET
+        $toDelete += [pscustomobject]@{
+          App = $app; Net = $match
+        }
+      }
+    }
+  }
+
+  if (-not $toDelete){
+    Write-Ok "Rule not met anywhere (no APP entries with a matching NET on the same endpoint by address/host/IP)."
+    return
+  }
+
+  # Deduplicate queue by unique (username + app.id) just in case
+  $toDelete = $toDelete | Group-Object { "{0}|{1}" -f $_.App.userName, $_.App.id } | ForEach-Object { $_.Group[0] }
+
+  Write-Info ("Found {0} APP entries with matching NET endpoints. Review & confirm..." -f $toDelete.Count)
+
+  foreach ($pair in $toDelete) {
+    $app = $pair.App
+    $net = $pair.Net
+
+    $msg = @"
+User:        $($app.userName)
+Endpoint(s): APP[$($app.address)]  vs  NET[$($net.address)]
+Normalized:  APP(host=$($app.addrHost); ip=$($app.addrIP))  |  NET(host=$($net.addrHost); ip=$($net.addrIP))
+
+APP: Id=$($app.id)  Safe=$($app.safeName)  Name=$($app.name)  Platform=$($app.platformId)
+NET: Id=$($net.id)  Safe=$($net.safeName)  Name=$($net.name)  Platform=$($net.platformId)
+
+Delete APP entry above? (NET is kept)
+"@
+
+    $caption = "Confirm deletion for [$($app.userName)] @ endpoint match"
+    $yes = $PSCmdlet.ShouldContinue($msg, $caption)
+    if (-not $yes) {
+      Write-Warn "Skipped deletion for APP Id=$($app.id) ($($app.address))"
+      continue
+    }
+
+    $display = "[APP DELETE] User=$($app.userName) Address=$($app.address) Safe=$($app.safeName) Id=$($app.id)"
+    if ($PSCmdlet.ShouldProcess($display, "Remove-PASAccount")) {
+      try {
+        Remove-PASAccount -AccountID $app.id -Confirm:$false
+        Write-Ok "Deleted $display"
+      } catch {
+        Write-Err "Failed to delete $display : $($_.Exception.Message)"
+      }
+    }
+  }
+
+} finally {
+  try { Close-PASSession | Out-Null; Write-Ok "Logged off." } catch { Write-Warn "Logoff warning: $($_.Exception.Message)" }
+}
