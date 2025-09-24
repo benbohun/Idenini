@@ -1,30 +1,165 @@
-At I:\Script\REPORTS\Remove-AppBreakGlass-Duplicates.ps1:100 char:81
-+ ... ct platformId values seen: {0}" -f (($platDiag -join ', ') ?: '<none> ...
-+                                                                ~~
-Unexpected token '?:' in expression or statement.
-At I:\Script\REPORTS\Remove-AppBreakGlass-Duplicates.ps1:100 char:80
-+ ... tinct platformId values seen: {0}" -f (($platDiag -join ', ') ?: '<no ...
-+                                                                  ~
-Missing closing ')' in expression.
-At I:\Script\REPORTS\Remove-AppBreakGlass-Duplicates.ps1:63 char:5
-+ try {
-+     ~
-Missing closing '}' in statement block or type definition.
-At I:\Script\REPORTS\Remove-AppBreakGlass-Duplicates.ps1:100 char:92
-+ ... platformId values seen: {0}" -f (($platDiag -join ', ') ?: '<none>'))
-+                                                                        ~
-The Try statement is missing its Catch or Finally block.
-At I:\Script\REPORTS\Remove-AppBreakGlass-Duplicates.ps1:100 char:92
-+ ... platformId values seen: {0}" -f (($platDiag -join ', ') ?: '<none>'))
-+                                                                        ~
-Unexpected token ')' in expression or statement.
-At I:\Script\REPORTS\Remove-AppBreakGlass-Duplicates.ps1:100 char:93
-+ ... platformId values seen: {0}" -f (($platDiag -join ', ') ?: '<none>'))
-+                                                                         ~
-Unexpected token ')' in expression or statement.
-At I:\Script\REPORTS\Remove-AppBreakGlass-Duplicates.ps1:162 char:1
-+ } finally {
-+ ~
-Unexpected token '}' in expression or statement.
-    + CategoryInfo          : ParserError: (:) [], ParentContainsErrorRecordException
-    + FullyQualifiedErrorId : UnexpectedToken
+<# 
+Delete APP_NetSecEngOps_BreakGlass_Remote when a NET_CiscoIOS exists
+for the SAME Safe + Username + Address (e.g., 10.74.8.40 + bg_CAADMIN).
+
+Examples:
+  APP: Application-APP_NetSecEngOps_BreakGlass_Remote-10.74.8.40-bg_CAADMIN
+  NET: Network Device-NET_CiscoIOS-10.74.8.40-bg_CAADMIN
+#>
+
+[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact='High')]
+param(
+  [string]$BaseURI = "https://alliantcredit.privilegecloud.cyberark.com",
+  [ValidateSet('CyberArk','LDAP','RADIUS','Windows','SAML','Shared')]
+  [string]$AuthType = 'CyberArk',
+
+  [string[]]$TargetUsernames = @('bg_CAADMIN','lcl_nseo_ops'),
+
+  # both examples live in this Safe:
+  [string]$TargetSafe = 'APP_NetSecEngOps_BreakGlass',
+
+  # platform display names:
+  [string]$PlatformApp = 'APP_NetSecEngOps_BreakGlass_Remote',
+  [string]$PlatformNet = 'NET_CiscoIOS'
+)
+
+Import-Module psPAS -ErrorAction Stop
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+function Write-Info($m){ Write-Host "[*] $m" -ForegroundColor Cyan }
+function Write-Ok($m){ Write-Host "[OK] $m" -ForegroundColor Green }
+function Write-Warn($m){ Write-Host "[!] $m" -ForegroundColor Yellow }
+function Write-Err($m){ Write-Host "[X] $m" -ForegroundColor Red }
+
+# tolerant platform checks (id, name, or object Name pattern)
+function Is-AppPlatform($acc, [string]$plat){
+  ($acc.platformId   -eq $plat) -or
+  ($acc.platformName -eq $plat) -or
+  ($acc.name -like "*-$plat-*")
+}
+function Is-NetPlatform($acc, [string]$plat){
+  ($acc.platformId   -eq $plat) -or
+  ($acc.platformName -eq $plat) -or
+  ($acc.name -like "*-$plat-*")
+}
+
+function NormAddr([string]$a){
+  if ([string]::IsNullOrWhiteSpace($a)) { return $null }
+  $a.Trim().ToLower()
+}
+
+# ---- Login
+$cred = Get-Credential -Message "Enter your CyberArk ($AuthType) credential"
+try {
+  New-PASSession -Credential $cred -BaseURI $BaseURI -Type $AuthType | Out-Null
+  Write-Ok "Authenticated to $BaseURI ($AuthType)."
+} catch {
+  Write-Err "Authentication failed: $($_.Exception.Message)"
+  return
+}
+
+try {
+  Write-Info "Searching in Safe '$TargetSafe' for usernames: $($TargetUsernames -join ', ')"
+
+  $all = @()
+  foreach ($u in $TargetUsernames) {
+    # narrow to safe + username
+    $page = Get-PASAccount -SafeName $TargetSafe -Search $u -searchType contains -ErrorAction SilentlyContinue
+    if (-not $page) { Write-Warn "No accounts in safe '$TargetSafe' for '$u'"; continue }
+
+    $filtered = $page | Where-Object { $_.userName -eq $u -and $_.address }
+    if ($filtered) {
+      $enriched = $filtered | ForEach-Object {
+        [pscustomobject]@{
+          id           = $_.id
+          name         = $_.name
+          userName     = $_.userName
+          safeName     = $_.safeName
+          platformId   = $_.platformId
+          platformName = $_.platformName
+          address      = $_.address
+          addrNorm     = NormAddr $_.address
+          isAPP        = Is-AppPlatform $_ $PlatformApp
+          isNET        = Is-NetPlatform $_ $PlatformNet
+        }
+      }
+      Write-Info ("Found {0} accounts (post-filter) for '{1}'" -f $enriched.Count, $u)
+      $all += $enriched
+    } else {
+      Write-Warn "No username/address matches for '$u' in '$TargetSafe'"
+    }
+  }
+
+  if (-not $all) { Write-Ok "No matches found. Nothing to do."; return }
+
+  # Diagnostics (PS 5.1-safe)
+  $platId   = ($all | Where-Object { $_.platformId }   | Select-Object -ExpandProperty platformId   -Unique)
+  $platName = ($all | Where-Object { $_.platformName } | Select-Object -ExpandProperty platformName -Unique)
+  if ($platId)   { Write-Info ("Distinct platformId values seen: {0}"   -f ($platId -join ', ')) }   else { Write-Info "Distinct platformId values seen: <none>" }
+  if ($platName) { Write-Info ("Distinct platformName values seen: {0}" -f ($platName -join ', ')) } else { Write-Info "Distinct platformName values seen: <none>" }
+
+  # Group by Safe + Username + Address (normalized)
+  $groups = $all | Group-Object { "{0}|{1}|{2}" -f $_.safeName, $_.userName, $_.addrNorm }
+
+  # Build deletion candidates: need >=1 NET and >=1 APP in the same group
+  $pairs = @()
+  foreach ($g in $groups){
+    $items = $g.Group
+    $apps  = $items | Where-Object { $_.isAPP }
+    $nets  = $items | Where-Object { $_.isNET }
+    if (($apps | Measure-Object).Count -ge 1 -and ($nets | Measure-Object).Count -ge 1){
+      foreach ($a in $apps){
+        $pairs += [pscustomobject]@{ App = $a; Net = $nets[0] }
+      }
+    }
+  }
+
+  if (-not $pairs) {
+    Write-Ok "Rule not met: no APP entries with a matching NET on same Safe/Username/Address."
+    return
+  }
+
+  Write-Info ("Found {0} APP entries with matching NET counterparts. Review & confirm..." -f ($pairs | Measure-Object).Count)
+
+  foreach ($pair in $pairs) {
+    $app = $pair.App; $net = $pair.Net
+
+    $details = @"
+Safe:        $($app.safeName)
+User:        $($app.userName)
+Address:     $($app.address)
+
+APP (to delete):
+  Id:        $($app.id)
+  Name:      $($app.name)
+  Platform:  id='$($app.platformId)' name='$($app.platformName)'
+
+NET (to keep):
+  Id:        $($net.id)
+  Name:      $($net.name)
+  Platform:  id='$($net.platformId)' name='$($net.platformName)'
+
+Proceed to DELETE the APP entry above?
+"@
+
+    $caption = "Confirm deletion for [$($app.userName) @ $($app.address)]"
+    $ok = $PSCmdlet.ShouldContinue($details, $caption)
+    if (-not $ok) {
+      Write-Warn "Skipped APP Id=$($app.id) ($($app.address))"
+      continue
+    }
+
+    $display = "[APP DELETE] User=$($app.userName) Address=$($app.address) Safe=$($app.safeName) Id=$($app.id)"
+    if ($PSCmdlet.ShouldProcess($display, "Remove-PASAccount")) {
+      try {
+        Remove-PASAccount -AccountID $app.id -Confirm:$false
+        Write-Ok "Deleted $display"
+      } catch {
+        Write-Err "Failed to delete $display : $($_.Exception.Message)"
+      }
+    }
+  }
+
+} finally {
+  try { Close-PASSession | Out-Null; Write-Ok "Logged off." } catch { Write-Warn "Logoff warning: $($_.Exception.Message)" }
+}
