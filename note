@@ -1,11 +1,186 @@
-PS I:\Script\AccountDiscovery> I:\Script\REPORTS\TempSafeCreation.ps1
-cmdlet TempSafeCreation.ps1 at command pipeline position 1
-Supply values for the following parameters:
-CsvPath: I:\Script\REPORTS\owners.csv
-BaseURI: https://alliantcredit.privilegecloud.cyberark.com
-[OK] Authenticated to https://alliantcredit.privilegecloud.cyberark.com.
-[*] Processing Safe: INDTEMP_mlsmith_902795 (Owner=mlsmith@alliantcreditunion.com)
-[X] Failed to create Safe 'INDTEMP_mlsmith_902795' : The term 'New-PASSafe' is not recognized as the name of a cmdlet, function, script file, or operable program. Check the spell
-ing of the name, or if a path was included, verify that the path is correct and try again.
-[OK] All rows processed.
-[OK] Logged off.
+<#
+Creates safes named INDTEMP_<Samaccountname>_<employeeID>, sets 7-day version retention,
+and assigns members/permissions.
+
+CSV columns: Samaccountname, employeeID, email
+
+Defaults (no prompt):
+  CsvPath     : I:\Script\REPORTS\owners.csv
+  BaseURI     : https://alliantcredit.privilegecloud.cyberark.com
+  ManagingCPM : HQVECYBARK101
+#>
+
+[CmdletBinding(SupportsShouldProcess=$true)]
+param(
+  [ValidateScript({ Test-Path $_ })]
+  [string]$CsvPath = "I:\Script\REPORTS\owners.csv",
+
+  [string]$BaseURI = "https://alliantcredit.privilegecloud.cyberark.com",
+
+  [ValidateSet('CyberArk','LDAP','RADIUS','Windows','SAML','Shared')]
+  [string]$AuthType = 'CyberArk',
+
+  [string]$ManagingCPM = 'HQVECYBARK101',
+
+  [string]$Location = "\"   # Safe folder; "\" is root
+)
+
+Import-Module psPAS -ErrorAction Stop
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+function Write-Info($m){ Write-Host "[*] $m" -ForegroundColor Cyan }
+function Write-Ok($m){ Write-Host "[OK] $m" -ForegroundColor Green }
+function Write-Warn($m){ Write-Host "[!] $m" -ForegroundColor Yellow }
+function Write-Err($m){ Write-Host "[X] $m" -ForegroundColor Red }
+
+# Build permission hashtables that align with Add/Set-PASSafeMember parameters (Gen2)
+function Get-AllPermFlags {
+  @{
+    UseAccounts                            = $true
+    RetrieveAccounts                       = $true
+    ListAccounts                           = $true
+    AddAccounts                            = $true
+    UpdateAccountContent                   = $true
+    UpdateAccountProperties                = $true
+    InitiateCPMAccountManagementOperations = $true
+    SpecifyNextAccountContent              = $true
+    ViewAuditLog                           = $true
+    ViewSafeMembers                        = $true
+    AccessWithoutConfirmation              = $true
+    ManageSafe                             = $true
+    ManageSafeMembers                      = $true
+    BackupSafe                             = $true
+    RestoreSafe                            = $true
+  }
+}
+function Get-OwnerPermFlags {
+  @{
+    ListAccounts                           = $true
+    UseAccounts                            = $true
+    RetrieveAccounts                       = $true
+    UpdateAccountContent                   = $true
+    InitiateCPMAccountManagementOperations = $true
+    SpecifyNextAccountContent              = $true
+    ViewSafeMembers                        = $true
+    ViewAuditLog                           = $true
+    AccessWithoutConfirmation              = $true
+
+    AddAccounts             = $false
+    UpdateAccountProperties = $false
+    ManageSafe              = $false
+    ManageSafeMembers       = $false
+    BackupSafe              = $false
+    RestoreSafe             = $false
+  }
+}
+
+# Add or update a safe member by splatting permission flags
+function Ensure-Member {
+  param(
+    [Parameter(Mandatory)][string]$SafeName,
+    [Parameter(Mandatory)][string]$MemberName,
+    [Parameter(Mandatory)][hashtable]$PermFlags
+  )
+  try {
+    if ($PSCmdlet.ShouldProcess("$SafeName :: $MemberName", "Add-PASSafeMember")) {
+      $params = @{ SafeName = $SafeName; MemberName = $MemberName }
+      $params += $PermFlags
+      Add-PASSafeMember @params -ErrorAction Stop | Out-Null
+      Write-Ok "Added member '$MemberName' to '$SafeName'."
+    }
+  } catch {
+    # If already a member, update permissions
+    if ($_.Exception.Message -match 'already exists' -or $_.Exception.Message -match '409') {
+      if ($PSCmdlet.ShouldProcess("$SafeName :: $MemberName", "Set-PASSafeMember")) {
+        $params = @{ SafeName = $SafeName; MemberName = $MemberName }
+        $params += $PermFlags
+        Set-PASSafeMember @params -ErrorAction Stop | Out-Null
+        Write-Ok "Updated permissions for '$MemberName' on '$SafeName'."
+      }
+    } else {
+      Write-Err "Member '$MemberName' on '$SafeName' failed: $($_.Exception.Message)"
+      throw
+    }
+  }
+}
+
+# ---------- Logon ----------
+$cred = Get-Credential -Message "Enter your CyberArk ($AuthType) credential"
+try {
+  New-PASSession -Credential $cred -BaseURI $BaseURI -Type $AuthType | Out-Null
+  Write-Ok "Authenticated to $BaseURI."
+} catch {
+  Write-Err "Authentication failed: $($_.Exception.Message)"
+  return
+}
+
+try {
+  $rows = Import-Csv -Path $CsvPath
+  if (-not $rows) { Write-Err "No rows in CSV ($CsvPath)."; return }
+
+  $permAll   = Get-AllPermFlags
+  $permOwner = Get-OwnerPermFlags
+
+  foreach ($row in $rows) {
+    $sam  = ($row.Samaccountname).Trim()
+    $eid  = ($row.employeeID).Trim()
+    $mail = ($row.email).Trim()
+
+    if ([string]::IsNullOrWhiteSpace($sam) -or [string]::IsNullOrWhiteSpace($eid) -or [string]::IsNullOrWhiteSpace($mail)) {
+      Write-Warn "Skipping row with missing fields: $($row | ConvertTo-Json -Compress)"
+      continue
+    }
+
+    $safeName = "INDTEMP_{0}_{1}" -f $sam, $eid
+    Write-Info "Processing Safe: $safeName (Owner=$mail)"
+
+    # Create Safe if missing
+    $exists = $null
+    try { $exists = Get-PASSafe -SafeName $safeName -ErrorAction SilentlyContinue } catch {}
+
+    if (-not $exists) {
+      $splat = @{
+        SafeName              = $safeName
+        Description           = "Temporary individual safe for $sam ($eid)"
+        ManagingCPM           = $ManagingCPM
+        NumberOfDaysRetention = 7
+        location              = $Location
+      }
+      if ($PSCmdlet.ShouldProcess($safeName, "Add-PASSafe")) {
+        try {
+          Add-PASSafe @splat -ErrorAction Stop | Out-Null
+          Write-Ok "Created Safe '$safeName'."
+        } catch {
+          Write-Err "Failed to create Safe '$safeName' : $($_.Exception.Message)"
+          continue
+        }
+      }
+    } else {
+      Write-Warn "Safe '$safeName' already exists; ensuring retention & members."
+      try {
+        Set-PASSafe -SafeName $safeName -NumberOfDaysRetention 7 -ErrorAction SilentlyContinue | Out-Null
+        Write-Ok "Ensured 7-day retention on '$safeName'."
+      } catch {
+        Write-Warn "Could not set retention on existing '$safeName': $($_.Exception.Message)"
+      }
+    }
+
+    # Default members (Permission = All)
+    Ensure-Member -SafeName $safeName -MemberName 'ACURestAPI_Local'                         -PermFlags $permAll   # User
+    Ensure-Member -SafeName $safeName -MemberName 'IAM_ACU_CA_Admins@alliantcreditunion.com' -PermFlags $permAll   # Group (directory or vault)
+    Ensure-Member -SafeName $safeName -MemberName 'identity-privilege-integration-user$'     -PermFlags $permAll   # User
+
+    # Owner (limited permissions)
+    Ensure-Member -SafeName $safeName -MemberName $mail -PermFlags $permOwner                 # User
+  }
+
+  Write-Ok "All rows processed."
+
+} finally {
+  try {
+    Close-PASSession | Out-Null
+    Write-Ok "Logged off."
+  } catch {
+    Write-Warn "Logoff warning: $($_.Exception.Message)"
+  }
+}
