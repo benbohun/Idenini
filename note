@@ -1,51 +1,157 @@
-Delete account with username bg_CAADMIN or lcl_nseo_ops that has the same address with platform NET_CiscoIOS and APP_NetSecEngOps_BreakGlass_Remote
-but delete the one on APP_NetSecEngOps_BreakGlass_Remote and ignore the one on NET_CiscoIOS
+# Requires: PowerShell 5.1+
+# Purpose: Delete APP_NetSecEngOps_BreakGlass_Remote accounts when a matching NET_CiscoIOS account
+#          exists for the same Address AND when the username is bg_CAADMIN or lcl_nseo_ops.
+#          Leaves the NET_CiscoIOS account intact.
 
+[CmdletBinding(SupportsShouldProcess = $true)]
+param(
+  [string]$Subdomain = "alliantcredit",  # change if needed
+  [string[]]$TargetUsernames = @('bg_CAADMIN','lcl_nseo_ops'),
+  [string]$PlatformApp = 'APP_NetSecEngOps_BreakGlass_Remote',
+  [string]$PlatformNet = 'NET_CiscoIOS'
+)
 
-Use the script below to construct, 
-
-# Force PowerShell to use TLS 1.2 for secure connections
+# --- TLS 1.2
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-# Prompt user for CyberArk credentials
-$cred = Get-Credential
+# --- Auth
+$cred = Get-Credential -Message "Enter your CyberArk Privilege Cloud user credentials"
 $Username = $cred.UserName
 $Password = $cred.GetNetworkCredential().Password
 
-# Define CyberArk Privilege Cloud API URLs (Using alliantcredit subdomain)
-$Subdomain = "alliantcredit"
 $BaseURL = "https://$Subdomain.privilegecloud.cyberark.com/PasswordVault/API"
-
-# Authentication URL
 $AuthURL = "$BaseURL/auth/Cyberark/Logon/"
-
-# Authenticate and get session token
-try {
-    $AuthResponse = Invoke-RestMethod -Uri $AuthURL -Method POST -Body (@{ username=$Username; password=$Password } | ConvertTo-Json) -ContentType "application/json"
-    $AuthToken = $AuthResponse
-    Write-Host "Authentication successful!" -ForegroundColor Green
-} catch {
-    Write-Host "Authentication failed: $_" -ForegroundColor Red
-    exit
-}
-
-# Set Authorization Header
-$Headers = @{
-    Authorization = $AuthToken
-    "Content-Type" = "application/json"
-}
-
-# DELETE all discovered accounts using the correct API URL
-$DeleteAllDiscoveredAccountsURL = "$BaseURL/DiscoveredAccounts/"
-
-try {
-    Invoke-RestMethod -Uri $DeleteAllDiscoveredAccountsURL -Method DELETE -Headers $Headers
-    Write-Host "All discovered accounts deleted successfully!" -ForegroundColor Green
-} catch {
-    Write-Host "Failed to delete discovered accounts. Error: $_" -ForegroundColor Red
-}
-
-# Log off session
 $LogoffURL = "$BaseURL/auth/Logoff"
-Invoke-RestMethod -Uri $LogoffURL -Method POST -Headers $Headers | Out-Null
-Write-Host "Logged out successfully." -ForegroundColor Cyan
+$AccountsURL = "$BaseURL/Accounts"
+
+function Write-Info($msg){ Write-Host "[*] $msg" -ForegroundColor Cyan }
+function Write-Ok($msg){ Write-Host "[OK] $msg" -ForegroundColor Green }
+function Write-Warn($msg){ Write-Host "[!] $msg" -ForegroundColor Yellow }
+function Write-Err($msg){ Write-Host "[X] $msg" -ForegroundColor Red }
+
+# --- Login
+try {
+  $AuthResponse = Invoke-RestMethod -Uri $AuthURL -Method POST -Body (@{ username=$Username; password=$Password } | ConvertTo-Json) -ContentType "application/json"
+  $AuthToken = $AuthResponse
+  if (-not $AuthToken) { throw "Empty auth token" }
+  Write-Ok "Authentication successful."
+} catch {
+  Write-Err "Authentication failed: $($_.Exception.Message)"
+  return
+}
+
+$Headers = @{
+  Authorization = $AuthToken
+  "Content-Type" = "application/json"
+}
+
+# --- Helper: pull accounts by username (with pagination)
+function Get-AccountsBySearch {
+  param(
+    [Parameter(Mandatory)][string]$Search
+  )
+  $results = @()
+  $offset = 0
+  $pageSize = 100
+  while ($true) {
+    $uri = "$AccountsURL?search=$( [uri]::EscapeDataString($Search) )&limit=$pageSize&offset=$offset"
+    try {
+      $resp = Invoke-RestMethod -Uri $uri -Headers $Headers -Method GET
+    } catch {
+      Write-Err "GET $uri failed: $($_.Exception.Message)"
+      break
+    }
+
+    if ($null -eq $resp -or $null -eq $resp.value) { break }
+    $batch = $resp.value
+    $results += $batch
+
+    if ($batch.Count -lt $pageSize) { break }
+    $offset += $pageSize
+  }
+  return $results
+}
+
+# --- Helper: delete account by id
+function Remove-AccountById {
+  param([Parameter(Mandatory)][string]$Id, [string]$display)
+  $delUri = "$AccountsURL/$Id"
+  if ($PSCmdlet.ShouldProcess($display, "DELETE $delUri")) {
+    try {
+      Invoke-RestMethod -Uri $delUri -Headers $Headers -Method DELETE -ErrorAction Stop | Out-Null
+      Write-Ok "Deleted account: $display"
+    } catch {
+      Write-Err "Failed to delete $display : $($_.Exception.Message)"
+    }
+  }
+}
+
+# --- Main logic
+Write-Info "Searching for candidate accounts by usernames: $($TargetUsernames -join ', ')"
+
+$allCandidates = @()
+foreach ($u in $TargetUsernames) {
+  $found = Get-AccountsBySearch -Search $u
+  if ($found.Count -eq 0) {
+    Write-Warn "No accounts found for username '$u'"
+  } else {
+    Write-Info "Found $($found.Count) accounts for '$u'"
+    $allCandidates += $found
+  }
+}
+
+if ($allCandidates.Count -eq 0) {
+  Write-Warn "No matching accounts found overall. Nothing to do."
+  goto LOGOFF
+}
+
+# Normalize and filter only the two platforms + usernames
+$filtered = $allCandidates | Where-Object {
+  $_.userName -and ($TargetUsernames -contains $_.userName) -and
+  $_.platformId -and ($_.platformId -in @($PlatformApp, $PlatformNet)) -and
+  $_.address
+}
+
+if ($filtered.Count -eq 0) {
+  Write-Warn "No accounts matched the platforms ($PlatformApp / $PlatformNet) and target usernames."
+  goto LOGOFF
+}
+
+# Group by Address + UserName, then act if BOTH platforms exist for that key
+$groups = $filtered | Group-Object -Property @{e={$_.address.ToString().ToLower()}}, @{e={$_.userName.ToString()}}
+
+$toDelete = @()
+foreach ($g in $groups) {
+  $items = $g.Group
+  # Need at least one NET and one APP
+  $net = $items | Where-Object { $_.platformId -eq $PlatformNet }
+  $app = $items | Where-Object { $_.platformId -eq $PlatformApp }
+
+  if ($net.Count -ge 1 -and $app.Count -ge 1) {
+    foreach ($a in $app) {
+      $desc = "User='$($a.userName)' Address='$($a.address)' Platform='$($a.platformId)' Safe='$($a.safeName)' Id=$($a.id)"
+      Write-Info "Candidate to delete (APP present & matching NET exists): $desc"
+      $toDelete += $a
+    }
+  }
+}
+
+if ($toDelete.Count -eq 0) {
+  Write-Ok "No APP accounts met the deletion rule (no matching NET_CiscoIOS pair found on the same Address)."
+  goto LOGOFF
+}
+
+# Confirm + delete
+foreach ($acct in $toDelete) {
+  $display = "[$($acct.userName)] $($acct.address) | $($acct.platformId) | Safe=$($acct.safeName) | Id=$($acct.id)"
+  Remove-AccountById -Id $acct.id -display $display
+}
+
+:LOGOFF
+# --- Logoff
+try {
+  Invoke-RestMethod -Uri $LogoffURL -Method POST -Headers $Headers | Out-Null
+  Write-Ok "Logged out."
+} catch {
+  Write-Warn "Logoff call failed: $($_.Exception.Message)"
+}
