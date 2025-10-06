@@ -5,22 +5,31 @@ Process
 Init=(script)set verifyLogon 1; set username "<username>"; set curr_pass "<pmpass>"
 RunCommand=(spawn)plink.exe <address> -<protocol> -P <port>
 StoreKeyInCache=y
+
+# --- We always prefer logging in with the LOGON account when present ---
 CheckInitAction=
 CheckExtraPass=
-LoginUser=$username
-SendPassword=$curr_pass
-CheckAction=
 LoginExtraUser=<extrapass1\username>
 SendExtraPassword=<pmextrapass1>
-# --- AsyncOS password change flow ---
-ChangeStep1=password
-ChangeStepOld=<$curr_pass>
-ChangeStepNew=<pmnewpass>
-ChangeStepRetype=<pmnewpass>
-ChangeStepCommit=commit
-ChangeStepCommitComment=
+
+# Fallback (only if no logon account provided)
+LoginUser=$username
+SendPassword=$curr_pass
+
+WaitForPrompt=
+CheckAction=
+
+# --- Change password using AsyncOS 'passwd' (changes current user's passphrase) ---
+ChangeStep1=passwd
+ChangeStep2=<pmpass>
+ChangeStep3=<pmnewpass>
+ChangeStep4=<pmnewpass>
+ChangeStep5=exit
+
 FinalStep=
 END=
+
+# --- Failures ---
 FAILNotSupported=FAIL(Change action is not supported, 8001)
 FAILNotSupported3=FAIL(Reconcile action is not supported, 8003)
 FAILUnableToConnect=FAIL(First login - Unable to connect to machine. Check machine address and port, 8000)
@@ -31,80 +40,85 @@ FAILNotSupported2=FAIL(Logon account is required, 8002)
 FAILInvalidExtraPassword=FAIL(First login - Current assigned logon account password is invalid, 8006)
 FAILAccountDisabled2=FAIL(First login - Current assigned logon account user is disabled, 8011)
 FAILNotAllowedLogin2=FAIL(First login - Current assigned logon account is not allowed to log in, 8013)
-# AsyncOS-specific failures
-FAILPassMismatch=FAIL(New password and confirmation do not match, 2102)
-FAILPassRejected=FAIL(New password rejected by device policy (complexity/invalid char), 2103)
-FAILCommitFailed=FAIL(Commit failed or not at top-level prompt, 2104)
+FAILPermissionDenied=FAIL(Permission denied during authentication, 2114)
+FAILOldPasswordRejected=FAIL(Current password rejected by device, 2114)
+FAILPasswordChangeDenied=FAIL(Device denied password change (policy/role), 2114)
 
 [transitions]
+# Start
 Init,TRUE,RunCommand
 
+# Spawn & key cache
 RunCommand,UnableToConnect,FAILUnableToConnect
 RunCommand,PlinkStoreKey,StoreKeyInCache
-# handle standard SSH login path
-RunCommand,Login,LoginUser
-LoginUser,Password,SendPassword
+RunCommand,Login,CheckInitAction
 
-# after sending password, branch by outcome
-SendPassword,InvalidLogin,FAILTARGETInvalidUsernameOrPassword
-SendPassword,AccountDisabled,FAILAccountDisabled1
-SendPassword,NotAllowedLogin,FAILNotAllowedLogin1
-SendPassword,StandardPrompt,CheckInitAction
+StoreKeyInCache,Login,CheckInitAction
 
-StoreKeyInCache,Login,LoginUser
-
+# Decide whether to use logon account
 CheckInitAction,ActionIsRecOrPreRec,FAILNotSupported3
 CheckInitAction,ActionIsNotRecOrPreRec,CheckExtraPass
 
+# If we have a logon account, use it; else use managed account directly
 CheckExtraPass,ExtraPassExists,LoginExtraUser
-CheckExtraPass,ExtraPassNotExists,FAILNotSupported2
+CheckExtraPass,ExtraPassNotExists,LoginUser
 
+# --- Logon account path ---
 LoginExtraUser,Password,SendExtraPassword
 SendExtraPassword,InvalidLogin,FAILInvalidExtraPassword
-SendExtraPassword,Password,FAILInvalidExtraPassword
+SendExtraPassword,PermissionDenied,FAILPermissionDenied
 SendExtraPassword,AccountDisabled,FAILAccountDisabled2
 SendExtraPassword,NotAllowedLogin,FAILNotAllowedLogin2
-SendExtraPassword,StandardPrompt,CheckAction
+SendExtraPassword,StandardPrompt,WaitForPrompt
 
-# main action router
+# --- Managed account fallback path ---
+LoginUser,Password,SendPassword
+SendPassword,InvalidLogin,FAILTARGETInvalidUsernameOrPassword
+SendPassword,PermissionDenied,FAILPermissionDenied
+SendPassword,AccountDisabled,FAILAccountDisabled1
+SendPassword,NotAllowedLogin,FAILNotAllowedLogin1
+SendPassword,StandardPrompt,WaitForPrompt
+
+# Common post-login
+WaitForPrompt,StandardPrompt,CheckAction
+
+# What are we doing?
 CheckAction,ActionIsVerify,END
 CheckAction,ActionIsLogon,END
 CheckAction,ActionIsChange,ChangeStep1
 
-# --- AsyncOS password change conversation ---
-ChangeStep1,PasswdOldPrompt,ChangeStepOld
-ChangeStepOld,PasswdNewPrompt,ChangeStepNew
-ChangeStepNew,PasswdRetypePrompt,ChangeStepRetype
+# --- Password change dialog (AsyncOS 'passwd') ---
+# ChangeStep1 runs 'passwd' and waits for the "old" prompt:
+ChangeStep1,OldPassPrompt,ChangeStep2
+# Provide old password (managed account’s current password)
+ChangeStep2,NewPassPrompt,ChangeStep3
+# Provide new password
+ChangeStep3,RetypePassPrompt,ChangeStep4
+# Confirm new password; look for success or go back to prompt
+ChangeStep4,PassChangeSuccess,ChangeStep5
+ChangeStep4,StandardPrompt,ChangeStep5
+ChangeStep4,OldPassRejected,FAILOldPasswordRejected
+ChangeStep4,PassChangeDenied,FAILPasswordChangeDenied
 
-# handle retype errors before we ever get the prompt again
-ChangeStepRetype,PassMismatch,FAILPassMismatch
-ChangeStepRetype,PassRejected,FAILPassRejected
-
-# after successful retype, we should be back at top-level '>' prompt
-ChangeStepRetype,StandardPrompt,ChangeStepCommit
-
-# commit sequence
-ChangeStepCommit,CommitPrompt,ChangeStepCommitComment
-ChangeStepCommit,CommitSucceeded,FinalStep
-ChangeStepCommitComment,CommitSucceeded,FinalStep
-ChangeStepCommit,CommitFailed,FAILCommitFailed
-ChangeStepCommitComment,CommitFailed,FAILCommitFailed
-
-# safety fallbacks
+# Exit session
+ChangeStep5,TRUE,FinalStep
 FinalStep,TRUE,END
 
 [CPM Parameters Validation]
 address, source=FILE, Mandatory=yes
 extrapass1\Username, source=FILE, Mandatory=![string equal -nocase "<pmextrapass1>" ""]
+
 [Parameters]
-PromptTimeout=30
+PromptTimeout=45
 SendHuman=.1 .3 1 .05 2
+
 [Debug Information]
 DebugLogFullParsingInfo=no
 DebugLogFullExecutionInfo=no
 DebugLogDetailBuiltInActions=no
 ExpectLog=yes
 ConsoleOutput=no
+
 
 :::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
 
@@ -116,46 +130,50 @@ Prompt
 
 #This plugin has been automatically generated by PGU. Version 1.0.0.0
 [Conditions]
+# Basics
 TRUE=(expression)true
 UnableToConnect=FATAL ERROR:|Unable to open connection:|Could not open connection to the host
 PlinkStoreKey=Store key in cache
 
-# --- SSH login prompts ---
+# --- AsyncOS SSH login banners & prompts ---
+# Devices often show "login as:" or "Username:"; include both
 Login=login as:|login:|Username:
-Password=Password:
+Password=Password:|Passphrase:
 
-InvalidLogin=Access denied|Login incorrect|You entered an invalid login name or passwd|Authentication failed
+# --- Generic auth failures visible before shell prompt ---
+InvalidLogin=Access denied|Login incorrect|Authentication failed
+PermissionDenied=(?i)Permission denied
+AccountDisabled=(?i)account has been locked|account disabled
 NotAllowedLogin=Wrong time period .*|You are not allowed to login at this time.|Remote logins are not allowed for this account.
-AccountDisabled=Account is disabled .*|account has been locked
 
-# --- AsyncOS top-level prompt (typical is hostname ending in '>')
-StandardPrompt=.*> ?$|.*\# ?$|.*\] ?$|.*\$\u001b\[.*m ?$|.*\> ?\u001b\[.*m ?$
+# --- We consider we've reached the shell when it ends with typical AsyncOS symbols (> or #) ---
+# Avoid any unicode/ANSI escapes in this pattern to prevent "unicode format" errors
+StandardPrompt=.*[>#] ?$
 
-# --- Action selectors ---
+# --- Actions ---
 ActionIsVerify=(expression)[string equal -nocase "<action>" verifypass]
 ActionIsLogon=(expression)[string equal -nocase "<action>" logon]
 ActionIsChange=(expression)[string equal -nocase "<action>" changepass]
-
 ActionIsRecOrPreRec=(expression)[string equal -nocase "<action>" "reconcilepass"]||[string equal -nocase "<action>" "prereconcilepass"]
 ActionIsNotRecOrPreRec=(expression)!([string equal -nocase "<action>" "reconcilepass"]&&[string equal -nocase "<action>" "prereconcilepass"])
 
+# --- ExtraPass presence checks ---
 ExtraPassExists=(expression)![string equal -nocase "<pmextrapass1>" ""]
 ExtraPassNotExists=(expression)[string equal -nocase "<pmextrapass1>" ""]
 
-# --- AsyncOS password change prompts ---
-PasswdOldPrompt=(?i)^(Old|Enter old|Current)\s+password:\s*$
-PasswdNewPrompt=(?i)^(Enter\s+new\s+password|New\s+password)\s*:\s*$
-PasswdRetypePrompt=(?i)^(Re-?enter\s+new\s+password|Retype\s+new\s+password)\s*:\s*$
+# --- AsyncOS 'passwd' dialogue variations (Email/Secure Web share the AsyncOS base) ---
+OldPassPrompt=(?i)Old (password|passphrase):|(?i)Please enter the old (password|passphrase):
+NewPassPrompt=(?i)New (password|passphrase):|(?i)Enter new (password|passphrase):
+RetypePassPrompt=(?i)Retype new (password|passphrase):|(?i)Re-enter new (password|passphrase):
+PassChangeSuccess=(?i)(password|passphrase) (updated|changed|success)
+OldPassRejected=(?i)incorrect (password|passphrase)|(?i)authentication token manipulation error
+PassChangeDenied=(?i)not authorized|permission denied|policy.*reject|meets the minimum.*no
 
-# Errors commonly seen during password set
-PassMismatch=(?i)passwords?\s+do(es)?\s+not\s+match
-PassRejected=(?i)password\s+(rejected|invalid)|too\s+short|complexity|not\s+meet|illegal|invalid\s+character
+# --- Common CLI error lines (just in case) ---
+InvalidCommand=(?i)^% ?Invalid (input|command).*$
+IncompleteCommand=(?i)^% ?Incomplete command\.$
+AmbiguousCommand=(?i)^% ?Ambiguous command\.$
+CommandRejected=(?i)^% ?(Error in|Command (rejected|failed)|Invalid input detected).*
 
-# --- Commit prompts/results ---
-CommitPrompt=(?i)Please\s+enter\s+some\s+comments\s+describing\s+your\s+changes:
-CommitSucceeded=(?i)Changes\s+committed|Configuration\s+committed
-CommitFailed=(?i)commit\s+(failed|error)|You\s+must\s+be\s+at\s+the\s+top-level
-
-# --- Pager prompt (rare on WSA, safe to include) ---
+# --- Pager prompts (rare on passwd, present on some 'show' outputs) ---
 MorePrompt=--More--|<--- More --->
-
