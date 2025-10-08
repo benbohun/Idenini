@@ -1,22 +1,38 @@
-atoss
+<# 
+Find accounts failing with: "The user name could not be found. (winRc=2221)"
+Outputs CSV with: AccountID, AccountName, Address, UserName, SafeName, PlatformID, LastFailTime, LastFailAction
 
+Requires:
+- psPAS module (latest)
+- Your helper Start-PASSessionFromCCP (provided) + Get-IdentityHeader in scope
+Refs: psPAS Get-PASAccount (savedFilter) + Get-PASAccountActivity docs.
+#>
 
-Am trying to identify accounts in error state with error Reason: The user name could not be found. (winRc=2221). 
-Kindly build a script to lookup all accounts failing for this error and export report in CSV
-
-Login using the below parameters
-
+param(
+    [Parameter(Mandatory=$true)]
+    [string]$ObjectName,      # e.g. cna.com-CA_PAMDiscovery_SVC  (CCP object)
+    [Parameter(Mandatory=$true)]
+    [string]$UPUser,          # e.g. CA_PAMDiscovery_SVC          (CCP username)
+    [string]$OutCsv = "$(Join-Path $PWD 'Accounts_winRc2221.csv')"
+)
 
 # --- CCP parameters (shared) ---
-$CCPAddress = "https://vskau1p1231.cna.com"
-$location   = "AIMWebService"
-$application= "PAMDiscovery"
-$safeCCP    = "CA_PCloud_Admins"
-$headers    = @{ "Content-Type" = "application/json" }
-$windowsAuth = $false
+$CCPAddress   = "https://vskau1p1231.cna.com"
+$location     = "AIMWebService"
+$application  = "PAMDiscovery"
+$safeCCP      = "CA_PCloud_Admins"
+$headers      = @{ "Content-Type" = "application/json" }
+$windowsAuth  = $false
 
-# --- Helper: start a PAS session from CCP creds using the SAME psPAS Identity method ---
-Function Start-PASSessionFromCCP {
+# -------------- Helpers --------------
+if (-not (Get-Command Write-Log -ErrorAction SilentlyContinue)) {
+    function Write-Log([string]$Message, [string]$Color="White") {
+        $ts = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+        Write-Host "$ts | $Message" -ForegroundColor $Color
+    }
+}
+
+function Start-PASSessionFromCCP {
     param(
         [Parameter(Mandatory)] [string]$ObjectName,   # e.g. cna.com-CA_PAMDiscovery_SVC
         [Parameter(Mandatory)] [string]$UPUser        # e.g. CA_PAMDiscovery_SVC
@@ -52,4 +68,108 @@ Function Start-PASSessionFromCCP {
     }
 
     return $resp   # return CCP record (may be useful later)
+}
+
+# Returns IEnumerable of PAS account objects narrowed to failure candidates
+function Get-FailureCandidates {
+    # Fast path (12.6+): saved filters for failures
+    $supportsSavedFilter = $false
+    try {
+        # Probe with a tiny limit to see if parameter / feature is accepted
+        $null = Get-PASAccount -savedFilter FailedChange -limit 1 -ErrorAction Stop
+        $supportsSavedFilter = $true
+        Write-Log "Detected support for -savedFilter (v12.6+). Using PVWA failure views..." "Green"
+    } catch {
+        Write-Log "Saved filters not available; falling back to full scan where secretManagement.status = failure." "Yellow"
+    }
+
+    if ($supportsSavedFilter) {
+        $sets = @('FailedChange','FailedVerify','FailedReconcile')
+        $all  = foreach ($f in $sets) { Get-PASAccount -savedFilter $f -limit 1000 }
+        # De-dup by id (accounts can appear in multiple failure buckets)
+        $all | Group-Object id | ForEach-Object { $_.Group | Select-Object -First 1 }
+    } else {
+        # Broad query; then filter client-side on secretManagement.status
+        # Pull in pages of up to 1000. If your env is very large, consider looping with -modificationTime window.
+        $accounts = Get-PASAccount -limit 1000
+        $accounts | Where-Object {
+            $_.secretManagement -and $_.secretManagement.status -eq 'failure'
+        }
+    }
+}
+
+# Inspect activity text for the specific error (winRc=2221)
+function Test-WinRc2221Hit {
+    param(
+        [Parameter(Mandatory)] $Account   # PAS account object
+    )
+    $errorRegex = 'winRc\s*=\s*2221|\bThe user name could not be found\b'
+
+    try {
+        $acts = Get-PASAccountActivity -AccountID $Account.id
+    } catch {
+        Write-Log ("⚠️ Could not read activities for {0} ({1}): {2}" -f $Account.id, $Account.safeName, $_.Exception.Message) "Yellow"
+        return $null
+    }
+
+    # Look most-recent-first for speed
+    $hit = $acts | Sort-Object time -Descending | Where-Object {
+        # Safely stringify each activity and search the rendered details
+        ($_ | Out-String) -match $errorRegex
+    } | Select-Object -First 1
+
+    if ($hit) {
+        # Extract a timestamp & rough action label if available
+        $ts     = $hit.time
+        $action = $hit.Action, $hit.activityType, $hit.TaskType | Where-Object { $_ } | Select-Object -First 1
+        [PSCustomObject]@{
+            Match        = $true
+            LastFailTime = $ts
+            LastFailAction = $action
+        }
+    } else {
+        $null
+    }
+}
+
+# -------------- MAIN --------------
+try {
+    Start-PASSessionFromCCP -ObjectName $ObjectName -UPUser $UPUser | Out-Null
+
+    Write-Log "Searching for failure candidates..." "Cyan"
+    $candidates = Get-FailureCandidates
+
+    Write-Log ("Found {0} failure candidates; scanning activities for winRc=2221..." -f ($candidates | Measure-Object).Count) "Cyan"
+
+    $report = New-Object System.Collections.Generic.List[object]
+
+    foreach ($acc in $candidates) {
+        $probe = Test-WinRc2221Hit -Account $acc
+        if ($probe -and $probe.Match) {
+            $report.Add([PSCustomObject]@{
+                AccountID      = $acc.id
+                AccountName    = $acc.name
+                Address        = $acc.address
+                UserName       = $acc.userName
+                SafeName       = $acc.safeName
+                PlatformID     = $acc.platformId
+                LastFailTime   = $probe.LastFailTime
+                LastFailAction = $probe.LastFailAction
+            })
+        }
+    }
+
+    if ($report.Count -eq 0) {
+        Write-Log "No accounts were found with the specific error text 'The user name could not be found. (winRc=2221)'." "Green"
+    } else {
+        $report | Sort-Object SafeName, PlatformID, UserName | Export-Csv -Path $OutCsv -NoTypeInformation -Encoding UTF8
+        Write-Log ("✅ Exported {0} impacted accounts to: {1}" -f $report.Count, $OutCsv) "Green"
+    }
+}
+catch {
+    Write-Log ("❌ Unhandled error: {0}" -f $_) "Red"
+    throw
+}
+finally {
+    try { Close-PASSession | Out-Null } catch {}
 }
