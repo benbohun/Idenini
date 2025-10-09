@@ -1,326 +1,288 @@
-I have a list of account thats needs vaulted in CyberArk, all of them already have existing safes that ends with their employee ID e.g samaccountname aquiroga
-has a safe called IND_aquiroga_903074.develop a script Use the psPas script to lookup the list of employee ID i have and determine which safe already has an existing account
-that has an address called extacu.local. 
-
-Export result of the once that do not have an existing account with extacu.local
-
-Use the login pattern of the script below
-
+Find-And-Vault-ExtAcuAccounts.ps1
 <#
-New-AppOrAamSafe.ps1
-Creates a Safe (name must start with APP_ or AAM_), sets 120-day retention,
-adds standard members with full permissions, then prompts for a CARK_* owner group
-and sets the Safe description to "Safe Managed By <CARK_group>".
+Find-And-Vault-ExtAcuAccounts.ps1
+
+1) Reads a CSV of EmployeeIDs (default: I:\Script\REPORTS\EmployeeIDs.csv).
+   Optional column: SamAccountName (if absent, script derives sAM from the safe name).
+
+2) Resolves the user's safe by suffix "_<EmployeeID>" (prefers "IND_" prefix).
+
+3) Checks whether the safe has any account with address == 'extacu.local'.
+   - Exports only those missing such an account to:
+     I:\Script\REPORTS\No_ExtAcuLocal_Accounts.csv
+
+4) For the missing ones, vaults a new account into the resolved safe with:
+   - PlatformId = WIN_P_DM_EXT_ADM_OTP_CICO_30D
+   - userName   = <SamAccountName>
+   - address    = extacu.local
+   - platformAccountProperties: LogonDomain = Extacu
+   - Name (display name): <SamAccountName>@extacu.local
 
 Requires: psPAS module and PVWA API connectivity.
 #>
 
-[CmdletBinding(SupportsShouldProcess=$true)]
+[CmdletBinding()]
 param(
-  [string]$BaseURI    = "https://alliantcredit.privilegecloud.cyberark.com",
+  # --- Alliant login pattern ---
+  [string]$BaseURI   = "https://alliantcredit.privilegecloud.cyberark.com",
   [ValidateSet('CyberArk','LDAP','RADIUS','Windows','SAML','Shared')]
-  [string]$AuthType   = 'CyberArk',
-  [string]$ManagingCPM= 'HQVECYBARK101',
-  [string]$Location   = "\",
-  # Directory integration SearchIn value (exact, as configured in PVWA)
-  [string]$DirLocation= 'HQVACUDC101.alliantcreditunion.com'
+  [string]$AuthType  = 'CyberArk',
+
+  # --- IO paths ---
+  # DEFAULT CSV PATH: set to your provided list
+  [string]$InputCsv  = "I:\Script\REPORTS\EmployeeIDs.csv",
+  [string]$OutputCsv = "I:\Script\REPORTS\No_ExtAcuLocal_Accounts.csv",
+
+  # --- Platform & constants ---
+  [string]$TargetPlatformId = "WIN_P_DM_EXT_ADM_OTP_CICO_30D",
+  [string]$TargetAddress    = "extacu.local",
+  [string]$TargetLogonAs    = "Extacu"   # sent as LogonDomain
 )
 
-# --- Module & TLS ---
+# ===== Prep & helpers =====
 Import-Module psPAS -ErrorAction Stop
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-# --- Pretty log helpers ---
-function Write-Info($m){ Write-Host "🛠  $m" -ForegroundColor Cyan }
-function Write-Ok($m){   Write-Host "✅ $m" -ForegroundColor Green }
-function Write-Warn($m){ Write-Host "⚠️  $m" -ForegroundColor Yellow }
-function Write-Err($m){  Write-Host "❌ $m" -ForegroundColor Red }
+function Write-Info($m){ Write-Host "[*] $m" -ForegroundColor Cyan }
+function Write-Ok($m){   Write-Host "[OK] $m" -ForegroundColor Green }
+function Write-Warn($m){ Write-Host "[!] $m" -ForegroundColor Yellow }
+function Write-Err($m){  Write-Host "[X] $m" -ForegroundColor Red }
 
-# --- GUI input helpers (fallback to Read-Host) ---
-Add-Type -AssemblyName System.Windows.Forms | Out-Null
-Add-Type -AssemblyName System.Drawing | Out-Null
+# Safe property accessor (defensive across API shapes)
+function Get-Prop {
+  param($obj, [string]$name)
+  if ($null -eq $obj) { return $null }
+  if ($obj.PSObject.Properties[$name]) { return $obj.$name }
+  if ($obj.properties -and $obj.properties.PSObject.Properties[$name]) { return $obj.properties.$name }
+  if ($obj.platformAccountProperties -and $obj.platformAccountProperties.PSObject.Properties[$name]) { return $obj.platformAccountProperties.$name }
+  if ($obj.additionalProperties -and $obj.additionalProperties.PSObject.Properties[$name]) { return $obj.additionalProperties.$name }
+  return $null
+}
 
-function Show-InputDialog {
-  param(
-    [Parameter(Mandatory)][string]$Title,
-    [Parameter(Mandatory)][string]$Prompt,
-    [Parameter()][string]$Default = '',
-    [Parameter()][scriptblock]$ValidateScript = {$true},
-    [Parameter()][string]$ValidationHint = ''
-  )
+# Resolve safe by EmployeeID (prefer IND_*, fallback to any *_<EmployeeID>)
+function Resolve-SafeByEmployeeID {
+  param([Parameter(Mandatory)][string]$EmployeeID)
+
   try {
-    $form = New-Object System.Windows.Forms.Form
-    $form.Text = $Title
-    $form.StartPosition = 'CenterScreen'
-    $form.TopMost = $true
-    $form.Size = New-Object System.Drawing.Size(480,190)
-    $form.FormBorderStyle = 'FixedDialog'
-    $form.MaximizeBox = $false
-
-    $lbl = New-Object System.Windows.Forms.Label
-    $lbl.Text = $Prompt
-    $lbl.AutoSize = $true
-    $lbl.Location = '12,15'
-    $lbl.Font = New-Object System.Drawing.Font('Segoe UI',10)
-    $form.Controls.Add($lbl)
-
-    $tb = New-Object System.Windows.Forms.TextBox
-    $tb.Location = '16,48'
-    $tb.Width = 430
-    $tb.Text = $Default
-    $tb.Font = New-Object System.Drawing.Font('Consolas',11)
-    $form.Controls.Add($tb)
-
-    $hint = New-Object System.Windows.Forms.Label
-    $hint.AutoSize = $true
-    $hint.ForeColor = [System.Drawing.Color]::DarkGray
-    $hint.Text = $ValidationHint
-    $hint.Location = '16,80'
-    $form.Controls.Add($hint)
-
-    $ok = New-Object System.Windows.Forms.Button
-    $ok.Text = 'Continue'
-    $ok.Location = '272,110'
-    $ok.Width = 80
-    $ok.DialogResult = [System.Windows.Forms.DialogResult]::OK
-    $form.AcceptButton = $ok
-    $form.Controls.Add($ok)
-
-    $cancel = New-Object System.Windows.Forms.Button
-    $cancel.Text = 'Cancel'
-    $cancel.Location = '366,110'
-    $cancel.Width = 80
-    $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
-    $form.CancelButton = $cancel
-    $form.Controls.Add($cancel)
-
-    # live validation color feedback
-    $tb.add_TextChanged({
-      try {
-        if (& $ValidateScript $tb.Text) { $tb.BackColor = [System.Drawing.Color]::White }
-        else { $tb.BackColor = [System.Drawing.Color]::MistyRose }
-      } catch { $tb.BackColor = [System.Drawing.Color]::MistyRose }
-    })
-
-    $dialog = $form.ShowDialog()
-    if ($dialog -ne [System.Windows.Forms.DialogResult]::OK) { return $null }
-
-    $val = $tb.Text.Trim()
-    if (-not (& $ValidateScript $val)) {
-      [System.Windows.Forms.MessageBox]::Show("Value is invalid. Please try again.","Validation",
-        [System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
-      return Show-InputDialog @PSBoundParameters
-    }
-    return $val
+    $all = Get-PASSafes -ErrorAction Stop
   } catch {
-    # Fallback
-    $val = Read-Host "$Title - $Prompt"
-    if (-not (& $ValidateScript $val)) { throw "Input failed validation." }
-    return $val
+    Write-Warn "Could not enumerate safes while resolving '$EmployeeID': $($_.Exception.Message)"
+    return $null
   }
+
+  $suffix = "_$([regex]::Escape($EmployeeID.Trim()))$"
+  $candidates = foreach ($s in $all) {
+    $name = (Get-Prop $s 'SafeName') ?? (Get-Prop $s 'safeName') ?? $s.name
+    if ($name -and ($name -match $suffix)) { $name }
+  }
+
+  if (-not $candidates) { return $null }
+  $preferInd = $candidates | Where-Object { $_.StartsWith('IND_') }
+  if ($preferInd) { return $preferInd | Select-Object -First 1 }
+  return $candidates | Select-Object -First 1
 }
 
-# --- Permissions (psPAS-supported flags only) ---
-$AllowedPermKeys = @(
-  'UseAccounts','RetrieveAccounts','ListAccounts','AddAccounts',
-  'UpdateAccountContent','UpdateAccountProperties',
-  'InitiateCPMAccountManagementOperations','SpecifyNextAccountContent',
-  'ViewAuditLog','ViewSafeMembers','AccessWithoutConfirmation',
-  'ManageSafe','ManageSafeMembers'
-)
-
-function Select-PermParams([hashtable]$h) {
-  $out = @{}; foreach ($k in $AllowedPermKeys) { if ($h.ContainsKey($k)) { $out[$k] = [bool]$h[$k] } }; $out
+# Extract SamAccountName from a safe like "IND_<sam>_<id>"
+function Get-SamFromSafeName {
+  param(
+    [Parameter(Mandatory)][string]$SafeName,
+    [Parameter(Mandatory)][string]$EmployeeID
+  )
+  # Expect pattern: PREFIX_<sam>_<EmployeeID>
+  $pattern = "^[^_]+_(.+?)_$([regex]::Escape($EmployeeID))$"
+  $m = [regex]::Match($SafeName, $pattern)
+  if ($m.Success) { return $m.Groups[1].Value }
+  return $null
 }
 
-function Get-FullPerms {
-  @{
-    UseAccounts                            = $true
-    RetrieveAccounts                       = $true
-    ListAccounts                           = $true
-    AddAccounts                            = $true
-    UpdateAccountContent                   = $true
-    UpdateAccountProperties                = $true
-    InitiateCPMAccountManagementOperations = $true
-    SpecifyNextAccountContent              = $true
-    ViewAuditLog                           = $true
-    ViewSafeMembers                        = $true
-    AccessWithoutConfirmation              = $true
-    ManageSafe                             = $true
-    ManageSafeMembers                      = $true
+# True if any account in safe has address == extacu.local
+function Test-SafeHasExtAcuAccount {
+  param([Parameter(Mandatory)][string]$SafeName, [string]$Address = $TargetAddress)
+  try {
+    $accts = Get-PASAccount -SafeName $SafeName -ErrorAction Stop
+  } catch {
+    Write-Warn "Unable to enumerate accounts for safe '$SafeName': $($_.Exception.Message)"
+    return $false
   }
+  foreach ($a in $accts) {
+    $addr = Get-Prop $a 'address'
+    if ($addr -and ($addr -eq $Address)) { return $true }
+  }
+  return $false
 }
 
-# Limited perms for CARK_* owner
-function Get-CarkPerms {
-  @{
-    ListAccounts                           = $true
-    UseAccounts                            = $true
-    RetrieveAccounts                       = $true
-    UpdateAccountContent                   = $true
-    InitiateCPMAccountManagementOperations = $true
-    ViewSafeMembers                        = $true
-    ViewAuditLog                           = $true
-    AccessWithoutConfirmation              = $true
-
-    # Not granted:
-    AddAccounts               = $false
-    UpdateAccountProperties   = $false
-    SpecifyNextAccountContent = $false
-    ManageSafe                = $false
-    ManageSafeMembers         = $false
-  }
-}
-
-# Build name variants for directory lookups (sAM first, then UPN)
-function Get-NameVariants([string]$MemberName, [string]$DirLocation) {
-  $list = [System.Collections.Generic.List[string]]::new()
-  $t = $MemberName.Trim(); if (-not $t) { return $list }
-  if ($t -like '*@*') {
-    $left = $t.Split('@')[0]; if ($left) { $list.Add($left) }
-    if (-not $list.Contains($t)) { $list.Add($t) }
-  } else {
-    $list.Add($t)
-    $upn = "$t@$DirLocation"; if (-not $list.Contains($upn)) { $list.Add($upn) }
-  }
-  if ($t.EndsWith('$')) {
-    $machUpn = "$t@$DirLocation"; if (-not $list.Contains($machUpn)) { $list.Add($machUpn) }
-  }
-  return $list
-}
-
-# Add/Update Safe member with SearchIn and DirectoryPrincipal support
-function Add-CAKSafeMember {
+# Create/Vault account into safe
+function New-ExtAcuAccount {
   [CmdletBinding()]
   param(
     [Parameter(Mandatory)][string]$SafeName,
-    [Parameter(Mandatory)][string]$MemberName,
-    [Parameter(Mandatory)][ValidateSet('User','Group','Role')][string]$Type,  # for logging only
-    [Parameter(Mandatory)][hashtable]$PermFlags,
-    [Parameter(Mandatory)][string]$SearchIn,
-    [switch]$DirectoryPrincipal
+    [Parameter(Mandatory)][string]$SamAccountName,
+    [Parameter()][string]$Address    = $TargetAddress,
+    [Parameter()][string]$PlatformId = $TargetPlatformId,
+    [Parameter()][string]$LogonAs    = $TargetLogonAs
   )
-  $perm = Select-PermParams $PermFlags
-  $variants = if ($DirectoryPrincipal) { Get-NameVariants $MemberName $SearchIn } else { [System.Collections.Generic.List[string]]@($MemberName.Trim()) }
-  foreach ($n in $variants) {
-    try {
-      $params = @{ SafeName=$SafeName; MemberName=$n; SearchIn=$SearchIn }
-      $params += $perm
-      Add-PASSafeMember @params -ErrorAction Stop | Out-Null
-      Write-Ok "Member added: [$Type] '$n' on '$SafeName' (SearchIn='$SearchIn')."
-      return
-    } catch {
-      $msg = $_.Exception.Message
-      if ($msg -match 'already exists' -or $msg -match '409') {
-        $params = @{ SafeName=$SafeName; MemberName=$n; SearchIn=$SearchIn }
-        $params += $perm
-        Set-PASSafeMember @params -ErrorAction Stop | Out-Null
-        Write-Ok "Member updated: [$Type] '$n' on '$SafeName'."
-        return
-      }
-      $retryableNotFound = ($DirectoryPrincipal -and ($msg -match '\[404\]' -or $msg -match 'Failed to find user' -or $msg -match 'was not found' -or $msg -match 'has not been defined' -or $msg -match 'in ldap mapping'))
-      if ($retryableNotFound) {
-        Write-Warn "Directory principal '$n' not found; trying next variant..."
-        continue
-      }
-      Write-Err "Failed adding '$n' to '$SafeName': $msg"
-      throw
-    }
+
+  $displayName = "$SamAccountName@$Address"
+
+  $platProps = @{
+    LogonDomain = $LogonAs
   }
-  throw "Exhausted principal variants for '$MemberName'."
+
+  $splat = @{
+    safeName                    = $SafeName
+    platformId                  = $PlatformId
+    address                     = $Address
+    userName                    = $SamAccountName
+    name                        = $displayName
+    platformAccountProperties   = $platProps
+    ErrorAction                 = 'Stop'
+  }
+
+  Write-Info "  -> Creating account:"
+  Write-Info "     Safe    : $SafeName"
+  Write-Info "     Platform: $PlatformId"
+  Write-Info "     Address : $Address"
+  Write-Info "     UserName: $SamAccountName"
+  Write-Info "     LogonAs : $LogonAs (LogonDomain)"
+  Add-PASAccount @splat | Out-Null
+  Write-Ok  "  -> Account created: $displayName in '$SafeName'"
 }
 
-# --- Authentication ---
+# ===== Authenticate =====
+if (-not (Test-Path $InputCsv)) {
+  Write-Err "Input CSV not found: $InputCsv"
+  return
+}
+
 $cred = Get-Credential -Message "Enter your CyberArk ($AuthType) credential"
 try {
   New-PASSession -Credential $cred -BaseURI $BaseURI -Type $AuthType | Out-Null
   Write-Ok "Authenticated to $BaseURI."
 } catch {
-  Write-Err "Authentication failed: $($_.Exception.Message)"; return
+  Write-Err "Authentication failed: $($_.Exception.Message)"
+  return
 }
+
+# ===== Load & normalize CSV =====
+try {
+  $rows = Import-Csv -Path $InputCsv
+} catch {
+  Write-Err "Failed reading CSV '$InputCsv': $($_.Exception.Message)"
+  Close-PASSession | Out-Null
+  return
+}
+
+if (-not $rows -or $rows.Count -eq 0) {
+  Write-Err "CSV is empty. It must contain at least one row with 'EmployeeID'. Optional column: 'SamAccountName'."
+  Close-PASSession | Out-Null
+  return
+}
+
+$norm = foreach ($r in $rows) {
+  [PSCustomObject]@{
+    EmployeeID     = ($r.EmployeeID ?? $r.employeeID ?? $r.EmpID ?? $r.empid ?? '').ToString().Trim()
+    SamAccountName = ($r.SamAccountName ?? $r.samaccountname ?? $r.SAM ?? '').ToString().Trim()
+  }
+}
+
+$valid = $norm | Where-Object { -not [string]::IsNullOrWhiteSpace($_.EmployeeID) }
+$skipped = $norm.Count - $valid.Count
+if ($skipped -gt 0) { Write-Warn "$skipped row(s) missing EmployeeID were skipped." }
+
+# ===== Discovery phase =====
+$missing = New-Object System.Collections.Generic.List[object]
+
+Write-Info "===== Phase 1: Discovering existing 'extacu.local' accounts ====="
+
+foreach ($row in $valid) {
+  $empId = $row.EmployeeID
+  $sam   = $row.SamAccountName
+
+  Write-Info "Checking EmployeeID=$empId $(if($sam){"/ sAM=$sam"}else{"(sAM will be derived)"})"
+
+  $safeName = Resolve-SafeByEmployeeID -EmployeeID $empId
+  if (-not $safeName) {
+    Write-Warn "  -> No safe found ending with _${empId}."
+    $missing.Add([PSCustomObject]@{
+      EmployeeID     = $empId
+      SamAccountName = $sam
+      SafeName       = ""
+      Reason         = "Safe not found / not accessible"
+    })
+    continue
+  }
+
+  Write-Info "  -> Resolved Safe: $safeName"
+
+  # Derive sAM from safe if not provided
+  if ([string]::IsNullOrWhiteSpace($sam)) {
+    $sam = Get-SamFromSafeName -SafeName $safeName -EmployeeID $empId
+    if ($sam) {
+      Write-Info "  -> Derived SamAccountName from Safe: $sam"
+    } else {
+      Write-Warn "  -> Could not derive SamAccountName from Safe; will still export as missing."
+    }
+  }
+
+  $has = Test-SafeHasExtAcuAccount -SafeName $safeName
+  if (-not $has) {
+    Write-Ok "  -> No 'extacu.local' account found in '$safeName' -> mark for export & vault."
+    $missing.Add([PSCustomObject]@{
+      EmployeeID     = $empId
+      SamAccountName = $sam
+      SafeName       = $safeName
+      Reason         = "No account with address=extacu.local"
+    })
+  } else {
+    Write-Info "  -> 'extacu.local' account exists in '$safeName' — OK."
+  }
+}
+
+# ===== Export phase =====
+Write-Info "===== Phase 2: Exporting missing list ====="
 
 try {
-  # --- Prompt for Safe name (APP_/AAM_) ---
-  $safeName = Show-InputDialog -Title "New Safe" `
-    -Prompt "Enter the Safe name (must start with APP_ or AAM_):" `
-    -Default "APP_" `
-    -ValidationHint "Examples: APP_MyApp_Prod, AAM_MySvc_NonProd" `
-    -ValidateScript {
-      param($x)
-      $t = $x.Trim()
-      if ([string]::IsNullOrWhiteSpace($t)) { return $false }
-      return ($t.StartsWith('APP_') -or $t.StartsWith('AAM_'))
-    }
-
-  if (-not $safeName) { Write-Warn "Cancelled by user."; return }
-  Write-Info "Provisioning Safe: $safeName"
-
-  # --- Create/ensure safe with 120-day retention (no description yet; we will set it after owner is known) ---
-  $exists = $null; try { $exists = Get-PASSafe -SafeName $safeName -ErrorAction SilentlyContinue } catch {}
-  if (-not $exists) {
-    $splat = @{
-      SafeName              = $safeName
-      Description           = ""                # will set after owner selected
-      ManagingCPM           = $ManagingCPM
-      NumberOfDaysRetention = 120
-      location              = $Location
-    }
-    if ($PSCmdlet.ShouldProcess($safeName, "Add-PASSafe")) {
-      Add-PASSafe @splat -ErrorAction Stop | Out-Null
-      Write-Ok "Safe created: '$safeName' (Retention: 120 days)."
-    }
+  if ($missing.Count -gt 0) {
+    $dir = Split-Path -Path $OutputCsv -Parent
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    $missing | Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8
+    Write-Ok "Exported $($missing.Count) row(s) to: $OutputCsv"
   } else {
-    Write-Warn "Safe '$safeName' already exists; enforcing retention."
-    try {
-      Set-PASSafe -SafeName $safeName -NumberOfDaysRetention 120 -ErrorAction Stop | Out-Null
-      Write-Ok "Ensured retention=120 on existing safe."
-    } catch { Write-Warn "Could not update existing Safe retention: $($_.Exception.Message)" }
+    Write-Ok "All EmployeeIDs have a safe with at least one account address = $TargetAddress. No export created."
+  }
+} catch {
+  Write-Err "Failed to export results: $($_.Exception.Message)"
+}
+
+# ===== Vaulting phase (create accounts for those missing) =====
+Write-Info "===== Phase 3: Vaulting new '$TargetAddress' accounts where missing ====="
+
+$createdCount = 0
+foreach ($m in $missing) {
+  $empId = $m.EmployeeID
+  $sam   = $m.SamAccountName
+  $safe  = $m.SafeName
+
+  if ([string]::IsNullOrWhiteSpace($safe)) {
+    Write-Warn "[EmpID=$empId] Skipping vaulting: Safe not found."
+    continue
+  }
+  if ([string]::IsNullOrWhiteSpace($sam)) {
+    Write-Warn "[EmpID=$empId | Safe=$safe] Skipping vaulting: SamAccountName unknown (not in CSV and not derivable)."
+    continue
   }
 
-  # --- Permissions payloads ---
-  $permAll  = Get-FullPerms
-  $permCark = Get-CarkPerms
-
-  # --- Add standard members (full permissions) ---
-  Write-Info "Adding standard Safe members with full permissions…"
-  Add-CAKSafeMember -SafeName $safeName -MemberName 'ACURestAPI_Local'                     -Type User  -PermFlags $permAll  -SearchIn 'Vault'
-  Add-CAKSafeMember -SafeName $safeName -MemberName 'identity-privilege-integration-user$' -Type User  -PermFlags $permAll  -SearchIn 'Vault'
-  Add-CAKSafeMember -SafeName $safeName -MemberName 'IAM_ACU_CA_Admins@alliantcreditunion.com' -Type Group -PermFlags $permAll -SearchIn $DirLocation -DirectoryPrincipal
-
-  # --- Prompt for CARK_* owner group and add limited permissions ---
-  $ownerGroup = Show-InputDialog -Title "Safe Owner (CARK_ Group)" `
-    -Prompt "Enter the AD group that will own the Safe (must start with CARK_):" `
-    -Default "CARK_" `
-    -ValidationHint "Example: CARK_AppTeam_Prod" `
-    -ValidateScript {
-      param($x)
-      $t = $x.Trim()
-      if ([string]::IsNullOrWhiteSpace($t)) { return $false }
-      return $t.StartsWith('CARK_')
-    }
-
-  if (-not $ownerGroup) {
-    Write-Warn "Owner group prompt cancelled; skipping owner assignment and description update."
+  try {
+    Write-Info "[EmpID=$empId | Safe=$safe] Creating account for sAM='$sam'..."
+    New-ExtAcuAccount -SafeName $safe -SamAccountName $sam `
+      -Address $TargetAddress -PlatformId $TargetPlatformId -LogonAs $TargetLogonAs
+    $createdCount++
+  } catch {
+    Write-Err  "[EmpID=$empId | Safe=$safe] Failed to create account for '$sam': $($_.Exception.Message)"
   }
-  else {
-    Write-Info "Adding owner group '$ownerGroup' with limited CARK permissions…"
-    Add-CAKSafeMember -SafeName $safeName -MemberName $ownerGroup -Type Group -PermFlags $permCark -SearchIn $DirLocation -DirectoryPrincipal
+}
 
-    # === Set description to EXACT text requested ===
-    try {
-      $desc = "Safe Managed By $ownerGroup"
-      Set-PASSafe -SafeName $safeName -Description $desc -ErrorAction Stop | Out-Null
-      Write-Ok "Description set: '$desc'"
-    } catch {
-      Write-Warn "Could not set description: $($_.Exception.Message)"
-    }
-  }
+Write-Ok "Vaulting phase complete. Accounts created: $createdCount"
 
-  Write-Ok "Provisioning complete for '$safeName'."
-}
-catch {
-  Write-Err $_
-}
-finally {
-  try { Close-PASSession | Out-Null; Write-Ok "Logged off." } catch { Write-Warn "Logoff warning: $($_.Exception.Message)" }
-}
+# ===== Cleanup =====
+try { Close-PASSession | Out-Null; Write-Ok "Logged off." } catch { }
