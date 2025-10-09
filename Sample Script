@@ -1,7 +1,7 @@
 # IND_SafeCreation.ps1
-# Creates/ensures IND_<Samaccountname>_<employeeID> safes, enforces 7-day retention,
-# and adds members with correct SearchIn (directory vs Vault).
-# Owner (email) receives ONLY the specified limited permissions.
+# Creates/ensures IND_<Samaccountname>_<employeeID> safes (7-day retention),
+# adds standard members & Owner (email) with LIMITED perms you specified,
+# and re-attempts membership if a target member is not present.
 
 [CmdletBinding(SupportsShouldProcess=$true)]
 param(
@@ -25,7 +25,7 @@ function Write-Warn($m){ Write-Host "[!] $m" -ForegroundColor Yellow }
 function Write-Err($m){ Write-Host "[X] $m" -ForegroundColor Red }
 
 # --- clear any conflicting helpers from the session ---
-foreach($f in 'Add-INDMemberSmart','Ensure-Member','Ensure-SafeMember','Add-CAKSafeMember'){
+foreach($f in 'Add-INDMemberSmart','Ensure-Member','Ensure-SafeMember','Add-CAKSafeMember','Ensure-CAKMemberPresent','Test-CAKMemberPresent'){
   if (Get-Command $f -ErrorAction SilentlyContinue) { Remove-Item "function:$f" -ErrorAction SilentlyContinue }
 }
 
@@ -56,7 +56,7 @@ function Get-AllPermFlags {
   }
 }
 
-# OWNER (email) gets ONLY the permissions listed by you; everything else explicitly false
+# OWNER (email) gets ONLY the permissions you listed
 function Get-OwnerPermFlags {
   @{
     ListAccounts                           = $true
@@ -83,9 +83,7 @@ function Select-PermParams([hashtable]$h) {
   $out
 }
 
-# Build name variants for directory lookups
-# For inputs like "name@domain", try sAM (left-of-@) FIRST, then UPN.
-# For "name$", also try "name$@DirLocation".
+# Build name variants for directory lookups (sAM left-of-@ first, then UPN; handle computer $)
 function Get-NameVariants([string]$MemberName, [string]$DirLocation) {
   $list = [System.Collections.Generic.List[string]]::new()
   $t = $MemberName.Trim(); if (-not $t) { return $list }
@@ -93,7 +91,7 @@ function Get-NameVariants([string]$MemberName, [string]$DirLocation) {
   if ($t -like '*@*') {
     $left = $t.Split('@')[0]
     if ($left) { $list.Add($left) }        # sAM first
-    if (-not $list.Contains($t)) { $list.Add($t) }  # then the given UPN
+    if (-not $list.Contains($t)) { $list.Add($t) }  # then given UPN
   } else {
     $list.Add($t)
     $upn = "$t@$DirLocation"
@@ -128,7 +126,7 @@ function Add-CAKSafeMember {
       $params += $perm
       Add-PASSafeMember @params -ErrorAction Stop | Out-Null
       Write-Ok "Added $Type '$n' (SearchIn='$SearchIn') to '$SafeName'."
-      return
+      return $true
     } catch {
       $msg = $_.Exception.Message
 
@@ -145,17 +143,76 @@ function Add-CAKSafeMember {
         $params += $perm
         Set-PASSafeMember @params -ErrorAction Stop | Out-Null
         Write-Ok "Updated $Type '$n' on '$SafeName'."
-        return
+        return $true
       } elseif ($retryableNotFound) {
         Write-Warn "Directory principal '$n' not found in '$SearchIn'. Trying next variant..."
         continue
       } else {
         Write-Err "Member '$n' failed on '$SafeName' : $msg"
-        throw
+        return $false
       }
     }
   }
   Write-Err "Exhausted variants; could not add '$MemberName' (Type=$Type, SearchIn='$SearchIn') to '$SafeName'."
+  return $false
+}
+
+# --- MEMBERSHIP VERIFICATION & RE-ATTEMPT ---
+
+# Returns $true if any of the candidate names is present in the safe's members (case-insensitive)
+function Test-CAKMemberPresent {
+  param(
+    [Parameter(Mandatory)][string]$SafeName,
+    [Parameter(Mandatory)][string[]]$CandidateNames
+  )
+  try {
+    $members = Get-PASSafeMembers -SafeName $SafeName -ErrorAction Stop
+  } catch {
+    Write-Warn "Could not read members of '$SafeName' for verification: $($_.Exception.Message)"
+    return $false
+  }
+
+  $set = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+  foreach ($m in $members) {
+    $n = $null
+    if ($m.MemberName) { $n = $m.MemberName.ToString().Trim() }
+    elseif ($m.name)   { $n = $m.name.ToString().Trim() }
+    if ($n -and -not $set.Contains($n)) { $set.Add($n) | Out-Null }
+  }
+
+  foreach ($c in $CandidateNames) {
+    if ($set.Contains($c)) { return $true }
+  }
+  return $false
+}
+
+# Ensures a member exists; add -> verify; if not found, retry up to 3 times (with short delays)
+function Ensure-CAKMemberPresent {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)][string]$SafeName,
+    [Parameter(Mandatory)][string]$MemberName,
+    [Parameter(Mandatory)][ValidateSet('User','Group','Role')][string]$Type,
+    [Parameter(Mandatory)][hashtable]$PermFlags,
+    [Parameter(Mandatory)][string]$SearchIn,
+    [switch]$DirectoryPrincipal
+  )
+
+  $candidates = @($MemberName.Trim())
+  if ($DirectoryPrincipal) { $candidates = Get-NameVariants -MemberName $MemberName -DirLocation $SearchIn }
+
+  for($i=1; $i -le 3; $i++){
+    Write-Info "Attempt $i to add/verify $Type '$MemberName' on '$SafeName'…"
+    $ok = Add-CAKSafeMember -SafeName $SafeName -MemberName $MemberName -Type $Type -PermFlags $PermFlags -SearchIn $SearchIn -DirectoryPrincipal:$DirectoryPrincipal
+    Start-Sleep -Seconds 2
+    $present = Test-CAKMemberPresent -SafeName $SafeName -CandidateNames $candidates
+    if ($present) {
+      Write-Ok "$Type '$MemberName' is present on '$SafeName'."
+      return
+    }
+    if (-not $ok) { Write-Warn "Add/Update may have failed; will retry." }
+  }
+  Write-Warn "After retries, $Type '$MemberName' still not confirmed on '$SafeName'."
 }
 
 # ---------- Logon ----------
@@ -175,15 +232,15 @@ try {
   $permOwner = Get-OwnerPermFlags
 
   foreach ($row in $rows) {
-    $sam  = ($row.Samaccountname).Trim()
-    $eid  = ($row.employeeID).Trim()
-    $mail = ($row.email).Trim()
+    $sam  = ($row.Samaccountname).ToString().Trim()
+    $eid  = ($row.employeeID).ToString().Trim()
+    $mail = ($row.email).ToString().Trim()
 
     if ([string]::IsNullOrWhiteSpace($sam) -or [string]::IsNullOrWhiteSpace($eid) -or [string]::IsNullOrWhiteSpace($mail)) {
       Write-Warn "Skipping row with missing fields: $($row | ConvertTo-Json -Compress)"; continue
     }
 
-    # *** Changed to IND_<sam>_<eid> ***
+    # IND_<sam>_<eid>
     $safeName = "IND_{0}_{1}" -f $sam, $eid
     Write-Info "Processing Safe: $safeName (Owner=$mail)"
 
@@ -207,15 +264,15 @@ try {
       catch { Write-Warn "Could not set retention on existing '$safeName': $($_.Exception.Message)" }
     }
 
-    # --- Members ---
+    # --- Members (with re-verify + re-attempt) ---
     # Vault users (full permissions)
-    Add-CAKSafeMember -SafeName $safeName -MemberName 'ACURestAPI_Local'                     -Type User  -PermFlags $permAll   -SearchIn 'Vault'
-    Add-CAKSafeMember -SafeName $safeName -MemberName 'identity-privilege-integration-user$' -Type User  -PermFlags $permAll   -SearchIn 'Vault'
+    Ensure-CAKMemberPresent -SafeName $safeName -MemberName 'ACURestAPI_Local'                     -Type User  -PermFlags $permAll   -SearchIn 'Vault'
+    Ensure-CAKMemberPresent -SafeName $safeName -MemberName 'identity-privilege-integration-user$' -Type User  -PermFlags $permAll   -SearchIn 'Vault'
 
     # Directory group with full perms
-    Add-CAKSafeMember -SafeName $safeName -MemberName 'IAM_ACU_CA_Admins@alliantcreditunion.com' -Type Group -PermFlags $permAll   -SearchIn $DirLocation -DirectoryPrincipal
+    Ensure-CAKMemberPresent -SafeName $safeName -MemberName 'IAM_ACU_CA_Admins@alliantcreditunion.com' -Type Group -PermFlags $permAll   -SearchIn $DirLocation -DirectoryPrincipal
     # Owner (email) with LIMITED perms you specified
-    Add-CAKSafeMember -SafeName $safeName -MemberName $mail                                      -Type User  -PermFlags $permOwner -SearchIn $DirLocation -DirectoryPrincipal
+    Ensure-CAKMemberPresent -SafeName $safeName -MemberName $mail                                      -Type User  -PermFlags $permOwner -SearchIn $DirLocation -DirectoryPrincipal
   }
 
   Write-Ok "All rows processed."
