@@ -1,0 +1,338 @@
+<#
+Find-And-Vault-ExtAcuAccounts.ps1  (PS 5.1 compatible)
+
+1) Reads EmployeeIDs CSV (default: I:\Script\REPORTS\EmployeeIDs.csv)
+   Optional column: SamAccountName
+
+2) Resolves each user's safe by searching PVWA /api/safes?search=<EmployeeID>,
+   then selecting a safe whose name ends with _<EmployeeID> (prefers IND_*).
+
+3) Checks if any account in that safe has address == 'extacu.local'.
+   - Exports only those missing such an account to:
+     I:\Script\REPORTS\No_ExtAcuLocal_Accounts.csv
+
+4) For the missing ones, creates a new account in the resolved safe:
+   - PlatformId = WIN_P_DM_EXT_ADM_OTP_CICO_30D
+   - userName   = <SamAccountName>  (derived from safe if not in CSV)
+   - address    = extacu.local
+   - platformAccountProperties: LogonDomain = Extacu
+   - name (display): <SamAccountName>@extacu.local
+#>
+
+[CmdletBinding()]
+param(
+  # --- Alliant login pattern ---
+  [string]$BaseURI   = "https://alliantcredit.privilegecloud.cyberark.com",
+  [ValidateSet('CyberArk','LDAP','RADIUS','Windows','SAML','Shared')]
+  [string]$AuthType  = 'CyberArk',
+
+  # --- IO paths ---
+  [string]$InputCsv  = "I:\Script\REPORTS\EmployeeIDs.csv",
+  [string]$OutputCsv = "I:\Script\REPORTS\No_ExtAcuLocal_Accounts.csv",
+
+  # --- Platform & constants ---
+  [string]$TargetPlatformId = "WIN_P_DM_EXT_ADM_OTP_CICO_30D",
+  [string]$TargetAddress    = "extacu.local",
+  [string]$TargetLogonAs    = "Extacu"   # sent as LogonDomain
+)
+
+# ===== Prep & helpers =====
+Import-Module psPAS -ErrorAction Stop
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+function Write-Info($m){ Write-Host "[*] $m" -ForegroundColor Cyan }
+function Write-Ok($m){   Write-Host "[OK] $m" -ForegroundColor Green }
+function Write-Warn($m){ Write-Host "[!] $m" -ForegroundColor Yellow }
+function Write-Err($m){  Write-Host "[X] $m" -ForegroundColor Red }
+
+# Returns the first non-empty scalar string among inputs; if an item is an array, uses the first non-empty element.
+function First-NotNullOrEmpty {
+  param([Parameter(ValueFromRemainingArguments=$true)] $Values)
+  foreach ($v in $Values) {
+    if ($null -eq $v) { continue }
+    if ($v -is [array]) {
+      foreach ($e in $v) {
+        if ($null -ne $e -and ($e.ToString()).Trim().Length -gt 0) { return ($e.ToString()).Trim() }
+      }
+    } else {
+      $s = ($v.ToString()).Trim()
+      if ($s.Length -gt 0) { return $s }
+    }
+  }
+  return ""
+}
+
+# Defensive getter for psPAS / REST objects
+function Get-Prop {
+  param($obj, [string]$name)
+  if ($null -eq $obj) { return $null }
+  if ($obj.PSObject.Properties[$name]) { return $obj.$name }
+  if ($obj.properties -and $obj.properties.PSObject.Properties[$name]) { return $obj.properties.$name }
+  if ($obj.platformAccountProperties -and $obj.platformAccountProperties.PSObject.Properties[$name]) { return $obj.platformAccountProperties.$name }
+  if ($obj.additionalProperties -and $obj.additionalProperties.PSObject.Properties[$name]) { return $obj.additionalProperties.$name }
+  return $null
+}
+
+# ---- Safe search via REST (works even if Get-PASSafes isn't defined) ----
+function Search-Safes {
+  [CmdletBinding()]
+  param([Parameter(Mandatory)][string]$Query)
+  # pvwa route: /api/safes?search=<q>&includeAccounts=false
+  $uri = "/api/safes?search=$([uri]::EscapeDataString($Query))&includeAccounts=false"
+  $resp = Invoke-PASRestMethod -Method GET -Uri $uri -ErrorAction Stop
+  # Expect .value or .safes depending on version; normalize to list of names
+  $names = @()
+  if ($resp) {
+    if ($resp.value) {
+      foreach ($s in $resp.value) {
+        $nm = First-NotNullOrEmpty (Get-Prop $s 'safeName'), (Get-Prop $s 'SafeName'), (Get-Prop $s 'name')
+        if ($nm) { $names += $nm }
+      }
+    } elseif ($resp.safes) {
+      foreach ($s in $resp.safes) {
+        $nm = First-NotNullOrEmpty (Get-Prop $s 'safeName'), (Get-Prop $s 'SafeName'), (Get-Prop $s 'name')
+        if ($nm) { $names += $nm }
+      }
+    } else {
+      # Some versions return a flat array
+      foreach ($s in $resp) {
+        $nm = First-NotNullOrEmpty (Get-Prop $s 'safeName'), (Get-Prop $s 'SafeName'), (Get-Prop $s 'name')
+        if ($nm) { $names += $nm }
+      }
+    }
+  }
+  return $names | Select-Object -Unique
+}
+
+# Resolve safe by EmployeeID (prefer names starting with IND_, ending with _<EmployeeID>)
+function Resolve-SafeByEmployeeID {
+  param([Parameter(Mandatory)][string]$EmployeeID)
+
+  try {
+    $candidates = Search-Safes -Query $EmployeeID
+  } catch {
+    Write-Warn "Could not search safes for '$EmployeeID': $($_.Exception.Message)"
+    return $null
+  }
+
+  if (-not $candidates -or $candidates.Count -eq 0) { return $null }
+
+  $suffix = "_$([regex]::Escape($EmployeeID.Trim()))$"
+  $ending = $candidates | Where-Object { $_ -match $suffix }
+  if (-not $ending -or $ending.Count -eq 0) { return $null }
+
+  $preferInd = $ending | Where-Object { $_ -like 'IND_*' }
+  if ($preferInd -and $preferInd.Count -gt 0) { return ($preferInd | Select-Object -First 1) }
+  return ($ending | Select-Object -First 1)
+}
+
+# Extract SamAccountName from a safe like "PREFIX_<sam>_<id>"
+function Get-SamFromSafeName {
+  param(
+    [Parameter(Mandatory)][string]$SafeName,
+    [Parameter(Mandatory)][string]$EmployeeID
+  )
+  $pattern = "^[^_]+_(.+?)_$([regex]::Escape($EmployeeID))$"
+  $m = [regex]::Match($SafeName, $pattern)
+  if ($m.Success) { return $m.Groups[1].Value }
+  return $null
+}
+
+# True if any account in safe has address == extacu.local
+function Test-SafeHasExtAcuAccount {
+  param([Parameter(Mandatory)][string]$SafeName, [string]$Address = $TargetAddress)
+  try {
+    $accts = Get-PASAccount -SafeName $SafeName -ErrorAction Stop
+  } catch {
+    Write-Warn "Unable to enumerate accounts for safe '$SafeName': $($_.Exception.Message)"
+    return $false
+  }
+  foreach ($a in $accts) {
+    $addr = Get-Prop $a 'address'
+    if ($addr -and ($addr -eq $Address)) { return $true }
+  }
+  return $false
+}
+
+# Create/Vault account into safe
+function New-ExtAcuAccount {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)][string]$SafeName,
+    [Parameter(Mandatory)][string]$SamAccountName,
+    [Parameter()][string]$Address    = $TargetAddress,
+    [Parameter()][string]$PlatformId = $TargetPlatformId,
+    [Parameter()][string]$LogonAs    = $TargetLogonAs
+  )
+
+  $displayName = "$SamAccountName@$Address"
+
+  $platProps = @{
+    LogonDomain = $LogonAs
+  }
+
+  $splat = @{
+    safeName                  = $SafeName
+    platformId                = $PlatformId
+    address                   = $Address
+    userName                  = $SamAccountName
+    name                      = $displayName
+    platformAccountProperties = $platProps
+    ErrorAction               = 'Stop'
+  }
+
+  Write-Info "  -> Creating account:"
+  Write-Info "     Safe    : $SafeName"
+  Write-Info "     Platform: $PlatformId"
+  Write-Info "     Address : $Address"
+  Write-Info "     UserName: $SamAccountName"
+  Write-Info "     LogonAs : $LogonAs (LogonDomain)"
+  Add-PASAccount @splat | Out-Null
+  Write-Ok  "  -> Account created: $displayName in '$SafeName'"
+}
+
+# ===== Authenticate =====
+if (-not (Test-Path $InputCsv)) {
+  Write-Err "Input CSV not found: $InputCsv"
+  return
+}
+
+$cred = Get-Credential -Message "Enter your CyberArk ($AuthType) credential"
+try {
+  New-PASSession -Credential $cred -BaseURI $BaseURI -Type $AuthType | Out-Null
+  Write-Ok "Authenticated to $BaseURI."
+} catch {
+  Write-Err "Authentication failed: $($_.Exception.Message)"
+  return
+}
+
+# ===== Load & normalize CSV =====
+try {
+  $rows = Import-Csv -Path $InputCsv
+} catch {
+  Write-Err "Failed reading CSV '$InputCsv': $($_.Exception.Message)"
+  Close-PASSession | Out-Null
+  return
+}
+
+if (-not $rows -or $rows.Count -eq 0) {
+  Write-Err "CSV is empty. It must contain at least one row with 'EmployeeID'. Optional column: 'SamAccountName'."
+  Close-PASSession | Out-Null
+  return
+}
+
+$norm = @()
+foreach ($r in $rows) {
+  $eid = First-NotNullOrEmpty $r.EmployeeID, $r.employeeID, $r.EmpID, $r.empid
+  $sam = First-NotNullOrEmpty $r.SamAccountName, $r.samaccountname, $r.SAM
+  if ($eid) {
+    $norm += [PSCustomObject]@{ EmployeeID = $eid; SamAccountName = $sam }
+  }
+}
+
+$valid = $norm
+$skipped = $rows.Count - $valid.Count
+if ($skipped -gt 0) { Write-Warn "$skipped row(s) missing EmployeeID were skipped." }
+
+# ===== Discovery phase =====
+$missing = New-Object System.Collections.Generic.List[object]
+
+Write-Info "===== Phase 1: Discovering existing 'extacu.local' accounts ====="
+
+foreach ($row in $valid) {
+  $empId = $row.EmployeeID
+  $sam   = $row.SamAccountName
+
+  if ($sam) {
+    Write-Info ("Checking EmployeeID={0} / sAM={1} …" -f $empId, $sam)
+  } else {
+    Write-Info ("Checking EmployeeID={0} (sAM will be derived) …" -f $empId)
+  }
+
+  $safeName = Resolve-SafeByEmployeeID -EmployeeID $empId
+  if (-not $safeName) {
+    Write-Warn "  -> No safe found ending with _${empId}."
+    $missing.Add([PSCustomObject]@{
+      EmployeeID     = $empId
+      SamAccountName = $sam
+      SafeName       = ""
+      Reason         = "Safe not found / not accessible"
+    })
+    continue
+  }
+
+  Write-Info "  -> Resolved Safe: $safeName"
+
+  # Derive sAM from safe if not provided
+  if (-not $sam) {
+    $samDerived = Get-SamFromSafeName -SafeName $safeName -EmployeeID $empId
+    if ($samDerived) {
+      $sam = $samDerived
+      Write-Info "  -> Derived SamAccountName from Safe: $sam"
+    } else {
+      Write-Warn "  -> Could not derive SamAccountName from Safe; will still export as missing."
+    }
+  }
+
+  $has = Test-SafeHasExtAcuAccount -SafeName $safeName
+  if (-not $has) {
+    Write-Ok "  -> No 'extacu.local' account found in '$safeName' -> mark for export & vault."
+    $missing.Add([PSCustomObject]@{
+      EmployeeID     = $empId
+      SamAccountName = $sam
+      SafeName       = $safeName
+      Reason         = "No account with address=extacu.local"
+    })
+  } else {
+    Write-Info "  -> 'extacu.local' account exists in '$safeName' — OK."
+  }
+}
+
+# ===== Export phase =====
+Write-Info "===== Phase 2: Exporting missing list ====="
+
+try {
+  if ($missing.Count -gt 0) {
+    $dir = Split-Path -Path $OutputCsv -Parent
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    $missing | Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8
+    Write-Ok "Exported $($missing.Count) row(s) to: $OutputCsv"
+  } else {
+    Write-Ok "All EmployeeIDs have a safe with at least one account address = $TargetAddress. No export created."
+  }
+} catch {
+  Write-Err "Failed to export results: $($_.Exception.Message)"
+}
+
+# ===== Vaulting phase =====
+Write-Info "===== Phase 3: Vaulting new '$TargetAddress' accounts where missing ====="
+
+$createdCount = 0
+foreach ($m in $missing) {
+  $empId = $m.EmployeeID
+  $sam   = $m.SamAccountName
+  $safe  = $m.SafeName
+
+  if (-not $safe) {
+    Write-Warn ("[EmpID={0}] Skipping vaulting: Safe not found." -f $empId)
+    continue
+  }
+  if (-not $sam) {
+    Write-Warn ("[EmpID={0} | Safe={1}] Skipping vaulting: SamAccountName unknown (not in CSV and not derivable)." -f $empId, $safe)
+    continue
+  }
+
+  try {
+    Write-Info ("[EmpID={0} | Safe={1}] Creating account for sAM='{2}'..." -f $empId, $safe, $sam)
+    New-ExtAcuAccount -SafeName $safe -SamAccountName $sam `
+      -Address $TargetAddress -PlatformId $TargetPlatformId -LogonAs $TargetLogonAs
+    $createdCount = $createdCount + 1
+  } catch {
+    Write-Err  ("[EmpID={0} | Safe={1}] Failed to create account for '{2}': {3}" -f $empId, $safe, $sam, $_.Exception.Message)
+  }
+}
+
+Write-Ok ("Vaulting phase complete. Accounts created: {0}" -f $createdCount)
+
+# ===== Cleanup =====
+try { Close-PASSession | Out-Null; Write-Ok "Logged off." } catch { }
