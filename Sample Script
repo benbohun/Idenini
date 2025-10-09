@@ -1,6 +1,7 @@
-# TempSafeCreation.ps1
-# Creates/ensures INDTEMP_<Samaccountname>_<employeeID> safes, enforces 7-day retention,
+# IND_SafeCreation.ps1
+# Creates/ensures IND_<Samaccountname>_<employeeID> safes, enforces 7-day retention,
 # and adds members with correct SearchIn (directory vs Vault).
+# Owner (email) gets ONLY the limited permissions requested.
 
 [CmdletBinding(SupportsShouldProcess=$true)]
 param(
@@ -11,17 +12,18 @@ param(
   [string]$AuthType  = 'CyberArk',
   [string]$ManagingCPM = 'HQVECYBARK101',
   [string]$Location  = "\",
-  # Directory integration (exact MemberLocation/SearchIn as configured in PVWA)
+  # Directory integration (exact "Search in" value as configured in PVWA)
   [string]$DirLocation = 'HQVACUDC101.alliantcreditunion.com'
 )
 
 Import-Module psPAS -ErrorAction Stop
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$ErrorActionPreference = 'Continue'
 
 function Write-Info($m){ Write-Host "[*] $m" -ForegroundColor Cyan }
-function Write-Ok($m){ Write-Host "[OK] $m" -ForegroundColor Green }
+function Write-Ok($m){   Write-Host "[OK] $m" -ForegroundColor Green }
 function Write-Warn($m){ Write-Host "[!] $m" -ForegroundColor Yellow }
-function Write-Err($m){ Write-Host "[X] $m" -ForegroundColor Red }
+function Write-Err($m){  Write-Host "[X] $m" -ForegroundColor Red }
 
 # --- clear any conflicting helpers from the session ---
 foreach($f in 'Add-INDMemberSmart','Ensure-Member','Ensure-SafeMember','Add-CAKSafeMember'){
@@ -36,6 +38,12 @@ $AllowedPermKeys = @(
   'ViewAuditLog','ViewSafeMembers','AccessWithoutConfirmation',
   'ManageSafe','ManageSafeMembers'
 )
+
+function Select-PermParams([hashtable]$h) {
+  $out = @{}
+  foreach ($k in $AllowedPermKeys) { if ($h.ContainsKey($k)) { $out[$k] = [bool]$h[$k] } }
+  $out
+}
 
 function Get-AllPermFlags {
   @{
@@ -54,28 +62,25 @@ function Get-AllPermFlags {
     ManageSafeMembers                      = $true
   }
 }
+
+# OWNER (email) -> ONLY the 7 you asked for
 function Get-OwnerPermFlags {
   @{
     ListAccounts                           = $true
     UseAccounts                            = $true
     RetrieveAccounts                       = $true
-    UpdateAccountContent                   = $true
     InitiateCPMAccountManagementOperations = $true
-    SpecifyNextAccountContent              = $true
     ViewSafeMembers                        = $true
     ViewAuditLog                           = $true
     AccessWithoutConfirmation              = $true
 
-    AddAccounts             = $false
-    UpdateAccountProperties = $false
-    ManageSafe              = $false
-    ManageSafeMembers       = $false
+    AddAccounts                            = $false
+    UpdateAccountContent                   = $false
+    UpdateAccountProperties                = $false
+    SpecifyNextAccountContent              = $false
+    ManageSafe                             = $false
+    ManageSafeMembers                      = $false
   }
-}
-function Select-PermParams([hashtable]$h) {
-  $out = @{}
-  foreach ($k in $AllowedPermKeys) { if ($h.ContainsKey($k)) { $out[$k] = [bool]$h[$k] } }
-  $out
 }
 
 # Build name variants for directory lookups
@@ -83,7 +88,7 @@ function Select-PermParams([hashtable]$h) {
 # For "name$", also try "name$@DirLocation".
 function Get-NameVariants([string]$MemberName, [string]$DirLocation) {
   $list = [System.Collections.Generic.List[string]]::new()
-  $t = $MemberName.Trim(); if (-not $t) { return $list }
+  $t = ($MemberName | ForEach-Object { $_.ToString() }).Trim(); if (-not $t) { return $list }
 
   if ($t -like '*@*') {
     $left = $t.Split('@')[0]
@@ -102,8 +107,23 @@ function Get-NameVariants([string]$MemberName, [string]$DirLocation) {
   return $list
 }
 
+# Helper to classify common directory "not found" errors so we just continue
+function Is-DirNotFound([string]$msg){
+  if (-not $msg) { return $false }
+  return (
+    $msg -match '\[404\]' -or
+    $msg -match '\bFailed to find user\b' -or
+    $msg -match '\bwas not found\b' -or
+    $msg -match '\bhas not been defined\b' -or
+    $msg -match '\bin ldap mapping\b' -or
+    $msg -match '\bNo such object\b' -or
+    $msg -match '\bobject does not exist\b'
+  )
+}
+
 # NEW unique helper: adds/updates a member.
 # NOTE: psPAS does NOT accept MemberType, so we DO NOT pass it. We keep -Type only for logs.
+# IMPORTANT: This version NEVER throws; it logs and continues.
 function Add-CAKSafeMember {
   [CmdletBinding()]
   param(
@@ -128,31 +148,31 @@ function Add-CAKSafeMember {
     } catch {
       $msg = $_.Exception.Message
 
-      # Retryable "not found" patterns seen in practice: 404, and 400 with LDAP mapping not found text
-      $retryableNotFound = ($DirectoryPrincipal -and (
-          $msg -match '\[404\]' -or
-          $msg -match '\[400\].*Failed to find user' -or
-          $msg -match 'has not been defined' -or
-          $msg -match 'was not found' -or
-          $msg -match 'in ldap mapping'
-        ))
-
       if ($msg -match 'already exists' -or $msg -match '409') {
-        $params = @{ SafeName = $SafeName; MemberName = $n; SearchIn = $SearchIn }
-        $params += $perm
-        Set-PASSafeMember @params -ErrorAction Stop | Out-Null
-        Write-Ok "Updated $Type '$n' on '$SafeName'."
-        return
-      } elseif ($retryableNotFound) {
+        try {
+          $params = @{ SafeName = $SafeName; MemberName = $n; SearchIn = $SearchIn }
+          $params += $perm
+          Set-PASSafeMember @params -ErrorAction Stop | Out-Null
+          Write-Ok "Updated $Type '$n' on '$SafeName'."
+          return
+        } catch {
+          Write-Warn "Set-PASSafeMember warning for $Type '$n' on '$SafeName': $($_.Exception.Message)"
+          return  # treat as present; continue processing others
+        }
+      }
+
+      $retryableNotFound = ($DirectoryPrincipal -and (Is-DirNotFound $msg))
+      if ($retryableNotFound) {
         Write-Warn "Directory principal '$n' not found in '$SearchIn'. Trying next variant..."
         continue
       } else {
         Write-Err "Member '$n' failed on '$SafeName' : $msg"
-        throw
+        # DO NOT throw; just continue to next variant or next member/user
+        continue
       }
     }
   }
-  Write-Err "Exhausted variants; could not add '$MemberName' (Type=$Type, SearchIn='$SearchIn') to '$SafeName'."
+  Write-Warn "Exhausted variants; could not add '$MemberName' (Type=$Type, SearchIn='$SearchIn') to '$SafeName'. Continuing…"
 }
 
 # ---------- Logon ----------
@@ -172,15 +192,16 @@ try {
   $permOwner = Get-OwnerPermFlags
 
   foreach ($row in $rows) {
-    $sam  = ($row.Samaccountname).Trim()
-    $eid  = ($row.employeeID).Trim()
-    $mail = ($row.email).Trim()
+    $sam  = ($row.Samaccountname).ToString().Trim()
+    $eid  = ($row.employeeID).ToString().Trim()
+    $mail = ($row.email).ToString().Trim()
 
     if ([string]::IsNullOrWhiteSpace($sam) -or [string]::IsNullOrWhiteSpace($eid) -or [string]::IsNullOrWhiteSpace($mail)) {
       Write-Warn "Skipping row with missing fields: $($row | ConvertTo-Json -Compress)"; continue
     }
 
-    $safeName = "INDTEMP_{0}_{1}" -f $sam, $eid
+    # *** Changed to IND_<sam>_<eid> ***
+    $safeName = "IND_{0}_{1}" -f $sam, $eid
     Write-Info "Processing Safe: $safeName (Owner=$mail)"
 
     # Create Safe if missing; ensure 7-day retention
@@ -188,7 +209,7 @@ try {
     if (-not $exists) {
       $splat = @{
         SafeName              = $safeName
-        Description           = "Temporary individual safe for $sam ($eid)"
+        Description           = "Individual safe for $sam ($eid)"
         ManagingCPM           = $ManagingCPM
         NumberOfDaysRetention = 7
         location              = $Location
@@ -203,7 +224,7 @@ try {
       catch { Write-Warn "Could not set retention on existing '$safeName': $($_.Exception.Message)" }
     }
 
-    # --- Members ---
+    # --- Members (original working flow; -SearchIn only) ---
     # Vault users
     Add-CAKSafeMember -SafeName $safeName -MemberName 'ACURestAPI_Local'                     -Type User  -PermFlags $permAll   -SearchIn 'Vault'
     Add-CAKSafeMember -SafeName $safeName -MemberName 'identity-privilege-integration-user$' -Type User  -PermFlags $permAll   -SearchIn 'Vault'
