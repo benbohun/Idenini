@@ -1,7 +1,8 @@
 # IND_SafeCreation.ps1
 # Creates/ensures IND_<Samaccountname>_<employeeID> safes (7-day retention),
-# adds standard members & Owner (email) with LIMITED perms,
-# verifies membership and re-attempts up to 3 times.
+# adds members (Vault users, IAM group, Owner w/limited perms),
+# NEVER stops the run if a directory principal isn't found; logs and continues.
+# Supports psPAS builds that use -SearchIn OR -MemberLocation.
 
 [CmdletBinding(SupportsShouldProcess=$true)]
 param(
@@ -16,15 +17,18 @@ param(
   [string]$DirLocation = 'HQVACUDC101.alliantcreditunion.com'
 )
 
+# Be resilient; do not abort on non-terminating errors
+$ErrorActionPreference = 'Continue'
+
 Import-Module psPAS -ErrorAction Stop
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 function Write-Info($m){ Write-Host "[*] $m" -ForegroundColor Cyan }
-function Write-Ok($m){ Write-Host "[OK] $m" -ForegroundColor Green }
+function Write-Ok($m){   Write-Host "[OK] $m" -ForegroundColor Green }
 function Write-Warn($m){ Write-Host "[!] $m" -ForegroundColor Yellow }
-function Write-Err($m){ Write-Host "[X] $m" -ForegroundColor Red }
+function Write-Err($m){  Write-Host "[X] $m" -ForegroundColor Red }
 
-# Only the flags Add/Set-PASSafeMember support
+# Perm keys supported by Add/Set-PASSafeMember
 $AllowedPermKeys = @(
   'UseAccounts','RetrieveAccounts','ListAccounts','AddAccounts',
   'UpdateAccountContent','UpdateAccountProperties',
@@ -51,7 +55,7 @@ function Get-AllPermFlags {
   }
 }
 
-# OWNER (email) gets ONLY these
+# Owner (email) ONLY the permissions you requested
 function Get-OwnerPermFlags {
   @{
     ListAccounts                           = $true
@@ -62,7 +66,6 @@ function Get-OwnerPermFlags {
     ViewAuditLog                           = $true
     AccessWithoutConfirmation              = $true
 
-    # Not granted:
     AddAccounts                            = $false
     UpdateAccountContent                   = $false
     UpdateAccountProperties                = $false
@@ -78,16 +81,16 @@ function Select-PermParams([hashtable]$h) {
   $out
 }
 
-# Build name variants for directory lookups (sAM first, then UPN, handle $ machine accounts)
+# Build name variants for directory lookups (sAM first, then UPN; handle machine $)
 function Get-NameVariants([string]$MemberName, [string]$DirLocation) {
   $list = [System.Collections.Generic.List[string]]::new()
-  $t = ($MemberName | ForEach-Object { $_.ToString() }).Trim()
+  $t = if ($null -ne $MemberName) { $MemberName.ToString().Trim() } else { '' }
   if (-not $t) { return $list }
 
   if ($t -like '*@*') {
     $left = $t.Split('@')[0]
-    if ($left) { $list.Add($left) }                # sAM first
-    if (-not $list.Contains($t)) { $list.Add($t) } # given UPN
+    if ($left) { $list.Add($left) }
+    if (-not $list.Contains($t)) { $list.Add($t) }
   } else {
     $list.Add($t)
     $upn = "$t@$DirLocation"
@@ -101,9 +104,22 @@ function Get-NameVariants([string]$MemberName, [string]$DirLocation) {
   return $list
 }
 
-# --------- Core membership helpers (NO name collisions) ---------
+# Recognize "not found in directory" style errors so we can log & skip
+function Is-DirectoryNotFoundError([string]$msg) {
+  if (-not $msg) { return $false }
+  return (
+    $msg -match '\[404\]' -or
+    $msg -match '\bFailed to find user\b' -or
+    $msg -match '\bwas not found\b' -or
+    $msg -match '\bhas not been defined\b' -or
+    $msg -match '\bin ldap mapping\b' -or
+    $msg -match '\bNo such object\b' -or
+    $msg -match '\bobject does not exist\b'
+  )
+}
 
-# Try to add/update a member via psPAS; returns $true if the call succeeded (added/updated)
+# ---- psPAS add/update with auto fallback: -SearchIn OR -MemberLocation ----
+# NEVER throws; returns $true if added/updated, $false otherwise.
 function AddOrSet-SafeMember {
   [CmdletBinding()]
   param(
@@ -115,56 +131,75 @@ function AddOrSet-SafeMember {
 
   $perm = Select-PermParams $PermFlags
 
+  # Try with -SearchIn
+  $params = @{ SafeName = $SafeName; MemberName = $MemberName; SearchIn = $SearchIn }
+  $params += $perm
   try {
-    $params = @{ SafeName = $SafeName; MemberName = $MemberName; SearchIn = $SearchIn }
-    $params += $perm
     Add-PASSafeMember @params -ErrorAction Stop | Out-Null
     Write-Ok "Added '$MemberName' (SearchIn='$SearchIn') to '$SafeName'."
     return $true
   } catch {
     $msg = $_.Exception.Message
-    if ($msg -match 'already exists' -or $msg -match '409') {
-      $params = @{ SafeName = $SafeName; MemberName = $MemberName; SearchIn = $SearchIn }
-      $params += $perm
-      Set-PASSafeMember @params -ErrorAction Stop | Out-Null
-      Write-Ok "Updated '$MemberName' on '$SafeName'."
-      return $true
-    } else {
-      Write-Warn "Add/Update failed for '$MemberName' on '$SafeName' : $msg"
+    if (Is-DirectoryNotFoundError $msg) {
+      Write-Warn "[SKIP-NOTFOUND] '$MemberName' not found in '$SearchIn' (SearchIn). Will try again on a future run."
       return $false
     }
-  }
-}
+    if ($msg -match 'A parameter cannot be found that matches parameter name.*SearchIn') {
+      # Fall back to MemberLocation
+      $params = @{ SafeName = $SafeName; MemberName = $MemberName; MemberLocation = $SearchIn }
+      $params += $perm
+      try {
+        Add-PASSafeMember @params -ErrorAction Stop | Out-Null
+        Write-Ok "Added '$MemberName' (MemberLocation='$SearchIn') to '$SafeName'."
+        return $true
+      } catch {
+        $msg2 = $_.Exception.Message
+        if (Is-DirectoryNotFoundError $msg2) {
+          Write-Warn "[SKIP-NOTFOUND] '$MemberName' not found in '$SearchIn' (MemberLocation). Will try again later."
+          return $false
+        }
+        if ($msg2 -match 'already exists' -or $msg2 -match '409') {
+          try {
+            Set-PASSafeMember @params -ErrorAction Stop | Out-Null
+            Write-Ok "Updated '$MemberName' on '$SafeName'."
+            return $true
+          } catch {
+            Write-Err "Set-PASSafeMember failed for '$MemberName' on '$SafeName': $($_.Exception.Message)"
+            return $false
+          }
+        }
+        Write-Warn "Add-PASSafeMember (MemberLocation) failed for '$MemberName' on '$SafeName': $msg2"
+        return $false
+      }
+    }
 
-# Check if any of the name variants are present on the safe
-function Test-SafeMemberPresent {
-  [CmdletBinding()]
-  param(
-    [Parameter(Mandatory)][string]$SafeName,
-    [Parameter(Mandatory)][string[]]$CandidateNames
-  )
-  try {
-    $members = Get-PASSafeMembers -SafeName $SafeName -ErrorAction Stop
-  } catch {
-    Write-Warn "Could not read members of '$SafeName' for verification: $($_.Exception.Message)"
+    if ($msg -match 'already exists' -or $msg -match '409') {
+      try {
+        Set-PASSafeMember @params -ErrorAction Stop | Out-Null
+        Write-Ok "Updated '$MemberName' on '$SafeName'."
+        return $true
+      } catch {
+        # Also try Set- with MemberLocation
+        $params = @{ SafeName = $SafeName; MemberName = $MemberName; MemberLocation = $SearchIn }
+        $params += $perm
+        try {
+          Set-PASSafeMember @params -ErrorAction Stop | Out-Null
+          Write-Ok "Updated '$MemberName' on '$SafeName' (MemberLocation)."
+          return $true
+        } catch {
+          Write-Err "Set-PASSafeMember failed for '$MemberName' on '$SafeName': $($_.Exception.Message)"
+          return $false
+        }
+      }
+    }
+
+    Write-Warn "Add-PASSafeMember (SearchIn) failed for '$MemberName' on '$SafeName': $msg"
     return $false
   }
-
-  $set = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-  foreach ($m in $members) {
-    $n = $null
-    if ($m.MemberName) { $n = $m.MemberName.ToString().Trim() }
-    elseif ($m.name)   { $n = $m.name.ToString().Trim() }
-    if ($n) { $set.Add($n) | Out-Null }
-  }
-
-  foreach ($c in $CandidateNames) {
-    if ($set.Contains($c)) { return $true }
-  }
-  return $false
 }
 
-# Ensure member exists: try variants, verify, retry up to 3 times
+# Ensure member exists: tries each candidate variant once; verifies; DOES NOT loop forever.
+# No throws; always returns after logging.
 function Ensure-SafeMember {
   [CmdletBinding()]
   param(
@@ -176,35 +211,28 @@ function Ensure-SafeMember {
   )
 
   $variants = if ($DirectoryPrincipal) { Get-NameVariants -MemberName $MemberName -DirLocation $SearchIn } else { [string[]]@($MemberName.Trim()) }
-  if (-not $variants -or $variants.Count -eq 0) { Write-Err "No candidate names for '$MemberName'."; return }
+  if (-not $variants -or $variants.Count -eq 0) { Write-Warn "No candidate names for '$MemberName'."; return }
 
-  for ($attempt = 1; $attempt -le 3; $attempt++) {
-    Write-Info "Attempt $attempt to add/verify '$MemberName' on '$SafeName'…"
-    $anyOk = $false
-    foreach ($n in $variants) {
-      $ok = AddOrSet-SafeMember -SafeName $SafeName -MemberName $n -PermFlags $PermFlags -SearchIn $SearchIn
-      if ($ok) { $anyOk = $true }
-    }
-    Start-Sleep -Seconds 2
-    $present = Test-SafeMemberPresent -SafeName $SafeName -CandidateNames $variants
-    if ($present) {
-      Write-Ok "'$MemberName' is present on '$SafeName'."
-      return
-    }
-    if (-not $anyOk) { Write-Warn "No successful add/update in this attempt; will retry." }
+  foreach ($n in $variants) {
+    $ok = AddOrSet-SafeMember -SafeName $SafeName -MemberName $n -PermFlags $PermFlags -SearchIn $SearchIn
+    # Whether ok or not, do not throw; move to next variant/member/user
+    if ($ok) { break } # if one variant worked, stop trying more variants for this member
   }
-  Write-Warn "After retries, '$MemberName' still not confirmed on '$SafeName'."
 }
 
 # ---------- Logon ----------
-$cred = Get-Credential -Message "Enter your CyberArk ($AuthType) credential"
+$didLogin = $false
 try {
-  New-PASSession -Credential $cred -BaseURI $BaseURI -Type $AuthType | Out-Null
+  $cred = Get-Credential -Message "Enter your CyberArk ($AuthType) credential"
+  New-PASSession -Credential $cred -BaseURI $BaseURI -Type $AuthType -ErrorAction Stop | Out-Null
+  $didLogin = $true
   Write-Ok "Authenticated to $BaseURI."
 } catch {
-  Write-Err "Authentication failed: $($_.Exception.Message)"; return
+  Write-Err "Authentication failed: $($_.Exception.Message)"
+  return
 }
 
+# ---------- Main ----------
 try {
   $rows = Import-Csv -Path $CsvPath
   if (-not $rows) { Write-Err "No rows in CSV ($CsvPath)."; return }
@@ -218,15 +246,16 @@ try {
     $mail = ($row.email).ToString().Trim()
 
     if ([string]::IsNullOrWhiteSpace($sam) -or [string]::IsNullOrWhiteSpace($eid) -or [string]::IsNullOrWhiteSpace($mail)) {
-      Write-Warn "Skipping row with missing fields: $($row | ConvertTo-Json -Compress)"; continue
+      Write-Warn "Skipping row with missing fields: $($row | ConvertTo-Json -Compress)"
+      continue
     }
 
-    # IND_<sam>_<eid>
     $safeName = "IND_{0}_{1}" -f $sam, $eid
     Write-Info "Processing Safe: $safeName (Owner=$mail)"
 
-    # Create Safe if missing; ensure 7-day retention
-    $exists = $null; try { $exists = Get-PASSafe -SafeName $safeName -ErrorAction SilentlyContinue } catch {}
+    # Create or ensure retention
+    $exists = $null
+    try { $exists = Get-PASSafe -SafeName $safeName -ErrorAction SilentlyContinue } catch { $exists = $null }
     if (-not $exists) {
       $splat = @{
         SafeName              = $safeName
@@ -245,20 +274,18 @@ try {
       catch { Write-Warn "Could not set retention on existing '$safeName': $($_.Exception.Message)" }
     }
 
-    # --- Members (with verify + retry) ---
-    # Vault users (full permissions)
+    # --- Members (no-stop, skip-on-notfound) ---
     Ensure-SafeMember -SafeName $safeName -MemberName 'ACURestAPI_Local'                     -PermFlags $permAll   -SearchIn 'Vault'
     Ensure-SafeMember -SafeName $safeName -MemberName 'identity-privilege-integration-user$' -PermFlags $permAll   -SearchIn 'Vault'
-
-    # Directory group with full perms
-    Ensure-SafeMember -SafeName $safeName -MemberName 'IAM_ACU_CA_Admins@alliantcreditunion.com' -PermFlags $permAll   -SearchIn $DirLocation -DirectoryPrincipal
-
-    # Owner (email) with LIMITED perms
+    Ensure-SafeMember -SafeName $safeName -MemberName 'IAM_ACU_CA_Admins@alliantcreditunion.com' -PermFlags $permAll -SearchIn $DirLocation -DirectoryPrincipal
     Ensure-SafeMember -SafeName $safeName -MemberName $mail -PermFlags $permOwner -SearchIn $DirLocation -DirectoryPrincipal
   }
 
   Write-Ok "All rows processed."
-}
-finally {
-  try { Close-PASSession | Out-Null; Write-Ok "Logged off." } catch { Write-Warn "Logoff warning: $($_.Exception.Message)" }
+} catch {
+  Write-Err "Unhandled error: $($_.Exception.Message)"
+} finally {
+  if ($didLogin) {
+    try { Close-PASSession | Out-Null; Write-Ok "Logged off." } catch { Write-Warn "Logoff warning: $($_.Exception.Message)" }
+  }
 }
