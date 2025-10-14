@@ -1,8 +1,17 @@
+<#
+Single report including status + owners from extensionAttribute3/4.
+- extensionAttribute3 => Primary owner (SAM expected)
+- extensionAttribute4 => Secondary owner (SAM expected)
+- Resolves each owner SAM to AD Name where possible.
+
+Output: AccountReport.csv (in the same folder as the input CSV)
+Requires: RSAT ActiveDirectory module.
+#>
+
 # ================================
 # CONFIG — EDIT ME
 # ================================
-$InputCsvPath       = "C:\Data\accounts.csv"  # local path to input CSV
-$EnforceStartsWithC = $false                  # optional internal check (no extra columns)
+$InputCsvPath = "C:\Data\accounts.csv"   # Local path to your input CSV
 # ================================
 
 # ---------- Prep & validation ----------
@@ -10,9 +19,7 @@ if (-not (Test-Path $InputCsvPath)) { throw "Input CSV not found: $InputCsvPath"
 
 $OutDir = Split-Path -Path $InputCsvPath -Parent
 if (-not $OutDir) { $OutDir = "." }
-
-$StatusCsv    = Join-Path $OutDir 'AccountStatus.csv'
-$OwnershipCsv = Join-Path $OutDir 'AccountOwnership.csv'
+$OutFile = Join-Path $OutDir "AccountReport.csv"
 
 # Ensure AD module
 if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
@@ -28,25 +35,38 @@ $possibleCols = @('samAccountName','Account')
 $samCol = $possibleCols | Where-Object { $_ -in $rows[0].PsObject.Properties.Name }
 if (-not $samCol) { throw "Input CSV must contain a column named 'samAccountName' or 'Account'." }
 
-# ---------- Regex built for 'info' parsing ----------
-# Capture values until a delimiter (; , |) or end-of-line/string
-$rxPrimary   = [regex]'(?im)\bPrimary\s*Owner\b\s*[:=\-]?\s*(?<val>.+?)(?=[;,\|\r\n]|$)'
-$rxSecondary = [regex]'(?im)\bSecondary\s*Owner(?:\s*/\s*|\s+)?(?:Approver)?\b\s*[:=\-]?\s*(?<val>.+?)(?=[;,\|\r\n]|$)|\bSecondary\s*Approver\b\s*[:=\-]?\s*(?<val>.+?)(?=[;,\|\r\n]|$)'
-$rxStartsWithC = [regex]'(?i)^\s*C'
+# ---------- Helpers ----------
+# Normalize a login value; often a plain SAM, but handle stray delimiters/whitespace.
+function Normalize-Login([string]$val) {
+  if ([string]::IsNullOrWhiteSpace($val)) { return "" }
+  $t = $val.Trim()
+  # If attributes contain multiple tokens, take the first non-empty token.
+  $parts = ($t -split '[;,\|\s]+' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+  if ($parts.Count -gt 0) { return $parts[0].Trim() }
+  return $t
+}
 
-function Clean-Val([string]$s) {
-  if ([string]::IsNullOrWhiteSpace($s)) { return "" }
-  # 1) Trim outer whitespace
-  $t = $s.Trim()
-  # 2) Remove trailing delimiters + whitespace (e.g., "C12345;  " -> "C12345")
-  $t = $t -replace '[;,\|\s]+$',''
-  # 3) Collapse internal spaces around the value (optional)
-  return $t.Trim()
+# Resolve a login (sam/upn) to AD user; returns PSCustomObject with Sam and Name
+function Resolve-Owner([string]$login) {
+  $loginNorm = Normalize-Login $login
+  if ([string]::IsNullOrWhiteSpace($loginNorm)) {
+    return [pscustomobject]@{ Sam = ""; Name = "" }
+  }
+
+  try {
+    # Try by sAM first; also consider UPN.
+    $u = Get-ADUser -LDAPFilter "(|(sAMAccountName=$loginNorm)(userPrincipalName=$loginNorm))" -Properties Name, displayName, sAMAccountName -ErrorAction Stop
+    $name = if ($u.displayName) { $u.displayName } elseif ($u.Name) { $u.Name } else { "" }
+    $sam  = if ($u.sAMAccountName) { $u.sAMAccountName } else { $loginNorm }
+    return [pscustomobject]@{ Sam = $sam; Name = $name }
+  } catch {
+    # Not found; keep the original token in Sam so you still see what was stored
+    return [pscustomobject]@{ Sam = $loginNorm; Name = "" }
+  }
 }
 
 # ---------- Process ----------
-$statusOut    = New-Object System.Collections.Generic.List[object]
-$ownershipAll = New-Object System.Collections.Generic.List[object]
+$report = New-Object System.Collections.Generic.List[object]
 
 foreach ($row in $rows) {
   $sam = ($row.$samCol).ToString().Trim()
@@ -54,62 +74,57 @@ foreach ($row in $rows) {
 
   $user = $null
   try {
-    $user = Get-ADUser -LDAPFilter "(sAMAccountName=$sam)" -Properties Enabled, info, whenCreated, lastLogonDate
+    # Pull status + owner attributes
+    $user = Get-ADUser -LDAPFilter "(sAMAccountName=$sam)" -Properties Enabled, whenCreated, lastLogonDate, extensionAttribute3, extensionAttribute4
   } catch { }
 
   if ($null -eq $user) {
-    $statusOut.Add([pscustomobject]@{
-      samAccountName = $sam
-      ADExists       = 'No'
-      Enabled        = ''
-      WhenCreated    = ''
-      LastLogonDate  = ''
+    $report.Add([pscustomobject]@{
+      samAccountName        = $sam
+      ADExists              = 'No'
+      Enabled               = ''
+      WhenCreated           = ''
+      LastLogonDate         = ''
+      OwnerPrimarySAM       = ''
+      OwnerPrimaryName      = ''
+      OwnerSecondarySAM     = ''
+      OwnerSecondaryName    = ''
+      OwnersCombined        = ''
     })
     continue
   }
 
-  $enabled = $false
-  if ($user.PSObject.Properties['Enabled']) { $enabled = [bool]$user.Enabled }
+  $enabled = if ($user.PSObject.Properties['Enabled']) { [bool]$user.Enabled } else { $false }
 
-  $statusOut.Add([pscustomobject]@{
-    samAccountName = $sam
-    ADExists       = 'Yes'
-    Enabled        = $(if ($enabled) { 'Enabled' } else { 'Disabled' })
-    WhenCreated    = $user.whenCreated
-    LastLogonDate  = $user.lastLogonDate
-  })
+  # Read owners from extension attributes
+  $rawPrim = $user.extensionAttribute3
+  $rawSec  = $user.extensionAttribute4
 
-  # Parse ONLY from 'info'
-  $infoText = ($user.info | Out-String)
-  $primaryVal = ""
-  $secondaryVal = ""
+  $prim = Resolve-Owner $rawPrim
+  $sec  = Resolve-Owner $rawSec
 
-  if (-not [string]::IsNullOrWhiteSpace($infoText)) {
-    $m1 = $rxPrimary.Matches($infoText);   if ($m1.Count -gt 0) { $primaryVal   = Clean-Val ($m1[0].Groups['val'].Value) }
-    $m2 = $rxSecondary.Matches($infoText); if ($m2.Count -gt 0) { $secondaryVal = Clean-Val ($m2[0].Groups['val'].Value) }
+  # Build a combined, human-readable string (omit missing parts cleanly)
+  $ownersParts = @()
+  if ($prim.Sam) { $ownersParts += ("Primary: {0}{1}" -f $prim.Sam, ($(if ($prim.Name) { " ($($prim.Name))" } else { "" }))) }
+  if ($sec.Sam)  { $ownersParts += ("Secondary: {0}{1}" -f $sec.Sam,  ($(if ($sec.Name)  { " ($($sec.Name))" }  else { "" }))) }
+  $ownersCombined = [string]::Join(" | ", $ownersParts)
 
-    if ($EnforceStartsWithC) {
-      if ($primaryVal   -and -not $rxStartsWithC.IsMatch($primaryVal))   { } # silent check
-      if ($secondaryVal -and -not $rxStartsWithC.IsMatch($secondaryVal)) { }
-    }
-  }
-
-  $ownershipAll.Add([pscustomobject]@{
-    samAccountName           = $sam
-    PrimaryOwner             = $primaryVal
-    SecondaryOwnerOrApprover = $secondaryVal
+  $report.Add([pscustomobject]@{
+    samAccountName        = $sam
+    ADExists              = 'Yes'
+    Enabled               = $(if ($enabled) { 'Enabled' } else { 'Disabled' })
+    WhenCreated           = $user.whenCreated
+    LastLogonDate         = $user.lastLogonDate
+    OwnerPrimarySAM       = $prim.Sam
+    OwnerPrimaryName      = $prim.Name
+    OwnerSecondarySAM     = $sec.Sam
+    OwnerSecondaryName    = $sec.Name
+    OwnersCombined        = $ownersCombined
   })
 }
 
 # ---------- Output ----------
-$statusOut | Export-Csv -Path $StatusCsv -NoTypeInformation -Encoding UTF8
-
-$filteredOwnership = $ownershipAll |
-  Where-Object { $_.PrimaryOwner -and $_.SecondaryOwnerOrApprover } |
-  Select-Object samAccountName, PrimaryOwner, SecondaryOwnerOrApprover
-
-$filteredOwnership | Export-Csv -Path $OwnershipCsv -NoTypeInformation -Encoding UTF8
+$report | Export-Csv -Path $OutFile -NoTypeInformation -Encoding UTF8
 
 Write-Host "✅ Done."
-Write-Host " - Status CSV:    $StatusCsv"
-Write-Host " - Ownership CSV: $OwnershipCsv (only rows with BOTH owners)"
+Write-Host " - Report: $OutFile"
