@@ -1,11 +1,15 @@
 <#
-Single report including status + owners from extensionAttribute3/4.
-- extensionAttribute3 => Primary owner (SAM expected)
-- extensionAttribute4 => Secondary owner (SAM expected)
-- Resolves each owner SAM to AD Name where possible.
+Single report: status + owners (combined string) next to the input CSV.
 
-Output: AccountReport.csv (in the same folder as the input CSV)
-Requires: RSAT ActiveDirectory module.
+Columns:
+  samAccountName, ADExists, Enabled, WhenCreated, LastLogonDate, OwnersCombined
+
+Owners are sourced from:
+  - extensionAttribute3 => Primary owner (SAM/UPN expected)
+  - extensionAttribute4 => Secondary owner (SAM/UPN expected)
+
+Each owner is resolved to AD to get a friendly Name; the combined string looks like:
+  "Primary: jsnow (Jon Snow) | Secondary: atargaryen (A. Targaryen)"
 #>
 
 # ================================
@@ -36,41 +40,51 @@ $samCol = $possibleCols | Where-Object { $_ -in $rows[0].PsObject.Properties.Nam
 if (-not $samCol) { throw "Input CSV must contain a column named 'samAccountName' or 'Account'." }
 
 # ---------- Helpers ----------
-# Normalize a login value; often a plain SAM, but handle stray delimiters/whitespace.
-function Normalize-Login([string]$val) {
-  if ([string]::IsNullOrWhiteSpace($val)) { return "" }
-  $t = $val.Trim()
-  # If attributes contain multiple tokens, take the first non-empty token.
-  $parts = ($t -split '[;,\|\s]+' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-  if ($parts.Count -gt 0) { return $parts[0].Trim() }
-  return $t
+# Normalize: ensure string, trim, split on common delimiters; always return a string
+function Normalize-Login([Parameter(ValueFromPipeline=$true)][object]$val) {
+  $s = [string]$val
+  if ([string]::IsNullOrWhiteSpace($s)) { return "" }
+  $s = $s.Trim()
+  # Replace delimiters with space, then take first token
+  $s = ([string]($s -replace '[;,\|\s]+',' ')).Trim()
+  if ([string]::IsNullOrWhiteSpace($s)) { return "" }
+  $first = ([string]($s -split '\s+')[0])
+  return $first
 }
 
-# Resolve a login (sam/upn) to AD user; returns PSCustomObject with Sam and Name
+# Resolve login (sam/upn) to {Sam, Name}; includes a small cache to avoid repeated AD lookups
+$ResolveCache = @{}
 function Resolve-Owner([string]$login) {
   $loginNorm = Normalize-Login $login
   if ([string]::IsNullOrWhiteSpace($loginNorm)) {
     return [pscustomobject]@{ Sam = ""; Name = "" }
   }
 
+  if ($ResolveCache.ContainsKey($loginNorm)) {
+    return $ResolveCache[$loginNorm]
+  }
+
   try {
-    # Try by sAM first; also consider UPN.
-    $u = Get-ADUser -LDAPFilter "(|(sAMAccountName=$loginNorm)(userPrincipalName=$loginNorm))" -Properties Name, displayName, sAMAccountName -ErrorAction Stop
+    $u = Get-ADUser -LDAPFilter "(|(sAMAccountName=$loginNorm)(userPrincipalName=$loginNorm))" -Properties displayName, Name, sAMAccountName -ErrorAction Stop
     $name = if ($u.displayName) { $u.displayName } elseif ($u.Name) { $u.Name } else { "" }
     $sam  = if ($u.sAMAccountName) { $u.sAMAccountName } else { $loginNorm }
-    return [pscustomobject]@{ Sam = $sam; Name = $name }
+    $obj = [pscustomobject]@{ Sam = $sam; Name = $name }
   } catch {
-    # Not found; keep the original token in Sam so you still see what was stored
-    return [pscustomobject]@{ Sam = $loginNorm; Name = "" }
+    # Not found; keep normalized token as SAM
+    $obj = [pscustomobject]@{ Sam = $loginNorm; Name = "" }
   }
+
+  $ResolveCache[$loginNorm] = $obj
+  return $obj
 }
 
 # ---------- Process ----------
 $report = New-Object System.Collections.Generic.List[object]
 
 foreach ($row in $rows) {
-  $sam = ($row.$samCol).ToString().Trim()
+  $sam = [string]($row.$samCol)
   if ([string]::IsNullOrWhiteSpace($sam)) { continue }
+  $sam = $sam.Trim()
 
   $user = $null
   try {
@@ -80,46 +94,35 @@ foreach ($row in $rows) {
 
   if ($null -eq $user) {
     $report.Add([pscustomobject]@{
-      samAccountName        = $sam
-      ADExists              = 'No'
-      Enabled               = ''
-      WhenCreated           = ''
-      LastLogonDate         = ''
-      OwnerPrimarySAM       = ''
-      OwnerPrimaryName      = ''
-      OwnerSecondarySAM     = ''
-      OwnerSecondaryName    = ''
-      OwnersCombined        = ''
+      samAccountName = $sam
+      ADExists       = 'No'
+      Enabled        = ''
+      WhenCreated    = ''
+      LastLogonDate  = ''
+      OwnersCombined = ''
     })
     continue
   }
 
   $enabled = if ($user.PSObject.Properties['Enabled']) { [bool]$user.Enabled } else { $false }
 
-  # Read owners from extension attributes
-  $rawPrim = $user.extensionAttribute3
-  $rawSec  = $user.extensionAttribute4
+  # Resolve owners from extension attributes
+  $prim = Resolve-Owner ([string]$user.extensionAttribute3)
+  $sec  = Resolve-Owner ([string]$user.extensionAttribute4)
 
-  $prim = Resolve-Owner $rawPrim
-  $sec  = Resolve-Owner $rawSec
-
-  # Build a combined, human-readable string (omit missing parts cleanly)
+  # Build combined string (only include parts that exist)
   $ownersParts = @()
   if ($prim.Sam) { $ownersParts += ("Primary: {0}{1}" -f $prim.Sam, ($(if ($prim.Name) { " ($($prim.Name))" } else { "" }))) }
   if ($sec.Sam)  { $ownersParts += ("Secondary: {0}{1}" -f $sec.Sam,  ($(if ($sec.Name)  { " ($($sec.Name))" }  else { "" }))) }
   $ownersCombined = [string]::Join(" | ", $ownersParts)
 
   $report.Add([pscustomobject]@{
-    samAccountName        = $sam
-    ADExists              = 'Yes'
-    Enabled               = $(if ($enabled) { 'Enabled' } else { 'Disabled' })
-    WhenCreated           = $user.whenCreated
-    LastLogonDate         = $user.lastLogonDate
-    OwnerPrimarySAM       = $prim.Sam
-    OwnerPrimaryName      = $prim.Name
-    OwnerSecondarySAM     = $sec.Sam
-    OwnerSecondaryName    = $sec.Name
-    OwnersCombined        = $ownersCombined
+    samAccountName = $sam
+    ADExists       = 'Yes'
+    Enabled        = $(if ($enabled) { 'Enabled' } else { 'Disabled' })
+    WhenCreated    = $user.whenCreated
+    LastLogonDate  = $user.lastLogonDate
+    OwnersCombined = $ownersCombined
   })
 }
 
