@@ -1,64 +1,143 @@
 <#
 .SYNOPSIS
-  From a list of accounts (samAccountName), produce:
+  From a URL (or path) to a CSV of samAccountNames, produce:
    - CSV #1: AD existence + Enabled/Disabled
-   - CSV #2: Owners parsed from the 'info' attribute (Primary Owner, SecondaryOwner/approver)
-
-.REQUIREMENTS
-  RSAT ActiveDirectory module (Get-ADUser). Run in a context that can read AD.
+   - CSV #2: Owners parsed from 'info' (Primary Owner, SecondaryOwner/approver)
+  Save locally and/or upload each CSV to a provided URL.
 
 .PARAMETERS
-  -InputCsv: Path to input CSV. Must contain a column named 'samAccountName' or 'Account'.
-  -OutDir:   Output directory for the 2 CSVs (created if missing).
+  -InputCsvUri              : URL (https://...) OR local path to the input CSV.
+  -OutDir                   : Local output directory (created if missing). Default: .\out
+  -OutputStatusUri          : Optional HTTP/HTTPS URL to upload AccountStatus.csv
+  -OutputOwnershipUri       : Optional HTTP/HTTPS URL to upload AccountOwnership.csv
+  -InputHeaders             : Optional hashtable for download headers (e.g., @{Authorization="Bearer ..."})
+  -OutputStatusHeaders      : Optional hashtable for upload headers for status CSV
+  -OutputOwnershipHeaders   : Optional hashtable for upload headers for ownership CSV
+  -EnforceStartsWithC       : If set, flags owner values that don’t start with “C”.
 
 .EXAMPLE
-  .\Audit-AdAccounts.ps1 -InputCsv .\accounts.csv -OutDir .\out
+  .\Audit-AdAccounts.ps1 `
+    -InputCsvUri "https://example.com/accounts.csv" `
+    -OutDir .\out `
+    -OutputStatusUri "https://presigned-upload/status.csv" `
+    -OutputOwnershipUri "https://presigned-upload/ownership.csv"
+
 #>
 
 [CmdletBinding()]
 param(
   [Parameter(Mandatory=$true)]
-  [string]$InputCsv,
+  [string]$InputCsvUri,
 
-  [Parameter(Mandatory=$true)]
-  [string]$OutDir
+  [string]$OutDir = ".\out",
+
+  [string]$OutputStatusUri,
+  [string]$OutputOwnershipUri,
+
+  [hashtable]$InputHeaders,
+  [hashtable]$OutputStatusHeaders,
+  [hashtable]$OutputOwnershipHeaders,
+
+  [switch]$EnforceStartsWithC
 )
 
-# --- Prep ---
-if (-not (Test-Path $InputCsv)) { throw "Input CSV not found: $InputCsv" }
-if (-not (Test-Path $OutDir))   { New-Item -ItemType Directory -Path $OutDir | Out-Null }
+# -----------------------
+# Helpers
+# -----------------------
+function Get-TempFile {
+  param([string]$Ext = ".tmp")
+  return [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), [System.IO.Path]::GetRandomFileName() + $Ext)
+}
+
+function Download-File {
+  param(
+    [Parameter(Mandatory=$true)][string]$Source,
+    [string]$Destination,
+    [hashtable]$Headers
+  )
+  if (-not $Destination) { $Destination = Get-TempFile -Ext (".csv") }
+
+  if (Test-Path $Source) {
+    Copy-Item -Path $Source -Destination $Destination -Force
+    return $Destination
+  }
+
+  if ($Source -match '^https?://') {
+    $iwrParams = @{
+      Uri = $Source
+      OutFile = $Destination
+      UseBasicParsing = $false
+      Method = 'GET'
+    }
+    if ($Headers) { $iwrParams['Headers'] = $Headers }
+    Invoke-WebRequest @iwrParams | Out-Null
+    return $Destination
+  }
+
+  throw "InputCsvUri is neither a valid path nor an http(s) URL: $Source"
+}
+
+function Upload-IfUri {
+  param(
+    [string]$FilePath,
+    [string]$Uri,
+    [hashtable]$Headers
+  )
+  if ([string]::IsNullOrWhiteSpace($Uri)) { return $false }
+  if ($Uri -notmatch '^https?://') { throw "Output URI must be http(s): $Uri" }
+
+  $iwrParams = @{
+    Uri = $Uri
+    Method = 'PUT'          # Most presigned endpoints expect PUT. Change to POST if your endpoint requires it.
+    InFile = $FilePath
+    UseBasicParsing = $false
+  }
+  if ($Headers) { $iwrParams['Headers'] = $Headers }
+
+  $resp = Invoke-WebRequest @iwrParams
+  Write-Host "⬆️ Uploaded $([IO.Path]::GetFileName($FilePath)) -> $Uri (Status: $($resp.StatusCode))"
+  return $true
+}
+
+# -----------------------
+# Prep
+# -----------------------
+if (-not (Test-Path $OutDir)) { New-Item -ItemType Directory -Path $OutDir | Out-Null }
 
 $StatusCsv    = Join-Path $OutDir 'AccountStatus.csv'
 $OwnershipCsv = Join-Path $OutDir 'AccountOwnership.csv'
 
-# Import data
-$rows = Import-Csv -Path $InputCsv
+# -----------------------
+# Input
+# -----------------------
+$localInput = Download-File -Source $InputCsvUri -Headers $InputHeaders
+$rows = Import-Csv -Path $localInput
 
-# Determine which column has the samAccountName
+# Determine username column
 $possibleCols = @('samAccountName','Account')
 $samCol = $possibleCols | Where-Object { $_ -in $rows[0].PsObject.Properties.Name }
-if (-not $samCol) {
-  throw "Input CSV must contain a column named 'samAccountName' or 'Account'."
-}
+if (-not $samCol) { throw "Input CSV must contain 'samAccountName' or 'Account'." }
 
-# Regex helpers for parsing 'info' attribute
-# Accepts variations like "Primary Owner:", "Primary Owner  :", "SecondaryOwner/approver :" etc
-# Captures text up to end, semicolon, or newline.
+# -----------------------
+# Regex & Flags
+# -----------------------
 $rxPrimary   = [regex]'(?im)\bPrimary\s*Owner\s*:\s*(?<val>.+?)(?:;|$|\r|\n)'
 $rxSecondary = [regex]'(?im)\bSecondary\s*Owner(?:/|\s*)approver\s*:\s*(?<val>.+?)(?:;|$|\r|\n)'
-
-# If you want to enforce “starts with C” (e.g., CNA IDs), set this to $true
-$EnforceStartsWithC = $false
 $rxStartsWithC = [regex]'(?i)^\s*C'
+$enforce = [bool]$EnforceStartsWithC
 
-# Results
+# -----------------------
+# Ensure AD module
+# -----------------------
+if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
+  throw "ActiveDirectory module not found. Install RSAT or run on a domain-joined host with RSAT."
+}
+
+# -----------------------
+# Process
+# -----------------------
 $statusOut    = New-Object System.Collections.Generic.List[object]
 $ownershipOut = New-Object System.Collections.Generic.List[object]
-
-# Ensure AD module
-if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
-  throw "ActiveDirectory module not found. Install RSAT or run on a domain-joined admin host with RSAT."
-}
 
 foreach ($row in $rows) {
   $sam = ($row.$samCol).ToString().Trim()
@@ -67,12 +146,9 @@ foreach ($row in $rows) {
   $user = $null
   try {
     $user = Get-ADUser -LDAPFilter "(sAMAccountName=$sam)" -Properties Enabled, info, whenCreated, whenChanged, lastLogonDate
-  } catch {
-    # ignore, will handle as not found
-  }
+  } catch { }
 
   if ($null -eq $user) {
-    # Not in AD
     $statusOut.Add([pscustomobject]@{
       samAccountName   = $sam
       ADExists         = 'No'
@@ -81,8 +157,6 @@ foreach ($row in $rows) {
       WhenCreated      = ''
       LastLogonDate    = ''
     })
-
-    # Ownership row (cannot parse info if not in AD)
     $ownershipOut.Add([pscustomobject]@{
       samAccountName            = $sam
       ADExists                  = 'No'
@@ -94,7 +168,6 @@ foreach ($row in $rows) {
     continue
   }
 
-  # Exists in AD
   $enabled = $false
   if ($user.PSObject.Properties['Enabled']) { $enabled = [bool]$user.Enabled }
 
@@ -107,34 +180,23 @@ foreach ($row in $rows) {
     LastLogonDate    = $user.lastLogonDate
   })
 
-  # Parse ownership from info
   $infoText = ($user.info | Out-String).Trim()
   $primaryVal   = ''
   $secondaryVal = ''
   $parseNote    = ''
 
   if (-not [string]::IsNullOrWhiteSpace($infoText)) {
-    $m1 = $rxPrimary.Match($infoText)
-    if ($m1.Success) {
-      $primaryVal = $m1.Groups['val'].Value.Trim()
-    }
-    $m2 = $rxSecondary.Match($infoText)
-    if ($m2.Success) {
-      $secondaryVal = $m2.Groups['val'].Value.Trim()
-    }
+    $m1 = $rxPrimary.Match($infoText);   if ($m1.Success) { $primaryVal   = $m1.Groups['val'].Value.Trim() }
+    $m2 = $rxSecondary.Match($infoText); if ($m2.Success) { $secondaryVal = $m2.Groups['val'].Value.Trim() }
 
-    if ($EnforceStartsWithC) {
-      if ($primaryVal -and -not $rxStartsWithC.IsMatch($primaryVal)) {
-        $parseNote += 'Primary Owner does not start with C; '
-      }
-      if ($secondaryVal -and -not $rxStartsWithC.IsMatch($secondaryVal)) {
-        $parseNote += 'SecondaryOwner/approver does not start with C; '
-      }
+    if ($enforce) {
+      if ($primaryVal   -and -not $rxStartsWithC.IsMatch($primaryVal))   { $parseNote += 'Primary Owner does not start with C; ' }
+      if ($secondaryVal -and -not $rxStartsWithC.IsMatch($secondaryVal)) { $parseNote += 'SecondaryOwner/approver does not start with C; ' }
       $parseNote = $parseNote.Trim()
     }
 
     if (-not $m1.Success -and -not $m2.Success) {
-      if ($infoText) { $parseNote = 'Keywords not found in info; verify formatting.' }
+      $parseNote = 'Keywords not found in info; verify formatting.'
     }
   } else {
     $parseNote = 'info attribute empty'
@@ -150,10 +212,24 @@ foreach ($row in $rows) {
   })
 }
 
-# Export both CSVs
+# -----------------------
+# Output (local)
+# -----------------------
 $statusOut    | Export-Csv -Path $StatusCsv -NoTypeInformation -Encoding UTF8
 $ownershipOut | Export-Csv -Path $OwnershipCsv -NoTypeInformation -Encoding UTF8
 
-Write-Host "✅ Done."
+Write-Host "✅ Local output:"
 Write-Host " - Status CSV:    $StatusCsv"
 Write-Host " - Ownership CSV: $OwnershipCsv"
+
+# -----------------------
+# Optional Uploads
+# -----------------------
+if ($OutputStatusUri) {
+  Upload-IfUri -FilePath $StatusCsv -Uri $OutputStatusUri -Headers $OutputStatusHeaders | Out-Null
+}
+if ($OutputOwnershipUri) {
+  Upload-IfUri -FilePath $OwnershipCsv -Uri $OutputOwnershipUri -Headers $OutputOwnershipHeaders | Out-Null
+}
+
+Write-Host "✅ Done."
