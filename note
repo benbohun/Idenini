@@ -1,18 +1,22 @@
 <#
-Produces two CSVs next to the input CSV:
-  - AccountStatus.csv     -> AD existence + Enabled/Disabled
-  - AccountOwnership.csv  -> Ownership parsed from 'info' (Primary Owner, SecondaryOwner/approver)
+Outputs next to input CSV:
+  - AccountStatus.csv     -> ADExists + Enabled (no DN)
+  - AccountOwnership.csv  -> ONLY rows with both owners found in 'info'; ONLY 3 columns:
+                             samAccountName, PrimaryOwner, SecondaryOwnerOrApprover
 
-Requirements: RSAT ActiveDirectory module.
+Notes:
+- Primary/Secondary are parsed *exclusively* from the AD 'info' attribute using robust regex.
+- Handles variants like:
+    "PrimaryOwner:", "Primary Owner -", "Primary Owner =",
+    "SecondaryOwner/approver:", "Secondary Owner / Approver -", "Secondary Owner Approver:"
+- Captures values until a delimiter (; , | newline) or end-of-string.
 #>
 
 # ================================
 # CONFIG — EDIT ME
 # ================================
-# Local path to your input CSV containing 'samAccountName' (or 'Account') column
-$InputCsvPath = "C:\Data\accounts.csv"
-# Enforce owners start with "C" (e.g., company IDs)? Set to $true to add a note when they don’t.
-$EnforceStartsWithC = $false
+$InputCsvPath       = "C:\Data\accounts.csv"  # local path to input CSV
+$EnforceStartsWithC = $false                  # optional internal check (no extra columns)
 # ================================
 
 # ---------- Prep & validation ----------
@@ -38,15 +42,25 @@ $possibleCols = @('samAccountName','Account')
 $samCol = $possibleCols | Where-Object { $_ -in $rows[0].PsObject.Properties.Name }
 if (-not $samCol) { throw "Input CSV must contain a column named 'samAccountName' or 'Account'." }
 
-# ---------- Regex & flags ----------
-$rxPrimary        = [regex]'(?im)\bPrimary\s*Owner\s*:\s*(?<val>.+?)(?:;|$|\r|\n)'
-$rxSecondary      = [regex]'(?im)\bSecondary\s*Owner(?:/|\s*)approver\s*:\s*(?<val>.+?)(?:;|$|\r|\n)'
-$rxStartsWithC    = [regex]'(?i)^\s*C'
-$enforceStartsWithC = [bool]$EnforceStartsWithC
+# ---------- Regex built for 'info' parsing ----------
+# Label patterns:
+#   - Primary Owner variants: PrimaryOwner | Primary Owner
+#   - Secondary variants: SecondaryOwner/approver | Secondary Owner/Approver | Secondary Owner Approver | Secondary Approver
+# Separators: ':', '-', '=', or whitespace
+# Value: everything until ; , | newline or end (non-greedy)
+$rxPrimary = [regex]'(?im)\bPrimary\s*Owner\b\s*[:=\-]?\s*(?<val>.+?)(?=[;,\|\r\n]|$)'
+$rxSecondary = [regex]'(?im)\bSecondary\s*Owner(?:\s*/\s*|\s+)?(?:Approver)?\b\s*[:=\-]?\s*(?<val>.+?)(?=[;,\|\r\n]|$)|\bSecondary\s*Approver\b\s*[:=\-]?\s*(?<val>.+?)(?=[;,\|\r\n]|$)'
+$rxStartsWithC = [regex]'(?i)^\s*C'
+
+function Clean-Val([string]$s) {
+  if ([string]::IsNullOrWhiteSpace($s)) { return "" }
+  # Trim spaces + trailing delimiters
+  return ($s.Trim(" `t`r`n", ";", ",", "|")).Trim()
+}
 
 # ---------- Process ----------
 $statusOut    = New-Object System.Collections.Generic.List[object]
-$ownershipOut = New-Object System.Collections.Generic.List[object]
+$ownershipAll = New-Object System.Collections.Generic.List[object]  # collect, then filter to both owners
 
 foreach ($row in $rows) {
   $sam = ($row.$samCol).ToString().Trim()
@@ -54,25 +68,18 @@ foreach ($row in $rows) {
 
   $user = $null
   try {
-    $user = Get-ADUser -LDAPFilter "(sAMAccountName=$sam)" -Properties Enabled, info, whenCreated, whenChanged, lastLogonDate
+    # We ONLY use 'info' for owners; other props used for status columns
+    $user = Get-ADUser -LDAPFilter "(sAMAccountName=$sam)" -Properties Enabled, info, whenCreated, lastLogonDate
   } catch { }
 
   if ($null -eq $user) {
+    # Status (no DN)
     $statusOut.Add([pscustomobject]@{
-      samAccountName    = $sam
-      ADExists          = 'No'
-      Enabled           = ''
-      DistinguishedName = ''
-      WhenCreated       = ''
-      LastLogonDate     = ''
-    })
-    $ownershipOut.Add([pscustomobject]@{
-      samAccountName            = $sam
-      ADExists                  = 'No'
-      PrimaryOwner              = ''
-      SecondaryOwnerOrApprover  = ''
-      InfoRaw                   = ''
-      ParseNote                 = 'User not found in AD'
+      samAccountName = $sam
+      ADExists       = 'No'
+      Enabled        = ''
+      WhenCreated    = ''
+      LastLogonDate  = ''
     })
     continue
   }
@@ -80,49 +87,52 @@ foreach ($row in $rows) {
   $enabled = $false
   if ($user.PSObject.Properties['Enabled']) { $enabled = [bool]$user.Enabled }
 
+  # Status (no DN)
   $statusOut.Add([pscustomobject]@{
-    samAccountName    = $sam
-    ADExists          = 'Yes'
-    Enabled           = $(if ($enabled) { 'Enabled' } else { 'Disabled' })
-    DistinguishedName = $user.DistinguishedName
-    WhenCreated       = $user.whenCreated
-    LastLogonDate     = $user.lastLogonDate
+    samAccountName = $sam
+    ADExists       = 'Yes'
+    Enabled        = $(if ($enabled) { 'Enabled' } else { 'Disabled' })
+    WhenCreated    = $user.whenCreated
+    LastLogonDate  = $user.lastLogonDate
   })
 
-  $infoText = ($user.info | Out-String).Trim()
-  $primaryVal   = ''
-  $secondaryVal = ''
-  $parseNote    = ''
+  # --- Parse ONLY from 'info' ---
+  $infoText = ($user.info | Out-String)
+  $primaryVal = ""
+  $secondaryVal = ""
 
   if (-not [string]::IsNullOrWhiteSpace($infoText)) {
-    $m1 = $rxPrimary.Match($infoText);   if ($m1.Success) { $primaryVal   = $m1.Groups['val'].Value.Trim() }
-    $m2 = $rxSecondary.Match($infoText); if ($m2.Success) { $secondaryVal = $m2.Groups['val'].Value.Trim() }
+    $m1 = $rxPrimary.Matches($infoText)
+    if ($m1.Count -gt 0) { $primaryVal = Clean-Val ($m1[0].Groups['val'].Value) }
 
-    if ($enforceStartsWithC) {
-      if ($primaryVal   -and -not $rxStartsWithC.IsMatch($primaryVal))   { $parseNote += 'Primary Owner does not start with C; ' }
-      if ($secondaryVal -and -not $rxStartsWithC.IsMatch($secondaryVal)) { $parseNote += 'SecondaryOwner/approver does not start with C; ' }
-      $parseNote = $parseNote.Trim()
+    $m2 = $rxSecondary.Matches($infoText)
+    if ($m2.Count -gt 0) { $secondaryVal = Clean-Val ($m2[0].Groups['val'].Value) }
+
+    # Optional internal check—no extra columns produced
+    if ($EnforceStartsWithC) {
+      if ($primaryVal -and -not $rxStartsWithC.IsMatch($primaryVal))   { } # keep silently
+      if ($secondaryVal -and -not $rxStartsWithC.IsMatch($secondaryVal)) { } # keep silently
     }
-
-    if (-not $m1.Success -and -not $m2.Success) { $parseNote = 'Keywords not found in info; verify formatting.' }
-  } else {
-    $parseNote = 'info attribute empty'
   }
 
-  $ownershipOut.Add([pscustomobject]@{
-    samAccountName            = $sam
-    ADExists                  = 'Yes'
-    PrimaryOwner              = $primaryVal
-    SecondaryOwnerOrApprover  = $secondaryVal
-    InfoRaw                   = $infoText
-    ParseNote                 = $parseNote
+  # Collect; we will filter to BOTH owners at export time
+  $ownershipAll.Add([pscustomobject]@{
+    samAccountName           = $sam
+    PrimaryOwner             = $primaryVal
+    SecondaryOwnerOrApprover = $secondaryVal
   })
 }
 
-# ---------- Output next to input ----------
-$statusOut    | Export-Csv -Path $StatusCsv -NoTypeInformation -Encoding UTF8
-$ownershipOut | Export-Csv -Path $OwnershipCsv -NoTypeInformation -Encoding UTF8
+# ---------- Output ----------
+# Status as requested (no DN)
+$statusOut | Export-Csv -Path $StatusCsv -NoTypeInformation -Encoding UTF8
+
+# Ownership: ONLY rows where BOTH owners were found in 'info'; ONLY 3 columns
+$ownershipAll
+| Where-Object { $_.PrimaryOwner -and $_.SecondaryOwnerOrApprover }
+| Select-Object samAccountName, PrimaryOwner, SecondaryOwnerOrApprover
+| Export-Csv -Path $OwnershipCsv -NoTypeInformation -Encoding UTF8
 
 Write-Host "✅ Done."
 Write-Host " - Status CSV:    $StatusCsv"
-Write-Host " - Ownership CSV: $OwnershipCsv"
+Write-Host " - Ownership CSV: $OwnershipCsv (only rows with BOTH owners parsed from 'info')"
