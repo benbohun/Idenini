@@ -1,20 +1,15 @@
-Using the same logic to search below, and the (input csv), i have a csv list that contains usernames with address gdeacu.com and extacu.local.
-develop script to search for this account in cyberark and output (outputcsv) the once that are not in Cyberark 
-No need to vault in CyberArk
-
-
 <#
-Find-Missing-GdeAcuAccounts.ps1  (PS 5.1 compatible; discovery + export only)
+Find-Missing-Accounts-ByAddress.ps1  (PS 5.1; discovery + export only)
 
-Exports ONLY Username (SamAccountName) and SafeName for employees whose resolved
-safes do NOT contain an account with address == 'gdeacu.com'.
+Now prompts with a popup (OpenFileDialog) to select the INPUT CSV.
+The CSV can contain ANY address/domain values.
 
-Input CSV (default): I:\Script\REPORTS\EmployeeIDs.csv
- - Required column: EmployeeID
- - Optional column: SamAccountName
+Accepted input headers (case-insensitive):
+ - Username: Username | UserName | SamAccountName | samaccountname | SAM
+ - Address : Address  | address  | Domain         | domain | Host | host | Hostname | hostname
 
-Output CSV (default): I:\Script\REPORTS\No_GdeAcu_Accounts.csv
- - Columns: Username,SafeName
+Default output: I:\Script\REPORTS\NotFound_Accounts.csv
+Output columns: Username, Address
 #>
 
 [CmdletBinding()]
@@ -24,23 +19,68 @@ param(
   [ValidateSet('CyberArk','LDAP','RADIUS','Windows','SAML','Shared')]
   [string]$AuthType  = 'CyberArk',
 
-  # --- IO paths ---
-  [string]$InputCsv  = "I:\Script\REPORTS\EmployeeIDs.csv",
-  [string]$OutputCsv = "I:\Script\REPORTS\No_GdeAcu_Accounts.csv",
-
-  # --- Constant to check against (GDE settings) ---
-  [string]$TargetAddress = "gdeacu.com",
-  [string]$TargetLogonAs = "gdeacu"  # kept for parity; not used in discovery-only mode
+  # --- Output path (input is chosen via popup) ---
+  [string]$OutputCsv = "I:\Script\REPORTS\NotFound_Accounts.csv"
 )
 
 # ===== Prep & helpers =====
 Import-Module psPAS -ErrorAction Stop
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$ErrorActionPreference = 'Continue'
 
 function Write-Info($m){ Write-Host "[*] $m" -ForegroundColor Cyan }
 function Write-Ok($m){   Write-Host "[OK] $m" -ForegroundColor Green }
 function Write-Warn($m){ Write-Host "[!] $m" -ForegroundColor Yellow }
 function Write-Err($m){  Write-Host "[X] $m" -ForegroundColor Red }
+
+# Fancy popup to select the input CSV (tries Windows Forms; safe fallback to Read-Host)
+function Get-InputCsvPath {
+  try {
+    if ([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA') {
+      Write-Warn "Current PowerShell not in STA; falling back to text prompt for file path."
+      throw "Not STA"
+    }
+
+    Add-Type -AssemblyName System.Windows.Forms | Out-Null
+    $dlg = New-Object System.Windows.Forms.OpenFileDialog
+    $dlg.Title = "Select the Accounts CSV (Username + Address)"
+    $dlg.Filter = "CSV files (*.csv)|*.csv|All files (*.*)|*.*"
+    $dlg.CheckFileExists = $true
+    $dlg.RestoreDirectory = $true
+    $dlg.Multiselect = $false
+    $dlg.InitialDirectory = Split-Path -Path "I:\Script\REPORTS" -ErrorAction SilentlyContinue
+
+    $null = $dlg.ShowDialog()
+    if ([string]::IsNullOrWhiteSpace($dlg.FileName)) {
+      Write-Err "No file selected. Exiting."
+      return $null
+    }
+    return $dlg.FileName
+  } catch {
+    # Fallback: simple input box (works anywhere)
+    try {
+      Add-Type -AssemblyName Microsoft.VisualBasic -ErrorAction Stop | Out-Null
+      $path = [Microsoft.VisualBasic.Interaction]::InputBox(
+        "Enter full path to the Accounts CSV (Username, Address).",
+        "Accounts CSV Path",
+        "I:\Script\REPORTS\AccountsToCheck.csv"
+      )
+      if ([string]::IsNullOrWhiteSpace($path)) {
+        Write-Err "No file path entered. Exiting."
+        return $null
+      }
+      return $path
+    } catch {
+      # Last resort: Read-Host
+      $path = Read-Host "Enter full path to the Accounts CSV (Username, Address)"
+      if ([string]::IsNullOrWhiteSpace($path)) {
+        Write-Err "No file path entered. Exiting."
+        return $null
+      }
+      return $path
+    }
+  }
+}
 
 # First non-empty scalar; arrays -> first non-empty element
 function First-NotNullOrEmpty {
@@ -59,7 +99,7 @@ function First-NotNullOrEmpty {
   return ""
 }
 
-# Safe getter across API shapes
+# Generic property getter across shapes
 function Get-Prop {
   param($obj, [string]$name)
   if ($null -eq $obj) { return $null }
@@ -88,7 +128,7 @@ function Invoke-PVWA {
   [CmdletBinding()]
   param(
     [Parameter(Mandatory)][ValidateSet('GET','POST','PUT','PATCH','DELETE')] [string]$Method,
-    [Parameter(Mandatory)][string]$Path,   # e.g. "/safes?search=abc"
+    [Parameter(Mandatory)][string]$Path,   # e.g., "/accounts?search=jdoe"
     [Parameter()][object]$Body = $null
   )
   if (-not $script:PVWA_Base)   { throw "PVWA not initialized." }
@@ -99,64 +139,59 @@ function Invoke-PVWA {
   Invoke-RestMethod @splat
 }
 
-# Resolve safe by EmployeeID (prefer IND_*, require suffix _<EmployeeID>)
-function Resolve-SafeByEmployeeID {
-  param([Parameter(Mandatory)][string]$EmployeeID)
-  try {
-    $resp = Invoke-PVWA -Method GET -Path ("/safes?search={0}&includeAccounts=false" -f [uri]::EscapeDataString($EmployeeID))
-  } catch {
-    Write-Warn ("Could not search safes for '{0}': {1}" -f $EmployeeID, $_.Exception.Message)
-    return $null
-  }
+# Check if an account with exact Username + Address exists in PVWA
+function Test-AccountExists {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)][string]$Username,
+    [Parameter(Mandatory)][string]$Address
+  )
 
-  $names = @()
-  if ($resp) {
-    if ($resp.value) {
-      foreach ($s in $resp.value) { $nm = First-NotNullOrEmpty (Get-Prop $s 'safeName'), (Get-Prop $s 'SafeName'), (Get-Prop $s 'name'); if ($nm) { $names += $nm } }
-    } elseif ($resp.safes) {
-      foreach ($s in $resp.safes) { $nm = First-NotNullOrEmpty (Get-Prop $s 'safeName'), (Get-Prop $s 'SafeName'), (Get-Prop $s 'name'); if ($nm) { $names += $nm } }
-    } elseif ($resp -is [array]) {
-      foreach ($s in $resp) { $nm = First-NotNullOrEmpty (Get-Prop $s 'safeName'), (Get-Prop $s 'SafeName'), (Get-Prop $s 'name'); if ($nm) { $names += $nm } }
+  # Pull accounts by username (broad), then filter locally for exact username/address match (case-insensitive).
+  $encUser = [uri]::EscapeDataString($Username)
+  $page    = 1
+  $limit   = 200
+
+  while ($true) {
+    $path = "/accounts?search=$encUser&limit=$limit&offset=$([int](($page-1)*$limit))"
+    try {
+      $resp = Invoke-PVWA -Method GET -Path $path
+    } catch {
+      Write-Warn ("  -> Search error for '{0}': {1}" -f $Username, $_.Exception.Message)
+      return $false
     }
+
+    $candidates = @()
+    if ($resp) {
+      if     ($resp.value)        { $candidates = $resp.value }
+      elseif ($resp.accounts)     { $candidates = $resp.accounts }
+      elseif ($resp -is [array])  { $candidates = $resp }
+    }
+
+    foreach ($a in $candidates) {
+      $u = (Get-Prop $a 'username'); if (-not $u) { $u = (Get-Prop $a 'userName') }
+      $ad= (Get-Prop $a 'address')
+      if ($u -and $ad) {
+        if ($u.ToString().Trim().ToLower() -eq $Username.ToLower() -and $ad.ToString().Trim().ToLower() -eq $Address.ToLower()) {
+          return $true
+        }
+      }
+    }
+
+    if ($candidates.Count -lt $limit) { break }  # no more pages
+    $page++
+    if ($page -gt 50) { break } # hard safety stop
   }
-  if (-not $names -or $names.Count -eq 0) { return $null }
 
-  $suffix = "_$([regex]::Escape($EmployeeID.Trim()))$"
-  $ending = $names | Where-Object { $_ -match $suffix }
-  if (-not $ending -or $ending.Count -eq 0) { return $null }
-
-  $preferInd = $ending | Where-Object { $_ -like 'IND_*' }
-  if ($preferInd -and $preferInd.Count -gt 0) { return ($preferInd | Select-Object -First 1) }
-  ($ending | Select-Object -First 1)
+  return $false
 }
 
-# Extract sAM from "PREFIX_<sam>_<id>"
-function Get-SamFromSafeName {
-  param([Parameter(Mandatory)][string]$SafeName,[Parameter(Mandatory)][string]$EmployeeID)
-  $pattern = "^[^_]+_(.+?)_$([regex]::Escape($EmployeeID))$"
-  $m = [regex]::Match($SafeName, $pattern)
-  if ($m.Success) { $m.Groups[1].Value } else { $null }
-}
-
-# True if any account in safe has address == target domain (gdeacu.com)
-function Test-SafeHasTargetAddress {
-  param([Parameter(Mandatory)][string]$SafeName,[string]$Address = $TargetAddress)
-  try {
-    $accts = Get-PASAccount -SafeName $SafeName -ErrorAction Stop
-  } catch {
-    Write-Warn "Unable to enumerate accounts for safe '$SafeName': $($_.Exception.Message)"
-    return $false
-  }
-  foreach ($a in $accts) {
-    $addr = Get-Prop $a 'address'
-    if ($addr -and ($addr -eq $Address)) { return $true }
-  }
-  $false
-}
-
-# ===== Authenticate =====
+# ===== Prompt for INPUT CSV =====
+$InputCsv = Get-InputCsvPath
+if (-not $InputCsv) { return }
 if (-not (Test-Path $InputCsv)) { Write-Err "Input CSV not found: $InputCsv"; return }
 
+# ===== Authenticate =====
 $cred = Get-Credential -Message "Enter your CyberArk ($AuthType) credential"
 try {
   New-PASSession -Credential $cred -BaseURI $BaseURI -Type $AuthType | Out-Null
@@ -175,61 +210,45 @@ try {
 
 # ===== Load & normalize CSV =====
 try { $rows = Import-Csv -Path $InputCsv } catch { Write-Err "Failed reading CSV '$InputCsv': $($_.Exception.Message)"; Close-PASSession | Out-Null; return }
-if (-not $rows -or $rows.Count -eq 0) { Write-Err "CSV is empty. Needs 'EmployeeID' column (optional 'SamAccountName')."; Close-PASSession | Out-Null; return }
+if (-not $rows -or $rows.Count -eq 0) { Write-Err "CSV is empty. Needs Username + Address columns."; Close-PASSession | Out-Null; return }
 
 $norm = @()
 foreach ($r in $rows) {
-  $eid = First-NotNullOrEmpty $r.EmployeeID, $r.employeeID, $r.EmpID, $r.empid
-  $sam = First-NotNullOrEmpty $r.SamAccountName, $r.samaccountname, $r.SAM
-  if ($eid) { $norm += [PSCustomObject]@{ EmployeeID = $eid; SamAccountName = $sam } }
+  $user = First-NotNullOrEmpty $r.Username, $r.UserName, $r.SamAccountName, $r.samaccountname, $r.SAM
+  $addr = First-NotNullOrEmpty $r.Address, $r.address, $r.Domain, $r.domain, $r.Host, $r.host, $r.Hostname, $r.hostname
+  if ($user -and $addr) {
+    $norm += [PSCustomObject]@{ Username = $user; Address = $addr }
+  }
 }
-$valid = $norm
+$valid   = $norm
 $skipped = $rows.Count - $valid.Count
-if ($skipped -gt 0) { Write-Warn "$skipped row(s) missing EmployeeID were skipped." }
+if ($skipped -gt 0) { Write-Warn "$skipped row(s) missing Username or Address were skipped." }
 
 # ===== Discovery =====
-$toExport = New-Object System.Collections.Generic.List[object]
-Write-Info ("===== Discovering '{0}' accounts and building export (Username,SafeName) =====" -f $TargetAddress)
+$missing = New-Object System.Collections.Generic.List[object]
+Write-Info "===== Checking accounts exist (Username + Address) and building export for MISSING only ====="
 
 foreach ($row in $valid) {
-  $empId = $row.EmployeeID
-  $sam   = $row.SamAccountName
+  $user = $row.Username
+  $addr = $row.Address
 
-  Write-Info ("Checking EmployeeID={0} {1}…" -f $empId, ($(if($sam){" / sAM="+$sam}else{"(sAM will be derived)"})))
-
-  $safeName = Resolve-SafeByEmployeeID -EmployeeID $empId
-  if (-not $safeName) {
-    Write-Warn "  -> No safe found ending with _${empId}. Skipping."
-    continue
-  }
-
-  # Derive sAM from safe if not provided
-  if (-not $sam) {
-    $samDerived = Get-SamFromSafeName -SafeName $safeName -EmployeeID $empId
-    if ($samDerived) { $sam = $samDerived; Write-Info "  -> Derived SamAccountName: $sam" }
-    else { Write-Warn "  -> Could not derive SamAccountName." }
-  }
-
-  $has = Test-SafeHasTargetAddress -SafeName $safeName -Address $TargetAddress
-  if (-not $has) {
-    # Export only Username + SafeName (as requested)
-    $toExport.Add([PSCustomObject]@{
-      Username = $sam
-      SafeName = $safeName
-    })
-    Write-Ok "  -> Missing in '$safeName' -> queued for export as Username/SafeName."
+  Write-Info ("Checking Username='{0}' Address='{1}' …" -f $user, $addr)
+  $exists = Test-AccountExists -Username $user -Address $addr
+  if (-not $exists) {
+    $missing.Add([PSCustomObject]@{ Username = $user; Address = $addr })
+    Write-Ok "  -> NOT FOUND. Queued for export."
   } else {
-    Write-Info ("  -> '{0}' account exists in '{1}' — OK." -f $TargetAddress, $safeName)
+    Write-Info "  -> Found in CyberArk. OK."
   }
 }
 
-# ===== Write export (Username,SafeName) =====
-Write-Info "===== Writing export (Username,SafeName) ====="
+# ===== Write export (Username,Address) =====
+Write-Info "===== Writing export (Username,Address) of NOT FOUND ====="
 try {
   $dir = Split-Path -Path $OutputCsv -Parent
   if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-  $toExport | Select-Object Username,SafeName | Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8
-  Write-Ok "Exported $($toExport.Count) row(s) to: $OutputCsv"
+  $missing | Select-Object Username,Address | Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8
+  Write-Ok "Exported $($missing.Count) row(s) to: $OutputCsv"
 } catch { Write-Err "Failed to export results: $($_.Exception.Message)" }
 
 # ===== Cleanup =====
