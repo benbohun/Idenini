@@ -1,42 +1,236 @@
-Driver={Oracle in instantclient_19_3};Dbq=%ADDRESS%;Uid=%USER%; Pwd=%OLDPASSWORD%;
+Using the same logic to search below, and the (input csv), i have a csv list that contains usernames with address gdeacu.com and extacu.local.
+develop script to search for this account in cyberark and output (outputcsv) the once that are not in Cyberark 
+No need to vault in CyberArk
 
-delete,drop,exec,create,alter,rename,truncate,comment,select,insert,update,merge,call,explain,lock,grant,revoke
 
+<#
+Find-Missing-GdeAcuAccounts.ps1  (PS 5.1 compatible; discovery + export only)
 
-$responseViaObject = $responseViaAddressAndUsername =  $null
-#$CCPAddress = "https://ccp-test.cna.com"
-#$CCPAddress = "https://vskau1p1216.cna.com"
-$CCPAddress = "https://vskch1d922.cna.com"
-$location = "AIMWebService"
-$application = "SECRETS_DEMO_APPID"
-$safe = "CyberArkCCPTest"
-$object = "10.10.10.1-SVC_demoaccount"
-$address = "10.10.10.1"
-$username = "SVC_demoaccount"
+Exports ONLY Username (SamAccountName) and SafeName for employees whose resolved
+safes do NOT contain an account with address == 'gdeacu.com'.
 
-$windowsAuth=$false
+Input CSV (default): I:\Script\REPORTS\EmployeeIDs.csv
+ - Required column: EmployeeID
+ - Optional column: SamAccountName
 
-$headers = New-Object "System.Collections.Generic.Dictionary[[String],[String]]"
-$headers.Add("Content-Type", "application/json")
+Output CSV (default): I:\Script\REPORTS\No_GdeAcu_Accounts.csv
+ - Columns: Username,SafeName
+#>
 
-if (![string]::IsNullOrEmpty($object)) {
-    Write-Host "Connecting to url: `"$CCPAddress/$location/api/Accounts?AppID=$application&Safe=$safe&Object=$object`""
-    $responseViaObject = Invoke-RestMethod "$CCPAddress/$location/api/Accounts?AppID=$application&Safe=$safe&Object=$object" -Method 'GET' -Headers $headers -UseDefaultCredentials:$windowsAuth
+[CmdletBinding()]
+param(
+  # --- Alliant login pattern ---
+  [string]$BaseURI   = "https://alliantcredit.privilegecloud.cyberark.com",
+  [ValidateSet('CyberArk','LDAP','RADIUS','Windows','SAML','Shared')]
+  [string]$AuthType  = 'CyberArk',
 
-    Write-Host "Pulled using Object Name"
-    write-host "Username: " $($responseViaObject.Username)
-    Write-Host "Password: " $($responseViaObject.content)
-    ""
-    $responseViaObject | ConvertTo-Json
+  # --- IO paths ---
+  [string]$InputCsv  = "I:\Script\REPORTS\EmployeeIDs.csv",
+  [string]$OutputCsv = "I:\Script\REPORTS\No_GdeAcu_Accounts.csv",
+
+  # --- Constant to check against (GDE settings) ---
+  [string]$TargetAddress = "gdeacu.com",
+  [string]$TargetLogonAs = "gdeacu"  # kept for parity; not used in discovery-only mode
+)
+
+# ===== Prep & helpers =====
+Import-Module psPAS -ErrorAction Stop
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+function Write-Info($m){ Write-Host "[*] $m" -ForegroundColor Cyan }
+function Write-Ok($m){   Write-Host "[OK] $m" -ForegroundColor Green }
+function Write-Warn($m){ Write-Host "[!] $m" -ForegroundColor Yellow }
+function Write-Err($m){  Write-Host "[X] $m" -ForegroundColor Red }
+
+# First non-empty scalar; arrays -> first non-empty element
+function First-NotNullOrEmpty {
+  param([Parameter(ValueFromRemainingArguments=$true)] $Values)
+  foreach ($v in $Values) {
+    if ($null -eq $v) { continue }
+    if ($v -is [array]) {
+      foreach ($e in $v) {
+        if ($null -ne $e -and ($e.ToString()).Trim().Length -gt 0) { return ($e.ToString()).Trim() }
+      }
+    } else {
+      $s = ($v.ToString()).Trim()
+      if ($s.Length -gt 0) { return $s }
+    }
+  }
+  return ""
 }
 
-if (![string]::IsNullOrEmpty($address) -and ![string]::IsNullOrEmpty($username)) {
-    Write-Host  "Connecting to url: `"$CCPAddress/$location/api/Accounts?AppID=$application&Safe=$safe&address=$address&username=$username`""
-    $responseViaAddressAndUsername = Invoke-RestMethod "$CCPAddress/$location/api/Accounts?AppID=$application&Safe=$safe&address=$address&username=$username" -Method 'GET' -Headers $headers -UseDefaultCredentials:$windowsAuth
-
-    Write-Host "Pulled using Address and Username"
-    write-host "Username: " $($responseViaAddressAndUsername.Username)
-    Write-Host "Password: " $($responseViaAddressAndUsername.content)
-    ""
-    $responseViaAddressAndUsername | ConvertTo-Json
+# Safe getter across API shapes
+function Get-Prop {
+  param($obj, [string]$name)
+  if ($null -eq $obj) { return $null }
+  if ($obj.PSObject.Properties[$name]) { return $obj.$name }
+  if ($obj.properties -and $obj.properties.PSObject.Properties[$name]) { return $obj.properties.$name }
+  if ($obj.platformAccountProperties -and $obj.platformAccountProperties.PSObject.Properties[$name]) { return $obj.platformAccountProperties.$name }
+  if ($obj.additionalProperties -and $obj.additionalProperties.PSObject.Properties[$name]) { return $obj.additionalProperties.$name }
+  return $null
 }
+
+# ---- PVWA REST (reuse psPAS session cookie) ----
+function Get-PVWAApiPrefix {
+  param([Parameter(Mandatory)][string]$BaseUri, [Parameter(Mandatory)]$WebSession)
+  $candidates = @("/api","/PasswordVault/api")
+  foreach ($p in $candidates) {
+    try {
+      $u = ($BaseUri.TrimEnd('/')) + $p + "/version"
+      Invoke-RestMethod -Method GET -Uri $u -WebSession $WebSession -ErrorAction Stop | Out-Null
+      return $p
+    } catch { continue }
+  }
+  "/api"
+}
+
+function Invoke-PVWA {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)][ValidateSet('GET','POST','PUT','PATCH','DELETE')] [string]$Method,
+    [Parameter(Mandatory)][string]$Path,   # e.g. "/safes?search=abc"
+    [Parameter()][object]$Body = $null
+  )
+  if (-not $script:PVWA_Base)   { throw "PVWA not initialized." }
+  if (-not $script:PVWA_Session){ throw "PVWA WebSession not set." }
+  $uri = ($script:PVWA_Base.TrimEnd('/')) + $script:PVWA_Prefix + $Path
+  $splat = @{ Method=$Method; Uri=$uri; WebSession=$script:PVWA_Session; ErrorAction='Stop' }
+  if ($null -ne $Body) { $splat['ContentType'] = 'application/json'; $splat['Body'] = ($Body | ConvertTo-Json -Depth 8) }
+  Invoke-RestMethod @splat
+}
+
+# Resolve safe by EmployeeID (prefer IND_*, require suffix _<EmployeeID>)
+function Resolve-SafeByEmployeeID {
+  param([Parameter(Mandatory)][string]$EmployeeID)
+  try {
+    $resp = Invoke-PVWA -Method GET -Path ("/safes?search={0}&includeAccounts=false" -f [uri]::EscapeDataString($EmployeeID))
+  } catch {
+    Write-Warn ("Could not search safes for '{0}': {1}" -f $EmployeeID, $_.Exception.Message)
+    return $null
+  }
+
+  $names = @()
+  if ($resp) {
+    if ($resp.value) {
+      foreach ($s in $resp.value) { $nm = First-NotNullOrEmpty (Get-Prop $s 'safeName'), (Get-Prop $s 'SafeName'), (Get-Prop $s 'name'); if ($nm) { $names += $nm } }
+    } elseif ($resp.safes) {
+      foreach ($s in $resp.safes) { $nm = First-NotNullOrEmpty (Get-Prop $s 'safeName'), (Get-Prop $s 'SafeName'), (Get-Prop $s 'name'); if ($nm) { $names += $nm } }
+    } elseif ($resp -is [array]) {
+      foreach ($s in $resp) { $nm = First-NotNullOrEmpty (Get-Prop $s 'safeName'), (Get-Prop $s 'SafeName'), (Get-Prop $s 'name'); if ($nm) { $names += $nm } }
+    }
+  }
+  if (-not $names -or $names.Count -eq 0) { return $null }
+
+  $suffix = "_$([regex]::Escape($EmployeeID.Trim()))$"
+  $ending = $names | Where-Object { $_ -match $suffix }
+  if (-not $ending -or $ending.Count -eq 0) { return $null }
+
+  $preferInd = $ending | Where-Object { $_ -like 'IND_*' }
+  if ($preferInd -and $preferInd.Count -gt 0) { return ($preferInd | Select-Object -First 1) }
+  ($ending | Select-Object -First 1)
+}
+
+# Extract sAM from "PREFIX_<sam>_<id>"
+function Get-SamFromSafeName {
+  param([Parameter(Mandatory)][string]$SafeName,[Parameter(Mandatory)][string]$EmployeeID)
+  $pattern = "^[^_]+_(.+?)_$([regex]::Escape($EmployeeID))$"
+  $m = [regex]::Match($SafeName, $pattern)
+  if ($m.Success) { $m.Groups[1].Value } else { $null }
+}
+
+# True if any account in safe has address == target domain (gdeacu.com)
+function Test-SafeHasTargetAddress {
+  param([Parameter(Mandatory)][string]$SafeName,[string]$Address = $TargetAddress)
+  try {
+    $accts = Get-PASAccount -SafeName $SafeName -ErrorAction Stop
+  } catch {
+    Write-Warn "Unable to enumerate accounts for safe '$SafeName': $($_.Exception.Message)"
+    return $false
+  }
+  foreach ($a in $accts) {
+    $addr = Get-Prop $a 'address'
+    if ($addr -and ($addr -eq $Address)) { return $true }
+  }
+  $false
+}
+
+# ===== Authenticate =====
+if (-not (Test-Path $InputCsv)) { Write-Err "Input CSV not found: $InputCsv"; return }
+
+$cred = Get-Credential -Message "Enter your CyberArk ($AuthType) credential"
+try {
+  New-PASSession -Credential $cred -BaseURI $BaseURI -Type $AuthType | Out-Null
+  Write-Ok "Authenticated to $BaseURI."
+} catch { Write-Err "Authentication failed: $($_.Exception.Message)"; return }
+
+# Grab psPAS WebSession and detect API prefix
+try {
+  $ses = Get-PASSession
+  $script:PVWA_Base    = if ($ses.BaseURI) { $ses.BaseURI } else { $BaseURI }
+  $script:PVWA_Session = $ses.WebSession
+  if (-not $script:PVWA_Session) { throw "psPAS WebSession not found after login." }
+  $script:PVWA_Prefix  = Get-PVWAApiPrefix -BaseUri $script:PVWA_Base -WebSession $script:PVWA_Session
+  Write-Info ("Detected API prefix: {0}" -f $script:PVWA_Prefix)
+} catch { Write-Err ("Could not initialize PVWA REST access: {0}" -f $_.Exception.Message); Close-PASSession | Out-Null; return }
+
+# ===== Load & normalize CSV =====
+try { $rows = Import-Csv -Path $InputCsv } catch { Write-Err "Failed reading CSV '$InputCsv': $($_.Exception.Message)"; Close-PASSession | Out-Null; return }
+if (-not $rows -or $rows.Count -eq 0) { Write-Err "CSV is empty. Needs 'EmployeeID' column (optional 'SamAccountName')."; Close-PASSession | Out-Null; return }
+
+$norm = @()
+foreach ($r in $rows) {
+  $eid = First-NotNullOrEmpty $r.EmployeeID, $r.employeeID, $r.EmpID, $r.empid
+  $sam = First-NotNullOrEmpty $r.SamAccountName, $r.samaccountname, $r.SAM
+  if ($eid) { $norm += [PSCustomObject]@{ EmployeeID = $eid; SamAccountName = $sam } }
+}
+$valid = $norm
+$skipped = $rows.Count - $valid.Count
+if ($skipped -gt 0) { Write-Warn "$skipped row(s) missing EmployeeID were skipped." }
+
+# ===== Discovery =====
+$toExport = New-Object System.Collections.Generic.List[object]
+Write-Info ("===== Discovering '{0}' accounts and building export (Username,SafeName) =====" -f $TargetAddress)
+
+foreach ($row in $valid) {
+  $empId = $row.EmployeeID
+  $sam   = $row.SamAccountName
+
+  Write-Info ("Checking EmployeeID={0} {1}…" -f $empId, ($(if($sam){" / sAM="+$sam}else{"(sAM will be derived)"})))
+
+  $safeName = Resolve-SafeByEmployeeID -EmployeeID $empId
+  if (-not $safeName) {
+    Write-Warn "  -> No safe found ending with _${empId}. Skipping."
+    continue
+  }
+
+  # Derive sAM from safe if not provided
+  if (-not $sam) {
+    $samDerived = Get-SamFromSafeName -SafeName $safeName -EmployeeID $empId
+    if ($samDerived) { $sam = $samDerived; Write-Info "  -> Derived SamAccountName: $sam" }
+    else { Write-Warn "  -> Could not derive SamAccountName." }
+  }
+
+  $has = Test-SafeHasTargetAddress -SafeName $safeName -Address $TargetAddress
+  if (-not $has) {
+    # Export only Username + SafeName (as requested)
+    $toExport.Add([PSCustomObject]@{
+      Username = $sam
+      SafeName = $safeName
+    })
+    Write-Ok "  -> Missing in '$safeName' -> queued for export as Username/SafeName."
+  } else {
+    Write-Info ("  -> '{0}' account exists in '{1}' — OK." -f $TargetAddress, $safeName)
+  }
+}
+
+# ===== Write export (Username,SafeName) =====
+Write-Info "===== Writing export (Username,SafeName) ====="
+try {
+  $dir = Split-Path -Path $OutputCsv -Parent
+  if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+  $toExport | Select-Object Username,SafeName | Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8
+  Write-Ok "Exported $($toExport.Count) row(s) to: $OutputCsv"
+} catch { Write-Err "Failed to export results: $($_.Exception.Message)" }
+
+# ===== Cleanup =====
+try { Close-PASSession | Out-Null; Write-Ok "Logged off." } catch { }
