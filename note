@@ -1,175 +1,273 @@
-# ============================
-# Script B: Accept issued cert & export PFX
-# ============================
- 
+<#
+Convert-IssuedCertToPfx.ps1  (PowerShell 5.1+)
+
+Purpose
+-------
+Accept an issued certificate (.cer) into the correct store (CurrentUser or LocalMachine),
+ensure it pairs with the private key created during CSR generation, and export a PFX.
+
+Highlights
+----------
+- Auto-detects context (user vs machine) from your metadata.txt (optional)
+- Otherwise honors -UseLocalMachine switch (defaults to CurrentUser\My)
+- Accepts cert with certreq (-user when needed) to force pairing
+- Verifies HasPrivateKey and CN/SAN match
+- Exports PFX (optionally builds full chain)
+- Optional PEM export via certutil/openssl (off by default)
+- Verbose logging and clear errors
+
+Usage
+-----
+.\Convert-IssuedCertToPfx.ps1 -IssuedCerPath "C:\Temp\issued.cer" -CN "sqlserver.cna.com" `
+  -MetaPath "C:\Temp\CyberArk_CCP_sqlserver.cna.com_20251029_112300\metadata.txt" `
+  -PfxOut "C:\Temp\sqlserver.cna.com-2025-10-30.pfx" -IncludeChain
+
+If you generated the key in LocalMachine\My, add -UseLocalMachine (or rely on MetaPath detection).
+
+#>
+
+[CmdletBinding()]
+param(
+  [Parameter(Mandatory)]
+  [ValidateScript({Test-Path $_})]
+  [string] $IssuedCerPath,
+
+  # CN helps us locate the right cert after acceptance (also matches SANs)
+  [Parameter(Mandatory)]
+  [string] $CN,
+
+  # Optional: metadata.txt from your CSR script (auto-detects store, key container, provider)
+  [Parameter()]
+  [ValidateScript({-not $_ -or (Test-Path $_)})]
+  [string] $MetaPath,
+
+  # If not using MetaPath, set this when you created the CSR in LocalMachine\My
+  [Parameter()]
+  [switch] $UseLocalMachine,
+
+  # Where to save the PFX (default constructed below)
+  [Parameter()]
+  [string] $PfxOut,
+
+  # Export full chain if Windows can build it
+  [Parameter()]
+  [switch] $IncludeChain,
+
+  # Optional: also emit PEMs using certutil/openssl if available
+  [Parameter()]
+  [switch] $ExportPem
+)
+
 $ErrorActionPreference = 'Stop'
- 
-# ---- Inputs ----
-$IssuedCer = Read-Host "C:\temp\sqlserver.cna.com.cer)"
-$PfxOut    = Read-Host "Output PFX path (e.g. C:\temp\sqlserver_ccp_client.pfx)"
-$UseLocalMachine = $true   # Set to $true if Script A used LocalMachine store
- 
-# ---- Store scope must match Script A ----
-$StorePath      = if ($UseLocalMachine) { 'Cert:\LocalMachine\My' } else { 'Cert:\CurrentUser\My' }
-$CertreqContext = if ($UseLocalMachine) { '' } else { '-user' }
- 
-if (!(Test-Path $IssuedCer)) { throw "Issued .cer not found: $IssuedCer" }
- 
-# ---- Accept the issued certificate (binds it to the existing private key)
-& certreq $CertreqContext -accept "`"$IssuedCer`"" | Out-Null
- 
-# ---- Locate the installed cert by thumbprint (from the .cer file)
-$cerObj = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($IssuedCer)
-$thumb  = $cerObj.Thumbprint
- 
-$cert = Get-ChildItem $StorePath | Where-Object { $_.Thumbprint -eq $thumb -and $_.HasPrivateKey } | Select-Object -First 1
-if (-not $cert) {
-  throw "Issued cert not found with private key in $StorePath (thumbprint $thumb). Was Script A run on this machine?"
+
+Write-Verbose "IssuedCerPath = $IssuedCerPath"
+Write-Verbose "CN            = $CN"
+Write-Verbose "MetaPath      = $MetaPath"
+Write-Verbose "UseLocalMachine (param) = $UseLocalMachine"
+
+# --- Helpers ------------------------------------------------------------------
+
+function Read-Metadata {
+  param([string]$path)
+  if (-not $path) { return $null }
+  try {
+    $content = Get-Content -LiteralPath $path -Raw
+  } catch {
+    Write-Warning "Could not read metadata at $path: $_"
+    return $null
+  }
+  $obj = [ordered]@{
+    Template     = ($content | Select-String -Pattern '^Template:\s*(.+)$' -AllMatches).Matches.Value
+    CN           = ($content | Select-String -Pattern '^CN:\s*(.+)$' -AllMatches).Matches.Value
+    Subject      = ($content | Select-String -Pattern '^Subject:\s*(.+)$' -AllMatches).Matches.Value
+    SANs         = ($content | Select-String -Pattern '^SANs:\s*(.+)$' -AllMatches).Matches.Value
+    Store        = ($content | Select-String -Pattern '^Store:\s*(.+)$' -AllMatches).Matches.Value
+    KeyContainer = ($content | Select-String -Pattern '^KeyContainer:\s*(.+)$' -AllMatches).Matches.Value
+    Provider     = ($content | Select-String -Pattern '^Provider:\s*(.+)$' -AllMatches).Matches.Value
+  }
+
+  # Extract the store hint
+  $store = ($obj.Store -split '\s+')[0]
+  $isMachine = $false
+  if ($store -match 'LocalMachine\\My') { $isMachine = $true }
+  elseif ($store -match 'CurrentUser\\My') { $isMachine = $false }
+
+  return [PSCustomObject]@{
+    IsMachine    = $isMachine
+    KeyContainer = ($obj.KeyContainer -replace '^KeyContainer:\s*','').Trim()
+    StoreRaw     = $obj.Store
+  }
 }
- 
-# ---- Export PFX (includes private key and chain)
-$pwd = Read-Host "Enter a password for the PFX" -AsSecureString
-Export-PfxCertificate -Cert $cert.PSPath -FilePath $PfxOut -Password $pwd -ChainOption BuildChain -Force | Out-Null
- 
-Write-Host "✅ PFX exported: $PfxOut"
-Write-Host "Subject (SN):  $($cert.Subject)"
-Write-Host "Thumbprint:     $($cert.Thumbprint)"
-Write-Host "SerialNumber:   $($cert.SerialNumber)"
-:::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
 
+function Get-ExpectedStore {
+  param([bool]$isMachine)
+  if ($isMachine) { return 'Cert:\LocalMachine\My' }
+  else { return 'Cert:\CurrentUser\My' }
+}
 
-# ============================
-# Script A: Generate CSR + Private Key (exportable)
-#           EKUs: Client & Server Authentication
-#           Template: "CNA CyberArk Project"
-# ============================
+function Find-CertByCNOrSAN {
+  param(
+    [string]$cn,
+    [bool]$isMachine
+  )
+  $store = Get-ExpectedStore -isMachine $isMachine
+  $items = Get-ChildItem -Path $store -ErrorAction SilentlyContinue
+  if (-not $items) { return $null }
 
-$ErrorActionPreference = 'Stop'
+  # find latest notBefore match where CN or SANs contain target CN
+  $match = $items | Where-Object {
+    ($_.HasPrivateKey) -and (
+      $_.Subject -match "(?i)CN\s*=\s*$([regex]::Escape($cn))(\s|,|$)" -or
+      ($_.DnsNameList -and ($_.DnsNameList.Unicode -contains $cn))
+    )
+  } | Sort-Object NotBefore -Descending | Select-Object -First 1
 
-# ---- Prompts ----
-$CN   = Read-Host "CN (e.g. sqlserver.cna.com)"
-$SANs = Read-Host "Optional: extra SANs (comma-separated) or blank"
+  return $match
+}
 
-# ---- Config ----
-$UseLocalMachine = $false        # $false = CurrentUser\My (no admin), $true = LocalMachine\My (run as Admin)
-$keyBits         = 2048          # use 3072/4096 if policy requires
+function Accept-IssuedCert {
+  param(
+    [string]$cerPath,
+    [bool]$isMachine
+  )
+  if ($isMachine) {
+    Write-Verbose "Running: certreq -accept `"$cerPath`""
+    & certreq -accept "$cerPath" | Out-Null
+  } else {
+    Write-Verbose "Running: certreq -user -accept `"$cerPath`""
+    & certreq -user -accept "$cerPath" | Out-Null
+  }
+}
 
-# Subject fields (edit for your org)
-$OU='IAM-CyberArk CCP'; $O='CNA FINANCIAL CORPORATION'; $L='Chicago'; $ST='Illinois'; $C='US'
+function Export-Pfx {
+  param(
+    [System.Security.Cryptography.X509Certificates.X509Certificate2] $cert,
+    [string] $pfxPath,
+    [switch] $withChain
+  )
+  if (-not $pfxPath) {
+    $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $safeCN = ($CN -replace '[^\w\.-]','_')
+    $pfxPath = "C:\Temp\${safeCN}_$stamp.pfx"
+  }
+  $null = New-Item -ItemType Directory -Path (Split-Path $pfxPath) -Force -ErrorAction SilentlyContinue
 
-# Provider (broad compatibility; CSP)
-$ProviderName = 'Microsoft Enhanced RSA and AES Cryptographic Provider'
-$ProviderType = 24  # PROV_RSA_AES
+  $pw = Read-Host "Enter PFX password" -AsSecureString
 
-# AD CS Template (used during submission)
-$TemplateName = 'CNA CyberArk Project'   # <-- per your request
+  $chainOpt = if ($withChain) { 'BuildChain' } else { 'EndEntityCertOnly' }
 
-# ---- Paths / names ----
-$TempRoot = 'C:\Temp'
-if (!(Test-Path $TempRoot)) { New-Item -ItemType Directory -Path $TempRoot | Out-Null }
+  Export-PfxCertificate -Cert $cert.PSPath -FilePath $pfxPath -Password $pw `
+    -ChainOption $chainOpt -CryptoAlgorithmOption AES256_SHA256 | Out-Null
 
-$SafeCN   = ($CN -replace '[^\w\.-]','_')
-$Stamp    = Get-Date -Format 'yyyyMMdd_HHmmss'
-$BaseDir  = Join-Path $TempRoot "CyberArk_CCP_${SafeCN}_$Stamp"
-[IO.Directory]::CreateDirectory($BaseDir) | Out-Null
+  return [PSCustomObject]@{ Path = $pfxPath; Password = $pw }
+}
 
-$ReqInf    = Join-Path $BaseDir 'csr.inf'
-$CsrPath   = Join-Path $BaseDir 'client.csr'
-$MetaPath  = Join-Path $BaseDir 'metadata.txt'
+function Try-ExportPem {
+  param(
+    [string] $pfxPath,
+    [System.Security.SecureString] $pfxPassword
+  )
+  try {
+    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($pfxPassword)
+    $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
 
-$MachineKeySet  = if ($UseLocalMachine) { 'TRUE' } else { 'FALSE' }
-$CertreqContext = if ($UseLocalMachine) { '' }    else { '-user' }
-$StorePath      = if ($UseLocalMachine) { 'Cert:\LocalMachine\My' } else { 'Cert:\CurrentUser\My' }
+    # Prefer openssl if present
+    $openssl = Get-Command openssl -ErrorAction SilentlyContinue
+    if ($openssl) {
+      $pemKey  = [IO.Path]::ChangeExtension($pfxPath, '.key.pem')
+      $pemCert = [IO.Path]::ChangeExtension($pfxPath, '.crt.pem')
 
-$KeyContainer = "CCP_${SafeCN}_$Stamp"
-$Subject      = "CN=$CN, OU=$OU, O=$O, L=$L, S=$ST, C=$C"
+      # Private key (unencrypted PEM; adjust flags if you want a passphrase)
+      & $openssl pkcs12 -in "$pfxPath" -passin "pass:$plain" -nocerts -nodes -out "$pemKey" | Out-Null
+      # Certificate (no private key)
+      & $openssl pkcs12 -in "$pfxPath" -passin "pass:$plain" -nokeys  -out "$pemCert" | Out-Null
+      return @("$pemKey","$pemCert")
+    }
 
-# SANs (always include CN)
-$sanList = @($CN)
-if ($SANs) { $sanList += ($SANs -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
-$sanText = 'dns=' + ($sanList -join '&dns=')
+    # Fallback to certutil split (emits multiple files)
+    $outDir = Join-Path (Split-Path $pfxPath) "pem-split"
+    $null = New-Item -ItemType Directory -Path $outDir -Force -ErrorAction SilentlyContinue
+    & certutil -p "$plain" -f -split -privatekey "$pfxPath" "$outDir\out" | Out-Null
+    return @($outDir)
+  } catch {
+    Write-Warning "PEM export failed: $_"
+    return @()
+  } finally {
+    if ($bstr) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+  }
+}
 
-# ---- Build INF (single-quoted here-string; placeholders replaced)
-# Adds EKUs for BOTH:
-#   - Server Authentication: 1.3.6.1.5.5.7.3.1
-#   - Client Authentication: 1.3.6.1.5.5.7.3.2
-# KeyUsage 0xA0 = digitalSignature + keyEncipherment
-$csrInf = @'
-[Version]
-Signature="$Windows NT$"
+# --- Resolve context (user vs machine) ----------------------------------------
 
-[NewRequest]
-Subject = "{SUBJECT}"
-KeySpec = 1
-KeyLength = {KEYBITS}
-Exportable = TRUE
-MachineKeySet = {MACHINEKEYSET}
-SMIME = FALSE
-PrivateKeyArchive = FALSE
-UserProtected = FALSE
-UseExistingKeySet = FALSE
-ProviderName = "{PROVIDERNAME}"
-ProviderType = {PROVIDERTYPE}
-RequestType = PKCS10
-KeyUsage = 0xa0
-KeyContainer = "{KEYCONTAINER}"
+$meta = Read-Metadata -path $MetaPath
+$contextIsMachine = if ($meta) { $meta.IsMachine } else { [bool]$UseLocalMachine }
+Write-Host "Context: " -NoNewline
+if ($contextIsMachine) { Write-Host "LocalMachine\My" } else { Write-Host "CurrentUser\My" }
 
-[Extensions]
-; Subject Alternative Name (SAN)
-2.5.29.17 = "{text}"
-_continue_ = "{SANTEXT}"
+# --- Step 1: See if a paired cert already exists --------------------------------
+$cert = Find-CertByCNOrSAN -cn $CN -isMachine $contextIsMachine
+if ($cert) {
+  Write-Host "Found existing certificate with private key for CN=$CN in the target store."
+} else {
+  Write-Host "No paired certificate found for CN=$CN. Accepting issued certificate into the proper store..."
+  Accept-IssuedCert -cerPath $IssuedCerPath -isMachine $contextIsMachine
+  Start-Sleep -Seconds 1
+  $cert = Find-CertByCNOrSAN -cn $CN -isMachine $contextIsMachine
+}
 
-; Enhanced Key Usage (EKU): Server + Client Auth
-2.5.29.37 = "{text}"
-_continue_ = "1.3.6.1.5.5.7.3.1,1.3.6.1.5.5.7.3.2"
-'@
+if (-not $cert) {
+  $storePath = Get-ExpectedStore -isMachine $contextIsMachine
+  throw "Issued cert is not paired with a private key in $storePath.
+- Ensure you are on the SAME machine & Windows profile that generated the CSR.
+- Accept using the same context: certreq $([string]::Join(' ', @($contextIsMachine ? '' : '-user','-accept',"`"$IssuedCerPath`"")))
+- If you imported via MMC/double-click, delete that copy and run certreq -accept again."
+}
 
-$csrInf = $csrInf.Replace('{SUBJECT}',$Subject).
-                  Replace('{KEYBITS}',$keyBits).
-                  Replace('{MACHINEKEYSET}',$MachineKeySet).
-                  Replace('{PROVIDERNAME}',$ProviderName).
-                  Replace('{PROVIDERTYPE}',$ProviderType).
-                  Replace('{KEYCONTAINER}',$KeyContainer).
-                  Replace('{SANTEXT}',$sanText)
+# Optional: sanity check by key container name (if we have it)
+if ($meta -and $meta.KeyContainer) {
+  try {
+    $cspInfo = $cert.PrivateKey.CspKeyContainerInfo
+    if ($cspInfo -and $cspInfo.KeyContainerName) {
+      if ($cspInfo.KeyContainerName -ne $meta.KeyContainer) {
+        Write-Warning "Paired cert's key container differs:
+ - Cert:     $($cspInfo.KeyContainerName)
+ - Metadata: $($meta.KeyContainer)
+This can happen if multiple requests for the same CN exist. Proceeding with the latest cert."
+      }
+    }
+  } catch {
+    # Some providers (KSP) won’t expose CSP info the same way; ignore.
+  }
+}
 
-[IO.File]::WriteAllText($ReqInf, $csrInf, [Text.Encoding]::ASCII)
+# --- Step 2: Export to PFX -----------------------------------------------------
+if (-not $PfxOut) {
+  $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+  $safeCN = ($CN -replace '[^\w\.-]','_')
+  $PfxOut = "C:\Temp\${safeCN}_$stamp.pfx"
+}
 
-# ---- Create CSR (and generate the key in the store)
-& certreq $CertreqContext -new "`"$ReqInf`"" "`"$CsrPath`"" | Out-Null
-if (!(Test-Path $CsrPath)) { throw "CSR was not created. See $ReqInf for details." }
+$export = Export-Pfx -cert $cert -pfxPath $PfxOut -withChain:$IncludeChain
+Write-Host "✅ PFX exported: $($export.Path)"
 
-# ---- Metadata for later step
-$meta = @"
-== CSR Generated ==
-Template:     $TemplateName
-CN:           $CN
-Subject:      $Subject
-SANs:         $($sanList -join ', ')
-EKUs:         Server Authentication (1.3.6.1.5.5.7.3.1), Client Authentication (1.3.6.1.5.5.7.3.2)
-CSR path:     $CsrPath
-Store:        $StorePath
-KeyContainer: $KeyContainer
-Provider:     $ProviderName (Type $ProviderType)
-"@
-[IO.File]::WriteAllText($MetaPath, $meta, [Text.Encoding]::UTF8)
+# --- Step 3 (optional): Export PEM(s) -----------------------------------------
+if ($ExportPem) {
+  $pemPaths = Try-ExportPem -pfxPath $export.Path -pfxPassword $export.Password
+  if ($pemPaths.Count -gt 0) {
+    Write-Host "📦 PEM export completed:"
+    $pemPaths | ForEach-Object { Write-Host "   $_" }
+  }
+}
 
-Write-Host "✅ CSR created: $CsrPath"
-Write-Host "   (Private key is in: $StorePath ; KeyContainer: $KeyContainer)"
-Write-Host "ℹ️  Metadata: $MetaPath"
+# --- Summary ------------------------------------------------------------------
 Write-Host ""
-
-# ---- OPTIONAL: Submit CSR directly to AD CS with the specified template
-#    1) Set your CA config as 'CAHost\CAName' (certsrv.msc → right-click CA → Properties → name)
-#    2) Uncomment the block to submit.
-# $CAConfig = Read-Host "Optional: specify your AD CS config (e.g., CAHOST01\Corp-RootCA). Leave blank to skip"
-# if ($CAConfig) {
-#     Write-Host "Submitting CSR to $CAConfig with template '$TemplateName'..."
-#     $CertOut = Join-Path $BaseDir "issued.cer"
-#     certreq -submit -config "$CAConfig" -attrib "CertificateTemplate:$TemplateName" "`"$CsrPath`"" "`"$CertOut`""
-#     if (Test-Path $CertOut) {
-#         Write-Host "🎉 Certificate issued: $CertOut"
-#         Write-Host "   You can complete the request with: certreq -accept `"$CertOut`""
-#     } else {
-#         Write-Warning "Submission complete, but no file saved. The request may be pending approval."
-#     }
-# }
+Write-Host "Summary"
+Write-Host "-------"
+Write-Host ("Store:           {0}" -f (Get-ExpectedStore -isMachine $contextIsMachine))
+Write-Host ("Subject:         {0}" -f $cert.Subject)
+Write-Host ("Thumbprint:      {0}" -f $cert.Thumbprint)
+Write-Host ("NotBefore/After: {0} – {1}" -f $cert.NotBefore, $cert.NotAfter)
+Write-Host ("HasPrivateKey:   {0}" -f $cert.HasPrivateKey)
+Write-Host ("PFX:             {0}" -f $export.Path)
+if ($IncludeChain) { Write-Host "Chain:           Included (BuildChain)" }
+if ($ExportPem)    { Write-Host "PEM:             Export attempted (see above)" }
