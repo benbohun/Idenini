@@ -1,24 +1,275 @@
-PS E:\Installation Media\Script\OnboardScript> .\UpdateSafeGroupDefaultPermission.ps1
-2025-10-31 15:05:50 - ----- Safe Member Permission Update started -----
-2025-10-31 15:05:50 - Retrieving CCP credential for 'CA_PAMDiscovery_SVC' via Object...
-2025-10-31 15:05:50 - CCP returned username for service principal.
-2025-10-31 15:05:50 - Requesting Identity header for 'aat4012.id.cyberark.cloud' (subdomain 'cna-prod').
-Challenge 1:
-UP - Enter Password
-Responding with stored credentials
-Identity Token Set Successfully
-2025-10-31 15:05:52 - PAS session established (no prompts).
-2025-10-31 15:06:00 - 🔹 Loaded 2 row(s) from CSV: E:\Installation Media\Script\OnboardScript\data\PermDatatest.csv
-2025-10-31 15:06:00 - 🔹 Processing: Safe='ca_abp_app' Member='ca_abp_app@cna.com' (Type=Group)
-2025-10-31 15:06:00 - • Found existing membership; updating permissions...
-2025-10-31 15:06:00 - ❌ ERROR on Safe='ca_abp_app' Member='ca_abp_app@cna.com' -> A parameter cannot be found that matches parameter name 'Permissions'.
-2025-10-31 15:06:00 - 🔹 Processing: Safe='CA_ACS_SUPPORT' Member='CA_ACS_support@cna.com' (Type=Group)
-2025-10-31 15:06:00 - • Found existing membership; updating permissions...
-2025-10-31 15:06:00 - ❌ ERROR on Safe='CA_ACS_SUPPORT' Member='CA_ACS_support@cna.com' -> A parameter cannot be found that matches parameter name 'Permissions'.
-2025-10-31 15:06:00 - ---- SUMMARY ----
-2025-10-31 15:06:00 - Updated : 0
-2025-10-31 15:06:00 - Added   : 0
-2025-10-31 15:06:00 - Skipped : 0
-2025-10-31 15:06:00 - Errors  : 2
-2025-10-31 15:06:00 - ----- Safe Member Permission Update complete -----
-PS E:\Installation Media\Script\OnboardScript>
+<# 
+Update Safe Member Permissions (psPAS + CCP)
+- Pops a file dialog to pick your CSV (or pass -CsvPath).
+- Updates each listed Safe+Member to the exact permission set requested.
+- Supports -WhatIf and -AddIfMissing.
+- Colorful console output.
+CSV needs columns:
+  SafeName, MemberName [, MemberType=Group|User]
+#>
+
+param(
+    [string] $CsvPath,      # optional; if omitted, a file picker pops up
+    [switch] $WhatIf,       # dry run (log-only)
+    [switch] $AddIfMissing  # add membership if not present
+)
+
+# ============================================
+# Script setup
+# ============================================
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$ErrorActionPreference = 'Stop'
+$ProgressPreference    = 'SilentlyContinue'
+
+Import-Module psPAS -Force
+
+# ---------- Color helpers ----------
+function Write-Info     { param($m) Write-Host $m -ForegroundColor Cyan }
+function Write-Good     { param($m) Write-Host $m -ForegroundColor Green }
+function Write-Warn     { param($m) Write-Host $m -ForegroundColor Yellow }
+function Write-Bad      { param($m) Write-Host $m -ForegroundColor Red }
+function Write-Title    { param($m) Write-Host $m -ForegroundColor Magenta }
+function Write-Subtle   { param($m) Write-Host $m -ForegroundColor DarkGray }
+
+# ---------- Minimal logger (no secrets) ----------
+$LogFile = "E:\Installation Media\Script\OnboardScript\data\SafeMemberPermUpdate.log"
+New-Item -ItemType File -Force -Path $LogFile | Out-Null
+function Write-Log {
+    param([string]$Message, [ConsoleColor]$Color = 'White')
+    $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $line = "$ts - $Message"
+    Write-Host $line -ForegroundColor $Color
+    Add-Content -Path $LogFile -Value $line
+}
+
+# ---------- Banner ----------
+Write-Host ""
+Write-Title "═══════════════════════════════════════════════════════════════════"
+Write-Title "   CyberArk Safe Member Permission Updater (psPAS + CCP Login)     "
+Write-Title "═══════════════════════════════════════════════════════════════════"
+Write-Subtle "Log: $LogFile"
+Write-Host ""
+
+# ---------- CCP / Identity config ----------
+$CCPAddress    = "https://vskau1p1231.cna.com"
+$location      = "AIMWebService"
+$application   = "PAMDiscovery"
+$safeCCP       = "CA_PCloud_Admins"
+$windowsAuth   = $false
+$headers       = @{ 'Content-Type' = 'application/json' }
+
+$IdentityTenantURL = "aat4012.id.cyberark.cloud"
+$PCloudSubdomain   = "cna-prod"
+
+# ---------- Target permission params (as individual flags) ----------
+function Get-PermParams {
+    # Returned hashtable is splatted to Set-/Add-PASSafeMember
+    @{
+        UseAccounts                             = $true
+        RetrieveAccounts                        = $true
+        ListAccounts                            = $true
+        AddAccounts                             = $false
+        UpdateAccountContent                    = $false
+        UpdateAccountProperties                 = $false
+        InitiateCPMAccountManagementOperations  = $true
+        SpecifyNextAccountContent               = $true
+        RenameAccounts                          = $false
+        DeleteAccounts                          = $false
+        UnlockAccounts                          = $false
+        ManageSafe                              = $false
+        ManageSafeMembers                       = $false
+        BackupSafe                              = $false
+        ViewAuditLog                            = $true
+        ViewSafeMembers                         = $true
+        AccessWithoutConfirmation               = $true
+        CreateFolders                           = $false
+        DeleteFolders                           = $false
+        MoveAccountsAndFolders                  = $false
+        requestsAuthorizationLevel1             = $true     # Gen2 flags
+        requestsAuthorizationLevel2             = $false
+    }
+}
+
+# ---------- Header + name helpers ----------
+function Resolve-Header {
+    param(
+        [Parameter(Mandatory)] $Record,
+        [Parameter(Mandatory)] [string[]] $Aliases
+    )
+    foreach ($a in $Aliases) {
+        if ($Record.PSObject.Properties.Name -contains $a) { return $a }
+    }
+    foreach ($prop in $Record.PSObject.Properties.Name) {
+        if ($Aliases -contains ($prop -replace '\s','')) { return $prop }
+    }
+    return $null
+}
+function Normalize-Name([string]$s) {
+    if ([string]::IsNullOrWhiteSpace($s)) { return $null }
+    return $s.Trim()
+}
+
+# ---------- GUI picker for CSV (with fallback to console prompt) ----------
+function Get-CsvPathInteractive {
+    param(
+        [string] $Title  = 'Select the Safe Members CSV',
+        [string] $Filter = 'CSV files (*.csv)|*.csv|All files (*.*)|*.*',
+        [string] $InitialDirectory = 'E:\Installation Media\Script\OnboardScript\data'
+    )
+    try {
+        $isSTA = [System.Threading.Thread]::CurrentThread.ApartmentState -eq 'STA'
+        if ($isSTA) {
+            Add-Type -AssemblyName System.Windows.Forms | Out-Null
+            $dlg = New-Object System.Windows.Forms.OpenFileDialog
+            $dlg.Title            = $Title
+            $dlg.Filter           = $Filter
+            $dlg.CheckFileExists  = $true
+            $dlg.Multiselect      = $false
+            if (Test-Path $InitialDirectory) { $dlg.InitialDirectory = $InitialDirectory }
+
+            $result = $dlg.ShowDialog()
+            if ($result -eq [System.Windows.Forms.DialogResult]::OK -and
+                -not [string]::IsNullOrWhiteSpace($dlg.FileName)) {
+                return $dlg.FileName
+            } else {
+                throw "Selection canceled."
+            }
+        } else {
+            throw "Non-STA host; using console prompt."
+        }
+    }
+    catch {
+        Write-Warn "GUI picker unavailable: $($_.Exception.Message)"
+        $path = Read-Host "Enter full path to the CSV (e.g. E:\Installation Media\Script\OnboardScript\data\SafeMembersToUpdate.csv)"
+        if ([string]::IsNullOrWhiteSpace($path)) { throw "No CSV path provided." }
+        return $path
+    }
+}
+
+# ---------- Login helper: CCP (Object) -> psPAS header ----------
+function Start-PASSessionFromCCP {
+    param(
+        [Parameter(Mandatory)] [string]$ObjectName,  # e.g., cna.com-CA_PAMDiscovery_SVC
+        [Parameter(Mandatory)] [string]$UPUser       # e.g., CA_PAMDiscovery_SVC
+    )
+
+    $ccpUrl = "$CCPAddress/$location/api/Accounts?AppID=$application&Safe=$safeCCP&Object=$ObjectName"
+    Write-Log "Retrieving CCP credential for '$UPUser' via Object..." 'Cyan'
+
+    $resp = Invoke-RestMethod -Uri $ccpUrl -Method GET -Headers $headers -UseDefaultCredentials:$windowsAuth
+    if (-not $resp -or -not $resp.Content -or -not $resp.Username) {
+        throw "CCP response missing Content/Username."
+    }
+    Write-Log "CCP returned username for service principal." 'Green'
+
+    # Build PSCredential (do not print secrets)
+    $secPass = ConvertTo-SecureString -String $resp.Content -AsPlainText -Force
+    $upCred  = [PSCredential]::new($UPUser, $secPass)
+
+    Write-Log "Requesting Identity header for '$IdentityTenantURL' (subdomain '$PCloudSubdomain')." 'Cyan'
+    $hdr = Get-IdentityHeader -IdentityTenantURL $IdentityTenantURL -psPASFormat -PCloudSubdomain $PCloudSubdomain -UPCreds $upCred
+    Use-PASSession $hdr
+    if (-not (Get-PASSession)) { throw "psPAS session not established." }
+
+    # Minimize plaintext exposure
+    $resp.Content = $null
+    Write-Log "PAS session established (no prompts)." 'Green'
+}
+
+# ---------- START ----------
+Write-Log "🟣 ----- Safe Member Permission Update started -----" 'Magenta'
+Start-PASSessionFromCCP -ObjectName "cna.com-CA_PAMDiscovery_SVC" -UPUser "CA_PAMDiscovery_SVC"
+
+# Resolve CSV path (param wins; otherwise interactive)
+if (-not $CsvPath) { $CsvPath = Get-CsvPathInteractive }
+if (-not (Test-Path $CsvPath)) {
+    Write-Log "❌ CSV not found: $CsvPath" 'Red'
+    exit 1
+}
+
+$rows = Import-Csv -Path $CsvPath
+if (-not $rows -or $rows.Count -eq 0) {
+    Write-Log "❌ CSV is empty: $CsvPath" 'Red'
+    exit 1
+}
+Write-Log "📄 Loaded $($rows.Count) row(s) from CSV: $CsvPath" 'Yellow'
+
+# Prep
+$permParams = Get-PermParams
+$updated = 0; $skipped = 0; $added = 0; $errors = 0
+
+foreach ($row in $rows) {
+    try {
+        $safeHeader   = Resolve-Header -Record $row -Aliases @('SafeName','Safe','VaultSafe','Vault_Safe')
+        $memberHeader = Resolve-Header -Record $row -Aliases @('MemberName','Member','Group','SafeMember','Safe_Member')
+        $typeHeader   = Resolve-Header -Record $row -Aliases @('MemberType','Type')
+
+        if (-not $safeHeader -or -not $memberHeader) {
+            Write-Log "⚠️ Skipping row (missing Safe/Member headers): $($row | ConvertTo-Json -Compress)" 'Yellow'
+            $skipped++; continue
+        }
+
+        $safeName    = Normalize-Name $row.$safeHeader
+        $memberName  = Normalize-Name $row.$memberHeader
+        $memberType  = if ($typeHeader) { Normalize-Name $row.$typeHeader } else { $null }
+        if (-not $memberType) { $memberType = 'Group' }  # default to Directory group
+
+        if (-not $safeName -or -not $memberName) {
+            Write-Log "⚠️ Skipping row (blank Safe/Member): Safe='$safeName' Member='$memberName'" 'Yellow'
+            $skipped++; continue
+        }
+
+        Write-Log "🔹 Processing: Safe='$safeName'  Member='$memberName'  (Type=$memberType)" 'Cyan'
+
+        # Look for existing membership (exact name match)
+        $existing = $null
+        try {
+            $existing = Get-PASSafeMember -SafeName $safeName -Search $memberName -ErrorAction Stop |
+                        Where-Object { $_.MemberName -eq $memberName }
+        } catch {
+            # Safe not found or insufficient rights; handled below
+        }
+
+        if ($existing) {
+            Write-Subtle "• Found existing membership; updating permissions..."
+            if ($WhatIf) {
+                Write-Warn "WHATIF: Set-PASSafeMember '$safeName' / '$memberName' with target flags."
+            } else {
+                Set-PASSafeMember -SafeName $safeName -MemberName $memberName @permParams -Confirm:$false | Out-Null
+                Write-Good "✅ Updated permissions for '$memberName' in '$safeName'."
+            }
+            $updated++
+        } else {
+            if ($AddIfMissing) {
+                Write-Subtle "• Membership not found; adding with target permissions..."
+                if ($WhatIf) {
+                    Write-Warn "WHATIF: Add-PASSafeMember '$memberName' (Type=$memberType) to '$safeName' with target flags."
+                } else {
+                    Add-PASSafeMember -SafeName $safeName -MemberName $memberName -memberType $memberType @permParams -Confirm:$false | Out-Null
+                    Write-Good "🟢 Added '$memberName' (Type=$memberType) to '$safeName' with target permissions."
+                }
+                $added++
+            } else {
+                Write-Warn "Member '$memberName' not found in '$safeName' (use -AddIfMissing to add)."
+                $skipped++
+            }
+        }
+    }
+    catch {
+        $errors++
+        Write-Bad ("❌ ERROR on Safe='{0}' Member='{1}' -> {2}" -f $safeName,$memberName,$_.Exception.Message)
+    }
+}
+
+Write-Host ""
+Write-Title "──────────────────── SUMMARY ────────────────────"
+Write-Host   ("Updated : {0}" -f $updated) -ForegroundColor Green
+Write-Host   ("Added   : {0}" -f $added)   -ForegroundColor Green
+Write-Host   ("Skipped : {0}" -f $skipped) -ForegroundColor Yellow
+Write-Host   ("Errors  : {0}" -f $errors)  -ForegroundColor Red
+Write-Title "────────────────────────────────────────────────"
+
+# ---------- Close session (best-effort) ----------
+try { Close-PASSession | Out-Null } catch {}
+Write-Log "🟣 ----- Safe Member Permission Update complete -----" 'Magenta'
+Write-Host ""
