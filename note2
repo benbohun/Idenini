@@ -1,1 +1,175 @@
-https://www.surveymonkey.com/r/N8PFN7J
+Using the login logic of the script,develop a script to update the permission below for the safe member group in my csv list.
+
+
+    UseAccounts                            = $true
+    RetrieveAccounts                       = $true
+    ListAccounts                           = $true
+    AddAccounts                            = $false
+    UpdateAccountContent                   = $false
+    UpdateAccountProperties                = $false
+    InitiateCPMAccountManagementOperations = $true
+    SpecifyNextAccountContent              = $true
+    RenameAccounts                         = $false
+    DeleteAccounts                         = $false
+    UnlockAccounts                         = $false
+    ManageSafe                             = $false
+    ManageSafeMembers                      = $false
+    BackupSafe                             = $false
+    ViewAuditLog                           = $true
+    ViewSafeMembers                        = $true
+    AccessWithoutConfirmation              = $true
+    CreateFolders                          = $false
+    DeleteFolders                          = $false
+    MoveAccountsAndFolders                 = $false
+    RequestsAuthorizationLevel1            = $true
+    RequestsAuthorizationLevel2            = $false
+
+
+# ============================================
+# CCP -> psPAS (no prompts) -> Safe Membership Report
+# ============================================
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$ErrorActionPreference = 'Stop'
+$ProgressPreference    = 'SilentlyContinue'
+
+Import-Module psPAS -Force
+
+# ---------- Minimal logger (no secrets) ----------
+$LogFile = "E:\Installation Media\Script\OnboardScript\data\SafeMembershipReport.log"
+New-Item -ItemType File -Force -Path $LogFile | Out-Null
+function Write-Log {
+    param([string]$Message, [ConsoleColor]$Color = 'White')
+    $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $line = "$ts - $Message"
+    Write-Host $line -ForegroundColor $Color
+    Add-Content -Path $LogFile -Value $line
+}
+
+# ---------- CCP / Identity config ----------
+$CCPAddress    = "https://vskau1p1231.cna.com"
+$location      = "AIMWebService"
+$application   = "PAMDiscovery"
+$safeCCP       = "CA_PCloud_Admins"
+$windowsAuth   = $false
+$headers       = @{ 'Content-Type' = 'application/json' }
+
+$IdentityTenantURL = "aat4012.id.cyberark.cloud"
+$PCloudSubdomain   = "cna-prod"
+
+# Output CSV
+$CsvFilePath = "E:\Installation Media\Script\OnboardScript\data\SafeMembershipReport.csv"
+
+# ---------- Login helper: CCP (Object) -> psPAS header ----------
+function Start-PASSessionFromCCP {
+    param(
+        [Parameter(Mandatory)] [string]$ObjectName,  # e.g., cna.com-CA_PAMDiscovery_SVC
+        [Parameter(Mandatory)] [string]$UPUser       # e.g., CA_PAMDiscovery_SVC
+    )
+
+    $ccpUrl = "$CCPAddress/$location/api/Accounts?AppID=$application&Safe=$safeCCP&Object=$ObjectName"
+    Write-Log "Retrieving CCP credential for '$UPUser' via Object..." 'Cyan'
+
+    $resp = Invoke-RestMethod -Uri $ccpUrl -Method GET -Headers $headers -UseDefaultCredentials:$windowsAuth
+    if (-not $resp -or -not $resp.Content -or -not $resp.Username) {
+        throw "CCP response missing Content/Username."
+    }
+    Write-Log "CCP returned username for service principal." 'Green'
+
+    # Build PSCredential (do not print secrets)
+    $secPass = ConvertTo-SecureString -String $resp.Content -AsPlainText -Force
+    $upCred  = [PSCredential]::new($UPUser, $secPass)
+
+    Write-Log "Requesting Identity header for '$IdentityTenantURL' (subdomain '$PCloudSubdomain')." 'Cyan'
+    $hdr = Get-IdentityHeader -IdentityTenantURL $IdentityTenantURL -psPASFormat -PCloudSubdomain $PCloudSubdomain -UPCreds $upCred
+    Use-PASSession $hdr
+    if (-not (Get-PASSession)) { throw "psPAS session not established." }
+
+    # Minimize plaintext exposure
+    $resp.Content = $null
+    Write-Log "PAS session established (no prompts)." 'Green'
+}
+
+# ---------- Authenticate (service: CA_PAMDiscovery_SVC) ----------
+Start-PASSessionFromCCP -ObjectName "cna.com-CA_PAMDiscovery_SVC" -UPUser "CA_PAMDiscovery_SVC"
+
+# ---------- Step 2: Retrieve All Safes ----------
+Write-Log "Retrieving list of Safes..." 'Yellow'
+try {
+    $Safes = Get-PASSafe -ErrorAction Stop
+    Write-Log "✅ Retrieved $($Safes.Count) Safes." 'Green'
+} catch {
+    Write-Log "❌ ERROR: Failed to retrieve Safes - $($_.Exception.Message)" 'Red'
+    exit 1
+}
+
+# ---------- Step 3: Retrieve Safe Members & Permissions ----------
+$SafeMembersReport = New-Object System.Collections.Generic.List[object]
+
+foreach ($Safe in $Safes) {
+    $SafeName = $Safe.safeName
+    Write-Log "🔹 Retrieving members for Safe: $SafeName" 'Cyan'
+
+    try {
+        $SafeMembers = Get-PASSafeMember -SafeName $SafeName -ErrorAction Stop
+
+        # Normalize to array
+        if ($null -eq $SafeMembers) { $SafeMembers = @() }
+        elseif ($SafeMembers -isnot [System.Collections.IEnumerable]) { $SafeMembers = @($SafeMembers) }
+
+        if ($SafeMembers.Count -eq 0) {
+            Write-Log "⚠️ No members found for Safe: $SafeName" 'Yellow'
+        }
+
+        foreach ($Member in $SafeMembers) {
+            $perm = $Member.Permissions
+
+            $SafeMembersReport.Add([PSCustomObject]@{
+                SafeName                                   = $SafeName
+                Member                                     = $Member.MemberName
+                MemberType                                 = $Member.MemberType
+                UseAccounts                                = $perm.useAccounts
+                RetrieveAccounts                           = $perm.retrieveAccounts
+                ListAccounts                               = $perm.listAccounts
+                AddAccounts                                = $perm.addAccounts
+                UpdateAccountContent                       = $perm.updateAccountContent
+                UpdateAccountProperties                    = $perm.updateAccountProperties
+                InitiateCPMAccountManagementOperations     = $perm.initiateCPMAccountManagementOperations
+                SpecifyNextAccountContent                  = $perm.specifyNextAccountContent
+                RenameAccounts                             = $perm.renameAccounts
+                DeleteAccounts                             = $perm.deleteAccounts
+                UnlockAccounts                             = $perm.unlockAccounts
+                ManageSafe                                 = $perm.manageSafe
+                ManageSafeMembers                          = $perm.manageSafeMembers
+                BackupSafe                                 = $perm.backupSafe
+                ViewAuditLog                               = $perm.viewAuditLog
+                ViewSafeMembers                            = $perm.viewSafeMembers
+                AccessWithoutConfirmation                  = $perm.accessWithoutConfirmation
+                CreateFolders                              = $perm.createFolders
+                DeleteFolders                              = $perm.deleteFolders
+                MoveAccountsAndFolders                     = $perm.moveAccountsAndFolders
+                RequestsAuthorizationLevel1                = $perm.requestsAuthorizationLevel1
+                RequestsAuthorizationLevel2                = $perm.requestsAuthorizationLevel2
+            })
+        }
+        Write-Log "✅ Retrieved $($SafeMembers.Count) members for Safe: $SafeName" 'Green'
+    } catch {
+        Write-Log "❌ ERROR: Failed to retrieve members for Safe: $SafeName - $($_.Exception.Message)" 'Red'
+    }
+}
+
+# ---------- Step 4: Export to CSV ----------
+# Ensure output directory exists
+$dir = Split-Path -Path $CsvFilePath -Parent
+if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+
+try {
+    $SafeMembersReport | Export-Csv -Path $CsvFilePath -NoTypeInformation -Encoding UTF8
+    Write-Log "✅ Safe Member Report successfully exported to: $CsvFilePath" 'Green'
+    Write-Log "🔹 Safe Member Report generation completed." 'Green'
+} catch {
+    Write-Log "❌ ERROR: Failed to export CSV - $($_.Exception.Message)" 'Red'
+    exit 1
+}
+
+# Optional: close session
+try { Close-PASSession | Out-Null } catch {}
