@@ -1,275 +1,328 @@
-<# 
-Update Safe Member Permissions (psPAS + CCP)
-- Pops a file dialog to pick your CSV (or pass -CsvPath).
-- Updates each listed Safe+Member to the exact permission set requested.
-- Supports -WhatIf and -AddIfMissing.
-- Colorful console output.
-CSV needs columns:
-  SafeName, MemberName [, MemberType=Group|User]
+<#
+Convert-IssuedCertToPfx.ps1  (PowerShell 5.1)
+
+Flow (no CN prompt):
+1) Prompt for issued certificate file (.cer)
+2) Optional: prompt for metadata.txt (to detect store and key container)
+3) Auto-detect CN from the .cer (fallback to metadata if needed)
+4) Accept cert into correct store (from metadata; else auto-try user then machine)
+5) Verify pairing (HasPrivateKey)
+6) Export PFX (with password confirmation; optional chain, optional PEM export)
+
+Run it and follow prompts.
 #>
 
-param(
-    [string] $CsvPath,      # optional; if omitted, a file picker pops up
-    [switch] $WhatIf,       # dry run (log-only)
-    [switch] $AddIfMissing  # add membership if not present
-)
+[CmdletBinding()]
+param()
 
-# ============================================
-# Script setup
-# ============================================
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $ErrorActionPreference = 'Stop'
-$ProgressPreference    = 'SilentlyContinue'
 
-Import-Module psPAS -Force
-
-# ---------- Color helpers ----------
-function Write-Info     { param($m) Write-Host $m -ForegroundColor Cyan }
-function Write-Good     { param($m) Write-Host $m -ForegroundColor Green }
-function Write-Warn     { param($m) Write-Host $m -ForegroundColor Yellow }
-function Write-Bad      { param($m) Write-Host $m -ForegroundColor Red }
-function Write-Title    { param($m) Write-Host $m -ForegroundColor Magenta }
-function Write-Subtle   { param($m) Write-Host $m -ForegroundColor DarkGray }
-
-# ---------- Minimal logger (no secrets) ----------
-$LogFile = "E:\Installation Media\Script\OnboardScript\data\SafeMemberPermUpdate.log"
-New-Item -ItemType File -Force -Path $LogFile | Out-Null
-function Write-Log {
-    param([string]$Message, [ConsoleColor]$Color = 'White')
-    $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    $line = "$ts - $Message"
-    Write-Host $line -ForegroundColor $Color
-    Add-Content -Path $LogFile -Value $line
+# =========== Prompts ===========
+function Read-FilePath {
+  param([string]$Prompt,[string]$FilterDesc='All files',[string]$FilterExt='*.*',[switch]$Optional)
+  try {
+    Add-Type -AssemblyName System.Windows.Forms | Out-Null
+    $dlg = New-Object System.Windows.Forms.OpenFileDialog
+    $dlg.Title  = $Prompt
+    $dlg.Filter = "{0} ({1})|{1}|All files (*.*)|*.*" -f $FilterDesc,$FilterExt
+    if ($dlg.ShowDialog() -eq 'OK') { return $dlg.FileName }
+  } catch { }
+  $p = Read-Host "$Prompt"
+  if ([string]::IsNullOrWhiteSpace($p)) {
+    if ($Optional) { return '' } else { throw "Path is required." }
+  }
+  if (-not (Test-Path -LiteralPath $p)) { throw "Path not found: $p" }
+  return $p
 }
 
-# ---------- Banner ----------
-Write-Host ""
-Write-Title "═══════════════════════════════════════════════════════════════════"
-Write-Title "   CyberArk Safe Member Permission Updater (psPAS + CCP Login)     "
-Write-Title "═══════════════════════════════════════════════════════════════════"
-Write-Subtle "Log: $LogFile"
-Write-Host ""
+$IssuedCerPath = Read-FilePath -Prompt "Select/enter path to ISSUED certificate (.cer)" -FilterDesc "Issued certificate" -FilterExt "*.cer"
+$MetaPath      = Read-FilePath -Prompt "Optional: select/enter path to metadata.txt (Enter to skip)" -FilterDesc "metadata.txt" -FilterExt "*.txt" -Optional
 
-# ---------- CCP / Identity config ----------
-$CCPAddress    = "https://vskau1p1231.cna.com"
-$location      = "AIMWebService"
-$application   = "PAMDiscovery"
-$safeCCP       = "CA_PCloud_Admins"
-$windowsAuth   = $false
-$headers       = @{ 'Content-Type' = 'application/json' }
+# Ask if you want to include chain and/or export PEMs
+$IncludeChain  = (Read-Host "Include full chain in PFX? (Y/N) [N]").Trim().ToUpper() -eq 'Y'
+$ExportPem     = (Read-Host "Also export PEM files? (Y/N) [N]").Trim().ToUpper() -eq 'Y'
 
-$IdentityTenantURL = "aat4012.id.cyberark.cloud"
-$PCloudSubdomain   = "cna-prod"
-
-# ---------- Target permission params (as individual flags) ----------
-function Get-PermParams {
-    # Returned hashtable is splatted to Set-/Add-PASSafeMember
-    @{
-        UseAccounts                             = $true
-        RetrieveAccounts                        = $true
-        ListAccounts                            = $true
-        AddAccounts                             = $false
-        UpdateAccountContent                    = $false
-        UpdateAccountProperties                 = $false
-        InitiateCPMAccountManagementOperations  = $true
-        SpecifyNextAccountContent               = $true
-        RenameAccounts                          = $false
-        DeleteAccounts                          = $false
-        UnlockAccounts                          = $false
-        ManageSafe                              = $false
-        ManageSafeMembers                       = $false
-        BackupSafe                              = $false
-        ViewAuditLog                            = $true
-        ViewSafeMembers                         = $true
-        AccessWithoutConfirmation               = $true
-        CreateFolders                           = $false
-        DeleteFolders                           = $false
-        MoveAccountsAndFolders                  = $false
-        requestsAuthorizationLevel1             = $true     # Gen2 flags
-        requestsAuthorizationLevel2             = $false
-    }
-}
-
-# ---------- Header + name helpers ----------
-function Resolve-Header {
-    param(
-        [Parameter(Mandatory)] $Record,
-        [Parameter(Mandatory)] [string[]] $Aliases
-    )
-    foreach ($a in $Aliases) {
-        if ($Record.PSObject.Properties.Name -contains $a) { return $a }
-    }
-    foreach ($prop in $Record.PSObject.Properties.Name) {
-        if ($Aliases -contains ($prop -replace '\s','')) { return $prop }
-    }
+# =========== Helpers ===========
+function Read-Metadata {
+  param([string]$Path)
+  if (-not $Path) { return $null }
+  try {
+    $content = Get-Content -LiteralPath $Path -Raw
+  } catch {
+    Write-Warning ("Could not read metadata at {0}: {1}" -f $Path, $_)
     return $null
-}
-function Normalize-Name([string]$s) {
-    if ([string]::IsNullOrWhiteSpace($s)) { return $null }
-    return $s.Trim()
+  }
+  $storeMatch = [regex]::Match($content, '(?m)^Store:\s*(.+)$')
+  $kcMatch    = [regex]::Match($content, '(?m)^KeyContainer:\s*(.+)$')
+  $cnMatch    = [regex]::Match($content, '(?m)^CN:\s*(.+)$')
+
+  $storeText  = if ($storeMatch.Success) { $storeMatch.Groups[1].Value.Trim() } else { '' }
+  $kcText     = if ($kcMatch.Success)    { $kcMatch.Groups[1].Value.Trim() }    else { '' }
+  $cnText     = if ($cnMatch.Success)    { $cnMatch.Groups[1].Value.Trim() }    else { '' }
+
+  $isMachine = $false
+  if ($storeText -match 'LocalMachine\\My') { $isMachine = $true }
+  elseif ($storeText -match 'CurrentUser\\My') { $isMachine = $false }
+
+  [PSCustomObject]@{
+    IsMachine    = $isMachine
+    KeyContainer = $kcText
+    CN           = $cnText
+    StoreRaw     = $storeText
+  }
 }
 
-# ---------- GUI picker for CSV (with fallback to console prompt) ----------
-function Get-CsvPathInteractive {
-    param(
-        [string] $Title  = 'Select the Safe Members CSV',
-        [string] $Filter = 'CSV files (*.csv)|*.csv|All files (*.*)|*.*',
-        [string] $InitialDirectory = 'E:\Installation Media\Script\OnboardScript\data'
-    )
+function Get-ExpectedStore {
+  param([bool]$IsMachine)
+  if ($IsMachine) { 'Cert:\LocalMachine\My' } else { 'Cert:\CurrentUser\My' }
+}
+
+function Get-CNFromCertFile {
+  param([string]$CerPath)
+  # Load from path (avoids byte[] constructor issues in PS 5.1)
+  $x = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 -ArgumentList $CerPath
+
+  # Try Subject CN first
+  $subject = $x.Subject
+  $cn = ''
+  $m = [regex]::Match($subject, '(?i)(?:^|,)\s*CN\s*=\s*([^,]+)')
+  if ($m.Success) { $cn = $m.Groups[1].Value.Trim() }
+
+  # Fallback to SAN DNS name
+  if (-not $cn) {
     try {
-        $isSTA = [System.Threading.Thread]::CurrentThread.ApartmentState -eq 'STA'
-        if ($isSTA) {
-            Add-Type -AssemblyName System.Windows.Forms | Out-Null
-            $dlg = New-Object System.Windows.Forms.OpenFileDialog
-            $dlg.Title            = $Title
-            $dlg.Filter           = $Filter
-            $dlg.CheckFileExists  = $true
-            $dlg.Multiselect      = $false
-            if (Test-Path $InitialDirectory) { $dlg.InitialDirectory = $InitialDirectory }
-
-            $result = $dlg.ShowDialog()
-            if ($result -eq [System.Windows.Forms.DialogResult]::OK -and
-                -not [string]::IsNullOrWhiteSpace($dlg.FileName)) {
-                return $dlg.FileName
-            } else {
-                throw "Selection canceled."
-            }
-        } else {
-            throw "Non-STA host; using console prompt."
-        }
-    }
-    catch {
-        Write-Warn "GUI picker unavailable: $($_.Exception.Message)"
-        $path = Read-Host "Enter full path to the CSV (e.g. E:\Installation Media\Script\OnboardScript\data\SafeMembersToUpdate.csv)"
-        if ([string]::IsNullOrWhiteSpace($path)) { throw "No CSV path provided." }
-        return $path
-    }
+      $dns = @()
+      if ($x.DnsNameList) { $dns = $x.DnsNameList | ForEach-Object { $_.Unicode } }
+      if ($dns.Count -gt 0) { $cn = $dns[0] }
+    } catch { }
+  }
+  return $cn
 }
 
-# ---------- Login helper: CCP (Object) -> psPAS header ----------
-function Start-PASSessionFromCCP {
-    param(
-        [Parameter(Mandatory)] [string]$ObjectName,  # e.g., cna.com-CA_PAMDiscovery_SVC
-        [Parameter(Mandatory)] [string]$UPUser       # e.g., CA_PAMDiscovery_SVC
-    )
+function Find-CertWithKeyByCNOrSAN {
+  param([string]$CN,[bool]$IsMachine)
+  $store = Get-ExpectedStore -IsMachine $IsMachine
+  $items = Get-ChildItem -Path $store -ErrorAction SilentlyContinue
+  if (-not $items) { return $null }
 
-    $ccpUrl = "$CCPAddress/$location/api/Accounts?AppID=$application&Safe=$safeCCP&Object=$ObjectName"
-    Write-Log "Retrieving CCP credential for '$UPUser' via Object..." 'Cyan'
-
-    $resp = Invoke-RestMethod -Uri $ccpUrl -Method GET -Headers $headers -UseDefaultCredentials:$windowsAuth
-    if (-not $resp -or -not $resp.Content -or -not $resp.Username) {
-        throw "CCP response missing Content/Username."
-    }
-    Write-Log "CCP returned username for service principal." 'Green'
-
-    # Build PSCredential (do not print secrets)
-    $secPass = ConvertTo-SecureString -String $resp.Content -AsPlainText -Force
-    $upCred  = [PSCredential]::new($UPUser, $secPass)
-
-    Write-Log "Requesting Identity header for '$IdentityTenantURL' (subdomain '$PCloudSubdomain')." 'Cyan'
-    $hdr = Get-IdentityHeader -IdentityTenantURL $IdentityTenantURL -psPASFormat -PCloudSubdomain $PCloudSubdomain -UPCreds $upCred
-    Use-PASSession $hdr
-    if (-not (Get-PASSession)) { throw "psPAS session not established." }
-
-    # Minimize plaintext exposure
-    $resp.Content = $null
-    Write-Log "PAS session established (no prompts)." 'Green'
+  $items |
+    Where-Object {
+      $_.HasPrivateKey -and (
+        $_.Subject -match ("(?i)CN\s*=\s*{0}(\s|,|$)" -f [regex]::Escape($CN)) -or
+        (($_.DnsNameList | ForEach-Object { $_.Unicode }) -contains $CN)
+      )
+    } |
+    Sort-Object NotBefore -Descending |
+    Select-Object -First 1
 }
 
-# ---------- START ----------
-Write-Log "🟣 ----- Safe Member Permission Update started -----" 'Magenta'
-Start-PASSessionFromCCP -ObjectName "cna.com-CA_PAMDiscovery_SVC" -UPUser "CA_PAMDiscovery_SVC"
-
-# Resolve CSV path (param wins; otherwise interactive)
-if (-not $CsvPath) { $CsvPath = Get-CsvPathInteractive }
-if (-not (Test-Path $CsvPath)) {
-    Write-Log "❌ CSV not found: $CsvPath" 'Red'
-    exit 1
+function Accept-IssuedCert {
+  param([string]$CerPath,[bool]$IsMachine)
+  if ($IsMachine) {
+    Write-Verbose ("Running: certreq -accept ""{0}""" -f $CerPath)
+    & certreq -accept "$CerPath" | Out-Null
+  } else {
+    Write-Verbose ("Running: certreq -user -accept ""{0}""" -f $CerPath)
+    & certreq -user -accept "$CerPath" | Out-Null
+  }
 }
 
-$rows = Import-Csv -Path $CsvPath
-if (-not $rows -or $rows.Count -eq 0) {
-    Write-Log "❌ CSV is empty: $CsvPath" 'Red'
-    exit 1
+function Remove-CertByThumbprint {
+  param([string]$Thumb,[bool]$IsMachine)
+  $store = Get-ExpectedStore -IsMachine $IsMachine
+  $c = Get-ChildItem -Path $store -ErrorAction SilentlyContinue | Where-Object { $_.Thumbprint -eq $Thumb }
+  if ($c) {
+    $c | Remove-Item -ErrorAction SilentlyContinue
+  }
 }
-Write-Log "📄 Loaded $($rows.Count) row(s) from CSV: $CsvPath" 'Yellow'
 
-# Prep
-$permParams = Get-PermParams
-$updated = 0; $skipped = 0; $added = 0; $errors = 0
+function Get-SecureStringConfirmed {
+  param(
+    [string]$Prompt = "Enter PFX password",
+    [string]$ConfirmPrompt = "Confirm PFX password"
+  )
+  while ($true) {
+    $p1 = Read-Host $Prompt -AsSecureString
+    $p2 = Read-Host $ConfirmPrompt -AsSecureString
 
-foreach ($row in $rows) {
+    $b1 = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($p1)
+    $s1 = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($b1)
+    $b2 = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($p2)
+    $s2 = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($b2)
     try {
-        $safeHeader   = Resolve-Header -Record $row -Aliases @('SafeName','Safe','VaultSafe','Vault_Safe')
-        $memberHeader = Resolve-Header -Record $row -Aliases @('MemberName','Member','Group','SafeMember','Safe_Member')
-        $typeHeader   = Resolve-Header -Record $row -Aliases @('MemberType','Type')
-
-        if (-not $safeHeader -or -not $memberHeader) {
-            Write-Log "⚠️ Skipping row (missing Safe/Member headers): $($row | ConvertTo-Json -Compress)" 'Yellow'
-            $skipped++; continue
-        }
-
-        $safeName    = Normalize-Name $row.$safeHeader
-        $memberName  = Normalize-Name $row.$memberHeader
-        $memberType  = if ($typeHeader) { Normalize-Name $row.$typeHeader } else { $null }
-        if (-not $memberType) { $memberType = 'Group' }  # default to Directory group
-
-        if (-not $safeName -or -not $memberName) {
-            Write-Log "⚠️ Skipping row (blank Safe/Member): Safe='$safeName' Member='$memberName'" 'Yellow'
-            $skipped++; continue
-        }
-
-        Write-Log "🔹 Processing: Safe='$safeName'  Member='$memberName'  (Type=$memberType)" 'Cyan'
-
-        # Look for existing membership (exact name match)
-        $existing = $null
-        try {
-            $existing = Get-PASSafeMember -SafeName $safeName -Search $memberName -ErrorAction Stop |
-                        Where-Object { $_.MemberName -eq $memberName }
-        } catch {
-            # Safe not found or insufficient rights; handled below
-        }
-
-        if ($existing) {
-            Write-Subtle "• Found existing membership; updating permissions..."
-            if ($WhatIf) {
-                Write-Warn "WHATIF: Set-PASSafeMember '$safeName' / '$memberName' with target flags."
-            } else {
-                Set-PASSafeMember -SafeName $safeName -MemberName $memberName @permParams -Confirm:$false | Out-Null
-                Write-Good "✅ Updated permissions for '$memberName' in '$safeName'."
-            }
-            $updated++
-        } else {
-            if ($AddIfMissing) {
-                Write-Subtle "• Membership not found; adding with target permissions..."
-                if ($WhatIf) {
-                    Write-Warn "WHATIF: Add-PASSafeMember '$memberName' (Type=$memberType) to '$safeName' with target flags."
-                } else {
-                    Add-PASSafeMember -SafeName $safeName -MemberName $memberName -memberType $memberType @permParams -Confirm:$false | Out-Null
-                    Write-Good "🟢 Added '$memberName' (Type=$memberType) to '$safeName' with target permissions."
-                }
-                $added++
-            } else {
-                Write-Warn "Member '$memberName' not found in '$safeName' (use -AddIfMissing to add)."
-                $skipped++
-            }
-        }
+      if ($s1 -ne $s2) {
+        Write-Warning "Passwords do not match. Please try again."
+        continue
+      }
+      if ([string]::IsNullOrEmpty($s1)) {
+        Write-Warning "Password cannot be empty. Please try again."
+        continue
+      }
+      return $p1
+    } finally {
+      if ($b1) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b1) }
+      if ($b2) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b2) }
+      if ($s1) { $s1 = $null }
+      if ($s2) { $s2 = $null }
     }
-    catch {
-        $errors++
-        Write-Bad ("❌ ERROR on Safe='{0}' Member='{1}' -> {2}" -f $safeName,$memberName,$_.Exception.Message)
-    }
+  }
 }
 
-Write-Host ""
-Write-Title "──────────────────── SUMMARY ────────────────────"
-Write-Host   ("Updated : {0}" -f $updated) -ForegroundColor Green
-Write-Host   ("Added   : {0}" -f $added)   -ForegroundColor Green
-Write-Host   ("Skipped : {0}" -f $skipped) -ForegroundColor Yellow
-Write-Host   ("Errors  : {0}" -f $errors)  -ForegroundColor Red
-Write-Title "────────────────────────────────────────────────"
+function Export-Pfx {
+  param(
+    [System.Security.Cryptography.X509Certificates.X509Certificate2] $Cert,
+    [string] $CN,
+    [switch] $WithChain
+  )
+  $stamp  = Get-Date -Format 'yyyyMMdd_HHmmss'
+  $safeCN = ($CN -replace '[^\w\.-]','_')
+  $pfxPath = "C:\Temp\${safeCN}_$stamp.pfx"
+  $null = New-Item -ItemType Directory -Path (Split-Path $pfxPath) -Force -ErrorAction SilentlyContinue
 
-# ---------- Close session (best-effort) ----------
-try { Close-PASSession | Out-Null } catch {}
-Write-Log "🟣 ----- Safe Member Permission Update complete -----" 'Magenta'
+  # Clear, double prompt with confirmation
+  $pw = Get-SecureStringConfirmed -Prompt "Enter PFX password" -ConfirmPrompt "Confirm PFX password"
+
+  try {
+    $chainOpt = 'EndEntityCertOnly'
+    if ($WithChain) { $chainOpt = 'BuildChain' }
+
+    Export-PfxCertificate `
+      -Cert $Cert.PSPath `
+      -FilePath $pfxPath `
+      -Password $pw `
+      -ChainOption $chainOpt `
+      -CryptoAlgorithmOption AES256_SHA256 | Out-Null
+  } catch {
+    # Fallback for older hosts
+    Export-PfxCertificate -Cert $Cert.PSPath -FilePath $pfxPath -Password $pw | Out-Null
+  }
+
+  [PSCustomObject]@{ Path = $pfxPath; Password = $pw }
+}
+
+function Try-ExportPem {
+  param([string]$PfxPath,[System.Security.SecureString]$PfxPassword)
+  $bstr = $null
+  try {
+    $bstr  = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($PfxPassword)
+    $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+
+    $openssl = Get-Command openssl -ErrorAction SilentlyContinue
+    if ($openssl) {
+      $pemKey  = [IO.Path]::ChangeExtension($PfxPath, '.key.pem')
+      $pemCert = [IO.Path]::ChangeExtension($PfxPath, '.crt.pem')
+      & $openssl pkcs12 -in "$PfxPath" -passin "pass:$plain" -nocerts -nodes -out "$pemKey"  | Out-Null
+      & $openssl pkcs12 -in "$PfxPath" -passin "pass:$plain" -nokeys  -out "$pemCert"        | Out-Null
+      return @("$pemKey","$pemCert")
+    }
+    $outDir = Join-Path (Split-Path $pfxPath) "pem-split"
+    $null   = New-Item -ItemType Directory -Path $outDir -Force -ErrorAction SilentlyContinue
+    & certutil -p "$plain" -f -split -privatekey "$pfxPath" "$outDir\out" | Out-Null
+    return @($outDir)
+  } catch {
+    Write-Warning ("PEM export failed: {0}" -f $_)
+    @()
+  } finally {
+    if ($bstr) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+  }
+}
+
+# =========== Load metadata & deduce CN/store ===========
+$meta = Read-Metadata -Path $MetaPath
+$contextIsMachine = $false
+if ($meta) { $contextIsMachine = [bool]$meta.IsMachine }
+
+# Compute CN from the issued .cer first; if not found, fallback to metadata CN
+$CN = Get-CNFromCertFile -CerPath $IssuedCerPath
+if (-not $CN -and $meta -and $meta.CN) { $CN = $meta.CN }
+if (-not $CN) { throw "Unable to determine CN from the issued certificate or metadata. Ensure the .cer has a CN or SAN DNS entry." }
+
+Write-Host ("Detected CN: {0}" -f $CN)
+
+# Precompute context hint (avoid inline if inside expressions)
+$contextHint = 'CurrentUser\My (or auto)'
+if ($contextIsMachine) { $contextHint = 'LocalMachine\My (from metadata)' }
+Write-Host ("Context hint: {0}" -f $contextHint)
+
+# =========== Accept & pair ===========
+$pairedCert = $null
+$acceptedThumb = ''
+
+# Load issued cert thumbprint for cleanup if needed
+try {
+  $tmpCert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 -ArgumentList $IssuedCerPath
+  $acceptedThumb = $tmpCert.Thumbprint
+} catch { }
+
+if ($meta) {
+  # Use metadata store directly
+  Accept-IssuedCert -CerPath $IssuedCerPath -IsMachine $contextIsMachine
+  Start-Sleep -Seconds 1
+  $pairedCert = Find-CertWithKeyByCNOrSAN -CN $CN -IsMachine $contextIsMachine
+} else {
+  # Auto-mode: try CurrentUser first, then LocalMachine
+  Accept-IssuedCert -CerPath $IssuedCerPath -IsMachine:$false
+  Start-Sleep -Seconds 1
+  $pairedCert = Find-CertWithKeyByCNOrSAN -CN $CN -IsMachine:$false
+
+  if (-not $pairedCert) {
+    # Remove unpaired copy from user store (to avoid duplicates) and retry as LocalMachine
+    if ($acceptedThumb) { Remove-CertByThumbprint -Thumb $acceptedThumb -IsMachine:$false | Out-Null }
+    Accept-IssuedCert -CerPath $IssuedCerPath -IsMachine:$true
+    Start-Sleep -Seconds 1
+    $pairedCert = Find-CertWithKeyByCNOrSAN -CN $CN -IsMachine:$true
+    $contextIsMachine = $true
+  }
+}
+
+if (-not $pairedCert) {
+  $storePath = Get-ExpectedStore -IsMachine $contextIsMachine
+  $acceptSwitch = ''
+  if (-not $contextIsMachine) { $acceptSwitch = '-user ' }
+  $cmd = ("certreq {0}-accept ""{1}""" -f $acceptSwitch, $IssuedCerPath)
+
+  $msg = @"
+Issued cert is not paired with a private key in $storePath.
+- Ensure you are on the SAME machine & Windows profile that generated the CSR.
+- Accept using the same context. Example:
+  $cmd
+- If you imported via MMC/double-click, delete that copy and run certreq -accept again.
+"@
+  throw $msg
+}
+
+# Optional sanity-check vs metadata key container
+if ($meta -and $meta.KeyContainer) {
+  try {
+    $cspInfo = $pairedCert.PrivateKey.CspKeyContainerInfo
+    if ($cspInfo -and $cspInfo.KeyContainerName -and ($cspInfo.KeyContainerName -ne $meta.KeyContainer)) {
+      Write-Warning ("Paired cert's key container differs. Cert='{0}' Metadata='{1}'" -f $cspInfo.KeyContainerName, $meta.KeyContainer)
+    }
+  } catch { }
+}
+
+# =========== Export PFX ===========
+$export = Export-Pfx -Cert $pairedCert -CN $CN -WithChain:([bool]$IncludeChain)
+Write-Host ("PFX exported: {0}" -f $export.Path)
+
+# (Optional) PEM
+if ($ExportPem) {
+  $pem = Try-ExportPem -PfxPath $export.Path -PfxPassword $export.Password
+  if ($pem.Count -gt 0) {
+    Write-Host "PEM export completed:"
+    $pem | ForEach-Object { Write-Host ("   {0}" -f $_) }
+  }
+}
+
+# =========== Summary ===========
 Write-Host ""
+Write-Host "Summary"
+Write-Host "-------"
+Write-Host ("Store:           {0}" -f (Get-ExpectedStore -IsMachine $contextIsMachine))
+Write-Host ("Subject:         {0}" -f $pairedCert.Subject)
+Write-Host ("Thumbprint:      {0}" -f $pairedCert.Thumbprint)
+Write-Host ("NotBefore/After: {0} – {1}" -f $pairedCert.NotBefore, $pairedCert.NotAfter)
+Write-Host ("HasPrivateKey:   {0}" -f $pairedCert.HasPrivateKey)
+Write-Host ("PFX:             {0}" -f $export.Path)
+if ($IncludeChain) { Write-Host "Chain:           Included (BuildChain)" }
+if ($ExportPem)    { Write-Host "PEM:             Export attempted (see above)" }
