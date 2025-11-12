@@ -1,53 +1,127 @@
-Update the script below to include securing the password like below. add comment after every process to make script understandable.
+#Requires -Version 5.1
+Set-StrictMode -Version Latest
 
-# ---- Build secure PSCredential (no printing of secrets) ----
-$SecurePassword = ConvertTo-SecureString -String $responseViaObject.Content -AsPlainText -Force
-$Cred           = New-Object System.Management.Automation.PSCredential ($responseViaObject.Username, $SecurePassword)
+<#
+    Purpose:
+      - Retrieve a credential from CyberArk CCP WITHOUT printing the password.
+      - Convert the plaintext password returned by CCP into a SecureString.
+      - Build a PSCredential object for safe downstream use.
+      - Sanitize outputs so no secret values are written to screen or logs.
 
-# Clear plaintext from memory as soon as possible
-$responseViaObject.Content = $null
-Remove-Variable SecurePassword -ErrorAction SilentlyContinue
+    Notes:
+      - Update $CCPAddress to your CCP base URL.
+      - If both queries are provided, both will run independently.
+#>
 
-# ---- Note (no sensitive data) ----
-Write-Host "[OK] Credential retrieved from CCP (Object) and stored securely in `$Cred." -ForegroundColor Green
+# ----------------------- Config (EDIT AS NEEDED) -----------------------
+$responseViaObject = $responseViaAddressAndUsername = $null   # Reset/clear any prior values  [Comment: ensure a clean start]
 
-# ---- Use $Cred below (examples) ----
-# Invoke-Command -ComputerName someHost -Credential $Cred -ScriptBlock { whoami }
-# Connect-DbaInstance -SqlInstance 'server\instance' -SqlCredential $Cred
+$CCPAddress  = "https://ccp-test.cna.com"                      # CCP base URL                  [Comment: base URL for CCP]
+$location    = "AIMWebService"                                 # CCP service path              [Comment: typical CCP path]
+$application = "SECRETS_DEMO_APPID"                            # AppID registered in CCP       [Comment: CCP authorization scope]
+$safe        = "CyberArkCCPTest"                               # Target Safe name              [Comment: CCP account location]
+$object      = "10.10.10.1-SVC_demoaccount"                    # CCP object (unique key)       [Comment: used by Object lookup]
+$address     = "10.10.10.1"                                    # Account address (e.g., host)  [Comment: used by Address+Username lookup]
+$username    = "SVC_demoaccount"                               # Account username              [Comment: used by Address+Username lookup]
 
+$windowsAuth = $false                                           # Toggle integrated auth         [Comment: 'true' uses current Windows creds]
 
-$responseViaObject = $responseViaAddressAndUsername =  $null
-#$CCPAddress = "https://ccp-test.cna.com"
-$location = "AIMWebService"
-$application = "SECRETS_DEMO_APPID"
-$safe = "CyberArkCCPTest"
-$object = "10.10.10.1-SVC_demoaccount"
-$address = "10.10.10.1"
-$username = "SVC_demoaccount"
+# Optional: force TLS 1.2 for older systems                         [Comment: ensure modern TLS]
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch { }
 
-$windowsAuth=$false
-
+# Build common headers for REST                                     [Comment: CCP expects JSON]
 $headers = New-Object "System.Collections.Generic.Dictionary[[String],[String]]"
 $headers.Add("Content-Type", "application/json")
 
-if (![string]::IsNullOrEmpty($object)) {
-    Write-Host "Connecting to url: `"$CCPAddress/$location/api/Accounts?AppID=$application&Safe=$safe&Object=$object`""
-    $responseViaObject = Invoke-RestMethod "$CCPAddress/$location/api/Accounts?AppID=$application&Safe=$safe&Object=$object" -Method 'GET' -Headers $headers -UseDefaultCredentials:$windowsAuth
+# Helper: Safely convert a CCP JSON response to PSCredential, then scrub secret
+function Convert-CcpResponseToCredential {
+    param(
+        [Parameter(Mandatory)] [pscustomobject] $CcpResponse,
+        [Parameter(Mandatory)] [string]         $SourceLabel
+    )
+    # -- Build SecureString from CCP content (password)             [Comment: secure in-memory representation]
+    $SecurePassword = ConvertTo-SecureString -String $CcpResponse.Content -AsPlainText -Force
 
-    Write-Host "Pulled using Object Name"
-    write-host "Username: " $($responseViaObject.Username)
-    Write-Host "Password: " $($responseViaObject.content)
-    ""
-    $responseViaObject | ConvertTo-Json
+    # -- Create PSCredential using username + SecureString          [Comment: standard PowerShell credential type]
+    $Cred = New-Object System.Management.Automation.PSCredential ($CcpResponse.Username, $SecurePassword)
+
+    # -- Immediately purge plaintext password from the object       [Comment: minimize secret exposure window]
+    $CcpResponse.Content = $null
+    Remove-Variable SecurePassword -ErrorAction SilentlyContinue
+
+    # -- Log non-sensitive success note                             [Comment: confirm success without leaking data]
+    Write-Host "[OK] Credential retrieved via $SourceLabel and stored securely in `$Cred." -ForegroundColor Green
+
+    # -- Return both sanitized response and PSCredential            [Comment: allow caller to use sanitized data and the credential]
+    [pscustomobject]@{
+        SanitizedResponse = $CcpResponse
+        Credential        = $Cred
+    }
 }
 
-if (![string]::IsNullOrEmpty($address) -and ![string]::IsNullOrEmpty($username)) {
-    Write-Host  "Connecting to url: `"$CCPAddress/$location/api/Accounts?AppID=$application&Safe=$safe&address=$address&username=$username`""
-    $responseViaAddressAndUsername = Invoke-RestMethod "$CCPAddress/$location/api/Accounts?AppID=$application&Safe=$safe&address=$address&username=$username" -Method 'GET' -Headers $headers -UseDefaultCredentials:$windowsAuth
+# ----------------------- Lookup by Object -----------------------
+if (![string]::IsNullOrWhiteSpace($object)) {
+    # Build URL                                                      [Comment: compose CCP endpoint with Object query]
+    $url = "$CCPAddress/$location/api/Accounts?AppID=$application&Safe=$safe&Object=$object"
+    Write-Host "Connecting to url: `"$url`"" -ForegroundColor Cyan   # [Comment: show where we're connecting, safe to display]
 
-    Write-Host "Pulled using Address and Username"
-    write-host "Username: " $($responseViaAddressAndUsername.Username)
-    Write-Host "Password: " $($responseViaAddressAndUsername.content)
-    ""
-    $responseViaAddressAndUsername | ConvertTo-Json
+    try {
+        # Invoke CCP for Object-based lookup                         [Comment: request JSON from CCP]
+        $responseViaObject = Invoke-RestMethod -Uri $url -Method 'GET' -Headers $headers -UseDefaultCredentials:$windowsAuth
+        Write-Host "[OK] Pulled using Object Name." -ForegroundColor Green  # [Comment: call succeeded]
+
+        # Build PSCredential & scrub secret                           [Comment: secure handling block]
+        $resultObj = Convert-CcpResponseToCredential -CcpResponse $responseViaObject -SourceLabel "Object"
+
+        # Display username only (safe)                                [Comment: never print password]
+        Write-Host ("Username: {0}" -f $resultObj.SanitizedResponse.Username) -ForegroundColor Yellow
+
+        # Show sanitized JSON (no 'Content' field)                    [Comment: visibility without secret]
+        ($resultObj.SanitizedResponse | Select-Object * -ExcludeProperty Content) | ConvertTo-Json -Depth 8
+
+        # Example usage (commented)                                   [Comment: how to use $resultObj.Cred securely]
+        # Invoke-Command -ComputerName someHost -Credential $resultObj.Cred -ScriptBlock { whoami }
+        # Connect-DbaInstance -SqlInstance 'server\instance' -SqlCredential $resultObj.Cred
+
+    } catch {
+        # Handle errors gracefully                                    [Comment: bubble up HTTP or parsing issues]
+        Write-Host "[ERR] Object lookup failed: $($_.Exception.Message)" -ForegroundColor Red
+    }
 }
+
+# ----------------------- Lookup by Address + Username -----------------------
+if (![string]::IsNullOrWhiteSpace($address) -and ![string]::IsNullOrWhiteSpace($username)) {
+    # Build URL                                                      [Comment: compose CCP endpoint with Address+Username query]
+    $url2 = "$CCPAddress/$location/api/Accounts?AppID=$application&Safe=$safe&address=$address&username=$username"
+    Write-Host "Connecting to url: `"$url2`"" -ForegroundColor Cyan   # [Comment: safe to display URL/query params]
+
+    try {
+        # Invoke CCP for Address+Username lookup                      [Comment: request JSON from CCP]
+        $responseViaAddressAndUsername = Invoke-RestMethod -Uri $url2 -Method 'GET' -Headers $headers -UseDefaultCredentials:$windowsAuth
+        Write-Host "[OK] Pulled using Address and Username." -ForegroundColor Green  # [Comment: call succeeded]
+
+        # Build PSCredential & scrub secret                           [Comment: secure handling block]
+        $resultAddr = Convert-CcpResponseToCredential -CcpResponse $responseViaAddressAndUsername -SourceLabel "Address+Username"
+
+        # Display username only (safe)                                [Comment: never print password]
+        Write-Host ("Username: {0}" -f $resultAddr.SanitizedResponse.Username) -ForegroundColor Yellow
+
+        # Show sanitized JSON (no 'Content' field)                    [Comment: visibility without secret]
+        ($resultAddr.SanitizedResponse | Select-Object * -ExcludeProperty Content) | ConvertTo-Json -Depth 8
+
+        # Example usage (commented)                                   [Comment: how to use $resultAddr.Cred securely]
+        # Invoke-Command -ComputerName someHost -Credential $resultAddr.Cred -ScriptBlock { whoami }
+        # Connect-DbaInstance -SqlInstance 'server\instance' -SqlCredential $resultAddr.Cred
+
+    } catch {
+        # Handle errors gracefully                                    [Comment: bubble up HTTP or parsing issues]
+        Write-Host "[ERR] Address+Username lookup failed: $($_.Exception.Message)" -ForegroundColor Red
+    }
+}
+
+# ----------------------- Final cleanup -----------------------
+# Explicitly drop references to responses that could have contained secrets  [Comment: reduce linger in memory]
+$responseViaObject = $null
+$responseViaAddressAndUsername = $null
+
+Write-Host "[DONE] Completed CCP retrieval flow. No plaintext secrets were written." -ForegroundColor Green
