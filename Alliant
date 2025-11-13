@@ -17,32 +17,25 @@ Function Write-Log {
 try { Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force -ErrorAction Stop } catch {}
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
 
-# --- Ensure PSGallery + auto-install/upgrade modules ---
+# --- Ensure PSGallery + auto-install/upgrade modules (silent) ---
 Function Ensure-PSGallery {
   try {
     $repo = Get-PSRepository -Name PSGallery -ErrorAction Stop
-    if ($repo.InstallationPolicy -ne 'Trusted') {
-      try { Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction Stop } catch {}
-    }
+    if ($repo.InstallationPolicy -ne 'Trusted') { Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction SilentlyContinue }
     Write-Log "PSGallery available." "Green"
   } catch {
     try {
-      Register-PSRepository -Name PSGallery -SourceLocation "https://www.powershellgallery.com/api/v2" `
-        -InstallationPolicy Trusted -ErrorAction Stop
+      Register-PSRepository -Name PSGallery -SourceLocation "https://www.powershellgallery.com/api/v2" -InstallationPolicy Trusted -ErrorAction Stop
       Write-Log "PSGallery registered." "Green"
-    } catch {
-      Write-Log "PSGallery not available; module auto-install may fail." "Yellow"
-    }
+    } catch { Write-Log "PSGallery not available; module install may fail." "Yellow" }
   }
 }
-
 Function Ensure-Module {
   param([Parameter(Mandatory)][string]$Name,[string]$MinVersion="0.0.0")
   $mod = Get-Module -ListAvailable -Name $Name | Sort-Object Version -Descending | Select-Object -First 1
   $install = $true
   if ($mod) { try { if ([Version]$mod.Version -ge [Version]$MinVersion) { $install = $false } } catch {} }
   if ($install) {
-    Write-Log ("Installing/Updating module: {0}" -f $Name) "Gray"
     try { Install-Module -Name $Name -Scope CurrentUser -Force -AllowClobber -MinimumVersion $MinVersion -ErrorAction Stop }
     catch { try { Install-Module -Name $Name -Scope AllUsers -Force -AllowClobber -MinimumVersion $MinVersion -ErrorAction Stop } catch {} }
   }
@@ -50,7 +43,6 @@ Function Ensure-Module {
   if (-not $mod) { throw "Module $Name not found after install attempt." }
   Import-Module $mod.Path -Force -ErrorAction Stop
   Write-Log ("{0} loaded." -f $Name) "Green"
-  return $mod.ModuleBase
 }
 
 # --- Unblock common module paths ---
@@ -64,13 +56,12 @@ try {
   foreach ($p in $paths) { Get-ChildItem -Path $p -Recurse -File | Unblock-File -ErrorAction SilentlyContinue }
 } catch {}
 
-# --- Prepare modules (install/import) ---
+# --- Prepare modules ---
 Ensure-PSGallery | Out-Null
-$psPASBase     = (Ensure-Module -Name psPAS           -MinVersion "6.4.0")
-$identityBase  = $null
-try { $identityBase = (Ensure-Module -Name IdentityCommand -MinVersion "1.0.0") } catch { Write-Log "IdentityCommand not found; will try to continue." "Yellow" }
+try { Ensure-Module -Name psPAS           -MinVersion "6.4.0" } catch { Write-Log "psPAS not found/loaded." "Red"; exit 1 }
+try { Ensure-Module -Name IdentityCommand -MinVersion "1.0.0" } catch { Write-Log "IdentityCommand not found; continuing." "Yellow" }
 
-# --- Parameters (your values; not printed) ---
+# --- Parameters (your values; nothing here is printed) ---
 $CCPAddress        = "https://HQVUCYBARK101.alliantcreditunion.com"
 $Location          = "AIMWebService"
 $AppID             = "PAMTEST"
@@ -78,19 +69,15 @@ $SafeForCCP        = "PAMTEST"
 $WindowsAuth       = $false
 $Headers           = @{ "Content-Type" = "application/json" }
 
-$IdentityTenantUrl = "https://aap4748.id.cyberark.cloud"  # force https & trimmed early
-$PCloudSubdomain   = "alliant-test"
-
 $ObjectName        = "alliant-test.cyberark.cloud-botpamtest"
 $UPUser            = "botpamtest@cyberark.cloud.4176"
-$OptionalUPNSuffix = ""
 
-# --- Utilities ---
+# --- Quick reachability check (no identifiers in output) ---
 Function Test-IdentityPreflight {
-  param([Parameter(Mandatory)][string]$IdentityTenantUrl)
+  param([Parameter(Mandatory)][string]$Tenant)
   try {
-    $u = $IdentityTenantUrl.TrimEnd('/') + '/.well-known/openid-configuration'
-    $r = Invoke-WebRequest -Uri $u -Method Head -TimeoutSec 12 -ErrorAction Stop
+    $url = ("https://" + $Tenant.TrimEnd('/')).TrimEnd('/') + "/.well-known/openid-configuration"
+    $r = Invoke-WebRequest -Uri $url -Method Head -TimeoutSec 12 -ErrorAction Stop
     Write-Log "Identity endpoint reachable." "Green"
     if ($r.Headers.Date) {
       $srv = [DateTime]::Parse($r.Headers.Date).ToUniversalTime()
@@ -101,6 +88,7 @@ Function Test-IdentityPreflight {
   } catch { Write-Log "Identity endpoint not reachable." "Red"; throw }
 }
 
+# --- CCP: pull secret -> secure PSCredential ($Cred) ---
 Function Get-CCPCredentialByObject {
   param([Parameter(Mandatory)][string]$ObjectName,[Parameter(Mandatory)][string]$UPUser)
   try {
@@ -115,78 +103,44 @@ Function Get-CCPCredentialByObject {
   } catch { Write-Log "Credential retrieval failed." "Red"; throw }
 }
 
-# --- Resolve/Get Get-IdentityHeader, dot-source if necessary ---
-Function Resolve-IdentityHeader {
-  # direct names
-  $candidates = @(
-    'Get-IdentityHeader',
-    'CyberArk.IdentityCommand\Get-IdentityHeader'
-  )
-  foreach ($n in $candidates) {
-    $cmd = Get-Command $n -ErrorAction SilentlyContinue
-    if ($cmd) { return $cmd }
-  }
+# --- MAIN AUTH BLOCK (uses your exact parameter values) ---
+Function Start-PASSessionFromCCP {
+  param([Parameter(Mandatory)][string]$ObjectName,[Parameter(Mandatory)][string]$UPUser)
 
-  # try dot-sourcing the function from module files (Public/Functions)
-  $roots = @()
-  if ($identityBase) { $roots += $identityBase }
-  $roots += "$env:ProgramFiles\WindowsPowerShell\Modules\IdentityCommand"
-  $roots += "$HOME\Documents\WindowsPowerShell\Modules\IdentityCommand"
-  $roots = $roots | Where-Object { Test-Path $_ } | Select-Object -Unique
+  # 1) CCP -> $Cred
+  $Cred = Get-CCPCredentialByObject -ObjectName $ObjectName -UPUser $UPUser
 
-  foreach ($root in $roots) {
-    $files = @()
-    $files += Get-ChildItem -Path $root -Recurse -Filter *.ps1 -ErrorAction SilentlyContinue
-    foreach ($f in $files) {
-      try {
-        $txt = Get-Content -Path $f.FullName -Raw -ErrorAction Stop
-        if ($txt -match '(?im)^\s*function\s+Get-IdentityHeader\b') {
-          . $f.FullName  # dot-source
-          $cmd = Get-Command Get-IdentityHeader -ErrorAction SilentlyContinue
-          if ($cmd) { Write-Log "Sourced Get-IdentityHeader from module files." "Green"; return $cmd }
-        }
-      } catch {}
-    }
-  }
-  return $null
-}
+  # 2) Preflight Identity
+  Test-IdentityPreflight -Tenant "aap4748.id.cyberark.cloud" | Out-Null
 
-# --- Adaptive call (supports minor param name variations) ---
-Function Invoke-IdentityHeaderAdaptive {
-  param([Parameter(Mandatory)][pscredential]$Cred,[Parameter(Mandatory)][string]$TenantUrl,[Parameter(Mandatory)][string]$Subdomain)
-  $cmd = Resolve-IdentityHeader
-  if (-not $cmd) { Write-Log "Get-IdentityHeader cmdlet not found." "Red"; throw "Missing IdentityHeader cmdlet" }
-  $p = $cmd.Parameters.Keys
-  $args = @{}
-  if ($p -contains 'IdentityTenantURL') { $args['IdentityTenantURL'] = $TenantUrl }
-  elseif ($p -contains 'TenantURL')     { $args['TenantURL']        = $TenantUrl }
-  if ($p -contains 'PCloudSubdomain')   { $args['PCloudSubdomain']  = $Subdomain }
-  elseif ($p -contains 'Subdomain')     { $args['Subdomain']        = $Subdomain }
-  if     ($p -contains 'UPCreds')       { $args['UPCreds']          = $Cred }
-  elseif ($p -contains 'Credential')    { $args['Credential']       = $Cred }
-  elseif ($p -contains 'UserName' -and $p -contains 'Password') { $args['UserName'] = $Cred.UserName; $args['Password'] = $Cred.Password }
-  if ($p -contains 'psPASFormat')       { $args['psPASFormat']      = $true }
-  try { return ,(& $cmd @args) } catch { $safe = $_.Exception.Message; Write-Log ("Identity error: {0}" -f $safe) "Red"; throw }
-}
-
-# --- Establish PAS session (Identity only) ---
-Function Start-PASIdentitySession {
-  param([Parameter(Mandatory)][pscredential]$Cred,[Parameter(Mandatory)][string]$TenantUrl,[Parameter(Mandatory)][string]$Subdomain)
-  Test-IdentityPreflight -IdentityTenantUrl $TenantUrl | Out-Null
-  $TenantUrl = $TenantUrl.TrimEnd('/')  # ensure normalized
+  # 3) Identity header -> psPAS session (EXACT parameters you requested)
   try {
-    $Header = Invoke-IdentityHeaderAdaptive -Cred $Cred -TenantUrl $TenantUrl -Subdomain $Subdomain
-    Use-PASSession $Header
-    if (-not (Get-PASSession)) { throw "Session not established" }
-    Write-Log "PAS session established." "Green"
-  } catch { Write-Log "PAS session establishment failed." "Red"; throw }
+    Write-Log "Requesting CyberArk PAS authentication (psPAS Identity header)..." "Gray"
+
+    # Build a temporary PSCredential with the same secure password
+    $UPCred = [PSCredential]::new($UPUser, $Cred.Password)
+
+    $header = Get-IdentityHeader `
+      -IdentityTenantURL "aap4748.id.cyberark.cloud" `
+      -psPASFormat `
+      -PCloudSubdomain "alliant-test" `
+      -UPCreds $UPCred
+
+    Use-PASSession $header
+    if (-not (Get-PASSession)) { throw "psPAS session not established" }
+    Write-Log "Authentication successful, PAS session established." "Green"
+  } catch {
+    Write-Log ("Failed to authenticate via psPAS Identity header: {0}" -f $_.Exception.Message) "Red"
+    throw
+  }
+
+  return $Cred
 }
 
 # ===================== MAIN =====================
 try {
-  $Cred = Get-CCPCredentialByObject -ObjectName $ObjectName -UPUser $UPUser
-  Start-PASIdentitySession -Cred $Cred -TenantUrl $IdentityTenantUrl -Subdomain $PCloudSubdomain
-  # secured psPAS actions go here
+  $Cred = Start-PASSessionFromCCP -ObjectName $ObjectName -UPUser $UPUser
+  # Place secured psPAS actions here (no property output)
   # Get-PASLoggedOnUser | Out-Null
   Write-Log "Ready to execute secured operations." "Green"
 }
