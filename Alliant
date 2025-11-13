@@ -21,15 +21,21 @@ try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::
 Function Ensure-PSGallery {
   try {
     $repo = Get-PSRepository -Name PSGallery -ErrorAction Stop
-    if ($repo.InstallationPolicy -ne 'Trusted') { Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction SilentlyContinue }
+    if ($repo.InstallationPolicy -ne 'Trusted') {
+      try { Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction Stop } catch {}
+    }
     Write-Log "PSGallery available." "Green"
   } catch {
     try {
-      Register-PSRepository -Name PSGallery -SourceLocation "https://www.powershellgallery.com/api/v2" -InstallationPolicy Trusted -ErrorAction Stop
+      Register-PSRepository -Name PSGallery -SourceLocation "https://www.powershellgallery.com/api/v2" `
+        -InstallationPolicy Trusted -ErrorAction Stop
       Write-Log "PSGallery registered." "Green"
-    } catch { Write-Log "PSGallery not available; module auto-install may fail." "Yellow" }
+    } catch {
+      Write-Log "PSGallery not available; module auto-install may fail." "Yellow"
+    }
   }
 }
+
 Function Ensure-Module {
   param([Parameter(Mandatory)][string]$Name,[string]$MinVersion="0.0.0")
   $mod = Get-Module -ListAvailable -Name $Name | Sort-Object Version -Descending | Select-Object -First 1
@@ -44,9 +50,10 @@ Function Ensure-Module {
   if (-not $mod) { throw "Module $Name not found after install attempt." }
   Import-Module $mod.Path -Force -ErrorAction Stop
   Write-Log ("{0} loaded." -f $Name) "Green"
+  return $mod.ModuleBase
 }
 
-# --- Unblock module files ---
+# --- Unblock common module paths ---
 try {
   $paths = @(
     "$env:ProgramFiles\WindowsPowerShell\Modules\psPAS",
@@ -57,12 +64,13 @@ try {
   foreach ($p in $paths) { Get-ChildItem -Path $p -Recurse -File | Unblock-File -ErrorAction SilentlyContinue }
 } catch {}
 
-# --- Prepare modules ---
+# --- Prepare modules (install/import) ---
 Ensure-PSGallery | Out-Null
-try { Ensure-Module -Name psPAS            -MinVersion "6.4.0" } catch { Write-Log "psPAS not found/loaded." "Red"; exit 1 }
-try { Ensure-Module -Name IdentityCommand  -MinVersion "1.0.0" } catch { Write-Log "IdentityCommand not found; continuing." "Yellow" }
+$psPASBase     = (Ensure-Module -Name psPAS           -MinVersion "6.4.0")
+$identityBase  = $null
+try { $identityBase = (Ensure-Module -Name IdentityCommand -MinVersion "1.0.0") } catch { Write-Log "IdentityCommand not found; will try to continue." "Yellow" }
 
-# --- Parameters (your values; nothing here is printed) ---
+# --- Parameters (your values; not printed) ---
 $CCPAddress        = "https://HQVUCYBARK101.alliantcreditunion.com"
 $Location          = "AIMWebService"
 $AppID             = "PAMTEST"
@@ -70,9 +78,8 @@ $SafeForCCP        = "PAMTEST"
 $WindowsAuth       = $false
 $Headers           = @{ "Content-Type" = "application/json" }
 
-$IdentityTenantUrl = "https://aap4748.id.cyberark.cloud"  # force https & trimmed
-$PCloudSubdomain   = "alliant-test"                       # Privilege Cloud subdomain
-$PVWAUrl           = "https://$PCloudSubdomain.privilegecloud.cyberark.cloud"  # direct PVWA URL
+$IdentityTenantUrl = "https://aap4748.id.cyberark.cloud"  # force https & trimmed early
+$PCloudSubdomain   = "alliant-test"
 
 $ObjectName        = "alliant-test.cyberark.cloud-botpamtest"
 $UPUser            = "botpamtest@cyberark.cloud.4176"
@@ -108,78 +115,77 @@ Function Get-CCPCredentialByObject {
   } catch { Write-Log "Credential retrieval failed." "Red"; throw }
 }
 
-# --- Try to find any IdentityHeader cmdlet (optional path) ---
+# --- Resolve/Get Get-IdentityHeader, dot-source if necessary ---
 Function Resolve-IdentityHeader {
-  $names = @(
+  # direct names
+  $candidates = @(
     'Get-IdentityHeader',
-    'CyberArk.IdentityCommand\Get-IdentityHeader',
-    'Get-PASIdentityHeader',
-    'New-IdentityHeader',
-    'New-PASIdentityHeader'
+    'CyberArk.IdentityCommand\Get-IdentityHeader'
   )
-  foreach ($n in $names) { $c = Get-Command $n -ErrorAction SilentlyContinue; if ($c) { return $c } }
-  $mods = @('psPAS','IdentityCommand')
-  $cands = Get-Command -Module $mods -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'Identity' -and $_.Name -match 'Header' }
-  if ($cands) { return $cands | Select-Object -First 1 }
+  foreach ($n in $candidates) {
+    $cmd = Get-Command $n -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd }
+  }
+
+  # try dot-sourcing the function from module files (Public/Functions)
+  $roots = @()
+  if ($identityBase) { $roots += $identityBase }
+  $roots += "$env:ProgramFiles\WindowsPowerShell\Modules\IdentityCommand"
+  $roots += "$HOME\Documents\WindowsPowerShell\Modules\IdentityCommand"
+  $roots = $roots | Where-Object { Test-Path $_ } | Select-Object -Unique
+
+  foreach ($root in $roots) {
+    $files = @()
+    $files += Get-ChildItem -Path $root -Recurse -Filter *.ps1 -ErrorAction SilentlyContinue
+    foreach ($f in $files) {
+      try {
+        $txt = Get-Content -Path $f.FullName -Raw -ErrorAction Stop
+        if ($txt -match '(?im)^\s*function\s+Get-IdentityHeader\b') {
+          . $f.FullName  # dot-source
+          $cmd = Get-Command Get-IdentityHeader -ErrorAction SilentlyContinue
+          if ($cmd) { Write-Log "Sourced Get-IdentityHeader from module files." "Green"; return $cmd }
+        }
+      } catch {}
+    }
+  }
   return $null
 }
 
-# --- Establish session: prefer IdentityHeader if available; otherwise PVWA direct login ---
-Function Start-PASSession {
-  param([Parameter(Mandatory)][pscredential]$Cred)
+# --- Adaptive call (supports minor param name variations) ---
+Function Invoke-IdentityHeaderAdaptive {
+  param([Parameter(Mandatory)][pscredential]$Cred,[Parameter(Mandatory)][string]$TenantUrl,[Parameter(Mandatory)][string]$Subdomain)
+  $cmd = Resolve-IdentityHeader
+  if (-not $cmd) { Write-Log "Get-IdentityHeader cmdlet not found." "Red"; throw "Missing IdentityHeader cmdlet" }
+  $p = $cmd.Parameters.Keys
+  $args = @{}
+  if ($p -contains 'IdentityTenantURL') { $args['IdentityTenantURL'] = $TenantUrl }
+  elseif ($p -contains 'TenantURL')     { $args['TenantURL']        = $TenantUrl }
+  if ($p -contains 'PCloudSubdomain')   { $args['PCloudSubdomain']  = $Subdomain }
+  elseif ($p -contains 'Subdomain')     { $args['Subdomain']        = $Subdomain }
+  if     ($p -contains 'UPCreds')       { $args['UPCreds']          = $Cred }
+  elseif ($p -contains 'Credential')    { $args['Credential']       = $Cred }
+  elseif ($p -contains 'UserName' -and $p -contains 'Password') { $args['UserName'] = $Cred.UserName; $args['Password'] = $Cred.Password }
+  if ($p -contains 'psPASFormat')       { $args['psPASFormat']      = $true }
+  try { return ,(& $cmd @args) } catch { $safe = $_.Exception.Message; Write-Log ("Identity error: {0}" -f $safe) "Red"; throw }
+}
 
-  Test-IdentityPreflight -IdentityTenantUrl $IdentityTenantUrl | Out-Null
-
-  $idCmd = Resolve-IdentityHeader
-  if ($idCmd) {
-    try {
-      Write-Log "Attempting Identity-based session..." "Gray"
-      $p = $idCmd.Parameters.Keys
-      $args = @{}
-      if ($p -contains 'IdentityTenantURL') { $args['IdentityTenantURL'] = $IdentityTenantUrl } elseif ($p -contains 'TenantURL') { $args['TenantURL'] = $IdentityTenantUrl }
-      if ($p -contains 'PCloudSubdomain')   { $args['PCloudSubdomain']   = $PCloudSubdomain }   elseif ($p -contains 'Subdomain') { $args['Subdomain'] = $PCloudSubdomain }
-      if     ($p -contains 'UPCreds')       { $args['UPCreds']           = $Cred }
-      elseif ($p -contains 'Credential')    { $args['Credential']        = $Cred }
-      elseif ($p -contains 'UserName' -and $p -contains 'Password') { $args['UserName'] = $Cred.UserName; $args['Password'] = $Cred.Password }
-      if ($p -contains 'psPASFormat')       { $args['psPASFormat']       = $true }
-
-      $hdr = & $idCmd @args
-      Use-PASSession $hdr
-      if (-not (Get-PASSession)) { throw "Session not established" }
-      Write-Log "PAS session established (Identity)." "Green"
-      return
-    } catch {
-      Write-Log "Identity path failed; trying PVWA direct login..." "Yellow"
-    }
-  } else {
-    Write-Log "Identity cmdlet not found; using PVWA direct login..." "Yellow"
-  }
-
+# --- Establish PAS session (Identity only) ---
+Function Start-PASIdentitySession {
+  param([Parameter(Mandatory)][pscredential]$Cred,[Parameter(Mandatory)][string]$TenantUrl,[Parameter(Mandatory)][string]$Subdomain)
+  Test-IdentityPreflight -IdentityTenantUrl $TenantUrl | Out-Null
+  $TenantUrl = $TenantUrl.TrimEnd('/')  # ensure normalized
   try {
-    # Direct PVWA (Privilege Cloud) login with psPAS
-    # psPAS supports: New-PASSession -Credential $Cred -BaseURI $PVWAUrl
-    New-PASSession -Credential $Cred -BaseURI $PVWAUrl | Out-Null
+    $Header = Invoke-IdentityHeaderAdaptive -Cred $Cred -TenantUrl $TenantUrl -Subdomain $Subdomain
+    Use-PASSession $Header
     if (-not (Get-PASSession)) { throw "Session not established" }
-    Write-Log "PAS session established (PVWA direct)." "Green"
-  } catch {
-    $msg = $_.Exception.Message
-    switch -Regex ($msg) {
-      '401|unauthori'                                    { Write-Log "PVWA auth rejected." "Red"; break }
-      '404|not\s*found|baseuri'                          { Write-Log "PVWA URL issue." "Red"; break }
-      'TLS|certificate|SSL'                              { Write-Log "PVWA TLS/certificate issue." "Red"; break }
-      'NameResolutionFailure|No such host|resolved'      { Write-Log "PVWA DNS/Network issue." "Red"; break }
-      'timed out|timeout'                                { Write-Log "PVWA timeout." "Red"; break }
-      default                                            { Write-Log "PVWA login failed." "Red" }
-    }
-    throw
-  }
+    Write-Log "PAS session established." "Green"
+  } catch { Write-Log "PAS session establishment failed." "Red"; throw }
 }
 
 # ===================== MAIN =====================
 try {
   $Cred = Get-CCPCredentialByObject -ObjectName $ObjectName -UPUser $UPUser
-  Start-PASSession -Cred $Cred
-
+  Start-PASIdentitySession -Cred $Cred -TenantUrl $IdentityTenantUrl -Subdomain $PCloudSubdomain
   # secured psPAS actions go here
   # Get-PASLoggedOnUser | Out-Null
   Write-Log "Ready to execute secured operations." "Green"
