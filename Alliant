@@ -1,9 +1,259 @@
-2025-11-13 09:15:51 - psPAS loaded.
-2025-11-13 09:15:51 - AD module not available (non-fatal).
-2025-11-13 09:15:51 - Credential retrieved securely.
-2025-11-13 09:15:51 - Identity endpoint reachable.
-2025-11-13 09:15:51 - IdentityCommand loaded.
-2025-11-13 09:15:51 - Get-IdentityHeader cmdlet not found. Install/upgrade IdentityCommand or psPAS.
-2025-11-13 09:15:51 - PAS session establishment failed.
-2025-11-13 09:15:51 - Operation failed.
-2025-11-13 09:15:51 - Completed
+#Requires -Version 5.1
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+$ProgressPreference    = 'SilentlyContinue'
+
+# --- Allow unsigned modules & unblock psPAS/IdentityCommand (silent) ---
+try { Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force -ErrorAction Stop } catch {}
+$psDirs = @(
+  "$env:ProgramFiles\WindowsPowerShell\Modules\psPAS\6.4.85",
+  "$HOME\Documents\WindowsPowerShell\Modules\psPAS\6.4.85",
+  "$env:ProgramFiles\WindowsPowerShell\Modules\IdentityCommand",
+  "$HOME\Documents\WindowsPowerShell\Modules\IdentityCommand"
+) | Where-Object { Test-Path $_ }
+foreach ($d in $psDirs) { try { Get-ChildItem $d -Recurse -File | Unblock-File -ErrorAction SilentlyContinue } catch {} }
+
+# --- Minimal logging (no secrets/identifiers) ---
+$LogPath = "G:\Script\logon.txt"
+Function Write-Log {
+    param([string]$Message,[string]$Color="White")
+    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $line = "$ts - $Message"
+    try { Write-Host $line -ForegroundColor $Color } catch { Write-Host $line }
+    try { Add-Content -Path $LogPath -Value $line } catch {}
+}
+
+# --- Load modules ---
+try { Import-Module psPAS -Force -ErrorAction Stop; Write-Log "psPAS loaded." "Green" }
+catch { Write-Log "psPAS not found/loaded." "Red"; exit 1 }
+$ADModuleLoaded = $false
+try { Import-Module ActiveDirectory -ErrorAction Stop; $ADModuleLoaded = $true }
+catch { Write-Log "AD module not available (non-fatal)." "Yellow" }
+
+# Try IdentityCommand (may or may not export Get-IdentityHeader)
+$IdentityModLoaded = $false
+try { Import-Module IdentityCommand -ErrorAction Stop; $IdentityModLoaded = $true; Write-Log "IdentityCommand loaded." "Green" } catch {}
+
+# --- TLS 1.2 ---
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+
+# --- Parameters (your values; nothing here is printed) ---
+$CCPAddress        = "https://HQVUCYBARK101.alliantcreditunion.com"
+$Location          = "AIMWebService"
+$AppID             = "PAMTEST"
+$SafeForCCP        = "PAMTEST"
+$WindowsAuth       = $false
+$Headers           = @{ "Content-Type" = "application/json" }
+$IdentityTenantUrl = "http://aap4748.id.cyberark.cloud/"  # normalized to https
+$PCloudSubdomain   = "alliant-test"
+$ObjectName        = "alliant-test.cyberark.cloud-botpamtest"
+$UPUser            = "botpamtest@cyberark.cloud.4176"
+$OptionalUPNSuffix = ""                                   # e.g. "corp.local" to try user@corp.local
+
+# ------------------- Helpers -------------------
+
+Function Normalize-IdentityTenantUrl {
+    param([Parameter(Mandatory)][string]$Url)
+    $u = $Url.Trim()
+    if (-not $u.StartsWith("http", [System.StringComparison]::OrdinalIgnoreCase)) { $u = "https://$u" }
+    $u = $u -replace '^http://','https://'
+    $u.TrimEnd('/')
+}
+
+# Find any reasonable "Identity Header" cmdlet across loaded modules
+Function Resolve-IdentityHeader {
+    # 1) Direct known names
+    $names = @(
+        'Get-IdentityHeader',
+        'CyberArk.IdentityCommand\Get-IdentityHeader',
+        'Get-PASIdentityHeader',
+        'New-IdentityHeader',
+        'New-PASIdentityHeader'
+    )
+    foreach ($n in $names) {
+        $c = Get-Command $n -ErrorAction SilentlyContinue
+        if ($c) { return $c }
+    }
+    # 2) Fuzzy search within psPAS & IdentityCommand
+    $mods = @('psPAS','IdentityCommand')
+    $cands = Get-Command -Module $mods -ErrorAction SilentlyContinue | Where-Object {
+        $_.Name -match 'Identity' -and $_.Name -match 'Header'
+    }
+    if ($cands) { return $cands | Select-Object -First 1 }
+    return $null
+}
+
+# Sanitize Identity error body (no identifiers)
+Function Get-SafeIdentityErrorText {
+    param([object]$Exception)
+    $status = $null; $body = $null
+    if ($Exception.PSObject.Properties.Name -contains 'Response' -and $Exception.Response) {
+        try { $status = [int]$Exception.Response.StatusCode } catch {}
+        try {
+            $stream = $Exception.Response.GetResponseStream()
+            if ($stream) {
+                $reader = New-Object System.IO.StreamReader($stream)
+                $raw = $reader.ReadToEnd()
+                if ($raw) {
+                    try { $json = $raw | ConvertFrom-Json -ErrorAction Stop } catch { $json = $null }
+                    if ($json) {
+                        $err  = $json.error
+                        $desc = $json.error_description
+                        if (-not $desc -and $json.message) { $desc = $json.message }
+                        $body = ($err, $desc) -join ' | '
+                    } else { $body = $raw }
+                }
+            }
+        } catch {}
+    }
+    if (-not $body) { $body = $Exception.Message }
+    $body = $body -replace '(?i)https?://\S+','[redacted-url]'
+    $body = $body -replace '(?i)[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}','[redacted-email]'
+    $body = $body -replace '(?i)([A-Z0-9-]+\.)+(com|net|org|cloud|local|io)\b','[redacted-host]'
+    $body = $body -replace '(?i)\b[0-9a-f]{8}-([0-9a-f]{4}-){3}[0-9a-f]{12}\b','[redacted-guid]'
+    $body = $body -replace '(?i)access_token|id_token|refresh_token','[redacted-token]'
+    $body = $body -replace '\s{2,}',' '
+    $prefix = if ($status) { "HTTP $status - " } else { "" }
+    return ($prefix + $body)
+}
+
+Function Get-CCPCredentialByObject {
+    param([Parameter(Mandatory)][string]$ObjectName,[Parameter(Mandatory)][string]$UPUser)
+    try {
+        $url  = "$CCPAddress/$Location/api/Accounts?AppID=$AppID&Safe=$SafeForCCP&Object=$ObjectName"
+        $resp = Invoke-RestMethod -Uri $url -Method GET -Headers $Headers -UseDefaultCredentials:$WindowsAuth
+        if (-not $resp -or -not $resp.Content) { throw "Empty CCP response" }
+        $sec  = ConvertTo-SecureString $resp.Content -AsPlainText -Force
+        $Cred = [PSCredential]::new($UPUser, $sec)
+        $resp.Content = $null; Remove-Variable sec -ErrorAction SilentlyContinue
+        Write-Log "Credential retrieved securely." "Green"
+        return $Cred
+    } catch { Write-Log "Credential retrieval failed." "Red"; throw }
+}
+
+Function Test-IdentityPreflight {
+    param([Parameter(Mandatory)][string]$IdentityTenantUrl)
+    try {
+        $u = $IdentityTenantUrl.TrimEnd('/') + '/.well-known/openid-configuration'
+        $r = Invoke-WebRequest -Uri $u -Method Head -TimeoutSec 12 -ErrorAction Stop
+        Write-Log "Identity endpoint reachable." "Green"
+        if ($r.Headers.Date) {
+            $srv = [DateTime]::Parse($r.Headers.Date).ToUniversalTime()
+            $loc = (Get-Date).ToUniversalTime()
+            $skew = [math]::Round(($loc - $srv).TotalSeconds,0)
+            if ([math]::Abs($skew) -gt 300) { Write-Log "Clock skew > 5 min; sync time." "Yellow" }
+        }
+    } catch { Write-Log "Identity endpoint not reachable." "Red"; throw }
+}
+
+# Try to call whatever "IdentityHeader" cmdlet exists with the right parameter names
+Function Invoke-IdentityHeaderAdaptive {
+    param(
+        [Parameter(Mandatory)][pscredential]$Cred,
+        [Parameter(Mandatory)][string]$TenantUrl,
+        [Parameter(Mandatory)][string]$Subdomain
+    )
+
+    $cmd = Resolve-IdentityHeader
+    if (-not $cmd) {
+        Write-Log "Get-IdentityHeader cmdlet not found. Install/upgrade IdentityCommand or psPAS." "Red"
+        throw "Missing IdentityHeader cmdlet"
+    }
+
+    $p = $cmd.Parameters.Keys
+
+    # Map common parameter variants
+    $paramSet = @{}
+    if ($p -contains 'IdentityTenantURL') { $paramSet['IdentityTenantURL'] = $TenantUrl }
+    elseif ($p -contains 'TenantURL')     { $paramSet['TenantURL'] = $TenantUrl }
+
+    if ($p -contains 'PCloudSubdomain')   { $paramSet['PCloudSubdomain'] = $Subdomain }
+    elseif ($p -contains 'Subdomain')     { $paramSet['Subdomain'] = $Subdomain }
+
+    if     ($p -contains 'UPCreds')       { $paramSet['UPCreds'] = $Cred }
+    elseif ($p -contains 'Credential')    { $paramSet['Credential'] = $Cred }
+    else {
+        # Some functions require -UserName and -Password; derive from PSCredential safely
+        if ($p -contains 'UserName' -and $p -contains 'Password') {
+            $paramSet['UserName'] = $Cred.UserName
+            $paramSet['Password'] = $Cred.Password
+        }
+    }
+
+    # Add switch if recognized
+    if ($p -contains 'psPASFormat') { $paramSet['psPASFormat'] = $true }
+
+    try {
+        return ,(& $cmd @paramSet)
+    } catch {
+        $safe = Get-SafeIdentityErrorText -Exception $_.Exception
+        Write-Log ("Identity error: {0}" -f $safe) "Red"
+        throw
+    }
+}
+
+Function Start-PASIdentitySession {
+    param(
+        [Parameter(Mandatory)][pscredential]$Cred,
+        [Parameter(Mandatory)][string]$IdentityTenantUrl,
+        [Parameter(Mandatory)][string]$PCloudSubdomain,
+        [string]$AltUPN = ""
+    )
+    Test-IdentityPreflight -IdentityTenantUrl $IdentityTenantUrl | Out-Null
+
+    try {
+        $Header = Invoke-IdentityHeaderAdaptive -Cred $Cred -TenantUrl $IdentityTenantUrl -Subdomain $PCloudSubdomain
+        Use-PASSession $Header
+        if (-not (Get-PASSession)) { throw "Session not established" }
+        Write-Log "PAS session established." "Green"
+        return
+    } catch {
+        Write-Log "PAS session establishment failed." "Red"
+        if (-not [string]::IsNullOrWhiteSpace($AltUPN)) {
+            try {
+                $altCred = [pscredential]::new($AltUPN, $Cred.Password)
+                $Header2 = Invoke-IdentityHeaderAdaptive -Cred $altCred -TenantUrl $IdentityTenantUrl -Subdomain $PCloudSubdomain
+                Use-PASSession $Header2
+                if (-not (Get-PASSession)) { throw "Session not established" }
+                Write-Log "PAS session established (UPN form)." "Green"
+                return
+            } catch {
+                Write-Log "PAS session establishment failed (UPN form)." "Red"
+                throw
+            }
+        } else {
+            throw
+        }
+    }
+}
+
+# ===================== MAIN FLOW =====================
+try {
+    $IdentityTenantUrl = Normalize-IdentityTenantUrl -Url $IdentityTenantUrl
+    $Cred = Get-CCPCredentialByObject -ObjectName $ObjectName -UPUser $UPUser
+
+    $altUPN = if ([string]::IsNullOrWhiteSpace($OptionalUPNSuffix)) { "" } else { "$UPUser@$OptionalUPNSuffix" }
+    Start-PASIdentitySession -Cred $Cred -IdentityTenantUrl $IdentityTenantUrl -PCloudSubdomain $PCloudSubdomain -AltUPN $altUPN
+
+    # secured operations here (no property output)
+    # Get-PASLoggedOnUser | Out-Null
+    Write-Log "Ready to execute secured operations." "Green"
+}
+catch {
+    Write-Log "Operation failed." "Red"
+}
+finally {
+    Remove-Variable Cred -ErrorAction SilentlyContinue
+    Write-Log "Completed." "Green"
+}
+
+
+
+
+::::::::::::::::::::::::
+
+Install-Module IdentityCommand -Scope AllUsers -Force
+Install-Module psPAS            -Scope AllUsers -Force
+# Or for current user if you lack admin rights:
+# Install-Module IdentityCommand -Scope CurrentUser -Force
+# Install-Module psPAS            -Scope CurrentUser -Force
