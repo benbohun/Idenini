@@ -11,43 +11,41 @@ $psPASDirs = @(
 ) | Where-Object { Test-Path $_ }
 foreach ($d in $psPASDirs) { try { Get-ChildItem $d -Recurse -File | Unblock-File -ErrorAction SilentlyContinue } catch {} }
 
-# --- Minimal logging (no secrets, no identifiers) ---
+# --- Minimal logging (no secrets/identifiers) ---
 $LogPath = "E:\Installation Media\Script\OnboardScript\accountonboarding.txt"
 Function Write-Log {
-    param([string]$Message, [string]$Color = "White")
+    param([string]$Message,[string]$Color="White")
     $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $line = "$ts - $Message"
     try { Write-Host $line -ForegroundColor $Color } catch { Write-Host $line }
     try { Add-Content -Path $LogPath -Value $line } catch {}
 }
 
-# --- Load psPAS ---
-try {
-    Import-Module psPAS -Force -ErrorAction Stop
-    Write-Log "psPAS loaded." "Green"
-} catch {
-    Write-Log "psPAS not found/loaded." "Red"; exit 1
-}
-
-# --- Optional AD module (non-fatal) ---
+# --- Load psPAS (and optionally AD) ---
+try { Import-Module psPAS -Force -ErrorAction Stop; Write-Log "psPAS loaded." "Green" }
+catch { Write-Log "psPAS not found/loaded." "Red"; exit 1 }
 $ADModuleLoaded = $false
-try { Import-Module ActiveDirectory -ErrorAction Stop; $ADModuleLoaded = $true } catch { Write-Log "AD module not available (non-fatal)." "Yellow" }
+try { Import-Module ActiveDirectory -ErrorAction Stop; $ADModuleLoaded = $true }
+catch { Write-Log "AD module not available (non-fatal)." "Yellow" }
+
+# --- Enforce TLS1.2 ---
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
 
 # --- CCP / Identity parameters (edit as needed; never printed) ---
-$CCPAddress     = "https://vskau1p1231.cna.com"
-$Location       = "AIMWebService"
-$AppID          = "PAMDiscovery"
-$SafeForCCP     = "CA_PCloud_Admins"
-$WindowsAuth    = $false
-$Headers        = @{ "Content-Type" = "application/json" }
+$CCPAddress        = "https://vskau1p1231.cna.com"
+$Location          = "AIMWebService"
+$AppID             = "PAMDiscovery"
+$SafeForCCP        = "CA_PCloud_Admins"
+$WindowsAuth       = $false
+$Headers           = @{ "Content-Type" = "application/json" }
 $IdentityTenantUrl = "https://aat4012.id.cyberark.cloud"
 $PCloudSubdomain   = "cna-prod"
 
-# --- Helper: fetch secret from CCP and return PSCredential ($Cred) ---
+# --- Fetch secret from CCP and return PSCredential as $Cred ---
 Function Get-CCPCredentialByObject {
     param(
-        [Parameter(Mandatory)] [string]$ObjectName,  # e.g. cna.com-CA_PAMDiscovery_SVC
-        [Parameter(Mandatory)] [string]$UPUser       # e.g. CA_PAMDiscovery_SVC
+        [Parameter(Mandatory)][string]$ObjectName,
+        [Parameter(Mandatory)][string]$UPUser
     )
     try {
         $url  = "$CCPAddress/$Location/api/Accounts?AppID=$AppID&Safe=$SafeForCCP&Object=$ObjectName"
@@ -63,40 +61,66 @@ Function Get-CCPCredentialByObject {
     }
 }
 
-# --- Helper: start psPAS Identity session using $Cred ---
+# --- Identity reachability & skew (generic) ---
+Function Test-IdentityPreflight {
+    param([Parameter(Mandatory)][string]$IdentityTenantUrl)
+    try {
+        $u = $IdentityTenantUrl.TrimEnd('/') + '/.well-known/openid-configuration'
+        $r = Invoke-WebRequest -Uri $u -Method Head -TimeoutSec 12 -ErrorAction Stop
+        Write-Log "Identity endpoint reachable." "Green"
+        if ($r.Headers.Date) {
+            $srv = [DateTime]::Parse($r.Headers.Date).ToUniversalTime()
+            $loc = (Get-Date).ToUniversalTime()
+            $skew = [math]::Round(($loc - $srv).TotalSeconds,0)
+            if ([math]::Abs($skew) -gt 300) { Write-Log "Clock skew > 5 min; sync time." "Yellow" }
+        }
+    } catch { Write-Log "Identity endpoint not reachable." "Red"; throw }
+}
+
+# --- Establish psPAS Identity session using $Cred (safe logs only) ---
 Function Start-PASIdentitySession {
-    param([Parameter(Mandatory)][pscredential]$Cred)
+    param(
+        [Parameter(Mandatory)][pscredential]$Cred,
+        [Parameter(Mandatory)][string]$IdentityTenantUrl,
+        [Parameter(Mandatory)][string]$PCloudSubdomain
+    )
+    try { Test-IdentityPreflight -IdentityTenantUrl $IdentityTenantUrl } catch { throw }
     try {
         $Header = Get-IdentityHeader -IdentityTenantURL $IdentityTenantUrl -psPASFormat -PCloudSubdomain $PCloudSubdomain -UPCreds $Cred
         Use-PASSession $Header
         if (-not (Get-PASSession)) { throw "Session not established" }
         Write-Log "PAS session established." "Green"
     } catch {
-        Write-Log "PAS session establishment failed." "Red"; throw
+        $m = $_.Exception.Message
+        switch -Regex ($m) {
+            '401|unauthori'                               { Write-Log "Identity auth rejected." "Red"; break }
+            'tenant|not\s*found|404'                      { Write-Log "Tenant URL / Subdomain mismatch." "Red"; break }
+            'TLS|certificate|SSL'                         { Write-Log "TLS/Certificate issue." "Red"; break }
+            'name.*could not be resolved|No such host|NameResolutionFailure' { Write-Log "DNS/Network issue." "Red"; break }
+            'timed out|timeout'                           { Write-Log "Timeout contacting Identity." "Red"; break }
+            default                                       { Write-Log "PAS session establishment failed." "Red" }
+        }
+        throw
     }
 }
 
 # ===================== MAIN FLOW =====================
 try {
-    # 1) Retrieve and store securely as $Cred (no output of properties)
+    # 1) Retrieve and store securely as $Cred
     $ObjectName = "cna.com-CA_PAMDiscovery_SVC"   # edit value; not printed
     $UPUser     = "CA_PAMDiscovery_SVC"           # edit value; not printed
     $Cred = Get-CCPCredentialByObject -ObjectName $ObjectName -UPUser $UPUser
 
     # 2) Use $Cred to authenticate to CyberArk via psPAS Identity
-    Start-PASIdentitySession -Cred $Cred
+    Start-PASIdentitySession -Cred $Cred -IdentityTenantUrl $IdentityTenantUrl -PCloudSubdomain $PCloudSubdomain
 
-    # 3) Execute your psPAS commands here (no printing of account properties)
-    # Example (safe placeholders only):
+    # 3) Execute secured operations here (no account properties printed)
+    # Example:
     # Get-PASLoggedOnUser | Out-Null
     Write-Log "Ready to execute secured operations." "Green"
 }
-catch {
-    # Generic failure (no details)
-    Write-Log "Operation failed." "Red"
-}
+catch { Write-Log "Operation failed." "Red" }
 finally {
-    # Cleanup references
     Remove-Variable Cred -ErrorAction SilentlyContinue
     Write-Log "Completed." "Green"
 }
