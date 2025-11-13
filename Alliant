@@ -1,97 +1,102 @@
-# --- Allow this process to load unsigned modules & unblock psPAS files (silent) ---
-try { Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force -ErrorAction Stop } catch {}
+#Requires -Version 5.1
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+$ProgressPreference    = 'SilentlyContinue'
 
+# --- Allow unsigned modules & unblock psPAS (silent) ---
+try { Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force -ErrorAction Stop } catch {}
 $psPASDirs = @(
   "$env:ProgramFiles\WindowsPowerShell\Modules\psPAS\6.4.85",
   "$HOME\Documents\WindowsPowerShell\Modules\psPAS\6.4.85"
 ) | Where-Object { Test-Path $_ }
+foreach ($d in $psPASDirs) { try { Get-ChildItem $d -Recurse -File | Unblock-File -ErrorAction SilentlyContinue } catch {} }
 
-foreach ($dir in $psPASDirs) {
-  try { Get-ChildItem -Path $dir -Recurse -File | Unblock-File -ErrorAction SilentlyContinue } catch {}
-}
-
-# --- Logging Utility ---
+# --- Minimal logging (no secrets, no identifiers) ---
 $LogPath = "E:\Installation Media\Script\OnboardScript\accountonboarding.txt"
 Function Write-Log {
     param([string]$Message, [string]$Color = "White")
-    $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $LogEntry = "$Timestamp - $Message"
-    try { Write-Host $LogEntry -ForegroundColor $Color } catch { Write-Host $LogEntry }
-    try { Add-Content -Path $LogPath -Value $LogEntry } catch {}
-}
-
-# --- Console "box" helper (for fallback dialog text) ---
-Function Show-Box {
-    param([string]$Title, [string]$BodyLine1 = "", [string]$BodyLine2 = "")
-    $line = ('=' * 72)
-    Write-Host $line -ForegroundColor DarkGray
-    if ($Title)    { Write-Host ("[ " + $Title + " ]") -ForegroundColor Gray }
-    if ($BodyLine1){ Write-Host $BodyLine1 -ForegroundColor Gray }
-    if ($BodyLine2){ Write-Host $BodyLine2 -ForegroundColor Gray }
-    Write-Host $line -ForegroundColor DarkGray
+    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $line = "$ts - $Message"
+    try { Write-Host $line -ForegroundColor $Color } catch { Write-Host $line }
+    try { Add-Content -Path $LogPath -Value $line } catch {}
 }
 
 # --- Load psPAS ---
 try {
     Import-Module psPAS -Force -ErrorAction Stop
-    $mod = Get-Module psPAS
-    Write-Log ("psPAS loaded ({0})." -f $mod.Version) "Green"
+    Write-Log "psPAS loaded." "Green"
 } catch {
-    Write-Log ("❌ psPAS module not found/loaded: {0}" -f $_.Exception.Message) "Red"
-    exit 1
+    Write-Log "psPAS not found/loaded." "Red"; exit 1
 }
 
-# --- Try to import AD module for OU validation (non-fatal if missing) ---
+# --- Optional AD module (non-fatal) ---
 $ADModuleLoaded = $false
-try {
-    Import-Module ActiveDirectory -ErrorAction Stop
-    $ADModuleLoaded = $true
-} catch {
-    Write-Log "⚠️ ActiveDirectory module not available; will still try to add group by UPN." "Yellow"
+try { Import-Module ActiveDirectory -ErrorAction Stop; $ADModuleLoaded = $true } catch { Write-Log "AD module not available (non-fatal)." "Yellow" }
+
+# --- CCP / Identity parameters (edit as needed; never printed) ---
+$CCPAddress     = "https://vskau1p1231.cna.com"
+$Location       = "AIMWebService"
+$AppID          = "PAMDiscovery"
+$SafeForCCP     = "CA_PCloud_Admins"
+$WindowsAuth    = $false
+$Headers        = @{ "Content-Type" = "application/json" }
+$IdentityTenantUrl = "https://aat4012.id.cyberark.cloud"
+$PCloudSubdomain   = "cna-prod"
+
+# --- Helper: fetch secret from CCP and return PSCredential ($Cred) ---
+Function Get-CCPCredentialByObject {
+    param(
+        [Parameter(Mandatory)] [string]$ObjectName,  # e.g. cna.com-CA_PAMDiscovery_SVC
+        [Parameter(Mandatory)] [string]$UPUser       # e.g. CA_PAMDiscovery_SVC
+    )
+    try {
+        $url  = "$CCPAddress/$Location/api/Accounts?AppID=$AppID&Safe=$SafeForCCP&Object=$ObjectName"
+        $resp = Invoke-RestMethod -Uri $url -Method GET -Headers $Headers -UseDefaultCredentials:$WindowsAuth
+        if (-not $resp -or -not $resp.Content) { throw "Empty CCP response" }
+        $sec  = ConvertTo-SecureString $resp.Content -AsPlainText -Force
+        $Cred = [PSCredential]::new($UPUser, $sec)
+        $resp.Content = $null; Remove-Variable sec -ErrorAction SilentlyContinue
+        Write-Log "Credential retrieved securely." "Green"
+        return $Cred
+    } catch {
+        Write-Log "Credential retrieval failed." "Red"; throw
+    }
 }
 
-# --- CCP parameters (shared) ---
-$CCPAddress = "https://vskau1p1231.cna.com"
-$location   = "AIMWebService"
-$application= "PAMDiscovery"
-$safeCCP    = "CA_PCloud_Admins"
-$headers    = @{ "Content-Type" = "application/json" }
-$windowsAuth = $false
-
-# --- Helper: start a PAS session from CCP creds using the SAME psPAS Identity method ---
-Function Start-PASSessionFromCCP {
-    param(
-        [Parameter(Mandatory)] [string]$ObjectName,   # e.g. cna.com-CA_PAMDiscovery_SVC
-        [Parameter(Mandatory)] [string]$UPUser        # e.g. CA_PAMDiscovery_SVC
-    )
-    $ccpUrl = "$CCPAddress/$location/api/Accounts?AppID=$application&Safe=$safeCCP&Object=$ObjectName"
-    Write-Log ("Retrieving CyberArk API credentials from CCP ({0}) via Object method..." -f $UPUser)
+# --- Helper: start psPAS Identity session using $Cred ---
+Function Start-PASIdentitySession {
+    param([Parameter(Mandatory)][pscredential]$Cred)
     try {
-        $resp = Invoke-RestMethod $ccpUrl -Method 'GET' -Headers $headers -UseDefaultCredentials:$windowsAuth
-        if (-not $resp -or -not $resp.Content) { throw "Empty CCP response" }
-        Write-Log ("✅ Successfully retrieved credentials for user: {0}" -f $resp.Username) "Green"
+        $Header = Get-IdentityHeader -IdentityTenantURL $IdentityTenantUrl -psPASFormat -PCloudSubdomain $PCloudSubdomain -UPCreds $Cred
+        Use-PASSession $Header
+        if (-not (Get-PASSession)) { throw "Session not established" }
+        Write-Log "PAS session established." "Green"
     } catch {
-        Write-Log ("❌ ERROR: CCP credential fetch failed - {0}" -f $_) "Red"
-        throw
+        Write-Log "PAS session establishment failed." "Red"; throw
     }
+}
 
-    try {
-        Write-Log ("Requesting CyberArk PAS authentication (psPAS Identity header) as {0}..." -f $UPUser)
-        $UPPass = ConvertTo-SecureString $resp.Content -AsPlainText -Force
-        $UPCred = [PSCredential]::new($UPUser, $UPPass)
+# ===================== MAIN FLOW =====================
+try {
+    # 1) Retrieve and store securely as $Cred (no output of properties)
+    $ObjectName = "cna.com-CA_PAMDiscovery_SVC"   # edit value; not printed
+    $UPUser     = "CA_PAMDiscovery_SVC"           # edit value; not printed
+    $Cred = Get-CCPCredentialByObject -ObjectName $ObjectName -UPUser $UPUser
 
-        $header = Get-IdentityHeader `
-            -IdentityTenantURL "aat4012.id.cyberark.cloud" `
-            -psPASFormat `
-            -PCloudSubdomain "cna-prod" `
-            -UPCreds $UPCred
+    # 2) Use $Cred to authenticate to CyberArk via psPAS Identity
+    Start-PASIdentitySession -Cred $Cred
 
-        Use-PASSession $header
-        if (-not (Get-PASSession)) { throw "psPAS session not established" }
-        Write-Log ("✅ Authentication successful, PAS session established ({0})." -f $UPUser) "Green"
-    } catch {
-        Write-Log ("❌ Failed to authenticate via psPAS Identity header: {0}" -f $_.Exception.Message) "Red"
-        throw
-    }
-
-    return $resp   # return CCP record (may be useful later)
+    # 3) Execute your psPAS commands here (no printing of account properties)
+    # Example (safe placeholders only):
+    # Get-PASLoggedOnUser | Out-Null
+    Write-Log "Ready to execute secured operations." "Green"
+}
+catch {
+    # Generic failure (no details)
+    Write-Log "Operation failed." "Red"
+}
+finally {
+    # Cleanup references
+    Remove-Variable Cred -ErrorAction SilentlyContinue
+    Write-Log "Completed." "Green"
+}
