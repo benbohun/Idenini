@@ -1,125 +1,97 @@
-#Requires -Version 5.1
-Set-StrictMode -Version Latest
+# --- Allow this process to load unsigned modules & unblock psPAS files (silent) ---
+try { Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force -ErrorAction Stop } catch {}
 
-<#
-  Purpose:
-    - Retrieve credentials from CyberArk CCP WITHOUT displaying any account properties.
-    - Convert plaintext password to SecureString and build PSCredential.
-    - Avoid printing or logging ANY sensitive identifiers or values.
-    - Provide only generic status messages.
+$psPASDirs = @(
+  "$env:ProgramFiles\WindowsPowerShell\Modules\psPAS\6.4.85",
+  "$HOME\Documents\WindowsPowerShell\Modules\psPAS\6.4.85"
+) | Where-Object { Test-Path $_ }
 
-  Behavior:
-    - No URLs, usernames, addresses, object names, safes, or passwords are written to output.
-    - Errors are generalized to avoid accidental data leaks.
-#>
+foreach ($dir in $psPASDirs) {
+  try { Get-ChildItem -Path $dir -Recurse -File | Unblock-File -ErrorAction SilentlyContinue } catch {}
+}
 
-# ----------------------- Safety & Runtime Controls -----------------------
-$ErrorActionPreference = 'Stop'                    # [Comment] Fail fast so we can handle in try/catch without noisy partial output
-$ProgressPreference   = 'SilentlyContinue'         # [Comment] Suppress any progress UI that could include hints
+# --- Logging Utility ---
+$LogPath = "E:\Installation Media\Script\OnboardScript\accountonboarding.txt"
+Function Write-Log {
+    param([string]$Message, [string]$Color = "White")
+    $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $LogEntry = "$Timestamp - $Message"
+    try { Write-Host $LogEntry -ForegroundColor $Color } catch { Write-Host $LogEntry }
+    try { Add-Content -Path $LogPath -Value $LogEntry } catch {}
+}
 
-# ----------------------- Config (EDIT AS NEEDED) -----------------------
-# [Comment] These variables are used internally; they are NEVER printed.
-$responseViaObject = $null
-$responseViaAddressAndUsername = $null
+# --- Console "box" helper (for fallback dialog text) ---
+Function Show-Box {
+    param([string]$Title, [string]$BodyLine1 = "", [string]$BodyLine2 = "")
+    $line = ('=' * 72)
+    Write-Host $line -ForegroundColor DarkGray
+    if ($Title)    { Write-Host ("[ " + $Title + " ]") -ForegroundColor Gray }
+    if ($BodyLine1){ Write-Host $BodyLine1 -ForegroundColor Gray }
+    if ($BodyLine2){ Write-Host $BodyLine2 -ForegroundColor Gray }
+    Write-Host $line -ForegroundColor DarkGray
+}
 
-$CCPAddress  = "https://ccp-test.cna.com"          # [Comment] CCP base URL (not printed)
-$location    = "AIMWebService"                     # [Comment] CCP path (not printed)
-$application = "SECRETS_DEMO_APPID"                # [Comment] AppID (not printed)
-$safe        = "CyberArkCCPTest"                   # [Comment] Safe (not printed)
-$object      = "10.10.10.1-SVC_demoaccount"        # [Comment] Object name (not printed)
-$address     = "10.10.10.1"                        # [Comment] Address (not printed)
-$username    = "SVC_demoaccount"                   # [Comment] Username (not printed)
+# --- Load psPAS ---
+try {
+    Import-Module psPAS -Force -ErrorAction Stop
+    $mod = Get-Module psPAS
+    Write-Log ("psPAS loaded ({0})." -f $mod.Version) "Green"
+} catch {
+    Write-Log ("❌ psPAS module not found/loaded: {0}" -f $_.Exception.Message) "Red"
+    exit 1
+}
 
-$windowsAuth = $false                               # [Comment] Integrated auth toggle (value not sensitive)
+# --- Try to import AD module for OU validation (non-fatal if missing) ---
+$ADModuleLoaded = $false
+try {
+    Import-Module ActiveDirectory -ErrorAction Stop
+    $ADModuleLoaded = $true
+} catch {
+    Write-Log "⚠️ ActiveDirectory module not available; will still try to add group by UPN." "Yellow"
+}
 
-# [Comment] Encourage modern TLS; no output
-try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+# --- CCP parameters (shared) ---
+$CCPAddress = "https://vskau1p1231.cna.com"
+$location   = "AIMWebService"
+$application= "PAMDiscovery"
+$safeCCP    = "CA_PCloud_Admins"
+$headers    = @{ "Content-Type" = "application/json" }
+$windowsAuth = $false
 
-# [Comment] Standard JSON header for CCP; not printed
-$headers = New-Object "System.Collections.Generic.Dictionary[[String],[String]]"
-$headers.Add("Content-Type", "application/json")
-
-# ----------------------- Helper: Secure handling -----------------------
-function Convert-CcpResponseToCredential {
-    <#
-      .SYNOPSIS
-        Convert CCP response to PSCredential and scrub plaintext.
-      .DESCRIPTION
-        - Builds SecureString from CCP Content.
-        - Creates PSCredential.
-        - Clears plaintext from the response object.
-        - Returns PSCredential only; sanitized response is NOT printed.
-    #>
+# --- Helper: start a PAS session from CCP creds using the SAME psPAS Identity method ---
+Function Start-PASSessionFromCCP {
     param(
-        [Parameter(Mandatory)] [pscustomobject] $CcpResponse
+        [Parameter(Mandatory)] [string]$ObjectName,   # e.g. cna.com-CA_PAMDiscovery_SVC
+        [Parameter(Mandatory)] [string]$UPUser        # e.g. CA_PAMDiscovery_SVC
     )
-
-    # [Comment] Convert to SecureString in-memory; never printed
-    $SecurePassword = ConvertTo-SecureString -String $CcpResponse.Content -AsPlainText -Force
-
-    # [Comment] Produce PSCredential for downstream use; never printed
-    $Cred = New-Object System.Management.Automation.PSCredential ($CcpResponse.Username, $SecurePassword)
-
-    # [Comment] Immediately scrub plaintext to minimize exposure window
-    $CcpResponse.Content = $null
-    Remove-Variable SecurePassword -ErrorAction SilentlyContinue
-
-    # [Comment] Return only the PSCredential (safe object)
-    return $Cred
-}
-
-# ----------------------- Lookup by Object (no display) -----------------------
-if (![string]::IsNullOrWhiteSpace($object)) {
-    # [Comment] Build URL internally; never echoed to screen
-    $url = "$CCPAddress/$location/api/Accounts?AppID=$application&Safe=$safe&Object=$object"
+    $ccpUrl = "$CCPAddress/$location/api/Accounts?AppID=$application&Safe=$safeCCP&Object=$ObjectName"
+    Write-Log ("Retrieving CyberArk API credentials from CCP ({0}) via Object method..." -f $UPUser)
+    try {
+        $resp = Invoke-RestMethod $ccpUrl -Method 'GET' -Headers $headers -UseDefaultCredentials:$windowsAuth
+        if (-not $resp -or -not $resp.Content) { throw "Empty CCP response" }
+        Write-Log ("✅ Successfully retrieved credentials for user: {0}" -f $resp.Username) "Green"
+    } catch {
+        Write-Log ("❌ ERROR: CCP credential fetch failed - {0}" -f $_) "Red"
+        throw
+    }
 
     try {
-        # [Comment] Perform request silently
-        $responseViaObject = Invoke-RestMethod -Uri $url -Method 'GET' -Headers $headers -UseDefaultCredentials:$windowsAuth
+        Write-Log ("Requesting CyberArk PAS authentication (psPAS Identity header) as {0}..." -f $UPUser)
+        $UPPass = ConvertTo-SecureString $resp.Content -AsPlainText -Force
+        $UPCred = [PSCredential]::new($UPUser, $UPPass)
 
-        # [Comment] Build credential securely and keep for use; do not print
-        $CredFromObject = Convert-CcpResponseToCredential -CcpResponse $responseViaObject
+        $header = Get-IdentityHeader `
+            -IdentityTenantURL "aat4012.id.cyberark.cloud" `
+            -psPASFormat `
+            -PCloudSubdomain "cna-prod" `
+            -UPCreds $UPCred
 
-        # [Comment] Generic success note (no properties)
-        Write-Host "[OK] Credential retrieved (method: object)." -ForegroundColor Green
+        Use-PASSession $header
+        if (-not (Get-PASSession)) { throw "psPAS session not established" }
+        Write-Log ("✅ Authentication successful, PAS session established ({0})." -f $UPUser) "Green"
+    } catch {
+        Write-Log ("❌ Failed to authenticate via psPAS Identity header: {0}" -f $_.Exception.Message) "Red"
+        throw
     }
-    catch {
-        # [Comment] Generic error note that reveals nothing sensitive
-        Write-Host "[ERR] Credential retrieval failed (method: object). Check connectivity, authorization, and CCP configuration." -ForegroundColor Red
-    }
-}
 
-# ----------------------- Lookup by Address + Username (no display) -----------------------
-if (![string]::IsNullOrWhiteSpace($address) -and ![string]::IsNullOrWhiteSpace($username)) {
-    # [Comment] Build URL internally; never echoed to screen
-    $url2 = "$CCPAddress/$location/api/Accounts?AppID=$application&Safe=$safe&address=$address&username=$username"
-
-    try {
-        # [Comment] Perform request silently
-        $responseViaAddressAndUsername = Invoke-RestMethod -Uri $url2 -Method 'GET' -Headers $headers -UseDefaultCredentials:$windowsAuth
-
-        # [Comment] Build credential securely and keep for use; do not print
-        $CredFromAddrUser = Convert-CcpResponseToCredential -CcpResponse $responseViaAddressAndUsername
-
-        # [Comment] Generic success note (no properties)
-        Write-Host "[OK] Credential retrieved (method: address+username)." -ForegroundColor Green
-    }
-    catch {
-        # [Comment] Generic error note that reveals nothing sensitive
-        Write-Host "[ERR] Credential retrieval failed (method: address+username). Check connectivity, authorization, and CCP configuration." -ForegroundColor Red
-    }
-}
-
-# ----------------------- Example (SAFE) Usage Patterns -----------------------
-# [Comment] Use the credentials in downstream commands WITHOUT printing them.
-#   Example (commented; remove comments to use):
-#   Invoke-Command -ComputerName someHost -Credential $CredFromObject -ScriptBlock { whoami }
-#   Connect-DbaInstance -SqlInstance 'server\instance' -SqlCredential $CredFromAddrUser
-
-# ----------------------- Cleanup -----------------------
-# [Comment] Drop references to objects that once held secrets
-$responseViaObject = $null
-$responseViaAddressAndUsername = $null
-
-# [Comment] Final neutral completion note
-Write-Host "[DONE] Completed CCP retrieval flow without displaying account properties." -ForegroundColor Green
+    return $resp   # return CCP record (may be useful later)
