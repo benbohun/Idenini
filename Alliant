@@ -12,7 +12,7 @@ $psPASDirs = @(
 foreach ($d in $psPASDirs) { try { Get-ChildItem $d -Recurse -File | Unblock-File -ErrorAction SilentlyContinue } catch {} }
 
 # --- Minimal logging (no secrets/identifiers) ---
-$LogPath = "E:\Installation Media\Script\OnboardScript\accountonboarding.txt"
+$LogPath = "G:\Script\logon.txt"
 Function Write-Log {
     param([string]$Message,[string]$Color="White")
     $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
@@ -21,32 +21,40 @@ Function Write-Log {
     try { Add-Content -Path $LogPath -Value $line } catch {}
 }
 
-# --- Load psPAS (and optionally AD) ---
+# --- Load psPAS (+ optional AD) ---
 try { Import-Module psPAS -Force -ErrorAction Stop; Write-Log "psPAS loaded." "Green" }
 catch { Write-Log "psPAS not found/loaded." "Red"; exit 1 }
 $ADModuleLoaded = $false
 try { Import-Module ActiveDirectory -ErrorAction Stop; $ADModuleLoaded = $true }
 catch { Write-Log "AD module not available (non-fatal)." "Yellow" }
 
-# --- Enforce TLS1.2 ---
+# --- TLS 1.2 ---
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
 
-# --- CCP / Identity parameters (edit as needed; never printed) ---
-$CCPAddress        = "https://vskau1p1231.cna.com"
+# --- Parameters (edit as needed; never printed) ---
+$CCPAddress        = "https://HQVUCYBARK101.alliantcreditunion.com"
 $Location          = "AIMWebService"
-$AppID             = "PAMDiscovery"
-$SafeForCCP        = "CA_PCloud_Admins"
+$AppID             = "PAMTEST"
+$SafeForCCP        = "PAMTEST"
 $WindowsAuth       = $false
 $Headers           = @{ "Content-Type" = "application/json" }
-$IdentityTenantUrl = "https://aat4012.id.cyberark.cloud"
-$PCloudSubdomain   = "cna-prod"
+$IdentityTenantUrl = "http://aap4748.id.cyberark.cloud/"   # normalized below
+$PCloudSubdomain   = "alliant-test"
+$ObjectName        = "alliant-test.cyberark.cloud-botpamtest"
+$UPUser            = "botpamtest@cyberark.cloud.4176"
+$OptionalUPNSuffix = ""                                    # e.g. "corp.local" if you want a UPN retry
 
-# --- Fetch secret from CCP and return PSCredential as $Cred ---
+# --- Helpers: normalize, CCP -> PSCredential, preflight, session start ---
+Function Normalize-IdentityTenantUrl {
+    param([Parameter(Mandatory)][string]$Url)
+    $u = $Url.Trim()
+    if (-not $u.StartsWith("http", [System.StringComparison]::OrdinalIgnoreCase)) { $u = "https://$u" }
+    $u = $u -replace '^http://','https://'
+    $u.TrimEnd('/')
+}
+
 Function Get-CCPCredentialByObject {
-    param(
-        [Parameter(Mandatory)][string]$ObjectName,
-        [Parameter(Mandatory)][string]$UPUser
-    )
+    param([Parameter(Mandatory)][string]$ObjectName,[Parameter(Mandatory)][string]$UPUser)
     try {
         $url  = "$CCPAddress/$Location/api/Accounts?AppID=$AppID&Safe=$SafeForCCP&Object=$ObjectName"
         $resp = Invoke-RestMethod -Uri $url -Method GET -Headers $Headers -UseDefaultCredentials:$WindowsAuth
@@ -56,12 +64,9 @@ Function Get-CCPCredentialByObject {
         $resp.Content = $null; Remove-Variable sec -ErrorAction SilentlyContinue
         Write-Log "Credential retrieved securely." "Green"
         return $Cred
-    } catch {
-        Write-Log "Credential retrieval failed." "Red"; throw
-    }
+    } catch { Write-Log "Credential retrieval failed." "Red"; throw }
 }
 
-# --- Identity reachability & skew (generic) ---
 Function Test-IdentityPreflight {
     param([Parameter(Mandatory)][string]$IdentityTenantUrl)
     try {
@@ -77,45 +82,80 @@ Function Test-IdentityPreflight {
     } catch { Write-Log "Identity endpoint not reachable." "Red"; throw }
 }
 
-# --- Establish psPAS Identity session using $Cred (safe logs only) ---
-Function Start-PASIdentitySession {
+Function Get-IdentityHeader-Safe {
     param(
         [Parameter(Mandatory)][pscredential]$Cred,
         [Parameter(Mandatory)][string]$IdentityTenantUrl,
         [Parameter(Mandatory)][string]$PCloudSubdomain
     )
-    try { Test-IdentityPreflight -IdentityTenantUrl $IdentityTenantUrl } catch { throw }
+    $status = $null
     try {
-        $Header = Get-IdentityHeader -IdentityTenantURL $IdentityTenantUrl -psPASFormat -PCloudSubdomain $PCloudSubdomain -UPCreds $Cred
+        $h = Get-IdentityHeader -IdentityTenantURL $IdentityTenantUrl -psPASFormat -PCloudSubdomain $PCloudSubdomain -UPCreds $Cred
+        return ,$h
+    } catch {
+        if ($_.Exception.PSObject.Properties.Name -contains 'Response' -and $_.Exception.Response) {
+            try { $status = [int]$_.Exception.Response.StatusCode } catch {}
+        }
+        throw [System.Exception]::new("IDENTITY_FAIL:$status")
+    }
+}
+
+Function Start-PASIdentitySession {
+    param(
+        [Parameter(Mandatory)][pscredential]$Cred,
+        [Parameter(Mandatory)][string]$IdentityTenantUrl,
+        [Parameter(Mandatory)][string]$PCloudSubdomain,
+        [string]$AltUPN = ""
+    )
+    Test-IdentityPreflight -IdentityTenantUrl $IdentityTenantUrl | Out-Null
+
+    try {
+        $Header = Get-IdentityHeader-Safe -Cred $Cred -IdentityTenantUrl $IdentityTenantUrl -PCloudSubdomain $PCloudSubdomain
         Use-PASSession $Header
         if (-not (Get-PASSession)) { throw "Session not established" }
         Write-Log "PAS session established." "Green"
+        return
     } catch {
         $m = $_.Exception.Message
-        switch -Regex ($m) {
-            '401|unauthori'                               { Write-Log "Identity auth rejected." "Red"; break }
-            'tenant|not\s*found|404'                      { Write-Log "Tenant URL / Subdomain mismatch." "Red"; break }
-            'TLS|certificate|SSL'                         { Write-Log "TLS/Certificate issue." "Red"; break }
-            'name.*could not be resolved|No such host|NameResolutionFailure' { Write-Log "DNS/Network issue." "Red"; break }
-            'timed out|timeout'                           { Write-Log "Timeout contacting Identity." "Red"; break }
-            default                                       { Write-Log "PAS session establishment failed." "Red" }
+        if ($m -like 'IDENTITY_FAIL:*') {
+            $code = $m.Split(':')[-1]
+            switch ($code) {
+                '401' { Write-Log "Identity auth rejected." "Red" }
+                '404' { Write-Log "Tenant URL / Subdomain mismatch." "Red" }
+                '429' { Write-Log "Identity throttled (retry later)." "Yellow" }
+                default { Write-Log "PAS session establishment failed." "Red" }
+            }
+        } else {
+            switch -Regex ($m) {
+                'TLS|certificate|SSL' { Write-Log "TLS/Certificate issue." "Red" }
+                'NameResolutionFailure|No such host|could not be resolved' { Write-Log "DNS/Network issue." "Red" }
+                'timed out|timeout' { Write-Log "Timeout contacting Identity." "Red" }
+                default { Write-Log "PAS session establishment failed." "Red" }
+            }
         }
-        throw
+
+        if (-not [string]::IsNullOrWhiteSpace($AltUPN)) {
+            try {
+                $altCred = New-Object System.Management.Automation.PSCredential ($AltUPN, $Cred.Password)
+                $Header2 = Get-IdentityHeader-Safe -Cred $altCred -IdentityTenantUrl $IdentityTenantUrl -PCloudSubdomain $PCloudSubdomain
+                Use-PASSession $Header2
+                if (-not (Get-PASSession)) { throw "Session not established" }
+                Write-Log "PAS session established (UPN form)." "Green"
+                return
+            } catch { Write-Log "PAS session establishment failed (UPN form)." "Red"; throw }
+        } else { throw }
     }
 }
 
 # ===================== MAIN FLOW =====================
 try {
-    # 1) Retrieve and store securely as $Cred
-    $ObjectName = "cna.com-CA_PAMDiscovery_SVC"   # edit value; not printed
-    $UPUser     = "CA_PAMDiscovery_SVC"           # edit value; not printed
+    $IdentityTenantUrl = Normalize-IdentityTenantUrl -Url $IdentityTenantUrl
     $Cred = Get-CCPCredentialByObject -ObjectName $ObjectName -UPUser $UPUser
 
-    # 2) Use $Cred to authenticate to CyberArk via psPAS Identity
-    Start-PASIdentitySession -Cred $Cred -IdentityTenantUrl $IdentityTenantUrl -PCloudSubdomain $PCloudSubdomain
+    $altUPN = if ([string]::IsNullOrWhiteSpace($OptionalUPNSuffix)) { "" } else { "$UPUser@$OptionalUPNSuffix" }
+    Start-PASIdentitySession -Cred $Cred -IdentityTenantUrl $IdentityTenantUrl -PCloudSubdomain $PCloudSubdomain -AltUPN $altUPN
 
-    # 3) Execute secured operations here (no account properties printed)
-    # Example:
+    # secured operations go here (no property output)
     # Get-PASLoggedOnUser | Out-Null
     Write-Log "Ready to execute secured operations." "Green"
 }
