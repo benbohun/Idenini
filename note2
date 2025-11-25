@@ -1,328 +1,203 @@
-<#
-Convert-IssuedCertToPfx.ps1  (PowerShell 5.1)
+public String createAdminAccountSafe(SailPointContext context, String identityName,
+			String cyberArkappName, String targetName) {
+		ProvisioningPlan plan = new ProvisioningPlan();
+		ProvisioningResult result = null;
+		String status= null;
+ 
+		Identity identity = context.getObjectByName(Identity.class, identityName);
 
-Flow (no CN prompt):
-1) Prompt for issued certificate file (.cer)
-2) Optional: prompt for metadata.txt (to detect store and key container)
-3) Auto-detect CN from the .cer (fallback to metadata if needed)
-4) Accept cert into correct store (from metadata; else auto-try user then machine)
-5) Verify pairing (HasPrivateKey)
-6) Export PFX (with password confirmation; optional chain, optional PEM export)
-
-Run it and follow prompts.
-#>
-
-[CmdletBinding()]
-param()
-
-$ErrorActionPreference = 'Stop'
-
-# =========== Prompts ===========
-function Read-FilePath {
-  param([string]$Prompt,[string]$FilterDesc='All files',[string]$FilterExt='*.*',[switch]$Optional)
-  try {
-    Add-Type -AssemblyName System.Windows.Forms | Out-Null
-    $dlg = New-Object System.Windows.Forms.OpenFileDialog
-    $dlg.Title  = $Prompt
-    $dlg.Filter = "{0} ({1})|{1}|All files (*.*)|*.*" -f $FilterDesc,$FilterExt
-    if ($dlg.ShowDialog() -eq 'OK') { return $dlg.FileName }
-  } catch { }
-  $p = Read-Host "$Prompt"
-  if ([string]::IsNullOrWhiteSpace($p)) {
-    if ($Optional) { return '' } else { throw "Path is required." }
-  }
-  if (-not (Test-Path -LiteralPath $p)) { throw "Path not found: $p" }
-  return $p
-}
-
-$IssuedCerPath = Read-FilePath -Prompt "Select/enter path to ISSUED certificate (.cer)" -FilterDesc "Issued certificate" -FilterExt "*.cer"
-$MetaPath      = Read-FilePath -Prompt "Optional: select/enter path to metadata.txt (Enter to skip)" -FilterDesc "metadata.txt" -FilterExt "*.txt" -Optional
-
-# Ask if you want to include chain and/or export PEMs
-$IncludeChain  = (Read-Host "Include full chain in PFX? (Y/N) [N]").Trim().ToUpper() -eq 'Y'
-$ExportPem     = (Read-Host "Also export PEM files? (Y/N) [N]").Trim().ToUpper() -eq 'Y'
-
-# =========== Helpers ===========
-function Read-Metadata {
-  param([string]$Path)
-  if (-not $Path) { return $null }
-  try {
-    $content = Get-Content -LiteralPath $Path -Raw
-  } catch {
-    Write-Warning ("Could not read metadata at {0}: {1}" -f $Path, $_)
-    return $null
-  }
-  $storeMatch = [regex]::Match($content, '(?m)^Store:\s*(.+)$')
-  $kcMatch    = [regex]::Match($content, '(?m)^KeyContainer:\s*(.+)$')
-  $cnMatch    = [regex]::Match($content, '(?m)^CN:\s*(.+)$')
-
-  $storeText  = if ($storeMatch.Success) { $storeMatch.Groups[1].Value.Trim() } else { '' }
-  $kcText     = if ($kcMatch.Success)    { $kcMatch.Groups[1].Value.Trim() }    else { '' }
-  $cnText     = if ($cnMatch.Success)    { $cnMatch.Groups[1].Value.Trim() }    else { '' }
-
-  $isMachine = $false
-  if ($storeText -match 'LocalMachine\\My') { $isMachine = $true }
-  elseif ($storeText -match 'CurrentUser\\My') { $isMachine = $false }
-
-  [PSCustomObject]@{
-    IsMachine    = $isMachine
-    KeyContainer = $kcText
-    CN           = $cnText
-    StoreRaw     = $storeText
-  }
-}
-
-function Get-ExpectedStore {
-  param([bool]$IsMachine)
-  if ($IsMachine) { 'Cert:\LocalMachine\My' } else { 'Cert:\CurrentUser\My' }
-}
-
-function Get-CNFromCertFile {
-  param([string]$CerPath)
-  # Load from path (avoids byte[] constructor issues in PS 5.1)
-  $x = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 -ArgumentList $CerPath
-
-  # Try Subject CN first
-  $subject = $x.Subject
-  $cn = ''
-  $m = [regex]::Match($subject, '(?i)(?:^|,)\s*CN\s*=\s*([^,]+)')
-  if ($m.Success) { $cn = $m.Groups[1].Value.Trim() }
-
-  # Fallback to SAN DNS name
-  if (-not $cn) {
-    try {
-      $dns = @()
-      if ($x.DnsNameList) { $dns = $x.DnsNameList | ForEach-Object { $_.Unicode } }
-      if ($dns.Count -gt 0) { $cn = $dns[0] }
-    } catch { }
-  }
-  return $cn
-}
-
-function Find-CertWithKeyByCNOrSAN {
-  param([string]$CN,[bool]$IsMachine)
-  $store = Get-ExpectedStore -IsMachine $IsMachine
-  $items = Get-ChildItem -Path $store -ErrorAction SilentlyContinue
-  if (-not $items) { return $null }
-
-  $items |
-    Where-Object {
-      $_.HasPrivateKey -and (
-        $_.Subject -match ("(?i)CN\s*=\s*{0}(\s|,|$)" -f [regex]::Escape($CN)) -or
-        (($_.DnsNameList | ForEach-Object { $_.Unicode }) -contains $CN)
-      )
-    } |
-    Sort-Object NotBefore -Descending |
-    Select-Object -First 1
-}
-
-function Accept-IssuedCert {
-  param([string]$CerPath,[bool]$IsMachine)
-  if ($IsMachine) {
-    Write-Verbose ("Running: certreq -accept ""{0}""" -f $CerPath)
-    & certreq -accept "$CerPath" | Out-Null
-  } else {
-    Write-Verbose ("Running: certreq -user -accept ""{0}""" -f $CerPath)
-    & certreq -user -accept "$CerPath" | Out-Null
-  }
-}
-
-function Remove-CertByThumbprint {
-  param([string]$Thumb,[bool]$IsMachine)
-  $store = Get-ExpectedStore -IsMachine $IsMachine
-  $c = Get-ChildItem -Path $store -ErrorAction SilentlyContinue | Where-Object { $_.Thumbprint -eq $Thumb }
-  if ($c) {
-    $c | Remove-Item -ErrorAction SilentlyContinue
-  }
-}
-
-function Get-SecureStringConfirmed {
-  param(
-    [string]$Prompt = "Enter PFX password",
-    [string]$ConfirmPrompt = "Confirm PFX password"
-  )
-  while ($true) {
-    $p1 = Read-Host $Prompt -AsSecureString
-    $p2 = Read-Host $ConfirmPrompt -AsSecureString
-
-    $b1 = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($p1)
-    $s1 = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($b1)
-    $b2 = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($p2)
-    $s2 = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($b2)
-    try {
-      if ($s1 -ne $s2) {
-        Write-Warning "Passwords do not match. Please try again."
-        continue
-      }
-      if ([string]::IsNullOrEmpty($s1)) {
-        Write-Warning "Password cannot be empty. Please try again."
-        continue
-      }
-      return $p1
-    } finally {
-      if ($b1) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b1) }
-      if ($b2) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b2) }
-      if ($s1) { $s1 = $null }
-      if ($s2) { $s2 = $null }
-    }
-  }
-}
-
-function Export-Pfx {
-  param(
-    [System.Security.Cryptography.X509Certificates.X509Certificate2] $Cert,
-    [string] $CN,
-    [switch] $WithChain
-  )
-  $stamp  = Get-Date -Format 'yyyyMMdd_HHmmss'
-  $safeCN = ($CN -replace '[^\w\.-]','_')
-  $pfxPath = "C:\Temp\${safeCN}_$stamp.pfx"
-  $null = New-Item -ItemType Directory -Path (Split-Path $pfxPath) -Force -ErrorAction SilentlyContinue
-
-  # Clear, double prompt with confirmation
-  $pw = Get-SecureStringConfirmed -Prompt "Enter PFX password" -ConfirmPrompt "Confirm PFX password"
-
-  try {
-    $chainOpt = 'EndEntityCertOnly'
-    if ($WithChain) { $chainOpt = 'BuildChain' }
-
-    Export-PfxCertificate `
-      -Cert $Cert.PSPath `
-      -FilePath $pfxPath `
-      -Password $pw `
-      -ChainOption $chainOpt `
-      -CryptoAlgorithmOption AES256_SHA256 | Out-Null
-  } catch {
-    # Fallback for older hosts
-    Export-PfxCertificate -Cert $Cert.PSPath -FilePath $pfxPath -Password $pw | Out-Null
-  }
-
-  [PSCustomObject]@{ Path = $pfxPath; Password = $pw }
-}
-
-function Try-ExportPem {
-  param([string]$PfxPath,[System.Security.SecureString]$PfxPassword)
-  $bstr = $null
-  try {
-    $bstr  = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($PfxPassword)
-    $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
-
-    $openssl = Get-Command openssl -ErrorAction SilentlyContinue
-    if ($openssl) {
-      $pemKey  = [IO.Path]::ChangeExtension($PfxPath, '.key.pem')
-      $pemCert = [IO.Path]::ChangeExtension($PfxPath, '.crt.pem')
-      & $openssl pkcs12 -in "$PfxPath" -passin "pass:$plain" -nocerts -nodes -out "$pemKey"  | Out-Null
-      & $openssl pkcs12 -in "$PfxPath" -passin "pass:$plain" -nokeys  -out "$pemCert"        | Out-Null
-      return @("$pemKey","$pemCert")
-    }
-    $outDir = Join-Path (Split-Path $pfxPath) "pem-split"
-    $null   = New-Item -ItemType Directory -Path $outDir -Force -ErrorAction SilentlyContinue
-    & certutil -p "$plain" -f -split -privatekey "$pfxPath" "$outDir\out" | Out-Null
-    return @($outDir)
-  } catch {
-    Write-Warning ("PEM export failed: {0}" -f $_)
-    @()
-  } finally {
-    if ($bstr) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
-  }
-}
-
-# =========== Load metadata & deduce CN/store ===========
-$meta = Read-Metadata -Path $MetaPath
-$contextIsMachine = $false
-if ($meta) { $contextIsMachine = [bool]$meta.IsMachine }
-
-# Compute CN from the issued .cer first; if not found, fallback to metadata CN
-$CN = Get-CNFromCertFile -CerPath $IssuedCerPath
-if (-not $CN -and $meta -and $meta.CN) { $CN = $meta.CN }
-if (-not $CN) { throw "Unable to determine CN from the issued certificate or metadata. Ensure the .cer has a CN or SAN DNS entry." }
-
-Write-Host ("Detected CN: {0}" -f $CN)
-
-# Precompute context hint (avoid inline if inside expressions)
-$contextHint = 'CurrentUser\My (or auto)'
-if ($contextIsMachine) { $contextHint = 'LocalMachine\My (from metadata)' }
-Write-Host ("Context hint: {0}" -f $contextHint)
-
-# =========== Accept & pair ===========
-$pairedCert = $null
-$acceptedThumb = ''
-
-# Load issued cert thumbprint for cleanup if needed
-try {
-  $tmpCert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 -ArgumentList $IssuedCerPath
-  $acceptedThumb = $tmpCert.Thumbprint
-} catch { }
-
-if ($meta) {
-  # Use metadata store directly
-  Accept-IssuedCert -CerPath $IssuedCerPath -IsMachine $contextIsMachine
-  Start-Sleep -Seconds 1
-  $pairedCert = Find-CertWithKeyByCNOrSAN -CN $CN -IsMachine $contextIsMachine
-} else {
-  # Auto-mode: try CurrentUser first, then LocalMachine
-  Accept-IssuedCert -CerPath $IssuedCerPath -IsMachine:$false
-  Start-Sleep -Seconds 1
-  $pairedCert = Find-CertWithKeyByCNOrSAN -CN $CN -IsMachine:$false
-
-  if (-not $pairedCert) {
-    # Remove unpaired copy from user store (to avoid duplicates) and retry as LocalMachine
-    if ($acceptedThumb) { Remove-CertByThumbprint -Thumb $acceptedThumb -IsMachine:$false | Out-Null }
-    Accept-IssuedCert -CerPath $IssuedCerPath -IsMachine:$true
-    Start-Sleep -Seconds 1
-    $pairedCert = Find-CertWithKeyByCNOrSAN -CN $CN -IsMachine:$true
-    $contextIsMachine = $true
-  }
-}
-
-if (-not $pairedCert) {
-  $storePath = Get-ExpectedStore -IsMachine $contextIsMachine
-  $acceptSwitch = ''
-  if (-not $contextIsMachine) { $acceptSwitch = '-user ' }
-  $cmd = ("certreq {0}-accept ""{1}""" -f $acceptSwitch, $IssuedCerPath)
-
-  $msg = @"
-Issued cert is not paired with a private key in $storePath.
-- Ensure you are on the SAME machine & Windows profile that generated the CSR.
-- Accept using the same context. Example:
-  $cmd
-- If you imported via MMC/double-click, delete that copy and run certreq -accept again.
-"@
-  throw $msg
-}
-
-# Optional sanity-check vs metadata key container
-if ($meta -and $meta.KeyContainer) {
-  try {
-    $cspInfo = $pairedCert.PrivateKey.CspKeyContainerInfo
-    if ($cspInfo -and $cspInfo.KeyContainerName -and ($cspInfo.KeyContainerName -ne $meta.KeyContainer)) {
-      Write-Warning ("Paired cert's key container differs. Cert='{0}' Metadata='{1}'" -f $cspInfo.KeyContainerName, $meta.KeyContainer)
-    }
-  } catch { }
-}
-
-# =========== Export PFX ===========
-$export = Export-Pfx -Cert $pairedCert -CN $CN -WithChain:([bool]$IncludeChain)
-Write-Host ("PFX exported: {0}" -f $export.Path)
-
-# (Optional) PEM
-if ($ExportPem) {
-  $pem = Try-ExportPem -PfxPath $export.Path -PfxPassword $export.Password
-  if ($pem.Count -gt 0) {
-    Write-Host "PEM export completed:"
-    $pem | ForEach-Object { Write-Host ("   {0}" -f $_) }
-  }
-}
-
-# =========== Summary ===========
-Write-Host ""
-Write-Host "Summary"
-Write-Host "-------"
-Write-Host ("Store:           {0}" -f (Get-ExpectedStore -IsMachine $contextIsMachine))
-Write-Host ("Subject:         {0}" -f $pairedCert.Subject)
-Write-Host ("Thumbprint:      {0}" -f $pairedCert.Thumbprint)
-Write-Host ("NotBefore/After: {0} – {1}" -f $pairedCert.NotBefore, $pairedCert.NotAfter)
-Write-Host ("HasPrivateKey:   {0}" -f $pairedCert.HasPrivateKey)
-Write-Host ("PFX:             {0}" -f $export.Path)
-if ($IncludeChain) { Write-Host "Chain:           Included (BuildChain)" }
-if ($ExportPem)    { Write-Host "PEM:             Export attempted (see above)" }
+ 
+		
+ 
+		String owner = "ownername";
+		String safeName = "PPA_" + owner;
+ 
+		logger.debug("Safe: " + safeName);
+ 
+		logger.debug(" ENTER buildCreateSafePlan ");
+ 
+		ProvisioningPlan p = new ProvisioningPlan();
+ 
+		ProvisioningPlan.ObjectRequest req = new ProvisioningPlan.ObjectRequest();
+		req.setApplication(cyberArkappName);
+		p.setTargetIntegration(targetName);
+		req.setTargetIntegration(cyberArkappName);
+		req.setNativeIdentity(safeName);
+		req.setOp(ProvisioningPlan.ObjectOperation.Create);
+		req.setType("Container");
+ 
+		req.add(new AttributeRequest("name", ProvisioningPlan.Operation.Set, safeName));
+		req.add(new AttributeRequest("displayName", ProvisioningPlan.Operation.Set, safeName));
+ 
+		req.add(new AttributeRequest("description", ProvisioningPlan.Operation.Set,
+				"Personal safe for " + owner + " admin account"));
+		req.add(new AttributeRequest("owner.value", ProvisioningPlan.Operation.Set, owner));
+		req.add(new AttributeRequest("NumberOfDaysRetention", ProvisioningPlan.Operation.Set, 14));
+		req.add(new AttributeRequest("resourceType", ProvisioningPlan.Operation.Set, "Container")); // CPC required
+		req.add(new AttributeRequest("ManagingCPM", ProvisioningPlan.Operation.Set,"CPM_VALUE")); // CPC
+ 
+		p.add(req);
+ 
+		logger.debug("buildCreateSafePlan: Done");
+		logger.debug("Create Safe Plan: " + p.toXml());
+ 
+		// return req;
+ 
+		try {
+			// Execute plan for provisioning
+			Attributes attrs = new Attributes();
+			attrs.put("noApplicationTemplates", true);
+			attrs.put("noCreateTemplates", true);
+ 
+			Provisioner pr = new Provisioner(context, attrs);
+			pr.setArgument(PlanCompiler.ARG_NO_FILTERING, true);
+ 
+			//pr.setOptimisticProvisioning(true);
+			ProvisioningProject pp = pr.compile(p);
+			//System.out.println("Plan: " + p.toXml());
+			pr.execute(pp);
+			//System.out.println("Project: " + pp.toXml());
+ 
+			if(pp.getPlans("CyberArk Privilege Cloud")!=null){
+				for(ProvisioningPlan np : pp.getPlans("CyberArk Privilege Cloud")){
+					//System.out.println("np: " + np.toXml());
+					if(np.getObjectRequests()!=null){
+						for(ObjectRequest objectRequest : np.getObjectRequests()){
+							if(objectRequest!= null && objectRequest.getResult()!=null)
+							{
+								result = objectRequest.getResult();
+								log.debug("createSafe  return : "+result);
+							}
+						}
+					}
+				}
+			}				
+			if(result != null){
+				status = result.getStatus();
+			}
+		} catch (Exception e) {			
+			logger.error("Exception thrown: " + e.toString());
+			return "Failed";
+		}
+		return status;
+	}
+	public String addAdminPrivilegeData(SailPointContext context, String identityName, String cyberArkappName,
+			String containerName, String targetName, String privilegedDataName, String password, String domainName) {
+			ProvisioningResult result = null;
+			String status= null;
+			String plaformId="";
+ 
+		try {
+			Map map = new HashMap();
+			String customObjectName = "CyberArk Default User and Group Mapping";
+			Custom customObject = context.getObjectByName(Custom.class, customObjectName);
+			if (customObject != null){
+				Map map = (Map)customObject.get("platformDetails");	
+				plaformId = (String)map.get(domainName);
+			}
+ 
+			String nativeIdentity = domainName+"-" + privilegedDataName;
+ 
+			ProvisioningPlan plan = new ProvisioningPlan();
+			// plan.setTargetIntegration(cyberArkappName);
+ 
+			ObjectRequest objReq = new ObjectRequest();
+ 
+			objReq.setApplication(cyberArkappName);
+			objReq.setNativeIdentity(nativeIdentity);
+			objReq.setOp(ProvisioningPlan.ObjectOperation.Create);
+			objReq.setType("PrivilegedData");
+ 
+			logger.debug("name: " + domainName + "-" + privilegedDataName);
+			objReq.add(new AttributeRequest("name", ProvisioningPlan.Operation.Set,
+					domainName+"-" + privilegedDataName));
+ 
+			
+			objReq.add(new AttributeRequest("type", ProvisioningPlan.Operation.Set, "password"));
+ 
+			logger.debug("containerName: " + containerName);
+			// objReq.add(new AttributeRequest("safe", ProvisioningPlan.Operation.Set,
+			// safeName));
+			objReq.add(new AttributeRequest("safe", ProvisioningPlan.Operation.Set, containerName));
+ 
+			
+			// setup Privileged Item properties, maybe to use custom mappings
+			List<Map> listProps = new ArrayList();
+			map = new HashMap();
+			map.put("key", "username");
+			map.put("value", privilegedDataName);
+			listProps.add(map);
+ 
+			map = new HashMap();
+			map.put("key", "platformId");
+			map.put("value", plaformId);
+			listProps.add(map);
+ 
+			map = new HashMap();
+			map.put("key", "address");
+			map.put("value", domainName);
+			listProps.add(map);
+ 
+			map = new HashMap();
+			map.put("key", "secret");
+			map.put("value", password);
+			listProps.add(map);
+ 
+			
+			objReq.add(new AttributeRequest("properties", ProvisioningPlan.Operation.Set, listProps));
+ 
+			plan.add(objReq);
+ 
+			// NO FILTERING otherwise type and description get filtered out
+			plan.put("noFiltering", Boolean.TRUE);
+ 
+			logger.debug("plan: " + plan.toXml());
+			logger.debug("End Add PrivilegedDat to Safe Rule");
+ 
+			String app = objReq.getApplicationName();
+ 
+			logger.debug("app : " + app);
+ 
+			// return plan;
+ 
+			// Execute plan for provisioning
+			Attributes attrs = new Attributes();
+			attrs.put("noApplicationTemplates", true);
+			attrs.put("noCreateTemplates", true);
+ 
+			Provisioner pr = new Provisioner(context, attrs);
+			pr.setArgument(PlanCompiler.ARG_NO_FILTERING, true);
+ 
+			//pr.setOptimisticProvisioning(true);
+			ProvisioningProject pp = pr.compile(plan);
+			//System.out.println("Plan: " + plan.toXml());
+			pr.execute(pp);
+			//System.out.println("Project: " + pp.toXml());
+ 
+			if(pp.getPlans(cyberArkappName)!=null){
+				for(ProvisioningPlan np : pp.getPlans(cyberArkappName)){
+					//System.out.println("np: " + np.toXml());
+					if(np.getObjectRequests()!=null){						
+						for(ObjectRequest objectRequest : np.getObjectRequests()){
+							if(objectRequest!= null && objectRequest.getResult()!=null)
+							{
+								result = objectRequest.getResult();
+								//System.out.println("result: " + result.toXml());
+								log.debug("addAdminPrivilegeData  return : "+result);
+							}
+						}
+					}
+				}
+			}
+				if(result != null){
+					status = result.getStatus();
+				}
+ 
+			
+ 
+		} catch (Exception e) {
+			logger.error("Exception thrown: " + e.toString());
+			return "Failed";
+		}
+		return status;
+	}		
