@@ -6,8 +6,8 @@ Flow:
   2. Use that credential with New-PASSession -ServiceUser (Identity Shared Services)
   3. Create APP_/AAM_ Safe (120-day retention)
   4. Add domain groups only:
-       - IAM_ACU_CA_Admins@alliantcreditunion.com
-       - CARK_* owner group (prompted)
+       - IAM_ACU_CA_Admins (sAMAccountName)
+       - CARK_* owner group (sAMAccountName, prompted)
      Each with an existence check before add/update
   5. Set description "Safe Managed By <CARK_group>"
 
@@ -27,9 +27,8 @@ param(
     [string]$ManagingCPM        = "HQVECYBARK101",
     [string]$Location           = "\",
 
-    # IMPORTANT: this must match the **Directory Name** configured in PVWA
-    # (Admin → Configuration → LDAP Integration → Directories, or Get-PASDirectory)
-    [string]$DirectoryName      = "alliantcreditunion.com",
+    # This must match the LDAP "Directory Name" in PVWA
+    [string]$DirLocation        = "HQVACUDC101.alliantcreditunion.com",
 
     # ===== CCP settings (for API Service User stored in Vault) =====
     [string]$CCPAddress         = "https://aam.alliantcreditunion.com",  # CCP base URL (no trailing slash)
@@ -193,102 +192,58 @@ function Get-CarkPerms {
     }
 }
 
-# --- Directory principal name variants ---
-function Get-NameVariants([string]$MemberName, [string]$DirectoryName) {
-    $list = [System.Collections.Generic.List[string]]::new()
-    $t = $MemberName.Trim()
-    if (-not $t) { return $list }
-
-    if ($t -like '*@*') {
-        $left = $t.Split('@')[0]; if ($left) { $list.Add($left) }
-        if (-not $list.Contains($t)) { $list.Add($t) }
-    }
-    else {
-        $list.Add($t)
-        $upn = "$t@$DirectoryName"
-        if (-not $list.Contains($upn)) { $list.Add($upn) }
-    }
-
-    if ($t.EndsWith('$')) {
-        $machUpn = "$t@$DirectoryName"
-        if (-not $list.Contains($machUpn)) { $list.Add($machUpn) }
-    }
-    return $list
-}
-
 # --- Safe member add/update helper with explicit existence check ---
 function Add-CAKSafeMember {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$SafeName,
-        [Parameter(Mandatory)][string]$MemberName,
+        [Parameter(Mandatory)][string]$MemberName,   # sAMAccountName or bare group name
         [Parameter(Mandatory)][ValidateSet('User','Group','Role')][string]$Type,
         [Parameter(Mandatory)][hashtable]$PermFlags,
-        [Parameter(Mandatory)][string]$SearchIn,
-        [switch]$DirectoryPrincipal
+        [Parameter(Mandatory)][string]$SearchIn      # Directory name, e.g. HQVACUDC101.alliantcreditunion.com
     )
 
-    $perm     = Select-PermParams $PermFlags
-    $variants = if ($DirectoryPrincipal) {
-                    Get-NameVariants $MemberName $SearchIn
-                } else {
-                    [System.Collections.Generic.List[string]]@($MemberName.Trim())
-                }
+    $perm = Select-PermParams $PermFlags
+    $n    = $MemberName.Trim()
+    if (-not $n) { throw "MemberName cannot be empty." }
 
-    foreach ($n in $variants) {
+    try {
+        # Explicit existence check
+        $existing = $null
         try {
-            # Explicit existence check
-            $existing = $null
-            try {
-                $existing = Get-PASSafeMember -SafeName $SafeName -MemberName $n -ErrorAction SilentlyContinue
-            } catch {}
+            $existing = Get-PASSafeMember -SafeName $SafeName -MemberName $n -ErrorAction SilentlyContinue
+        } catch {}
 
-            $params = @{ SafeName = $SafeName; MemberName = $n; SearchIn = $SearchIn }
-            $params += $perm
+        $params = @{ SafeName = $SafeName; MemberName = $n; SearchIn = $SearchIn }
+        $params += $perm
 
-            if ($existing) {
-                Write-Warn "Member '$n' already exists on '$SafeName'; updating permissions..."
-                Set-PASSafeMember @params -ErrorAction Stop | Out-Null
-                Write-Ok "Member updated: [$Type] '$n' on '$SafeName'."
-                return
-            }
-
-            # Not found → add
-            Add-PASSafeMember @params -ErrorAction Stop | Out-Null
-            Write-Ok "Member added: [$Type] '$n' on '$SafeName' (SearchIn='$SearchIn')."
+        if ($existing) {
+            Write-Warn "Member '$n' already exists on '$SafeName'; updating permissions..."
+            Set-PASSafeMember @params -ErrorAction Stop | Out-Null
+            Write-Ok "Member updated: [$Type] '$n' on '$SafeName'."
             return
         }
-        catch {
-            $msg = $_.Exception.Message
 
-            # Fallback on 409 / already exists from API if race condition
-            if ($msg -match 'already exists' -or $msg -match '409') {
-                $params = @{ SafeName = $SafeName; MemberName = $n; SearchIn = $SearchIn }
-                $params += $perm
-                Set-PASSafeMember @params -ErrorAction Stop | Out-Null
-                Write-Ok "Member updated (409 handled): [$Type] '$n' on '$SafeName'."
-                return
-            }
-
-            $retryableNotFound = (
-                $DirectoryPrincipal -and
-                ($msg -match '\[404\]' -or
-                 $msg -match 'Failed to find user' -or
-                 $msg -match 'was not found' -or
-                 $msg -match 'has not been defined' -or
-                 $msg -match 'in ldap mapping')
-            )
-            if ($retryableNotFound) {
-                Write-Warn "Directory principal '$n' not found; trying next variant..."
-                continue
-            }
-
-            Write-Err "Failed adding '$n' to '$SafeName': $msg"
-            throw
-        }
+        # Not found → add
+        Add-PASSafeMember @params -ErrorAction Stop | Out-Null
+        Write-Ok "Member added: [$Type] '$n' on '$SafeName' (SearchIn='$SearchIn')."
+        return
     }
+    catch {
+        $msg = $_.Exception.Message
 
-    throw "Exhausted principal variants for '$MemberName'."
+        # Fallback on 409 / already exists from API if race condition
+        if ($msg -match 'already exists' -or $msg -match '409') {
+            $params = @{ SafeName = $SafeName; MemberName = $n; SearchIn = $SearchIn }
+            $params += $perm
+            Set-PASSafeMember @params -ErrorAction Stop | Out-Null
+            Write-Ok "Member updated (409 handled): [$Type] '$n' on '$SafeName'."
+            return
+        }
+
+        Write-Err "Failed adding '$n' to '$SafeName': $msg"
+        throw
+    }
 }
 
 # --- CCP → PSCredential (API Service User) ---
@@ -409,18 +364,17 @@ try {
     # 6) Add standard domain group members (no Identity users)
     Write-Info "Adding standard Safe members (domain groups only)…"
 
-    # IAM admin AD group (on-prem directory)
+    # IAM admin AD group (sAMAccountName only)
     Add-CAKSafeMember `
         -SafeName   $safeName `
-        -MemberName 'IAM_ACU_CA_Admins@alliantcreditunion.com' `
+        -MemberName 'IAM_ACU_CA_Admins' `
         -Type       Group `
         -PermFlags  $permAll `
-        -SearchIn   $DirectoryName `
-        -DirectoryPrincipal
+        -SearchIn   $DirLocation
 
-    # 7) Prompt for CARK_* owner group
+    # 7) Prompt for CARK_* owner group (sAMAccountName only)
     $ownerGroup = Show-InputDialog -Title "Safe Owner (CARK_ Group)" `
-        -Prompt "Enter the AD group that will own the Safe (must start with CARK_):" `
+        -Prompt "Enter the AD group (sAMAccountName) that will own the Safe (must start with CARK_):" `
         -Default "CARK_" `
         -ValidationHint "Example: CARK_AppTeam_Prod" `
         -ValidateScript {
@@ -441,8 +395,7 @@ try {
             -MemberName $ownerGroup `
             -Type       Group `
             -PermFlags  $permCark `
-            -SearchIn   $DirectoryName `
-            -DirectoryPrincipal
+            -SearchIn   $DirLocation
 
         try {
             $desc = "Safe Managed By $ownerGroup"
