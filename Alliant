@@ -1,10 +1,366 @@
-✅ CCP returned service user: acurestapi_local@alliantcreditunion.admin
-🛠  Authenticating to Privilege Cloud via Identity (Service User)...
-✅ Authenticated to https://alliantcredit.privilegecloud.cyberark.cloud as service user: acurestapi_local@alliantcreditunion.admin
-🛠  Provisioning Safe: APP_MAFO2
-✅ Safe created: 'APP_MAFO2' (Retention: 120 days).
-🛠  Adding standard Safe members (domain groups only)…
-🛠  Adding member 'IAM_ACU_CA_Admins@alliantcreditunion.com' to 'APP_MAFO2' (no SearchIn, letting PVWA directory mapping resolve it)...
-❌ Failed adding 'IAM_ACU_CA_Admins@alliantcreditunion.com' to 'APP_MAFO2': There are some invalid parameters
-❌ There are some invalid parameters
-✅ Logged off.
+<#
+CCP → Identity Service User → Privilege Cloud → Safe + Domain Group Membership
+
+Flow:
+  1. Retrieve API Service User credential from CCP (UserName + Content)
+  2. Use that credential with New-PASSession -ServiceUser (Identity Shared Services)
+  3. Create APP_/AAM_ Safe (120-day retention)
+  4. Add domain groups only:
+       - IAM_ACU_CA_Admins@alliantcreditunion.com  (with SearchIn HQVACUDC101.alliantcreditunion.com)
+       - CARK_* owner group (with same SearchIn)
+     Each with an existence check before add/update
+  5. Set description "Safe Managed By <CARK_group>"
+
+Requires:
+  - psPAS module
+  - IdentityCommand module
+  - CCP endpoint configured & reachable
+#>
+
+[CmdletBinding(SupportsShouldProcess=$true)]
+param(
+    # ===== Identity / Privilege Cloud (Shared Services) =====
+    [string]$IdentityTenantURL  = "https://aak4521.my.idaptive.app",
+    [string]$PrivilegeCloudURL  = "https://alliantcredit.privilegecloud.cyberark.cloud",
+
+    # ===== CPM / Safe settings =====
+    [string]$ManagingCPM        = "HQVECYBARK101",
+    [string]$Location           = "\",
+
+    # LDAP Directory Name as configured in PVWA
+    [string]$DirLocation        = "HQVACUDC101.alliantcreditunion.com",
+
+    # ===== CCP settings (for API Service User stored in Vault) =====
+    [string]$CCPAddress         = "https://aam.alliantcreditunion.com",  # CCP base URL (no trailing slash)
+    [string]$CCPLocation        = "AIMWebService",
+    [string]$CCPAppID           = "ACURestAPI",
+    [string]$CCPSafe            = "ACU-VAULT-API",
+    [string]$CCPObject          = "Application-CyberArkVaultRestAPI-alliantcredit.cyberark.cloud",
+    [bool]  $CCPWindowsAuth     = $false                                # true if CCP uses integrated auth
+)
+
+# --- Modules & TLS ---
+Import-Module psPAS           -ErrorAction Stop
+Import-Module IdentityCommand -ErrorAction Stop
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+# --- Pretty log helpers ---
+function Write-Info($m){ Write-Host "🛠  $m" -ForegroundColor Cyan }
+function Write-Ok($m){   Write-Host "✅ $m" -ForegroundColor Green }
+function Write-Warn($m){ Write-Host "⚠️  $m" -ForegroundColor Yellow }
+function Write-Err($m){  Write-Host "❌ $m" -ForegroundColor Red }
+
+# --- GUI input helpers (fallback to Read-Host) ---
+Add-Type -AssemblyName System.Windows.Forms | Out-Null
+Add-Type -AssemblyName System.Drawing       | Out-Null
+
+function Show-InputDialog {
+    param(
+        [Parameter(Mandatory)][string]$Title,
+        [Parameter(Mandatory)][string]$Prompt,
+        [Parameter()][string]$Default = '',
+        [Parameter()][scriptblock]$ValidateScript = {$true},
+        [Parameter()][string]$ValidationHint = ''
+    )
+    try {
+        $form                 = New-Object System.Windows.Forms.Form
+        $form.Text            = $Title
+        $form.StartPosition   = 'CenterScreen'
+        $form.TopMost         = $true
+        $form.Size            = New-Object System.Drawing.Size(480,190)
+        $form.FormBorderStyle = 'FixedDialog'
+        $form.MaximizeBox     = $false
+
+        $lbl                  = New-Object System.Windows.Forms.Label
+        $lbl.Text             = $Prompt
+        $lbl.AutoSize         = $true
+        $lbl.Location         = '12,15'
+        $lbl.Font             = New-Object System.Drawing.Font('Segoe UI',10)
+        $form.Controls.Add($lbl)
+
+        $tb                   = New-Object System.Windows.Forms.TextBox
+        $tb.Location          = '16,48'
+        $tb.Width             = 430
+        $tb.Text              = $Default
+        $tb.Font              = New-Object System.Drawing.Font('Consolas',11)
+        $form.Controls.Add($tb)
+
+        $hint                 = New-Object System.Windows.Forms.Label
+        $hint.AutoSize        = $true
+        $hint.ForeColor       = [System.Drawing.Color]::DarkGray
+        $hint.Text            = $ValidationHint
+        $hint.Location        = '16,80'
+        $form.Controls.Add($hint)
+
+        $ok                   = New-Object System.Windows.Forms.Button
+        $ok.Text              = 'Continue'
+        $ok.Location          = '272,110'
+        $ok.Width             = 80
+        $ok.DialogResult      = [System.Windows.Forms.DialogResult]::OK
+        $form.AcceptButton    = $ok
+        $form.Controls.Add($ok)
+
+        $cancel               = New-Object System.Windows.Forms.Button
+        $cancel.Text          = 'Cancel'
+        $cancel.Location      = '366,110'
+        $cancel.Width         = 80
+        $cancel.DialogResult  = [System.Windows.Forms.DialogResult]::Cancel
+        $form.CancelButton    = $cancel
+        $form.Controls.Add($cancel)
+
+        $tb.add_TextChanged({
+            try {
+                if (& $ValidateScript $tb.Text) { $tb.BackColor = [System.Drawing.Color]::White }
+                else                            { $tb.BackColor = [System.Drawing.Color]::MistyRose }
+            } catch {
+                $tb.BackColor = [System.Drawing.Color]::MistyRose
+            }
+        })
+
+        $dialog = $form.ShowDialog()
+        if ($dialog -ne [System.Windows.Forms.DialogResult]::OK) { return $null }
+
+        $val = $tb.Text.Trim()
+        if (-not (& $ValidateScript $val)) {
+            [System.Windows.Forms.MessageBox]::Show(
+                "Value is invalid. Please try again.",
+                "Validation",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Warning
+            ) | Out-Null
+            return Show-InputDialog @PSBoundParameters
+        }
+        return $val
+    } catch {
+        $val = Read-Host "$Title - $Prompt"
+        if (-not (& $ValidateScript $val)) { throw "Input failed validation." }
+        return $val
+    }
+}
+
+# --- CCP → PSCredential (API Service User) ---
+function Get-ServiceUserCredentialFromCCP {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$CCPAddress,
+        [Parameter(Mandatory)][string]$Location,
+        [Parameter(Mandatory)][string]$AppID,
+        [Parameter(Mandatory)][string]$Safe,
+        [Parameter(Mandatory)][string]$Object,
+        [bool]$WindowsAuth = $false
+    )
+
+    $base = $CCPAddress.TrimEnd('/')
+    $loc  = $Location.Trim('/')
+
+    $url  = "{0}/{1}/api/Accounts?AppID={2}&Safe={3}&Object={4}" -f $base, $loc, $AppID, $Safe, $Object
+
+    Write-Info "Retrieving **Service User** credential from CCP:"
+    Write-Info "  $url"
+
+    $headers = @{ "Content-Type" = "application/json" }
+
+    $resp = Invoke-RestMethod -Uri $url -Method GET -Headers $headers -UseDefaultCredentials:$WindowsAuth -ErrorAction Stop
+
+    if (-not $resp.UserName -or -not $resp.Content) {
+        throw "CCP response missing UserName/Content. Raw: $($resp | ConvertTo-Json -Depth 5)"
+    }
+
+    Write-Ok "CCP returned service user: $($resp.UserName)"
+
+    $sec = ConvertTo-SecureString $resp.Content -AsPlainText -Force
+    return [PSCredential]::new($resp.UserName, $sec)
+}
+
+# --- MAIN ---
+$sessionCreated = $false
+
+try {
+    # 1) Get Shared Services API Service User creds from CCP
+    $serviceCred = Get-ServiceUserCredentialFromCCP `
+        -CCPAddress $CCPAddress `
+        -Location   $CCPLocation `
+        -AppID      $CCPAppID `
+        -Safe       $CCPSafe `
+        -Object     $CCPObject `
+        -WindowsAuth:$CCPWindowsAuth
+
+    # 2) Authenticate via Identity Shared Services using SERVICE USER
+    Write-Info "Authenticating to Privilege Cloud via Identity (Service User)..."
+
+    New-PASSession `
+        -IdentityTenantURL $IdentityTenantURL `
+        -PrivilegeCloudURL $PrivilegeCloudURL `
+        -Credential        $serviceCred `
+        -ServiceUser `
+        -ErrorAction Stop | Out-Null
+
+    $session = Get-PASSession
+    if (-not $session) { throw "psPAS session not established via ServiceUser." }
+
+    $sessionCreated = $true
+    Write-Ok "Authenticated to $PrivilegeCloudURL as service user: $($serviceCred.UserName)"
+
+    # 3) Prompt for Safe name (APP_/AAM_)
+    $safeName = Show-InputDialog -Title "New Safe" `
+        -Prompt "Enter the Safe name (must start with APP_ or AAM_):" `
+        -Default "APP_" `
+        -ValidationHint "Examples: APP_MyApp_Prod, AAM_MySvc_NonProd" `
+        -ValidateScript {
+            param($x)
+            $t = $x.Trim()
+            if ([string]::IsNullOrWhiteSpace($t)) { return $false }
+            return ($t.StartsWith('APP_') -or $t.StartsWith('AAM_'))
+        }
+
+    if (-not $safeName) {
+        Write-Warn "Safe name entry cancelled."
+        return
+    }
+
+    Write-Info "Provisioning Safe: $safeName"
+
+    # 4) Create/ensure safe with 120-day retention
+    $exists = $null
+    try {
+        $exists = Get-PASSafe -SafeName $safeName -ErrorAction SilentlyContinue
+    } catch {}
+
+    if (-not $exists) {
+        $splat = @{
+            SafeName              = $safeName
+            Description           = ""          # will set after owner is known
+            ManagingCPM           = $ManagingCPM
+            NumberOfDaysRetention = 120
+            location              = $Location
+        }
+        if ($PSCmdlet.ShouldProcess($safeName, "Add-PASSafe")) {
+            Add-PASSafe @splat -ErrorAction Stop | Out-Null
+            Write-Ok "Safe created: '$safeName' (Retention: 120 days)."
+        }
+    }
+    else {
+        Write-Warn "Safe '$safeName' already exists; enforcing retention=120."
+        try {
+            Set-PASSafe -SafeName $safeName -NumberOfDaysRetention 120 -ErrorAction Stop | Out-Null
+            Write-Ok "Retention updated on existing Safe."
+        } catch {
+            Write-Warn "Could not update existing Safe retention: $($_.Exception.Message)"
+        }
+    }
+
+    # 5) Add IAM_ACU_CA_Admins with a **minimal** rights set
+    Write-Info "Adding IAM_ACU_CA_Admins@alliantcreditunion.com to '$safeName'..."
+
+    # Check if it already exists
+    $existingIAM = $null
+    try {
+        $existingIAM = Get-PASSafeMember -SafeName $safeName -MemberName 'IAM_ACU_CA_Admins@alliantcreditunion.com' -ErrorAction SilentlyContinue
+    } catch {}
+
+    $iamParams = @{
+        SafeName       = $safeName
+        MemberName     = 'IAM_ACU_CA_Admins@alliantcreditunion.com'
+        SearchIn       = $DirLocation
+        UseAccounts    = $true
+        RetrieveAccounts = $true
+        ListAccounts   = $true
+        ViewAuditLog   = $true
+        ViewSafeMembers= $true
+    }
+
+    try {
+        if ($existingIAM) {
+            Write-Warn "IAM_ACU_CA_Admins already exists on '$safeName'; updating minimal rights..."
+            Set-PASSafeMember @iamParams -ErrorAction Stop | Out-Null
+            Write-Ok "Updated IAM_ACU_CA_Admins permissions on '$safeName'."
+        }
+        else {
+            Add-PASSafeMember @iamParams -ErrorAction Stop | Out-Null
+            Write-Ok "Added IAM_ACU_CA_Admins to '$safeName'."
+        }
+    }
+    catch {
+        Write-Err "Failed to add/update IAM_ACU_CA_Admins on '$safeName': $($_.Exception.Message)"
+        throw
+    }
+
+    # 6) Prompt for CARK_* owner group (you enter sAM or UPN; script uses as-is)
+    $ownerGroup = Show-InputDialog -Title "Safe Owner (CARK_ Group)" `
+        -Prompt "Enter the AD group that will own the Safe (sAM or UPN, must start with CARK_):" `
+        -Default "CARK_" `
+        -ValidationHint "Examples: CARK_AppTeam_Prod or CARK_AppTeam_Prod@alliantcreditunion.com" `
+        -ValidateScript {
+            param($x)
+            $t = $x.Trim()
+            if ([string]::IsNullOrWhiteSpace($t)) { return $false }
+            return $t.StartsWith('CARK_')
+        }
+
+    if (-not $ownerGroup) {
+        Write-Warn "Owner group entry cancelled; skipping owner assignment and description."
+    }
+    else {
+        Write-Info "Adding owner group '$ownerGroup' with limited CARK permissions…"
+
+        # Check if owner already on safe
+        $existingOwner = $null
+        try {
+            $existingOwner = Get-PASSafeMember -SafeName $safeName -MemberName $ownerGroup -ErrorAction SilentlyContinue
+        } catch {}
+
+        $carkParams = @{
+            SafeName       = $safeName
+            MemberName     = $ownerGroup
+            SearchIn       = $DirLocation
+            UseAccounts    = $true
+            RetrieveAccounts = $true
+            ListAccounts   = $true
+            UpdateAccountContent                   = $true
+            InitiateCPMAccountManagementOperations = $true
+            ViewSafeMembers                        = $true
+            ViewAuditLog                           = $true
+            AccessWithoutConfirmation              = $true
+        }
+
+        try {
+            if ($existingOwner) {
+                Write-Warn "Owner group '$ownerGroup' already exists; updating permissions..."
+                Set-PASSafeMember @carkParams -ErrorAction Stop | Out-Null
+                Write-Ok "Updated owner group '$ownerGroup' on '$safeName'."
+            }
+            else {
+                Add-PASSafeMember @carkParams -ErrorAction Stop | Out-Null
+                Write-Ok "Added owner group '$ownerGroup' to '$safeName'."
+            }
+        }
+        catch {
+            Write-Err "Failed to add/update owner group '$ownerGroup' on '$safeName': $($_.Exception.Message)"
+            throw
+        }
+
+        # 7) Set description
+        try {
+            $desc = "Safe Managed By $ownerGroup"
+            Set-PASSafe -SafeName $safeName -Description $desc -ErrorAction Stop | Out-Null
+            Write-Ok "Description set: '$desc'"
+        } catch {
+            Write-Warn "Could not set description: $($_.Exception.Message)"
+        }
+    }
+
+    Write-Ok "Provisioning complete for '$safeName'."
+}
+catch {
+    Write-Err $_
+}
+finally {
+    if ($sessionCreated) {
+        try {
+            Close-PASSession | Out-Null
+            Write-Ok "Logged off."
+        } catch {
+            Write-Warn "Logoff warning: $($_.Exception.Message)"
+        }
+    }
+}
