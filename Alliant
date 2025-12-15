@@ -1,6 +1,356 @@
-show-command : A command named '-IdentityTenantURL' was not found.
-At line:1 char:1
-+ show-command '-IdentityTenantURL'
-+ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    + CategoryInfo          : InvalidOperation: (-IdentityTenantURL:String) [Show-Command], InvalidOperationException
-    + FullyQualifiedErrorId : NoCommand,Microsoft.PowerShell.Commands.ShowCommandCommand
+$responseViaObject = $responseViaAddressAndUsername =  $null
+$CCPAddress = "https://aam.fffdn.com"
+$location = "XXXX"
+$application = "XXXX"
+$safe = "XXXX"
+$object = "XXXX"
+$address = "XXXX"
+$username = "XXXX"
+
+$windowsAuth=$false
+
+$headers = New-Object "System.Collections.Generic.Dictionary[[String],[String]]"
+$headers.Add("Content-Type", "application/json")
+
+if (![string]::IsNullOrEmpty($object)) {
+    Write-Host "Connecting to url: `"$CCPAddress/$location/api/Accounts?AppID=$application&Safe=$safe&Object=$object`""
+    $responseViaObject = Invoke-RestMethod "$CCPAddress/$location/api/Accounts?AppID=$application&Safe=$safe&Object=$object" -Method 'GET' -Headers $headers -UseDefaultCredentials:$windowsAuth
+
+    Write-Host "Pulled using Object Name"
+    write-host "Username: " $($responseViaObject.Username)
+    Write-Host "Password: " $($responseViaObject.content)
+    ""
+    $responseViaObject | ConvertTo-Json
+}
+
+if (![string]::IsNullOrEmpty($address) -and ![string]::IsNullOrEmpty($username)) {
+    Write-Host  "Connecting to url: `"$CCPAddress/$location/api/Accounts?AppID=$application&Safe=$safe&address=$address&username=$username`""
+    $responseViaAddressAndUsername = Invoke-RestMethod "$CCPAddress/$location/api/Accounts?AppID=$application&Safe=$safe&address=$address&username=$username" -Method 'GET' -Headers $headers -UseDefaultCredentials:$windowsAuth
+
+    Write-Host "Pulled using Address and Username"
+    write-host "Username: " $($responseViaAddressAndUsername.Username)
+    Write-Host "Password: " $($responseViaAddressAndUsername.content)
+    ""
+    $responseViaAddressAndUsername | ConvertTo-Json
+}
+
+
+
+<#
+New-AppOrAamSafe.ps1
+Creates a Safe (name must start with APP_ or AAM_), sets 120-day retention,
+adds standard members with full permissions, then prompts for a CARK_* owner group
+and sets the Safe description to "Safe Managed By <CARK_group>".
+
+Requires: psPAS module and PVWA API connectivity.
+#>
+
+[CmdletBinding(SupportsShouldProcess=$true)]
+param(
+  [string]$BaseURI    = "https://alliantcredit.privilegecloud.cyberark.com",
+  [ValidateSet('CyberArk','LDAP','RADIUS','Windows','SAML','Shared')]
+  [string]$AuthType   = 'CyberArk',
+  [string]$ManagingCPM= 'HQVECYBARK101',
+  [string]$Location   = "\",
+  # Directory integration SearchIn value (exact, as configured in PVWA)
+  [string]$DirLocation= 'HQVACUDC101.alliantcreditunion.com'
+)
+
+# --- Module & TLS ---
+Import-Module psPAS -ErrorAction Stop
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+# --- Pretty log helpers ---
+function Write-Info($m){ Write-Host "🛠  $m" -ForegroundColor Cyan }
+function Write-Ok($m){   Write-Host "✅ $m" -ForegroundColor Green }
+function Write-Warn($m){ Write-Host "⚠️  $m" -ForegroundColor Yellow }
+function Write-Err($m){  Write-Host "❌ $m" -ForegroundColor Red }
+
+# --- GUI input helpers (fallback to Read-Host) ---
+Add-Type -AssemblyName System.Windows.Forms | Out-Null
+Add-Type -AssemblyName System.Drawing | Out-Null
+
+function Show-InputDialog {
+  param(
+    [Parameter(Mandatory)][string]$Title,
+    [Parameter(Mandatory)][string]$Prompt,
+    [Parameter()][string]$Default = '',
+    [Parameter()][scriptblock]$ValidateScript = {$true},
+    [Parameter()][string]$ValidationHint = ''
+  )
+  try {
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = $Title
+    $form.StartPosition = 'CenterScreen'
+    $form.TopMost = $true
+    $form.Size = New-Object System.Drawing.Size(480,190)
+    $form.FormBorderStyle = 'FixedDialog'
+    $form.MaximizeBox = $false
+
+    $lbl = New-Object System.Windows.Forms.Label
+    $lbl.Text = $Prompt
+    $lbl.AutoSize = $true
+    $lbl.Location = '12,15'
+    $lbl.Font = New-Object System.Drawing.Font('Segoe UI',10)
+    $form.Controls.Add($lbl)
+
+    $tb = New-Object System.Windows.Forms.TextBox
+    $tb.Location = '16,48'
+    $tb.Width = 430
+    $tb.Text = $Default
+    $tb.Font = New-Object System.Drawing.Font('Consolas',11)
+    $form.Controls.Add($tb)
+
+    $hint = New-Object System.Windows.Forms.Label
+    $hint.AutoSize = $true
+    $hint.ForeColor = [System.Drawing.Color]::DarkGray
+    $hint.Text = $ValidationHint
+    $hint.Location = '16,80'
+    $form.Controls.Add($hint)
+
+    $ok = New-Object System.Windows.Forms.Button
+    $ok.Text = 'Continue'
+    $ok.Location = '272,110'
+    $ok.Width = 80
+    $ok.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $form.AcceptButton = $ok
+    $form.Controls.Add($ok)
+
+    $cancel = New-Object System.Windows.Forms.Button
+    $cancel.Text = 'Cancel'
+    $cancel.Location = '366,110'
+    $cancel.Width = 80
+    $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $form.CancelButton = $cancel
+    $form.Controls.Add($cancel)
+
+    # live validation color feedback
+    $tb.add_TextChanged({
+      try {
+        if (& $ValidateScript $tb.Text) { $tb.BackColor = [System.Drawing.Color]::White }
+        else { $tb.BackColor = [System.Drawing.Color]::MistyRose }
+      } catch { $tb.BackColor = [System.Drawing.Color]::MistyRose }
+    })
+
+    $dialog = $form.ShowDialog()
+    if ($dialog -ne [System.Windows.Forms.DialogResult]::OK) { return $null }
+
+    $val = $tb.Text.Trim()
+    if (-not (& $ValidateScript $val)) {
+      [System.Windows.Forms.MessageBox]::Show("Value is invalid. Please try again.","Validation",
+        [System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
+      return Show-InputDialog @PSBoundParameters
+    }
+    return $val
+  } catch {
+    # Fallback
+    $val = Read-Host "$Title - $Prompt"
+    if (-not (& $ValidateScript $val)) { throw "Input failed validation." }
+    return $val
+  }
+}
+
+# --- Permissions (psPAS-supported flags only) ---
+$AllowedPermKeys = @(
+  'UseAccounts','RetrieveAccounts','ListAccounts','AddAccounts',
+  'UpdateAccountContent','UpdateAccountProperties',
+  'InitiateCPMAccountManagementOperations','SpecifyNextAccountContent',
+  'ViewAuditLog','ViewSafeMembers','AccessWithoutConfirmation',
+  'ManageSafe','ManageSafeMembers'
+)
+
+function Select-PermParams([hashtable]$h) {
+  $out = @{}; foreach ($k in $AllowedPermKeys) { if ($h.ContainsKey($k)) { $out[$k] = [bool]$h[$k] } }; $out
+}
+
+function Get-FullPerms {
+  @{
+    UseAccounts                            = $true
+    RetrieveAccounts                       = $true
+    ListAccounts                           = $true
+    AddAccounts                            = $true
+    UpdateAccountContent                   = $true
+    UpdateAccountProperties                = $true
+    InitiateCPMAccountManagementOperations = $true
+    SpecifyNextAccountContent              = $true
+    ViewAuditLog                           = $true
+    ViewSafeMembers                        = $true
+    AccessWithoutConfirmation              = $true
+    ManageSafe                             = $true
+    ManageSafeMembers                      = $true
+  }
+}
+
+# Limited perms for CARK_* owner
+function Get-CarkPerms {
+  @{
+    ListAccounts                           = $true
+    UseAccounts                            = $true
+    RetrieveAccounts                       = $true
+    UpdateAccountContent                   = $true
+    InitiateCPMAccountManagementOperations = $true
+    ViewSafeMembers                        = $true
+    ViewAuditLog                           = $true
+    AccessWithoutConfirmation              = $true
+
+    # Not granted:
+    AddAccounts               = $false
+    UpdateAccountProperties   = $false
+    SpecifyNextAccountContent = $false
+    ManageSafe                = $false
+    ManageSafeMembers         = $false
+  }
+}
+
+# Build name variants for directory lookups (sAM first, then UPN)
+function Get-NameVariants([string]$MemberName, [string]$DirLocation) {
+  $list = [System.Collections.Generic.List[string]]::new()
+  $t = $MemberName.Trim(); if (-not $t) { return $list }
+  if ($t -like '*@*') {
+    $left = $t.Split('@')[0]; if ($left) { $list.Add($left) }
+    if (-not $list.Contains($t)) { $list.Add($t) }
+  } else {
+    $list.Add($t)
+    $upn = "$t@$DirLocation"; if (-not $list.Contains($upn)) { $list.Add($upn) }
+  }
+  if ($t.EndsWith('$')) {
+    $machUpn = "$t@$DirLocation"; if (-not $list.Contains($machUpn)) { $list.Add($machUpn) }
+  }
+  return $list
+}
+
+# Add/Update Safe member with SearchIn and DirectoryPrincipal support
+function Add-CAKSafeMember {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)][string]$SafeName,
+    [Parameter(Mandatory)][string]$MemberName,
+    [Parameter(Mandatory)][ValidateSet('User','Group','Role')][string]$Type,  # for logging only
+    [Parameter(Mandatory)][hashtable]$PermFlags,
+    [Parameter(Mandatory)][string]$SearchIn,
+    [switch]$DirectoryPrincipal
+  )
+  $perm = Select-PermParams $PermFlags
+  $variants = if ($DirectoryPrincipal) { Get-NameVariants $MemberName $SearchIn } else { [System.Collections.Generic.List[string]]@($MemberName.Trim()) }
+  foreach ($n in $variants) {
+    try {
+      $params = @{ SafeName=$SafeName; MemberName=$n; SearchIn=$SearchIn }
+      $params += $perm
+      Add-PASSafeMember @params -ErrorAction Stop | Out-Null
+      Write-Ok "Member added: [$Type] '$n' on '$SafeName' (SearchIn='$SearchIn')."
+      return
+    } catch {
+      $msg = $_.Exception.Message
+      if ($msg -match 'already exists' -or $msg -match '409') {
+        $params = @{ SafeName=$SafeName; MemberName=$n; SearchIn=$SearchIn }
+        $params += $perm
+        Set-PASSafeMember @params -ErrorAction Stop | Out-Null
+        Write-Ok "Member updated: [$Type] '$n' on '$SafeName'."
+        return
+      }
+      $retryableNotFound = ($DirectoryPrincipal -and ($msg -match '\[404\]' -or $msg -match 'Failed to find user' -or $msg -match 'was not found' -or $msg -match 'has not been defined' -or $msg -match 'in ldap mapping'))
+      if ($retryableNotFound) {
+        Write-Warn "Directory principal '$n' not found; trying next variant..."
+        continue
+      }
+      Write-Err "Failed adding '$n' to '$SafeName': $msg"
+      throw
+    }
+  }
+  throw "Exhausted principal variants for '$MemberName'."
+}
+
+# --- Authentication ---
+$cred = Get-Credential -Message "Enter your CyberArk ($AuthType) credential"
+try {
+  New-PASSession -Credential $cred -BaseURI $BaseURI -Type $AuthType | Out-Null
+  Write-Ok "Authenticated to $BaseURI."
+} catch {
+  Write-Err "Authentication failed: $($_.Exception.Message)"; return
+}
+
+try {
+  # --- Prompt for Safe name (APP_/AAM_) ---
+  $safeName = Show-InputDialog -Title "New Safe" `
+    -Prompt "Enter the Safe name (must start with APP_ or AAM_):" `
+    -Default "APP_" `
+    -ValidationHint "Examples: APP_MyApp_Prod, AAM_MySvc_NonProd" `
+    -ValidateScript {
+      param($x)
+      $t = $x.Trim()
+      if ([string]::IsNullOrWhiteSpace($t)) { return $false }
+      return ($t.StartsWith('APP_') -or $t.StartsWith('AAM_'))
+    }
+
+  if (-not $safeName) { Write-Warn "Cancelled by user."; return }
+  Write-Info "Provisioning Safe: $safeName"
+
+  # --- Create/ensure safe with 120-day retention (no description yet; we will set it after owner is known) ---
+  $exists = $null; try { $exists = Get-PASSafe -SafeName $safeName -ErrorAction SilentlyContinue } catch {}
+  if (-not $exists) {
+    $splat = @{
+      SafeName              = $safeName
+      Description           = ""                # will set after owner selected
+      ManagingCPM           = $ManagingCPM
+      NumberOfDaysRetention = 120
+      location              = $Location
+    }
+    if ($PSCmdlet.ShouldProcess($safeName, "Add-PASSafe")) {
+      Add-PASSafe @splat -ErrorAction Stop | Out-Null
+      Write-Ok "Safe created: '$safeName' (Retention: 120 days)."
+    }
+  } else {
+    Write-Warn "Safe '$safeName' already exists; enforcing retention."
+    try {
+      Set-PASSafe -SafeName $safeName -NumberOfDaysRetention 120 -ErrorAction Stop | Out-Null
+      Write-Ok "Ensured retention=120 on existing safe."
+    } catch { Write-Warn "Could not update existing Safe retention: $($_.Exception.Message)" }
+  }
+
+  # --- Permissions payloads ---
+  $permAll  = Get-FullPerms
+  $permCark = Get-CarkPerms
+
+  # --- Add standard members (full permissions) ---
+  Write-Info "Adding standard Safe members with full permissions…"
+  Add-CAKSafeMember -SafeName $safeName -MemberName 'ACURestAPI_Local'                     -Type User  -PermFlags $permAll  -SearchIn 'Vault'
+  Add-CAKSafeMember -SafeName $safeName -MemberName 'identity-privilege-integration-user$' -Type User  -PermFlags $permAll  -SearchIn 'Vault'
+  Add-CAKSafeMember -SafeName $safeName -MemberName 'IAM_ACU_CA_Admins@alliantcreditunion.com' -Type Group -PermFlags $permAll -SearchIn $DirLocation -DirectoryPrincipal
+
+  # --- Prompt for CARK_* owner group and add limited permissions ---
+  $ownerGroup = Show-InputDialog -Title "Safe Owner (CARK_ Group)" `
+    -Prompt "Enter the AD group that will own the Safe (must start with CARK_):" `
+    -Default "CARK_" `
+    -ValidationHint "Example: CARK_AppTeam_Prod" `
+    -ValidateScript {
+      param($x)
+      $t = $x.Trim()
+      if ([string]::IsNullOrWhiteSpace($t)) { return $false }
+      return $t.StartsWith('CARK_')
+    }
+
+  if (-not $ownerGroup) {
+    Write-Warn "Owner group prompt cancelled; skipping owner assignment and description update."
+  }
+  else {
+    Write-Info "Adding owner group '$ownerGroup' with limited CARK permissions…"
+    Add-CAKSafeMember -SafeName $safeName -MemberName $ownerGroup -Type Group -PermFlags $permCark -SearchIn $DirLocation -DirectoryPrincipal
+
+    # === Set description to EXACT text requested ===
+    try {
+      $desc = "Safe Managed By $ownerGroup"
+      Set-PASSafe -SafeName $safeName -Description $desc -ErrorAction Stop | Out-Null
+      Write-Ok "Description set: '$desc'"
+    } catch {
+      Write-Warn "Could not set description: $($_.Exception.Message)"
+    }
+  }
+
+  Write-Ok "Provisioning complete for '$safeName'."
+}
+catch {
+  Write-Err $_
+}
+finally {
+  try { Close-PASSession | Out-Null; Write-Ok "Logged off." } catch { Write-Warn "Logoff warning: $($_.Exception.Message)" }
+}
