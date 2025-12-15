@@ -6,14 +6,13 @@ Flow:
   2. Use that credential with New-PASSession -ServiceUser (Identity Shared Services)
   3. Create APP_/AAM_ Safe (120-day retention)
   4. Add domain groups only:
-       - IAM_ACU_CA_Admins@alliantcreditunion.com  (with SearchIn HQVACUDC101.alliantcreditunion.com)
-       - CARK_* owner group (with same SearchIn)
+       - IAM_ACU_CA_Admins (tries UPN then sAM)
+       - CARK_* owner group (you enter sAM or UPN)
      Each with an existence check before add/update
   5. Set description "Safe Managed By <CARK_group>"
 
 Requires:
   - psPAS module
-  - IdentityCommand module
   - CCP endpoint configured & reachable
 #>
 
@@ -27,9 +26,6 @@ param(
     [string]$ManagingCPM        = "HQVECYBARK101",
     [string]$Location           = "\",
 
-    # LDAP Directory Name as configured in PVWA
-    [string]$DirLocation        = "HQVACUDC101.alliantcreditunion.com",
-
     # ===== CCP settings (for API Service User stored in Vault) =====
     [string]$CCPAddress         = "https://aam.alliantcreditunion.com",  # CCP base URL (no trailing slash)
     [string]$CCPLocation        = "AIMWebService",
@@ -40,8 +36,7 @@ param(
 )
 
 # --- Modules & TLS ---
-Import-Module psPAS           -ErrorAction Stop
-Import-Module IdentityCommand -ErrorAction Stop
+Import-Module psPAS -ErrorAction Stop
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # --- Pretty log helpers ---
@@ -138,6 +133,44 @@ function Show-InputDialog {
     }
 }
 
+# --- Permissions helpers: valid psPAS flags only ---
+function Get-AdminPerms {
+    @{
+        UseAccounts                            = $true
+        RetrieveAccounts                       = $true
+        ListAccounts                           = $true
+        AddAccounts                            = $true
+        UpdateAccountContent                   = $true
+        UpdateAccountProperties                = $true
+        InitiateCPMAccountManagementOperations = $true
+        SpecifyNextAccountContent              = $true
+        ViewAuditLog                           = $true
+        ViewSafeMembers                        = $true
+        AccessWithoutConfirmation              = $true
+        ManageSafe                             = $true
+        ManageSafeMembers                      = $true
+    }
+}
+
+function Get-CarkPerms {
+    @{
+        UseAccounts                            = $true
+        RetrieveAccounts                       = $true
+        ListAccounts                           = $true
+        UpdateAccountContent                   = $true
+        InitiateCPMAccountManagementOperations = $true
+        ViewSafeMembers                        = $true
+        ViewAuditLog                           = $true
+        AccessWithoutConfirmation              = $true
+
+        AddAccounts               = $false
+        UpdateAccountProperties   = $false
+        SpecifyNextAccountContent = $false
+        ManageSafe                = $false
+        ManageSafeMembers         = $false
+    }
+}
+
 # --- CCP → PSCredential (API Service User) ---
 function Get-ServiceUserCredentialFromCCP {
     [CmdletBinding()]
@@ -170,6 +203,52 @@ function Get-ServiceUserCredentialFromCCP {
 
     $sec = ConvertTo-SecureString $resp.Content -AsPlainText -Force
     return [PSCredential]::new($resp.UserName, $sec)
+}
+
+# --- Safe member ensure helper (pattern like your working script) ---
+function Ensure-SafeMember {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$SafeName,
+        [Parameter(Mandatory)][string]$MemberName,   # sAM or UPN
+        [Parameter(Mandatory)][ValidateSet('User','Group','Role')][string]$MemberType,
+        [Parameter(Mandatory)][hashtable]$PermFlags
+    )
+
+    Write-Info "Processing member '$MemberName' on '$SafeName' (Type=$MemberType)..."
+
+    # 1) Check if member exists (same pattern: Get-PASSafeMember -Search ...)
+    $existing = $null
+    try {
+        $existing = Get-PASSafeMember -SafeName $SafeName -Search $MemberName -ErrorAction SilentlyContinue |
+                    Where-Object { $_.MemberName -eq $MemberName }
+    } catch {
+        # ignore; treat as not found
+    }
+
+    # Build splat (no SearchIn, same as working updater)
+    $permParams = @{}
+    foreach ($k in $PermFlags.Keys) {
+        $permParams[$k] = $PermFlags[$k]
+    }
+
+    $splat = @{
+        SafeName   = $SafeName
+        MemberName = $MemberName
+        MemberType = $MemberType
+    }
+    $splat += $permParams
+
+    if ($existing) {
+        Write-Info "Member exists; updating permissions via Set-PASSafeMember..."
+        Set-PASSafeMember @splat -ErrorAction Stop | Out-Null
+        Write-Ok  "Updated '$MemberName' on '$SafeName'."
+    }
+    else {
+        Write-Info "Member not found; adding via Add-PASSafeMember..."
+        Add-PASSafeMember @splat -ErrorAction Stop | Out-Null
+        Write-Ok  "Added '$MemberName' to '$SafeName'."
+    }
 }
 
 # --- MAIN ---
@@ -249,43 +328,41 @@ try {
         }
     }
 
-    # 5) Add IAM_ACU_CA_Admins with a **minimal** rights set
-    Write-Info "Adding IAM_ACU_CA_Admins@alliantcreditunion.com to '$safeName'..."
+    # 5) Permissions payloads
+    $permAdmin = Get-AdminPerms
+    $permCark  = Get-CarkPerms
 
-    # Check if it already exists
-    $existingIAM = $null
-    try {
-        $existingIAM = Get-PASSafeMember -SafeName $safeName -MemberName 'IAM_ACU_CA_Admins@alliantcreditunion.com' -ErrorAction SilentlyContinue
-    } catch {}
+    # 6) Add IAM_ACU_CA_Admins – try UPN first, then fallback to sAM if *invalid parameters* appears
+    $iamUpn = 'IAM_ACU_CA_Admins@alliantcreditunion.com'
+    $iamSam = 'IAM_ACU_CA_Admins'
 
-    $iamParams = @{
-        SafeName       = $safeName
-        MemberName     = 'IAM_ACU_CA_Admins@alliantcreditunion.com'
-        SearchIn       = $DirLocation
-        UseAccounts    = $true
-        RetrieveAccounts = $true
-        ListAccounts   = $true
-        ViewAuditLog   = $true
-        ViewSafeMembers= $true
-    }
+    Write-Info "Adding/updating IAM admin group on '$safeName'..."
+
+    $iamDone = $false
 
     try {
-        if ($existingIAM) {
-            Write-Warn "IAM_ACU_CA_Admins already exists on '$safeName'; updating minimal rights..."
-            Set-PASSafeMember @iamParams -ErrorAction Stop | Out-Null
-            Write-Ok "Updated IAM_ACU_CA_Admins permissions on '$safeName'."
-        }
-        else {
-            Add-PASSafeMember @iamParams -ErrorAction Stop | Out-Null
-            Write-Ok "Added IAM_ACU_CA_Admins to '$safeName'."
-        }
+        Ensure-SafeMember -SafeName $safeName -MemberName $iamUpn -MemberType Group -PermFlags $permAdmin
+        $iamDone = $true
     }
     catch {
-        Write-Err "Failed to add/update IAM_ACU_CA_Admins on '$safeName': $($_.Exception.Message)"
-        throw
+        $msg = $_.Exception.Message
+        Write-Warn "UPN '$iamUpn' failed: $msg"
+
+        if ($msg -match 'invalid parameters') {
+            Write-Info "Retrying IAM group with sAMAccountName '$iamSam'..."
+            Ensure-SafeMember -SafeName $safeName -MemberName $iamSam -MemberType Group -PermFlags $permAdmin
+            $iamDone = $true
+        }
+        else {
+            throw
+        }
     }
 
-    # 6) Prompt for CARK_* owner group (you enter sAM or UPN; script uses as-is)
+    if ($iamDone) {
+        Write-Ok "IAM_ACU_CA_Admins membership ensured on '$safeName'."
+    }
+
+    # 7) Prompt for CARK_* owner group (you can enter sAM or UPN; script uses it as-is)
     $ownerGroup = Show-InputDialog -Title "Safe Owner (CARK_ Group)" `
         -Prompt "Enter the AD group that will own the Safe (sAM or UPN, must start with CARK_):" `
         -Default "CARK_" `
@@ -301,45 +378,9 @@ try {
         Write-Warn "Owner group entry cancelled; skipping owner assignment and description."
     }
     else {
-        Write-Info "Adding owner group '$ownerGroup' with limited CARK permissions…"
+        Write-Info "Adding/updating owner group '$ownerGroup' with CARK permissions…"
+        Ensure-SafeMember -SafeName $safeName -MemberName $ownerGroup -MemberType Group -PermFlags $permCark
 
-        # Check if owner already on safe
-        $existingOwner = $null
-        try {
-            $existingOwner = Get-PASSafeMember -SafeName $safeName -MemberName $ownerGroup -ErrorAction SilentlyContinue
-        } catch {}
-
-        $carkParams = @{
-            SafeName       = $safeName
-            MemberName     = $ownerGroup
-            SearchIn       = $DirLocation
-            UseAccounts    = $true
-            RetrieveAccounts = $true
-            ListAccounts   = $true
-            UpdateAccountContent                   = $true
-            InitiateCPMAccountManagementOperations = $true
-            ViewSafeMembers                        = $true
-            ViewAuditLog                           = $true
-            AccessWithoutConfirmation              = $true
-        }
-
-        try {
-            if ($existingOwner) {
-                Write-Warn "Owner group '$ownerGroup' already exists; updating permissions..."
-                Set-PASSafeMember @carkParams -ErrorAction Stop | Out-Null
-                Write-Ok "Updated owner group '$ownerGroup' on '$safeName'."
-            }
-            else {
-                Add-PASSafeMember @carkParams -ErrorAction Stop | Out-Null
-                Write-Ok "Added owner group '$ownerGroup' to '$safeName'."
-            }
-        }
-        catch {
-            Write-Err "Failed to add/update owner group '$ownerGroup' on '$safeName': $($_.Exception.Message)"
-            throw
-        }
-
-        # 7) Set description
         try {
             $desc = "Safe Managed By $ownerGroup"
             Set-PASSafe -SafeName $safeName -Description $desc -ErrorAction Stop | Out-Null
