@@ -1,234 +1,489 @@
-# IND_SafeCreation.ps1
-# Creates/ensures IND_<Samaccountname>_<employeeID> safes, enforces 7-day retention,
-# and adds members with correct SearchIn (directory vs Vault).
-# Owner (email) gets ONLY the limited permissions requested.
-# NOTE: No Set-PASSafeMember usage; on "already exists" we just log and continue.
+<#
+IND_SafeCreation_Identity.ps1
+
+- Logs in using CCP → Identity Shared Services → ServiceUser (same as APP script).
+- Mode:
+    - CSV   : reads owners from CSV (Samaccountname, employeeID, email).
+    - Single: prompts for one owner and creates a single IND_ safe.
+- Creates/ensures IND_<Samaccountname>_<employeeID> safes with 7-day retention.
+- Adds:
+    - IAM_ACU_CA_Admins with full classic permissions.
+    - Owner (email) with limited "CARK-style" permissions (no RA1/RA2).
+- Description:
+    "Individual safe for <sam> (<employeeID>) – Managed By <OwnerNameNoDomain>".
+#>
 
 [CmdletBinding(SupportsShouldProcess=$true)]
 param(
-  [ValidateScript({ Test-Path $_ })]
-  [string]$CsvPath   = "I:\Script\REPORTS\owners.csv",
-  [string]$BaseURI   = "https://alliantcredit.privilegecloud.cyberark.com",
-  [ValidateSet('CyberArk','LDAP','RADIUS','Windows','SAML','Shared')]
-  [string]$AuthType  = 'CyberArk',
-  [string]$ManagingCPM = 'HQVECYBARK101',
-  [string]$Location  = "\",
-  # Directory integration (exact "Search in" value as configured in PVWA)
-  [string]$DirLocation = 'HQVACUDC101.alliantcreditunion.com'
+    # --- Mode: CSV or Single row ---
+    [ValidateSet('CSV','Single')]
+    [string]$Mode       = 'CSV',
+
+    [string]$CsvPath    = "I:\Script\REPORTS\owners.csv",
+
+    # ===== Identity / Privilege Cloud (Shared Services) =====
+    [string]$IdentityTenantURL  = "https://aak4521.my.idaptive.app",
+    [string]$PrivilegeCloudURL  = "https://alliantcredit.privilegecloud.cyberark.cloud",
+
+    # ===== CPM / Safe settings =====
+    [string]$ManagingCPM        = "HQVECYBARK101",
+    [string]$Location           = "\",
+
+    # ===== CCP settings (for API Service User stored in Vault) =====
+    [string]$CCPAddress         = "https://aam.alliantcreditunion.com",  # CCP base URL (no trailing slash)
+    [string]$CCPLocation        = "AIMWebService",
+    [string]$CCPAppID           = "ACURestAPI",
+    [string]$CCPSafe            = "ACU-VAULT-API",
+    [string]$CCPObject          = "Application-CyberArkVaultRestAPI-alliantcredit.cyberark.cloud",
+    [bool]  $CCPWindowsAuth     = $false
 )
 
+# --- Modules & TLS ---
 Import-Module psPAS -ErrorAction Stop
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $ErrorActionPreference = 'Continue'
 
-function Write-Info($m){ Write-Host "[*] $m" -ForegroundColor Cyan }
-function Write-Ok($m){   Write-Host "[OK] $m" -ForegroundColor Green }
-function Write-Warn($m){ Write-Host "[!] $m" -ForegroundColor Yellow }
-function Write-Err($m){  Write-Host "[X] $m" -ForegroundColor Red }
+# --- Pretty log helpers ---
+function Write-Info($m){ Write-Host "🛠  $m" -ForegroundColor Cyan }
+function Write-Ok($m){   Write-Host "✅ $m" -ForegroundColor Green }
+function Write-Warn($m){ Write-Host "⚠️  $m" -ForegroundColor Yellow }
+function Write-Err($m){  Write-Host "❌ $m" -ForegroundColor Red }
 
-# --- clear any conflicting helpers from the session ---
-foreach($f in 'Add-INDMemberSmart','Ensure-Member','Ensure-SafeMember','Add-CAKSafeMember'){
-  if (Get-Command $f -ErrorAction SilentlyContinue) { Remove-Item "function:$f" -ErrorAction SilentlyContinue }
-}
+# --- GUI input helper (for Single mode) ---
+Add-Type -AssemblyName System.Windows.Forms | Out-Null
+Add-Type -AssemblyName System.Drawing       | Out-Null
 
-# Only the flags Add-PASSafeMember supports (and Set-, but we aren't using Set- here)
-$AllowedPermKeys = @(
-  'UseAccounts','RetrieveAccounts','ListAccounts','AddAccounts',
-  'UpdateAccountContent','UpdateAccountProperties',
-  'InitiateCPMAccountManagementOperations','SpecifyNextAccountContent',
-  'ViewAuditLog','ViewSafeMembers','AccessWithoutConfirmation',
-  'ManageSafe','ManageSafeMembers'
-)
-
-function Select-PermParams([hashtable]$h) {
-  $out = @{}
-  foreach ($k in $AllowedPermKeys) { if ($h.ContainsKey($k)) { $out[$k] = [bool]$h[$k] } }
-  $out
-}
-
-function Get-AllPermFlags {
-  @{
-    UseAccounts                            = $true
-    RetrieveAccounts                       = $true
-    ListAccounts                           = $true
-    AddAccounts                            = $true
-    UpdateAccountContent                   = $true
-    UpdateAccountProperties                = $true
-    InitiateCPMAccountManagementOperations = $true
-    SpecifyNextAccountContent              = $true
-    ViewAuditLog                           = $true
-    ViewSafeMembers                        = $true
-    AccessWithoutConfirmation              = $true
-    ManageSafe                             = $true
-    ManageSafeMembers                      = $true
-  }
-}
-
-# OWNER (email) -> ONLY the 7 you asked for
-function Get-OwnerPermFlags {
-  @{
-    ListAccounts                           = $true
-    UseAccounts                            = $true
-    RetrieveAccounts                       = $true
-    InitiateCPMAccountManagementOperations = $true
-    ViewSafeMembers                        = $true
-    ViewAuditLog                           = $true
-    AccessWithoutConfirmation              = $true
-
-    AddAccounts                            = $false
-    UpdateAccountContent                   = $false
-    UpdateAccountProperties                = $false
-    SpecifyNextAccountContent              = $false
-    ManageSafe                             = $false
-    ManageSafeMembers                      = $false
-  }
-}
-
-# Build name variants for directory lookups
-# For inputs like "name@domain", try sAM (left-of-@) FIRST, then UPN.
-# For "name$", also try "name$@DirLocation".
-function Get-NameVariants([string]$MemberName, [string]$DirLocation) {
-  $list = [System.Collections.Generic.List[string]]::new()
-  $t = ($MemberName | ForEach-Object { $_.ToString() }).Trim(); if (-not $t) { return $list }
-
-  if ($t -like '*@*') {
-    $left = $t.Split('@')[0]
-    if ($left) { $list.Add($left) }        # sAM first
-    if (-not $list.Contains($t)) { $list.Add($t) }  # then the given UPN
-  } else {
-    $list.Add($t)
-    $upn = "$t@$DirLocation"
-    if (-not $list.Contains($upn)) { $list.Add($upn) }
-  }
-
-  if ($t.EndsWith('$')) {
-    $machUpn = "$t@$DirLocation"
-    if (-not $list.Contains($machUpn)) { $list.Add($machUpn) }
-  }
-  return $list
-}
-
-# Helper to classify common directory "not found" errors so we just continue
-function Is-DirNotFound([string]$msg){
-  if (-not $msg) { return $false }
-  return (
-    $msg -match '\[404\]' -or
-    $msg -match '\bFailed to find user\b' -or
-    $msg -match '\bwas not found\b' -or
-    $msg -match '\bhas not been defined\b' -or
-    $msg -match '\bin ldap mapping\b' -or
-    $msg -match '\bNo such object\b' -or
-    $msg -match '\bobject does not exist\b'
-  )
-}
-
-# NEW unique helper: adds a member (NO Set-PASSafeMember on "exists").
-# NOTE: psPAS does NOT accept MemberType, so we DO NOT pass it. We keep -Type only for logs.
-# IMPORTANT: This version NEVER throws; it logs and continues.
-function Add-CAKSafeMember {
-  [CmdletBinding()]
-  param(
-    [Parameter(Mandatory)][string]$SafeName,
-    [Parameter(Mandatory)][string]$MemberName,
-    [Parameter(Mandatory)][ValidateSet('User','Group','Role')][string]$Type,  # log only
-    [Parameter(Mandatory)][hashtable]$PermFlags,
-    [Parameter(Mandatory)][string]$SearchIn,
-    [switch]$DirectoryPrincipal
-  )
-
-  $perm = Select-PermParams $PermFlags
-  $namesToTry = if ($DirectoryPrincipal) { Get-NameVariants -MemberName $MemberName -DirLocation $SearchIn } else { [System.Collections.Generic.List[string]]@($MemberName.Trim()) }
-
-  foreach ($n in $namesToTry) {
+function Show-InputDialog {
+    param(
+        [Parameter(Mandatory)][string]$Title,
+        [Parameter(Mandatory)][string]$Prompt,
+        [Parameter()][string]$Default = '',
+        [Parameter()][scriptblock]$ValidateScript = {$true},
+        [Parameter()][string]$ValidationHint = ''
+    )
     try {
-      $params = @{ SafeName = $SafeName; MemberName = $n; SearchIn = $SearchIn }
-      $params += $perm
-      Add-PASSafeMember @params -ErrorAction Stop | Out-Null
-      Write-Ok "Added $Type '$n' (SearchIn='$SearchIn') to '$SafeName'."
-      return
+        $form                 = New-Object System.Windows.Forms.Form
+        $form.Text            = $Title
+        $form.StartPosition   = 'CenterScreen'
+        $form.TopMost         = $true
+        $form.Size            = New-Object System.Drawing.Size(480,190)
+        $form.FormBorderStyle = 'FixedDialog'
+        $form.MaximizeBox     = $false
+
+        $lbl                  = New-Object System.Windows.Forms.Label
+        $lbl.Text             = $Prompt
+        $lbl.AutoSize         = $true
+        $lbl.Location         = '12,15'
+        $lbl.Font             = New-Object System.Drawing.Font('Segoe UI',10)
+        $form.Controls.Add($lbl)
+
+        $tb                   = New-Object System.Windows.Forms.TextBox
+        $tb.Location          = '16,48'
+        $tb.Width             = 430
+        $tb.Text              = $Default
+        $tb.Font              = New-Object System.Drawing.Font('Consolas',11)
+        $form.Controls.Add($tb)
+
+        $hint                 = New-Object System.Windows.Forms.Label
+        $hint.AutoSize        = $true
+        $hint.ForeColor       = [System.Drawing.Color]::DarkGray
+        $hint.Text            = $ValidationHint
+        $hint.Location        = '16,80'
+        $form.Controls.Add($hint)
+
+        $ok                   = New-Object System.Windows.Forms.Button
+        $ok.Text              = 'Continue'
+        $ok.Location          = '272,110'
+        $ok.Width             = 80
+        $ok.DialogResult      = [System.Windows.Forms.DialogResult]::OK
+        $form.AcceptButton    = $ok
+        $form.Controls.Add($ok)
+
+        $cancel               = New-Object System.Windows.Forms.Button
+        $cancel.Text          = 'Cancel'
+        $cancel.Location      = '366,110'
+        $cancel.Width         = 80
+        $cancel.DialogResult  = [System.Windows.Forms.DialogResult]::Cancel
+        $form.CancelButton    = $cancel
+        $form.Controls.Add($cancel)
+
+        $tb.add_TextChanged({
+            try {
+                if (& $ValidateScript $tb.Text) { $tb.BackColor = [System.Drawing.Color]::White }
+                else                            { $tb.BackColor = [System.Drawing.Color]::MistyRose }
+            } catch {
+                $tb.BackColor = [System.Drawing.Color]::MistyRose
+            }
+        })
+
+        $dialog = $form.ShowDialog()
+        if ($dialog -ne [System.Windows.Forms.DialogResult]::OK) { return $null }
+
+        $val = $tb.Text.Trim()
+        if (-not (& $ValidateScript $val)) {
+            [System.Windows.Forms.MessageBox]::Show(
+                "Value is invalid. Please try again.",
+                "Validation",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Warning
+            ) | Out-Null
+            return Show-InputDialog @PSBoundParameters
+        }
+        return $val
     } catch {
-      $msg = $_.Exception.Message
+        $val = Read-Host "$Title - $Prompt"
+        if (-not (& $ValidateScript $val)) { throw "Input failed validation." }
+        return $val
+    }
+}
 
-      if ($msg -match 'already exists' -or $msg -match '409') {
-        Write-Info "$Type '$n' already exists on '$SafeName' — skipping update."
+# --- Permissions helpers ---
+
+# IAM_ACU_CA_Admins → full classic permissions (no RA1/RA2 – tenant didn’t like these)
+function Get-AdminPerms {
+    @{
+        UseAccounts                             = $true
+        RetrieveAccounts                        = $true
+        ListAccounts                            = $true
+        AddAccounts                             = $true
+        UpdateAccountContent                    = $true
+        UpdateAccountProperties                 = $true
+        InitiateCPMAccountManagementOperations  = $true
+        SpecifyNextAccountContent               = $true
+        RenameAccounts                          = $true
+        DeleteAccounts                          = $true
+        UnlockAccounts                          = $true
+        ManageSafe                              = $true
+        ManageSafeMembers                       = $true
+        BackupSafe                              = $true
+        ViewAuditLog                            = $true
+        ViewSafeMembers                         = $true
+        AccessWithoutConfirmation               = $true
+        CreateFolders                           = $true
+        DeleteFolders                           = $true
+        MoveAccountsAndFolders                  = $true
+    }
+}
+
+# Owner (email) → your limited CARK-style permission set, minus RA1/RA2 for compatibility
+function Get-OwnerPerms {
+    @{
+        UseAccounts                             = $true
+        RetrieveAccounts                        = $true
+        ListAccounts                            = $true
+        AddAccounts                             = $false
+        UpdateAccountContent                    = $true
+        UpdateAccountProperties                 = $false
+        InitiateCPMAccountManagementOperations  = $true
+        SpecifyNextAccountContent               = $true
+        RenameAccounts                          = $false
+        DeleteAccounts                          = $false
+        UnlockAccounts                          = $false
+        ManageSafe                              = $false
+        ManageSafeMembers                       = $false
+        BackupSafe                              = $false
+        ViewAuditLog                            = $true
+        ViewSafeMembers                         = $true
+        AccessWithoutConfirmation               = $true
+        CreateFolders                           = $false
+        DeleteFolders                           = $false
+        MoveAccountsAndFolders                  = $false
+    }
+}
+
+# --- CCP → PSCredential (API Service User) ---
+function Get-ServiceUserCredentialFromCCP {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$CCPAddress,
+        [Parameter(Mandatory)][string]$Location,
+        [Parameter(Mandatory)][string]$AppID,
+        [Parameter(Mandatory)][string]$Safe,
+        [Parameter(Mandatory)][string]$Object,
+        [bool]$WindowsAuth = $false
+    )
+
+    $base = $CCPAddress.TrimEnd('/')
+    $loc  = $Location.Trim('/')
+
+    $url  = "{0}/{1}/api/Accounts?AppID={2}&Safe={3}&Object={4}" -f $base, $loc, $AppID, $Safe, $Object
+
+    Write-Info "Retrieving **Service User** credential from CCP:"
+    Write-Info "  $url"
+
+    $headers = @{ "Content-Type" = "application/json" }
+
+    $resp = Invoke-RestMethod -Uri $url -Method GET -Headers $headers -UseDefaultCredentials:$WindowsAuth -ErrorAction Stop
+
+    if (-not $resp.UserName -or -not $resp.Content) {
+        throw "CCP response missing UserName/Content. Raw: $($resp | ConvertTo-Json -Depth 5)"
+    }
+
+    Write-Ok "CCP returned service user: $($resp.UserName)"
+
+    $sec = ConvertTo-SecureString $resp.Content -AsPlainText -Force
+    return [PSCredential]::new($resp.UserName, $sec)
+}
+
+# --- Safe member ensure helper (same pattern as APP script) ---
+function Ensure-SafeMember {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$SafeName,
+        [Parameter(Mandatory)][string]$MemberName,   # sAM or UPN
+        [Parameter(Mandatory)][ValidateSet('User','Group','Role')][string]$MemberType,
+        [Parameter(Mandatory)][hashtable]$PermFlags
+    )
+
+    Write-Info "Processing member '$MemberName' on '$SafeName' (Type=$MemberType)..."
+
+    # 1) Check if member exists
+    $existing = $null
+    try {
+        $existing = Get-PASSafeMember -SafeName $SafeName -Search $MemberName -ErrorAction SilentlyContinue |
+                    Where-Object { $_.MemberName -eq $MemberName }
+    } catch {
+        # ignore; treat as not found
+    }
+
+    # Build splat
+    $permParams = @{}
+    foreach ($k in $PermFlags.Keys) {
+        $permParams[$k] = $PermFlags[$k]
+    }
+
+    $splat = @{
+        SafeName   = $SafeName
+        MemberName = $MemberName
+        MemberType = $MemberType
+    }
+    $splat += $permParams
+
+    if ($existing) {
+        Write-Info "Member exists; updating permissions via Set-PASSafeMember..."
+        Set-PASSafeMember @splat -ErrorAction Stop | Out-Null
+        Write-Ok  "Updated '$MemberName' on '$SafeName'."
+    }
+    else {
+        Write-Info "Member not found; adding via Add-PASSafeMember..."
+        Add-PASSafeMember @splat -ErrorAction Stop | Out-Null
+        Write-Ok  "Added '$MemberName' to '$SafeName'."
+    }
+}
+
+# --- Core row processor: one IND_ safe + memberships ---
+function Process-INDRow {
+    param(
+        [Parameter(Mandatory)][string]$SamAccountName,
+        [Parameter(Mandatory)][string]$EmployeeID,
+        [Parameter(Mandatory)][string]$OwnerEmail
+    )
+
+    $sam  = $SamAccountName.Trim()
+    $eid  = $EmployeeID.Trim()
+    $mail = $OwnerEmail.Trim()
+
+    if ([string]::IsNullOrWhiteSpace($sam) -or
+        [string]::IsNullOrWhiteSpace($eid) -or
+        [string]::IsNullOrWhiteSpace($mail)) {
+        Write-Warn "Skipping row with missing fields: Sam='$sam' EmployeeID='$eid' Email='$mail'"
         return
-      }
-
-      $retryableNotFound = ($DirectoryPrincipal -and (Is-DirNotFound $msg))
-      if ($retryableNotFound) {
-        Write-Warn "Directory principal '$n' not found in '$SearchIn'. Trying next variant..."
-        continue
-      } else {
-        Write-Err "Member '$n' failed on '$SafeName' : $msg"
-        # DO NOT throw; just continue to next variant or next member/user
-        continue
-      }
-    }
-  }
-  Write-Warn "Exhausted variants; could not add '$MemberName' (Type=$Type, SearchIn='$SearchIn') to '$SafeName'. Continuing…"
-}
-
-# ---------- Logon ----------
-$cred = Get-Credential -Message "Enter your CyberArk ($AuthType) credential"
-try {
-  New-PASSession -Credential $cred -BaseURI $BaseURI -Type $AuthType | Out-Null
-  Write-Ok "Authenticated to $BaseURI."
-} catch {
-  Write-Err "Authentication failed: $($_.Exception.Message)"; return
-}
-
-try {
-  $rows = Import-Csv -Path $CsvPath
-  if (-not $rows) { Write-Err "No rows in CSV ($CsvPath)."; return }
-
-  $permAll   = Get-AllPermFlags
-  $permOwner = Get-OwnerPermFlags
-
-  foreach ($row in $rows) {
-    $sam  = ($row.Samaccountname).ToString().Trim()
-    $eid  = ($row.employeeID).ToString().Trim()
-    $mail = ($row.email).ToString().Trim()
-
-    if ([string]::IsNullOrWhiteSpace($sam) -or [string]::IsNullOrWhiteSpace($eid) -or [string]::IsNullOrWhiteSpace($mail)) {
-      Write-Warn "Skipping row with missing fields: $($row | ConvertTo-Json -Compress)"; continue
     }
 
-    # IND_<sam>_<eid>
     $safeName = "IND_{0}_{1}" -f $sam, $eid
     Write-Info "Processing Safe: $safeName (Owner=$mail)"
 
     # Create Safe if missing; ensure 7-day retention
-    $exists = $null; try { $exists = Get-PASSafe -SafeName $safeName -ErrorAction SilentlyContinue } catch {}
+    $exists = $null
+    try {
+        $exists = Get-PASSafe -SafeName $safeName -ErrorAction SilentlyContinue
+    } catch {}
+
     if (-not $exists) {
-      $splat = @{
-        SafeName              = $safeName
-        Description           = "Individual safe for $sam ($eid)"
-        ManagingCPM           = $ManagingCPM
-        NumberOfDaysRetention = 7
-        location              = $Location
-      }
-      if ($PSCmdlet.ShouldProcess($safeName, "Add-PASSafe")) {
-        try { Add-PASSafe @splat -ErrorAction Stop | Out-Null; Write-Ok "Created Safe '$safeName'." }
-        catch { Write-Err "Failed to create Safe '$safeName' : $($_.Exception.Message)"; continue }
-      }
-    } else {
-      Write-Warn "Safe '$safeName' already exists; ensuring retention & members."
-      try { Set-PASSafe -SafeName $safeName -NumberOfDaysRetention 7 -ErrorAction SilentlyContinue | Out-Null; Write-Ok "Ensured 7-day retention on '$safeName'." }
-      catch { Write-Warn "Could not set retention on existing '$safeName': $($_.Exception.Message)" }
+        $splat = @{
+            SafeName              = $safeName
+            Description           = "Individual safe for $sam ($eid)"
+            ManagingCPM           = $ManagingCPM
+            NumberOfDaysRetention = 7
+            location              = $Location
+        }
+        if ($PSCmdlet.ShouldProcess($safeName, "Add-PASSafe")) {
+            try {
+                Add-PASSafe @splat -ErrorAction Stop | Out-Null
+                Write-Ok "Created Safe '$safeName'."
+            } catch {
+                Write-Err "Failed to create Safe '$safeName' : $($_.Exception.Message)"
+                return
+            }
+        }
+    }
+    else {
+        Write-Warn "Safe '$safeName' already exists; ensuring retention & members."
+        try {
+            Set-PASSafe -SafeName $safeName -NumberOfDaysRetention 7 -ErrorAction SilentlyContinue | Out-Null
+            Write-Ok "Ensured 7-day retention on '$safeName'."
+        } catch {
+            Write-Warn "Could not set retention on existing '$safeName': $($_.Exception.Message)"
+        }
     }
 
-    # --- Members (original working flow; -SearchIn only; no Set-) ---
-    # Vault users
-    Add-CAKSafeMember -SafeName $safeName -MemberName 'ACURestAPI_Local'                     -Type User  -PermFlags $permAll   -SearchIn 'Vault'
-    Add-CAKSafeMember -SafeName $safeName -MemberName 'identity-privilege-integration-user$' -Type User  -PermFlags $permAll   -SearchIn 'Vault'
+    # --- Permissions payloads ---
+    $permAdmin = Get-AdminPerms
+    $permOwner = Get-OwnerPerms
 
-    # Directory group (try sAM first, then UPN) & Owner (email) — search in DirLocation
-    Add-CAKSafeMember -SafeName $safeName -MemberName 'IAM_ACU_CA_Admins@alliantcreditunion.com' -Type Group -PermFlags $permAll   -SearchIn $DirLocation -DirectoryPrincipal
-    Add-CAKSafeMember -SafeName $safeName -MemberName $mail                                      -Type User  -PermFlags $permOwner -SearchIn $DirLocation -DirectoryPrincipal
-  }
+    # --- Add IAM_ACU_CA_Admins (full perms) – UPN then sAM on invalid parameters ---
+    $iamUpn = 'IAM_ACU_CA_Admins@alliantcreditunion.com'
+    $iamSam = 'IAM_ACU_CA_Admins'
 
-  Write-Ok "All rows processed."
+    Write-Info "Ensuring IAM_ACU_CA_Admins membership on '$safeName'..."
+    $iamDone = $false
+    try {
+        Ensure-SafeMember -SafeName $safeName -MemberName $iamUpn -MemberType Group -PermFlags $permAdmin
+        $iamDone = $true
+    }
+    catch {
+        $msg = $_.Exception.Message
+        Write-Warn "UPN '$iamUpn' failed on '$safeName': $msg"
+        if ($msg -match 'invalid parameters') {
+            Write-Info "Retrying with sAMAccountName '$iamSam'..."
+            Ensure-SafeMember -SafeName $safeName -MemberName $iamSam -MemberType Group -PermFlags $permAdmin
+            $iamDone = $true
+        }
+        else {
+            throw
+        }
+    }
+    if ($iamDone) {
+        Write-Ok "IAM_ACU_CA_Admins membership ensured on '$safeName'."
+    }
+
+    # --- Add Owner (email) with limited owner perms; same pattern as IAM group ---
+    Write-Info "Ensuring Owner '$mail' membership on '$safeName'..."
+    $ownerDone = $false
+
+    try {
+        Ensure-SafeMember -SafeName $safeName -MemberName $mail -MemberType User -PermFlags $permOwner
+        $ownerDone = $true
+    }
+    catch {
+        $msg = $_.Exception.Message
+        Write-Warn "Owner UPN '$mail' failed on '$safeName': $msg"
+
+        if ($msg -match 'invalid parameters' -and $mail -like '*@*') {
+            $ownerSam = $mail.Split('@')[0]
+            Write-Info "Retrying Owner with sAM '$ownerSam'..."
+            Ensure-SafeMember -SafeName $safeName -MemberName $ownerSam -MemberType User -PermFlags $permOwner
+            $ownerDone = $true
+        }
+        else {
+            throw
+        }
+    }
+
+    if ($ownerDone) {
+        # Description: strip domain from owner for description
+        $ownerNoDomain = $mail.Split('@')[0]
+        try {
+            $desc = "Individual safe for $sam ($eid) – Managed By $ownerNoDomain"
+            Set-PASSafe -SafeName $safeName -Description $desc -ErrorAction Stop | Out-Null
+            Write-Ok "Description set on '$safeName': '$desc'"
+        } catch {
+            Write-Warn "Could not set description on '$safeName': $($_.Exception.Message)"
+        }
+    }
+
+    Write-Ok "Completed processing '$safeName'."
+}
+
+# --- MAIN ---
+$sessionCreated = $false
+
+try {
+    # 1) Get Shared Services API Service User creds from CCP
+    $serviceCred = Get-ServiceUserCredentialFromCCP `
+        -CCPAddress $CCPAddress `
+        -Location   $CCPLocation `
+        -AppID      $CCPAppID `
+        -Safe       $CCPSafe `
+        -Object     $CCPObject `
+        -WindowsAuth:$CCPWindowsAuth
+
+    # 2) Authenticate via Identity Shared Services using SERVICE USER
+    Write-Info "Authenticating to Privilege Cloud via Identity (Service User)..."
+
+    New-PASSession `
+        -IdentityTenantURL $IdentityTenantURL `
+        -PrivilegeCloudURL $PrivilegeCloudURL `
+        -Credential        $serviceCred `
+        -ServiceUser `
+        -ErrorAction Stop | Out-Null
+
+    $session = Get-PASSession
+    if (-not $session) { throw "psPAS session not established via ServiceUser." }
+
+    $sessionCreated = $true
+    Write-Ok "Authenticated to $PrivilegeCloudURL as service user: $($serviceCred.UserName)"
+
+    # 3) Process based on Mode
+    if ($Mode -eq 'CSV') {
+        Write-Info "Mode = CSV. Loading: $CsvPath"
+        if (-not (Test-Path $CsvPath)) {
+            throw "CSV not found: $CsvPath"
+        }
+        $rows = Import-Csv -Path $CsvPath
+        if (-not $rows -or $rows.Count -eq 0) {
+            throw "CSV '$CsvPath' has no rows."
+        }
+
+        foreach ($row in $rows) {
+            $sam  = ($row.Samaccountname).ToString()
+            $eid  = ($row.employeeID).ToString()
+            $mail = ($row.email).ToString()
+            Process-INDRow -SamAccountName $sam -EmployeeID $eid -OwnerEmail $mail
+        }
+
+        Write-Ok "CSV processing completed for $($rows.Count) row(s)."
+    }
+    else {
+        Write-Info "Mode = Single. Prompting for one IND_ Safe owner..."
+
+        $sam = Show-InputDialog -Title "IND Safe Owner" `
+            -Prompt "Enter SamAccountName (e.g. jdoe)" `
+            -Default "" `
+            -ValidationHint "SamAccountName only" `
+            -ValidateScript { param($x) -not [string]::IsNullOrWhiteSpace($x.Trim()) }
+
+        if (-not $sam) { Write-Warn "Cancelled (SamAccountName)."; return }
+
+        $eid = Show-InputDialog -Title "IND Safe Owner" `
+            -Prompt "Enter employeeID" `
+            -Default "" `
+            -ValidationHint "HR/AD employeeID" `
+            -ValidateScript { param($x) -not [string]::IsNullOrWhiteSpace($x.Trim()) }
+
+        if (-not $eid) { Write-Warn "Cancelled (employeeID)."; return }
+
+        $mail = Show-InputDialog -Title "IND Safe Owner" `
+            -Prompt "Enter owner email (UPN)" `
+            -Default "" `
+            -ValidationHint "Example: user@alliantcreditunion.com" `
+            -ValidateScript { param($x) -not [string]::IsNullOrWhiteSpace($x.Trim()) }
+
+        if (-not $mail) { Write-Warn "Cancelled (email)."; return }
+
+        Process-INDRow -SamAccountName $sam -EmployeeID $eid -OwnerEmail $mail
+    }
+}
+catch {
+    Write-Err $_
 }
 finally {
-  try { Close-PASSession | Out-Null; Write-Ok "Logged off." } catch { Write-Warn "Logoff warning: $($_.Exception.Message)" }
+    if ($sessionCreated) {
+        try {
+            Close-PASSession | Out-Null
+            Write-Ok "Logged off."
+        } catch {
+            Write-Warn "Logoff warning: $($_.Exception.Message)"
+        }
+    }
 }
