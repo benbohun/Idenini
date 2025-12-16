@@ -1,17 +1,12 @@
 <#
-.SYNOPSIS
-  CyberArk Platform Report (with NF* Notification Settings)
+Get-PCloudPlatformReport_Merged.ps1
 
-.DESCRIPTION
-  - Authenticates to Privilege Cloud via Identity using a **service user** from CCP
-  - Uses psPAS Get-PASPlatform to retrieve platform info
-  - For each platform, pulls .Details (or refetches by PlatformID if needed)
-  - Exports a CSV including NF* notification parameters
-
-.REQUIREMENTS
-  - psPAS and IdentityCommand modules installed
-  - CCP configured & reachable for the ACURestAPI service user
-  - Identity service user has rights to query platforms
+- Auth: CCP → Identity Shared Services → ServiceUser (same as your working APP/IND scripts)
+- Step 1: Use psPAS session BaseURI + WebSession to call /API/Platforms (REST)
+          → gives full general/credentials/session/workflow fields
+- Step 2: For each platform, call Get-PASPlatform -PlatformID <general.id>
+          → pull NF* notification settings from .Details
+- Step 3: Export a merged CSV with both sets of fields.
 #>
 
 [CmdletBinding()]
@@ -21,7 +16,7 @@ param(
     [string]$PrivilegeCloudURL  = "https://alliantcredit.privilegecloud.cyberark.cloud",
 
     # ===== CCP settings (for API Service User stored in Vault) =====
-    [string]$CCPAddress         = "https://aam.alliantcreditunion.com",
+    [string]$CCPAddress         = "https://aam.alliantcreditunion.com",  # CCP base URL (no trailing slash)
     [string]$CCPLocation        = "AIMWebService",
     [string]$CCPAppID           = "ACURestAPI",
     [string]$CCPSafe            = "ACU-VAULT-API",
@@ -29,14 +24,14 @@ param(
     [bool]  $CCPWindowsAuth     = $false,
 
     # ===== Output =====
-    [string]$CsvFilePath        = "I:\Script\REPORTS\CyberArk_FullPlatformReport_WithNF.csv"
+    [string]$CsvFilePath        = ".\CyberArk_FullPlatformReport_Merged.csv"
 )
 
-# --- TLS & Modules ---
+# --- TLS & modules ---
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-
 Import-Module psPAS           -ErrorAction Stop
 Import-Module IdentityCommand -ErrorAction Stop
+$ErrorActionPreference = 'Stop'
 
 # --- Pretty log helpers ---
 function Write-Info($m){ Write-Host "🛠  $m" -ForegroundColor Cyan }
@@ -82,7 +77,7 @@ function Get-ServiceUserCredentialFromCCP {
 $sessionCreated = $false
 
 try {
-    # 1) Get Shared Services API Service User creds from CCP
+    # 1) Get Service User creds from CCP
     $serviceCred = Get-ServiceUserCredentialFromCCP `
         -CCPAddress $CCPAddress `
         -Location   $CCPLocation `
@@ -101,88 +96,57 @@ try {
         -ServiceUser `
         -ErrorAction Stop | Out-Null
 
-    if (-not (Get-PASSession)) { throw "psPAS session not established via ServiceUser." }
+    $session = Get-PASSession
+    if (-not $session) { throw "psPAS session not established via ServiceUser." }
 
     $sessionCreated = $true
     Write-Ok "Authenticated to $PrivilegeCloudURL as service user: $($serviceCred.UserName)"
 
-    # 3) Retrieve platforms via psPAS (includes .Details property)
-    Write-Info "Retrieving platforms via Get-PASPlatform..."
-    # You can tweak filters if you want (Active only, type, etc.)
-    $platforms = Get-PASPlatform -ErrorAction Stop
+    # 3) REST list of platforms (for all non-NF fields)
+    $baseUri    = $session.BaseURI.TrimEnd('/')       # e.g. https://alliantcredit.privilegecloud.cyberark.cloud/PasswordVault
+    $webSession = $session.WebSession
+    $platformsUrl = "$baseUri/API/Platforms"
 
-    if (-not $platforms) {
-        Write-Warn "No platforms returned from Get-PASPlatform."
-        return
+    Write-Info "Retrieving platform list from: $platformsUrl"
+    $platformsResponse = Invoke-RestMethod -Uri $platformsUrl -Method GET -WebSession $webSession -ErrorAction Stop
+
+    $restPlatforms =
+        if ($platformsResponse.PSObject.Properties.Name -contains 'Platforms') {
+            $platformsResponse.Platforms
+        } else {
+            $platformsResponse
+        }
+
+    if (-not $restPlatforms -or $restPlatforms.Count -eq 0) {
+        throw "No platforms found in /API/Platforms response. Raw: $($platformsResponse | ConvertTo-Json -Depth 5)"
     }
 
-    # 4) Build report rows, including NF* values from .Details
+    Write-Ok ("REST /Platforms returned {0} platform(s)." -f $restPlatforms.Count)
+
+    # 4) Build merged report: REST general + psPAS details for NF*
     $report = @()
+    $idx    = 0
 
-    foreach ($p in $platforms) {
+    foreach ($p in $restPlatforms) {
+        $idx++
+        $id   = $p.general.id
+        $name = $p.general.name
+        Write-Info ("[{0}/{1}] Processing platform '{2}' (ID={3})" -f $idx, $restPlatforms.Count, $name, $id)
 
-        # Handle different object shapes between API versions
-        $general = if ($p.PSObject.Properties.Name -contains 'General') { $p.General } else { $p }
-
-        # Basic high-level props (defensive null checks)
-        $platformId     = $general.PlatformID
-        $platformName   = $general.Name
-        $active         = $general.Active
-        $description    = $general.Description
-        $platformBaseID = $general.PlatformBaseID
-        $platformType   = $general.PlatformType
-        $systemType     = $general.SystemType
-
-        # Required / Optional account properties
-        $requiredProps = $null
-        $optionalProps = $null
-        if ($p.PSObject.Properties.Name -contains 'Properties') {
-            if ($p.Properties.required) {
-                $requiredProps = ($p.Properties.required | ForEach-Object { $_.name }) -join '; '
-            }
-            if ($p.Properties.optional) {
-                $optionalProps = ($p.Properties.optional | ForEach-Object { $_.name }) -join '; '
-            }
-        }
-
-        # Linked accounts (if available)
-        $linkedAccounts = $null
-        if ($p.PSObject.Properties.Name -contains 'LinkedAccounts' -and $p.LinkedAccounts) {
-            $linkedAccounts = ($p.LinkedAccounts | ForEach-Object { $_.name }) -join '; '
-        }
-
-        # Credential management block
-        $cm = if ($p.PSObject.Properties.Name -contains 'CredentialsManagement') { $p.CredentialsManagement } else { $null }
-
-        # Session management block
-        $sm = if ($p.PSObject.Properties.Name -contains 'SessionManagement') { $p.SessionManagement } else { $null }
-
-        # Workflows
-        $wf = if ($p.PSObject.Properties.Name -contains 'PrivilegedAccessWorkflows') { $p.PrivilegedAccessWorkflows } else { $null }
-
-        # --- NF* notification settings come from .Details ---
+        # --- Pull NF* via Get-PASPlatform -PlatformID ---
         $details = $null
-
-        # Try details straight off the object
-        if ($p.PSObject.Properties.Name -contains 'Details' -and $p.Details) {
-            $details = $p.Details
-        }
-
-        # If Details missing or doesn't expose NF* yet, refetch by PlatformID
-        if (-not $details -or -not ($details.PSObject.Properties.Name -contains 'NFNotifyPriorExpiration')) {
-            if ($platformId) {
-                try {
-                    $full = Get-PASPlatform -PlatformID $platformId -ErrorAction Stop
-                    if ($full -and $full.Details) {
-                        $details = $full.Details
-                    }
-                } catch {
-                    Write-Warn "Could not retrieve full details for PlatformID '$platformId': $($_.Exception.Message)"
-                }
+        try {
+            $full = Get-PASPlatform -PlatformID $id -ErrorAction Stop
+            if ($full -and $full.Details) {
+                $details = $full.Details
+            } else {
+                Write-Warn "Get-PASPlatform did not expose .Details for ID=$id (NF* will be blank)."
             }
+        } catch {
+            Write-Warn "Get-PASPlatform failed for ID=$id: $($_.Exception.Message)"
         }
 
-        # Map NF* safely (details may still be $null)
+        # NF* values (null-safe)
         $NFNotifyPriorExpiration          = $details.NFNotifyPriorExpiration
         $NFPriorExpirationRecipients      = $details.NFPriorExpirationRecipients
         $NFNotifyOnPasswordDisable        = $details.NFNotifyOnPasswordDisable
@@ -192,42 +156,51 @@ try {
         $NFNotifyOnPasswordUsed           = $details.NFNotifyOnPasswordUsed
         $NFOnPasswordUsedRecipients       = $details.NFOnPasswordUsedRecipients
 
-        # Build a row
+        # Required / Optional property names from REST payload
+        $reqNames = @()
+        $optNames = @()
+        if ($p.properties -and $p.properties.required) { $reqNames = $p.properties.required.name }
+        if ($p.properties -and $p.properties.optional) { $optNames = $p.properties.optional.name }
+
+        # Flatten
         $report += [PSCustomObject]@{
-            PlatformID    = $platformId
-            PlatformName  = $platformName
-            Active        = $active
-            Description   = $description
-            PlatformBaseID= $platformBaseID
-            PlatformType  = $platformType
-            SystemType    = $systemType
+            # --- General (REST) ---
+            PlatformID     = $p.general.id
+            PlatformName   = $p.general.name
+            Active         = $p.general.active
+            Description    = $p.general.description
+            PlatformBaseID = $p.general.platformBaseID
+            PlatformType   = $p.general.platformType
+            SystemType     = $p.general.systemType
 
-            RequiredProperties = $requiredProps
-            OptionalProperties = $optionalProps
-            LinkedAccounts     = $linkedAccounts
+            RequiredProperties = ($reqNames -join '; ')
+            OptionalProperties = ($optNames -join '; ')
 
-            # Credential Management (common fields)
-            AllowedSafes                          = $cm.AllowedSafes
-            AllowManualChange                     = ($cm.AllowManualChange                     -as [string])
-            PerformPeriodicChange                 = ($cm.PerformPeriodicChange                 -as [string])
-            RequirePasswordChangeEveryXDays       = ($cm.RequirePasswordChangeEveryXDays       -as [string])
-            AllowManualVerification               = ($cm.AllowManualVerification               -as [string])
-            PerformPeriodicVerification           = ($cm.PerformPeriodicVerification           -as [string])
-            RequirePasswordVerificationEveryXDays = ($cm.RequirePasswordVerificationEveryXDays -as [string])
-            AllowManualReconciliation             = ($cm.AllowManualReconciliation             -as [string])
-            AutomaticReconcileWhenUnsynched       = ($cm.AutomaticReconcileWhenUnsynched       -as [string])
+            # Linked Accounts (REST)
+            LinkedAccounts = ($p.linkedAccounts.name -join '; ')
 
-            # Session Management (common fields)
-            RequirePrivilegedSessionMonitoringAndIsolation = ($sm.RequirePrivilegedSessionMonitoringAndIsolation -as [string])
-            RecordAndSaveSessionActivity                   = ($sm.RecordAndSaveSessionActivity                   -as [string])
-            PSMServerID                                    = ($sm.PSMServerID                                    -as [string])
+            # --- Credentials Management (REST) ---
+            AllowedSafes                          = $p.credentialsManagement.allowedSafes
+            AllowManualChange                     = $p.credentialsManagement.allowManualChange                     -as [string]
+            PerformPeriodicChange                 = $p.credentialsManagement.performPeriodicChange                 -as [string]
+            RequirePasswordChangeEveryXDays       = $p.credentialsManagement.requirePasswordChangeEveryXDays       -as [string]
+            AllowManualVerification               = $p.credentialsManagement.allowManualVerification               -as [string]
+            PerformPeriodicVerification           = $p.credentialsManagement.performPeriodicVerification           -as [string]
+            RequirePasswordVerificationEveryXDays = $p.credentialsManagement.requirePasswordVerificationEveryXDays -as [string]
+            AllowManualReconciliation             = $p.credentialsManagement.allowManualReconciliation             -as [string]
+            AutomaticReconcileWhenUnsynched       = $p.credentialsManagement.automaticReconcileWhenUnsynched       -as [string]
 
-            # Privileged Access Workflows
-            RequireDualControlPasswordAccessApproval       = ($wf.RequireDualControlPasswordAccessApproval       -as [string])
-            EnforceCheckinCheckoutExclusiveAccess          = ($wf.EnforceCheckinCheckoutExclusiveAccess          -as [string])
-            EnforceOnetimePasswordAccess                   = ($wf.EnforceOnetimePasswordAccess                   -as [string])
+            # --- Session Management (REST) ---
+            RequirePrivilegedSessionMonitoringAndIsolation = $p.sessionManagement.requirePrivilegedSessionMonitoringAndIsolation -as [string]
+            RecordAndSaveSessionActivity                   = $p.sessionManagement.recordAndSaveSessionActivity                   -as [string]
+            PSMServerID                                    = $p.sessionManagement.PSMServerID                                    -as [string]
 
-            # NF* notification settings (from platform details)
+            # --- Privileged Access Workflows (REST) ---
+            RequireDualControlPasswordAccessApproval = $p.privilegedAccessWorkflows.requireDualControlPasswordAccessApproval -as [string]
+            EnforceCheckinCheckoutExclusiveAccess    = $p.privilegedAccessWorkflows.enforceCheckinCheckoutExclusiveAccess    -as [string]
+            EnforceOnetimePasswordAccess             = $p.privilegedAccessWorkflows.enforceOnetimePasswordAccess             -as [string]
+
+            # --- NF* notification settings (Details from Get-PASPlatform) ---
             NFNotifyPriorExpiration           = $NFNotifyPriorExpiration
             NFPriorExpirationRecipients       = $NFPriorExpirationRecipients
             NFNotifyOnPasswordDisable         = $NFNotifyOnPasswordDisable
@@ -239,11 +212,10 @@ try {
         }
     }
 
-    # 5) Export to CSV
-    Write-Info "Exporting platform report to CSV:"
-    Write-Info "  $CsvFilePath"
+    # 5) Export merged CSV
+    Write-Info "Exporting merged platform report to: $CsvFilePath"
     $report | Export-Csv -Path $CsvFilePath -NoTypeInformation -Encoding UTF8
-    Write-Ok "CyberArk platform report exported successfully."
+    Write-Ok "CyberArk merged platform report successfully exported to: $CsvFilePath"
 }
 catch {
     Write-Err $_
