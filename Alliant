@@ -1,105 +1,230 @@
-Use the same login session to fetch platform report.
-Also see if you can fetch addtional attributes like below
+<#
+Get-PCloudPlatformReport.ps1
 
-NFNotifyPriorExpiration=
-NFPriorExpirationRecipients=
-NFNotifyOnPasswordDisable=
-NFOnPasswordDisableRecipients=
-NFNotifyOnVerificationErrors=
-NFOnVerificationErrorsRecipients=
-NFNotifyOnPasswordUsed=
-NFOnPasswordUsedRecipients=
+- Uses CCP → Identity Shared Services → ServiceUser to authenticate.
+- Uses psPAS Invoke-PASRestMethod to call the /Platforms API.
+- Outputs a CSV "CyberArk_FullPlatformReport.csv" with:
+    - General platform details
+    - Required/optional property names
+    - Credential/session/workflow settings
+    - NF* notification-related attributes, if present as platform properties:
+        NFNotifyPriorExpiration
+        NFPriorExpirationRecipients
+        NFNotifyOnPasswordDisable
+        NFOnPasswordDisableRecipients
+        NFNotifyOnVerificationErrors
+        NFOnVerificationErrorsRecipients
+        NFNotifyOnPasswordUsed
+        NFOnPasswordUsedRecipients
+#>
 
+[CmdletBinding()]
+param(
+    # ===== Identity / Privilege Cloud (Shared Services) =====
+    [string]$IdentityTenantURL  = "https://aak4521.my.idaptive.app",
+    [string]$PrivilegeCloudURL  = "https://alliantcredit.privilegecloud.cyberark.cloud",
 
-# Force PowerShell to use TLS 1.2 for secure connections
+    # ===== CCP settings (for API Service User stored in Vault) =====
+    [string]$CCPAddress         = "https://aam.alliantcreditunion.com",  # CCP base URL (no trailing slash)
+    [string]$CCPLocation        = "AIMWebService",
+    [string]$CCPAppID           = "ACURestAPI",
+    [string]$CCPSafe            = "ACU-VAULT-API",
+    [string]$CCPObject          = "Application-CyberArkVaultRestAPI-alliantcredit.cyberark.cloud",
+    [bool]  $CCPWindowsAuth     = $false,
+
+    # ===== Output =====
+    [string]$CsvFilePath        = ".\CyberArk_FullPlatformReport.csv"
+)
+
+# --- TLS & modules ---
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+Import-Module psPAS -ErrorAction Stop
+$ErrorActionPreference = 'Stop'
 
-# Prompt user for CyberArk credentials
-$cred = Get-Credential
-$Username = $cred.UserName
-$Password = $cred.GetNetworkCredential().Password
+# --- Pretty log helpers ---
+function Write-Info($m){ Write-Host "🛠  $m" -ForegroundColor Cyan }
+function Write-Ok($m){   Write-Host "✅ $m" -ForegroundColor Green }
+function Write-Warn($m){ Write-Host "⚠️  $m" -ForegroundColor Yellow }
+function Write-Err($m){  Write-Host "❌ $m" -ForegroundColor Red }
 
-# Define CyberArk Privilege Cloud API URLs (Using alliantcredit subdomain)
-$Subdomain = "alliantcredit"
-$BaseURL = "https://$Subdomain.privilegecloud.cyberark.com/PasswordVault/API"
+# --- CCP → PSCredential (API Service User) ---
+function Get-ServiceUserCredentialFromCCP {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$CCPAddress,
+        [Parameter(Mandatory)][string]$Location,
+        [Parameter(Mandatory)][string]$AppID,
+        [Parameter(Mandatory)][string]$Safe,
+        [Parameter(Mandatory)][string]$Object,
+        [bool]$WindowsAuth = $false
+    )
 
-# Authentication URL
-$AuthURL = "$BaseURL/auth/Cyberark/Logon/"
+    $base = $CCPAddress.TrimEnd('/')
+    $loc  = $Location.Trim('/')
 
-# Authenticate and get session token
+    $url  = "{0}/{1}/api/Accounts?AppID={2}&Safe={3}&Object={4}" -f $base, $loc, $AppID, $Safe, $Object
+
+    Write-Info "Retrieving **Service User** credential from CCP:"
+    Write-Info "  $url"
+
+    $headers = @{ "Content-Type" = "application/json" }
+
+    $resp = Invoke-RestMethod -Uri $url -Method GET -Headers $headers -UseDefaultCredentials:$WindowsAuth -ErrorAction Stop
+
+    if (-not $resp.UserName -or -not $resp.Content) {
+        throw "CCP response missing UserName/Content. Raw: $($resp | ConvertTo-Json -Depth 5)"
+    }
+
+    Write-Ok "CCP returned service user: $($resp.UserName)"
+
+    $sec = ConvertTo-SecureString $resp.Content -AsPlainText -Force
+    return [PSCredential]::new($resp.UserName, $sec)
+}
+
+# Helper: safely get the list of all platform properties (required + optional)
+function Get-PlatformProperties {
+    param($Platform)
+    $props = @()
+    if ($Platform.properties -and $Platform.properties.required) { $props += $Platform.properties.required }
+    if ($Platform.properties -and $Platform.properties.optional) { $props += $Platform.properties.optional }
+    return $props
+}
+
+# Helper: fetch value for a specific property name (NF* etc.)
+function Get-PlatformPropertyValue {
+    param(
+        $Platform,
+        [Parameter(Mandatory)][string]$Name
+    )
+
+    $props = Get-PlatformProperties -Platform $Platform
+    if (-not $props) { return $null }
+
+    $match = $props | Where-Object { $_.name -eq $Name } | Select-Object -First 1
+    if ($match -and $match.PSObject.Properties.Name -contains 'value') {
+        return $match.value
+    }
+    elseif ($match) {
+        # Fallback – some versions use different casing; try Value property
+        if ($match.PSObject.Properties.Name -contains 'Value') {
+            return $match.Value
+        }
+    }
+    return $null
+}
+
+# --- MAIN ---
+$sessionCreated = $false
+
 try {
-    $AuthResponse = Invoke-RestMethod -Uri $AuthURL -Method POST -Body (@{ username=$Username; password=$Password } | ConvertTo-Json) -ContentType "application/json"
-    $AuthToken = $AuthResponse
-    Write-Host "Authentication successful!" -ForegroundColor Green
-} catch {
-    Write-Host "Authentication failed: $_" -ForegroundColor Red
-    exit
+    # 1) Get Service User creds from CCP
+    $serviceCred = Get-ServiceUserCredentialFromCCP `
+        -CCPAddress $CCPAddress `
+        -Location   $CCPLocation `
+        -AppID      $CCPAppID `
+        -Safe       $CCPSafe `
+        -Object     $CCPObject `
+        -WindowsAuth:$CCPWindowsAuth
+
+    # 2) Authenticate via Identity Shared Services using SERVICE USER
+    Write-Info "Authenticating to Privilege Cloud via Identity (Service User)..."
+
+    New-PASSession `
+        -IdentityTenantURL $IdentityTenantURL `
+        -PrivilegeCloudURL $PrivilegeCloudURL `
+        -Credential        $serviceCred `
+        -ServiceUser `
+        -ErrorAction Stop | Out-Null
+
+    $session = Get-PASSession
+    if (-not $session) { throw "psPAS session not established via ServiceUser." }
+
+    $sessionCreated = $true
+    Write-Ok "Authenticated to $PrivilegeCloudURL as service user: $($serviceCred.UserName)"
+
+    # 3) Call /Platforms via psPAS
+    Write-Info "Retrieving Platforms via Invoke-PASRestMethod..."
+    $platformsResponse = Invoke-PASRestMethod -Uri "Platforms" -Method GET
+    if (-not $platformsResponse -or -not $platformsResponse.Platforms) {
+        throw "Platforms API returned no data. Raw: $($platformsResponse | ConvertTo-Json -Depth 5)"
+    }
+
+    Write-Ok ("Retrieved {0} platform(s)." -f $platformsResponse.Platforms.Count)
+
+    # 4) Project into flat objects for CSV, including NF* fields
+    $processed = $platformsResponse.Platforms | ForEach-Object {
+        $p = $_
+
+        # Flatten required/optional property names (for quick visibility)
+        $reqNames = @()
+        $optNames = @()
+        if ($p.properties -and $p.properties.required) { $reqNames = $p.properties.required.name }
+        if ($p.properties -and $p.properties.optional) { $optNames = $p.properties.optional.name }
+
+        [PSCustomObject]@{
+            PlatformID    = $p.general.id
+            PlatformName  = $p.general.name
+            Active        = $p.general.active
+            Description   = $p.general.description
+            PlatformBaseID = $p.general.platformBaseID
+            PlatformType  = $p.general.platformType
+            SystemType    = $p.general.systemType
+
+            # Property name lists
+            RequiredProperties = ($reqNames -join "; ")
+            OptionalProperties = ($optNames -join "; ")
+
+            # Linked Accounts
+            LinkedAccounts = ($p.linkedAccounts.name -join "; ")
+
+            # Credentials Management
+            AllowedSafes                          = $p.credentialsManagement.allowedSafes
+            AllowManualChange                     = $p.credentialsManagement.allowManualChange                     -as [string]
+            PerformPeriodicChange                 = $p.credentialsManagement.performPeriodicChange                 -as [string]
+            RequirePasswordChangeEveryXDays       = $p.credentialsManagement.requirePasswordChangeEveryXDays       -as [string]
+            AllowManualVerification               = $p.credentialsManagement.allowManualVerification               -as [string]
+            PerformPeriodicVerification           = $p.credentialsManagement.performPeriodicVerification           -as [string]
+            RequirePasswordVerificationEveryXDays = $p.credentialsManagement.requirePasswordVerificationEveryXDays -as [string]
+            AllowManualReconciliation             = $p.credentialsManagement.allowManualReconciliation             -as [string]
+            AutomaticReconcileWhenUnsynched       = $p.credentialsManagement.automaticReconcileWhenUnsynched       -as [string]
+
+            # Session Management
+            RequirePrivilegedSessionMonitoringAndIsolation = $p.sessionManagement.requirePrivilegedSessionMonitoringAndIsolation -as [string]
+            RecordAndSaveSessionActivity                   = $p.sessionManagement.recordAndSaveSessionActivity                   -as [string]
+            PSMServerID                                    = $p.sessionManagement.PSMServerID                                    -as [string]
+
+            # Privileged Access Workflows
+            RequireDualControlPasswordAccessApproval = $p.privilegedAccessWorkflows.requireDualControlPasswordAccessApproval -as [string]
+            EnforceCheckinCheckoutExclusiveAccess    = $p.privilegedAccessWorkflows.enforceCheckinCheckoutExclusiveAccess    -as [string]
+            EnforceOnetimePasswordAccess             = $p.privilegedAccessWorkflows.enforceOnetimePasswordAccess             -as [string]
+
+            # --- NF* notification-related attributes (from platform properties) ---
+            NFNotifyPriorExpiration          = Get-PlatformPropertyValue -Platform $p -Name 'NFNotifyPriorExpiration'
+            NFPriorExpirationRecipients      = Get-PlatformPropertyValue -Platform $p -Name 'NFPriorExpirationRecipients'
+            NFNotifyOnPasswordDisable        = Get-PlatformPropertyValue -Platform $p -Name 'NFNotifyOnPasswordDisable'
+            NFOnPasswordDisableRecipients    = Get-PlatformPropertyValue -Platform $p -Name 'NFOnPasswordDisableRecipients'
+            NFNotifyOnVerificationErrors     = Get-PlatformPropertyValue -Platform $p -Name 'NFNotifyOnVerificationErrors'
+            NFOnVerificationErrorsRecipients = Get-PlatformPropertyValue -Platform $p -Name 'NFOnVerificationErrorsRecipients'
+            NFNotifyOnPasswordUsed           = Get-PlatformPropertyValue -Platform $p -Name 'NFNotifyOnPasswordUsed'
+            NFOnPasswordUsedRecipients       = Get-PlatformPropertyValue -Platform $p -Name 'NFOnPasswordUsedRecipients'
+        }
+    }
+
+    # 5) Export to CSV
+    Write-Info "Exporting platform report to: $CsvFilePath"
+    $processed | Export-Csv -Path $CsvFilePath -NoTypeInformation -Encoding UTF8
+    Write-Ok "CyberArk platform report successfully exported to: $CsvFilePath"
 }
-
-# Set Authorization Header
-$Headers = @{
-    Authorization = $AuthToken
-    "Content-Type" = "application/json"
+catch {
+    Write-Err $_
 }
-
-# Define Platform API URL and output CSV file path
-$GetPlatformsURL = "$BaseURL/Platforms"
-$CsvFilePath = "CyberArk_FullPlatformReport.csv"
-
-try {
-    $PlatformsResponse = Invoke-RestMethod -Uri $GetPlatformsURL -Method GET -Headers $Headers
-    Write-Host "Platforms data retrieved." -ForegroundColor Green
-} catch {
-    Write-Host "Failed to retrieve platform data: $_" -ForegroundColor Red
-    exit
-}
-
-# Process Data with Correct JSON Structure
-$ProcessedPlatforms = $PlatformsResponse.Platforms | ForEach-Object {
-    [PSCustomObject]@{
-        PlatformID    = $_.general.id
-        PlatformName  = $_.general.name
-        Active        = $_.general.active
-        Description   = $_.general.description
-        PlatformBaseID = $_.general.platformBaseID
-        PlatformType  = $_.general.platformType
-        SystemType    = $_.general.systemType
-
-        # Required and Optional Properties
-        RequiredProperties = ($_.properties.required.name -join "; ")
-        OptionalProperties = ($_.properties.optional.name -join "; ")
-
-        # Linked Accounts
-        LinkedAccounts = ($_.linkedAccounts.name -join "; ")
-
-        # Credentials Management
-        AllowedSafes                            = $_.credentialsManagement.allowedSafes
-        AllowManualChange                       = $_.credentialsManagement.allowManualChange -as [string]
-        PerformPeriodicChange                   = $_.credentialsManagement.performPeriodicChange -as [string]
-        RequirePasswordChangeEveryXDays         = $_.credentialsManagement.requirePasswordChangeEveryXDays -as [string]
-        AllowManualVerification                 = $_.credentialsManagement.allowManualVerification -as [string]
-        PerformPeriodicVerification             = $_.credentialsManagement.performPeriodicVerification -as [string]
-        RequirePasswordVerificationEveryXDays   = $_.credentialsManagement.requirePasswordVerificationEveryXDays -as [string]
-        AllowManualReconciliation               = $_.credentialsManagement.allowManualReconciliation -as [string]
-        AutomaticReconcileWhenUnsynched         = $_.credentialsManagement.automaticReconcileWhenUnsynched -as [string]
-
-        # Session Management
-        RequirePrivilegedSessionMonitoringAndIsolation = $_.sessionManagement.requirePrivilegedSessionMonitoringAndIsolation -as [string]
-        RecordAndSaveSessionActivity           = $_.sessionManagement.recordAndSaveSessionActivity -as [string]
-        PSMServerID                            = $_.sessionManagement.PSMServerID -as [string]
-
-        # Privileged Access Workflows
-        RequireDualControlPasswordAccessApproval = $_.privilegedAccessWorkflows.requireDualControlPasswordAccessApproval -as [string]
-        EnforceCheckinCheckoutExclusiveAccess    = $_.privilegedAccessWorkflows.enforceCheckinCheckoutExclusiveAccess -as [string]
-        EnforceOnetimePasswordAccess             = $_.privilegedAccessWorkflows.enforceOnetimePasswordAccess -as [string]
+finally {
+    if ($sessionCreated) {
+        try {
+            Close-PASSession | Out-Null
+            Write-Ok "Logged off."
+        } catch {
+            Write-Warn "Logoff warning: $($_.Exception.Message)"
+        }
     }
 }
-
-# Export to CSV
-$ProcessedPlatforms | Export-Csv -Path $CsvFilePath -NoTypeInformation
-Write-Host "✅ CyberArk platform report has been successfully exported to: $CsvFilePath" -ForegroundColor Yellow
-
-# Log off session
-$LogoffURL = "$BaseURL/auth/Logoff"
-Invoke-RestMethod -Uri $LogoffURL -Method POST -Headers $Headers | Out-Null
-Write-Host "Logged out successfully." -ForegroundColor Cyan
