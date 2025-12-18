@@ -1,98 +1,205 @@
-# Import the psPAS module
-Import-Module psPAS -ErrorAction Stop
+<#
+SafeMemberReport_IdentityServiceUser.ps1
 
-# Define log file and logging function
-$LogFile = "SafeMemberAudit.log"
+- Auth: CCP → Identity Shared Services → ServiceUser (same method as your APP/IND scripts)
+- Enumerates all Safes via Get-PASSafe
+- For each Safe, enumerates members via Get-PASSafeMember
+- Exports full membership + permissions report to CSV
+#>
+
+[CmdletBinding()]
+param(
+    # ===== Identity / Privilege Cloud (Shared Services) =====
+    [string]$IdentityTenantURL  = "https://aak4521.my.idaptive.app",
+    [string]$PrivilegeCloudURL  = "https://alliantcredit.privilegecloud.cyberark.cloud",
+
+    # ===== CCP settings (for API Service User stored in Vault) =====
+    [string]$CCPAddress         = "https://aam.alliantcreditunion.com",
+    [string]$CCPLocation        = "AIMWebService",
+    [string]$CCPAppID           = "ACURestAPI",
+    [string]$CCPSafe            = "ACU-VAULT-API",
+    [string]$CCPObject          = "Application-CyberArkVaultRestAPI-alliantcredit.cyberark.cloud",
+    [bool]  $CCPWindowsAuth     = $false,
+
+    # ===== Output =====
+    [string]$CsvFilePath        = "I:\Script\REPORTS\csv\SafeMembersReport.csv",
+    [string]$LogFile            = "SafeMemberAudit.log"
+)
+
+# --- TLS & modules ---
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+Import-Module psPAS           -ErrorAction Stop
+Import-Module IdentityCommand -ErrorAction Stop
+
+$ErrorActionPreference = 'Stop'
+
+# --- Logging helper ---
 function Write-Log {
-    param ([string]$Message)
+    param(
+        [Parameter(Mandatory)][string]$Message,
+        [ConsoleColor]$Color = [ConsoleColor]::White
+    )
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $entry = "$timestamp | $Message"
+    $entry     = "$timestamp | $Message"
     Add-Content -Path $LogFile -Value $entry
-    Write-Host $entry
+    Write-Host $entry -ForegroundColor $Color
 }
 
-# Prompt for credentials
-$Cred = Get-Credential
+Write-Log "🔹 Safe Member Report (Identity Service User) starting..." 'Cyan'
 
-# Define PVWA / Privilege Cloud base URL
-$PVWAURL = "https://alliantcredit.privilegecloud.cyberark.com"
+# --- CCP → PSCredential (API Service User) ---
+function Get-ServiceUserCredentialFromCCP {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$CCPAddress,
+        [Parameter(Mandatory)][string]$Location,
+        [Parameter(Mandatory)][string]$AppID,
+        [Parameter(Mandatory)][string]$Safe,
+        [Parameter(Mandatory)][string]$Object,
+        [bool]$WindowsAuth = $false
+    )
 
-# Authenticate using New-PASSession
-try {
-    New-PASSession -Credential $Cred -BaseURI $PVWAURL
-    Write-Log "✅ Connected to CyberArk Privilege Cloud using psPAS."
-} catch {
-    Write-Log "❌ Authentication failed using New-PASSession: $_"
-    exit
+    $base = $CCPAddress.TrimEnd('/')
+    $loc  = $Location.Trim('/')
+
+    $url  = "{0}/{1}/api/Accounts?AppID={2}&Safe={3}&Object={4}" -f $base, $loc, $AppID, $Safe, $Object
+
+    Write-Log "🛠  Retrieving Service User credential from CCP: $url" 'Cyan'
+
+    $headers = @{ "Content-Type" = "application/json" }
+
+    $resp = Invoke-RestMethod -Uri $url -Method GET -Headers $headers -UseDefaultCredentials:$WindowsAuth -ErrorAction Stop
+
+    if (-not $resp.UserName -or -not $resp.Content) {
+        throw "CCP response missing UserName/Content. Raw: $($resp | ConvertTo-Json -Depth 5)"
+    }
+
+    Write-Log ("✅ CCP returned service user: {0}" -f $resp.UserName) 'Green'
+
+    $sec = ConvertTo-SecureString $resp.Content -AsPlainText -Force
+    return [PSCredential]::new($resp.UserName, $sec)
 }
 
-# Step 2: Get all Safes
-try {
-    $Safes = Get-PASSafe
-    Write-Log "📦 Retrieved $($Safes.Count) safes."
-} catch {
-    Write-Log "❌ Failed to retrieve safes: $_"
-    exit
-}
-
-# Step 3: Retrieve Safe Members and Permissions
+# --- MAIN ---
+$sessionCreated    = $false
 $SafeMembersReport = @()
 
-foreach ($Safe in $Safes) {
-    $SafeName = $Safe.safeName
-    Write-Log "🔹 Retrieving members for Safe: ${SafeName}"
+try {
+    # 1) Get Service User creds from CCP
+    $serviceCred = Get-ServiceUserCredentialFromCCP `
+        -CCPAddress $CCPAddress `
+        -Location   $CCPLocation `
+        -AppID      $CCPAppID `
+        -Safe       $CCPSafe `
+        -Object     $CCPObject `
+        -WindowsAuth:$CCPWindowsAuth
 
-    try {
-        # Fetch Safe Members using psPAS
-        $SafeMembers = Get-PASSafeMember -SafeName $SafeName
+    # 2) Authenticate via Identity Shared Services using SERVICE USER
+    Write-Log "🛠  Authenticating to Privilege Cloud via Identity (Service User)..." 'Cyan'
 
-        if ($SafeMembers.Count -eq 0) {
-            Write-Log "⚠️ No members found for Safe: ${SafeName}"
-            continue
-        }
+    New-PASSession `
+        -IdentityTenantURL $IdentityTenantURL `
+        -PrivilegeCloudURL $PrivilegeCloudURL `
+        -Credential        $serviceCred `
+        -ServiceUser `
+        -ErrorAction Stop | Out-Null
 
-        foreach ($Member in $SafeMembers) {
-            $SafeMembersReport += [PSCustomObject]@{
-                SafeName                                 = $SafeName
-                Member                                   = $Member.MemberName
-                MemberType                               = $Member.MemberType
-                UseAccounts                              = $Member.Permissions.useAccounts
-                RetrieveAccounts                         = $Member.Permissions.retrieveAccounts
-                ListAccounts                             = $Member.Permissions.listAccounts
-                AddAccounts                              = $Member.Permissions.addAccounts
-                UpdateAccountContent                     = $Member.Permissions.updateAccountContent
-                UpdateAccountProperties                  = $Member.Permissions.updateAccountProperties
-                InitiateCPMAccountManagementOperations   = $Member.Permissions.initiateCPMAccountManagementOperations
-                SpecifyNextAccountContent                = $Member.Permissions.specifyNextAccountContent
-                RenameAccounts                           = $Member.Permissions.renameAccounts
-                DeleteAccounts                           = $Member.Permissions.deleteAccounts
-                UnlockAccounts                           = $Member.Permissions.unlockAccounts
-                ManageSafe                               = $Member.Permissions.manageSafe
-                ManageSafeMembers                        = $Member.Permissions.manageSafeMembers
-                BackupSafe                               = $Member.Permissions.backupSafe
-                ViewAuditLog                             = $Member.Permissions.viewAuditLog
-                ViewSafeMembers                          = $Member.Permissions.viewSafeMembers
-                AccessWithoutConfirmation                = $Member.Permissions.accessWithoutConfirmation
-                CreateFolders                            = $Member.Permissions.createFolders
-                DeleteFolders                            = $Member.Permissions.deleteFolders
-                MoveAccountsAndFolders                   = $Member.Permissions.moveAccountsAndFolders
-                RequestsAuthorizationLevel1              = $Member.Permissions.requestsAuthorizationLevel1
-                RequestsAuthorizationLevel2              = $Member.Permissions.requestsAuthorizationLevel2
+    if (-not (Get-PASSession)) { throw "psPAS session not established via ServiceUser." }
+
+    $sessionCreated = $true
+    Write-Log ("✅ Authenticated to {0} as service user: {1}" -f $PrivilegeCloudURL, $serviceCred.UserName) 'Green'
+
+    # 3) Get all Safes
+    Write-Log "🛠  Retrieving safes via Get-PASSafe..." 'Cyan'
+    $Safes = Get-PASSafe -ErrorAction Stop
+
+    if (-not $Safes -or $Safes.Count -eq 0) {
+        Write-Log "⚠️  No safes returned from Get-PASSafe." 'Yellow'
+        return
+    }
+
+    Write-Log ("📦 Retrieved {0} safes." -f $Safes.Count) 'Green'
+
+    # 4) For each Safe, get Safe Members and permissions
+    $i = 0
+    foreach ($Safe in $Safes) {
+        $i++
+        $SafeName = $Safe.SafeName
+        Write-Log ("🔹 [{0}/{1}] Retrieving members for Safe: {2}" -f $i, $Safes.Count, $SafeName) 'Cyan'
+
+        try {
+            $SafeMembers = Get-PASSafeMember -SafeName $SafeName -ErrorAction Stop
+
+            if (-not $SafeMembers -or $SafeMembers.Count -eq 0) {
+                Write-Log ("⚠️  No members found for Safe: {0}" -f $SafeName) 'Yellow'
+                continue
             }
+
+            foreach ($Member in $SafeMembers) {
+
+                # Defensive null-check on Permissions so script doesn't blow up on weird entries
+                $perm = $Member.Permissions
+
+                $SafeMembersReport += [PSCustomObject]@{
+                    SafeName                               = $SafeName
+                    Member                                 = $Member.MemberName
+                    MemberType                             = $Member.MemberType
+
+                    UseAccounts                            = $perm.useAccounts
+                    RetrieveAccounts                       = $perm.retrieveAccounts
+                    ListAccounts                           = $perm.listAccounts
+                    AddAccounts                            = $perm.addAccounts
+                    UpdateAccountContent                   = $perm.updateAccountContent
+                    UpdateAccountProperties                = $perm.updateAccountProperties
+                    InitiateCPMAccountManagementOperations = $perm.initiateCPMAccountManagementOperations
+                    SpecifyNextAccountContent              = $perm.specifyNextAccountContent
+                    RenameAccounts                         = $perm.renameAccounts
+                    DeleteAccounts                         = $perm.deleteAccounts
+                    UnlockAccounts                         = $perm.unlockAccounts
+                    ManageSafe                             = $perm.manageSafe
+                    ManageSafeMembers                      = $perm.manageSafeMembers
+                    BackupSafe                             = $perm.backupSafe
+                    ViewAuditLog                           = $perm.viewAuditLog
+                    ViewSafeMembers                        = $perm.viewSafeMembers
+                    AccessWithoutConfirmation              = $perm.accessWithoutConfirmation
+                    CreateFolders                          = $perm.createFolders
+                    DeleteFolders                          = $perm.deleteFolders
+                    MoveAccountsAndFolders                 = $perm.moveAccountsAndFolders
+                    RequestsAuthorizationLevel1            = $perm.requestsAuthorizationLevel1
+                    RequestsAuthorizationLevel2            = $perm.requestsAuthorizationLevel2
+                }
+            }
+
+            Write-Log ("✅ Retrieved {0} member(s) for Safe: {1}" -f $SafeMembers.Count, $SafeName) 'Green'
         }
-        Write-Log "✅ Retrieved $($SafeMembers.Count) members for Safe: ${SafeName}"
-    } catch {
-        Write-Log "❌ ERROR: Failed to retrieve members for Safe: ${SafeName} - $_"
+        catch {
+            Write-Log ("❌ ERROR: Failed to retrieve members for Safe: {0} - {1}" -f $SafeName, $_.Exception.Message) 'Red'
+        }
+    }
+
+    # 5) Export to CSV
+    if (-not $SafeMembersReport -or $SafeMembersReport.Count -eq 0) {
+        Write-Log "⚠️  No Safe Member data collected; skipping CSV export." 'Yellow'
+    }
+    else {
+        Write-Log ("🛠  Exporting Safe Member Report to: {0}" -f $CsvFilePath) 'Cyan'
+        $SafeMembersReport | Export-Csv -Path $CsvFilePath -NoTypeInformation -Encoding UTF8
+        Write-Log "✅ Safe Member Report successfully exported." 'Green'
+    }
+
+    Write-Log "🔹 Safe Member Report generation completed." 'Cyan'
+}
+catch {
+    Write-Log ("❌ FATAL ERROR: {0}" -f $_.Exception.Message) 'Red'
+}
+finally {
+    if ($sessionCreated) {
+        try {
+            Close-PASSession | Out-Null
+            Write-Log "✅ Logged off from Privilege Cloud." 'Green'
+        } catch {
+            Write-Log ("⚠️  Logoff warning: {0}" -f $_.Exception.Message) 'Yellow'
+        }
     }
 }
-
-# Step 4: Export Report to CSV
-$CsvFilePath = "I:\Script\REPORTS\csv\SafeMembersReport.csv"
-try {
-    $SafeMembersReport | Export-Csv -Path $CsvFilePath -NoTypeInformation -Encoding UTF8
-    Write-Log "✅ Safe Member Report successfully exported to: $CsvFilePath"
-} catch {
-    Write-Log "❌ Failed to export Safe Member Report to CSV: $_"
-}
-
-Write-Log "🔹 Safe Member Report generation completed."
