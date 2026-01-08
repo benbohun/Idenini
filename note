@@ -1,17 +1,15 @@
-Generate a report of all accounts in CYberArk, then Create a logic that will export report of account that are assigned to Platform that have PerformPeriodicChange set to True or False
-List account account name, safe, platform, username address and all attributes, the reflect PerformPeriodicChange True or False based on their assigned platform
-export report in CSV
-Use the script login below
-
 <#
-Get-PCloudPlatformReport_Merged.ps1
+Get-PCloudAccounts_PeriodicChange_SingleCSV.ps1
 
-- Auth: CCP → Identity Shared Services → ServiceUser (same as your working APP/IND scripts)
-- Step 1: Use psPAS session BaseURI + WebSession to call /API/Platforms (REST)
-          → gives full general/credentials/session/workflow fields
-- Step 2: For each platform, call Get-PASPlatform -PlatformID <general.id>
-          → pull NF* notification settings from .Details
-- Step 3: Export a merged CSV with both sets of fields.
+- Auth: CCP → Identity Shared Services → ServiceUser (same as your working scripts)
+- Pull /API/Platforms once and cache PerformPeriodicChange by PlatformID (plus merged platform info)
+- Pull /API/Accounts (paged)
+- Reflect PerformPeriodicChange onto each account based on its PlatformID
+- Export ONE CSV (single output file)
+
+“All attributes” approach:
+- AccountRawJson: full (compressed) JSON of the account record
+- PlatformRawJson: full (compressed) JSON of the merged platform record (REST + NF* best-effort)
 #>
 
 [CmdletBinding()]
@@ -29,7 +27,10 @@ param(
     [bool]  $CCPWindowsAuth     = $false,
 
     # ===== Output =====
-    [string]$CsvFilePath        = ".\CyberArk_FullPlatformReport_Merged.csv"
+    [string]$CsvFilePath        = ".\CyberArk_Accounts_PerformPeriodicChange_Report.csv",
+
+    # Accounts paging
+    [int]   $PageSize           = 1000
 )
 
 # --- TLS & modules ---
@@ -43,6 +44,21 @@ function Write-Info($m){ Write-Host "🛠  $m" -ForegroundColor Cyan }
 function Write-Ok($m){   Write-Host "✅ $m" -ForegroundColor Green }
 function Write-Warn($m){ Write-Host "⚠️  $m" -ForegroundColor Yellow }
 function Write-Err($m){  Write-Host "❌ $m" -ForegroundColor Red }
+
+function Normalize-Bool {
+    param([object]$Value)
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [bool]) { return $Value }
+    $s = $Value.ToString().Trim().ToLower()
+    if ($s -in @('true','1','yes','y'))  { return $true }
+    if ($s -in @('false','0','no','n')) { return $false }
+    return $null
+}
+
+function To-JsonCompressed {
+    param([object]$Obj, [int]$Depth = 35)
+    try { return ($Obj | ConvertTo-Json -Depth $Depth -Compress) } catch { return $null }
+}
 
 # --- CCP → PSCredential (API Service User) ---
 function Get-ServiceUserCredentialFromCCP {
@@ -78,6 +94,111 @@ function Get-ServiceUserCredentialFromCCP {
     return [PSCredential]::new($resp.UserName, $sec)
 }
 
+function Get-AllPlatformsMergedMap {
+    param(
+        [Parameter(Mandatory)][string]$BaseUri,
+        [Parameter(Mandatory)]$WebSession
+    )
+
+    $platformsUrl = "$BaseUri/API/Platforms"
+    Write-Info "Retrieving platform list from: $platformsUrl"
+
+    $platformsResponse = Invoke-RestMethod -Uri $platformsUrl -Method GET -WebSession $WebSession -ErrorAction Stop
+    $restPlatforms =
+        if ($platformsResponse.PSObject.Properties.Name -contains 'Platforms') { $platformsResponse.Platforms }
+        else { $platformsResponse }
+
+    if (-not $restPlatforms -or $restPlatforms.Count -eq 0) {
+        throw "No platforms found in /API/Platforms response."
+    }
+
+    Write-Ok ("REST /Platforms returned {0} platform(s)." -f $restPlatforms.Count)
+
+    $map = @{}
+    $idx = 0
+
+    foreach ($p in $restPlatforms) {
+        $idx++
+        $id   = $p.general.id
+        $name = $p.general.name
+        Write-Info ("[{0}/{1}] Caching platform '{2}' (ID={3})" -f $idx, $restPlatforms.Count, $name, $id)
+
+        # Best-effort NF* enrich
+        $details = $null
+        try {
+            $full = Get-PASPlatform -PlatformID $id -ErrorAction Stop
+            if ($full -and $full.Details) { $details = $full.Details }
+        } catch {
+            Write-Warn ("Get-PASPlatform failed for ID {0}: {1}" -f $id, $_.Exception.Message)
+        }
+
+        $merged = [PSCustomObject]@{
+            PlatformID   = $id
+            PlatformName = $name
+
+            # Key field you need:
+            PerformPeriodicChange = Normalize-Bool $p.credentialsManagement.performPeriodicChange
+
+            # Some common platform controls (nice to have)
+            AllowManualChange                     = Normalize-Bool $p.credentialsManagement.allowManualChange
+            RequirePasswordChangeEveryXDays       = $p.credentialsManagement.requirePasswordChangeEveryXDays
+            PerformPeriodicVerification           = Normalize-Bool $p.credentialsManagement.performPeriodicVerification
+            RequirePasswordVerificationEveryXDays = $p.credentialsManagement.requirePasswordVerificationEveryXDays
+            AutomaticReconcileWhenUnsynched       = Normalize-Bool $p.credentialsManagement.automaticReconcileWhenUnsynched
+
+            # NF* from Details (if available)
+            NFNotifyPriorExpiration           = $details.NFNotifyPriorExpiration
+            NFPriorExpirationRecipients       = $details.NFPriorExpirationRecipients
+            NFNotifyOnPasswordDisable         = $details.NFNotifyOnPasswordDisable
+            NFOnPasswordDisableRecipients     = $details.NFOnPasswordDisableRecipients
+            NFNotifyOnVerificationErrors      = $details.NFNotifyOnVerificationErrors
+            NFOnVerificationErrorsRecipients  = $details.NFOnVerificationErrorsRecipients
+            NFNotifyOnPasswordUsed            = $details.NFNotifyOnPasswordUsed
+            NFOnPasswordUsedRecipients        = $details.NFOnPasswordUsedRecipients
+
+            # Raw payloads for “all attributes”
+            PlatformRestJson    = To-JsonCompressed $p
+            PlatformDetailsJson = To-JsonCompressed $details
+        }
+
+        $map[$id] = $merged
+    }
+
+    return $map
+}
+
+function Get-AllAccountsPaged {
+    param(
+        [Parameter(Mandatory)][string]$BaseUri,
+        [Parameter(Mandatory)]$WebSession,
+        [int]$Limit = 1000
+    )
+
+    $all = New-Object System.Collections.Generic.List[object]
+    $offset = 0
+
+    while ($true) {
+        $url = "$BaseUri/API/Accounts?limit=$Limit&offset=$offset"
+        Write-Info "Retrieving accounts page: limit=$Limit offset=$offset"
+
+        $resp = Invoke-RestMethod -Uri $url -Method GET -WebSession $WebSession -ErrorAction Stop
+
+        $page =
+            if ($resp.PSObject.Properties.Name -contains 'value') { $resp.value }
+            elseif ($resp.PSObject.Properties.Name -contains 'accounts') { $resp.accounts }
+            else { $resp }
+
+        if (-not $page -or $page.Count -eq 0) { break }
+
+        foreach ($a in $page) { $all.Add($a) }
+
+        if ($page.Count -lt $Limit) { break }
+        $offset += $Limit
+    }
+
+    return $all
+}
+
 # --- MAIN ---
 $sessionCreated = $false
 
@@ -107,120 +228,67 @@ try {
     $sessionCreated = $true
     Write-Ok "Authenticated to $PrivilegeCloudURL as service user: $($serviceCred.UserName)"
 
-    # 3) REST list of platforms (for all non-NF fields)
-    $baseUri    = $session.BaseURI.TrimEnd('/')       # e.g. https://alliantcredit.privilegecloud.cyberark.cloud/PasswordVault
+    $baseUri    = $session.BaseURI.TrimEnd('/')   # includes /PasswordVault
     $webSession = $session.WebSession
-    $platformsUrl = "$baseUri/API/Platforms"
 
-    Write-Info "Retrieving platform list from: $platformsUrl"
-    $platformsResponse = Invoke-RestMethod -Uri $platformsUrl -Method GET -WebSession $webSession -ErrorAction Stop
+    # 3) Cache platforms
+    $platformMap = Get-AllPlatformsMergedMap -BaseUri $baseUri -WebSession $webSession
 
-    $restPlatforms =
-        if ($platformsResponse.PSObject.Properties.Name -contains 'Platforms') {
-            $platformsResponse.Platforms
-        } else {
-            $platformsResponse
+    # 4) Get all accounts (paged)
+    $accounts = Get-AllAccountsPaged -BaseUri $baseUri -WebSession $webSession -Limit $PageSize
+    Write-Ok ("Retrieved {0} total account(s)." -f $accounts.Count)
+
+    # 5) Build report rows
+    $rows = New-Object System.Collections.Generic.List[object]
+    $i = 0
+
+    foreach ($a in $accounts) {
+        $i++
+        if (($i % 1000) -eq 0) { Write-Info "Processing account $i / $($accounts.Count)..." }
+
+        $plat = $null
+        if ($a.platformId -and $platformMap.ContainsKey($a.platformId)) {
+            $plat = $platformMap[$a.platformId]
         }
 
-    if (-not $restPlatforms -or $restPlatforms.Count -eq 0) {
-        throw "No platforms found in /API/Platforms response. Raw: $($platformsResponse | ConvertTo-Json -Depth 5)"
+        $rows.Add([PSCustomObject]@{
+            # --- Required columns ---
+            AccountName  = $a.name
+            SafeName     = $a.safeName
+            PlatformID   = $a.platformId
+            PlatformName = if ($plat) { $plat.PlatformName } else { $null }
+            UserName     = $a.userName
+            Address      = $a.address
+
+            # --- Reflected platform setting ---
+            PerformPeriodicChange = if ($plat) { $plat.PerformPeriodicChange } else { $null }
+
+            # --- Common account fields (best-effort) ---
+            AccountID     = $a.id
+            SecretType    = $a.secretType
+            CPMDisabled   = $a.cpmDisabled
+            AutomaticManagementEnabled = $a.automaticManagementEnabled
+            CreatedTime   = $a.createdTime
+            LastChangeTime= $a.lastChangeTime
+            LastVerifiedTime = $a.lastVerifiedTime
+
+            # --- Helpful platform controls (best-effort) ---
+            Platform_AllowManualChange                     = if ($plat) { $plat.AllowManualChange } else { $null }
+            Platform_RequirePasswordChangeEveryXDays       = if ($plat) { $plat.RequirePasswordChangeEveryXDays } else { $null }
+            Platform_PerformPeriodicVerification           = if ($plat) { $plat.PerformPeriodicVerification } else { $null }
+            Platform_RequirePasswordVerificationEveryXDays = if ($plat) { $plat.RequirePasswordVerificationEveryXDays } else { $null }
+            Platform_AutomaticReconcileWhenUnsynched       = if ($plat) { $plat.AutomaticReconcileWhenUnsynched } else { $null }
+
+            # --- “All attributes” capture ---
+            AccountRawJson  = To-JsonCompressed $a
+            PlatformRawJson = if ($plat) { To-JsonCompressed $plat } else { $null }
+        })
     }
 
-    Write-Ok ("REST /Platforms returned {0} platform(s)." -f $restPlatforms.Count)
-
-    # 4) Build merged report: REST general + psPAS details for NF*
-    $report = @()
-    $idx    = 0
-
-    foreach ($p in $restPlatforms) {
-        $idx++
-        $id   = $p.general.id
-        $name = $p.general.name
-        Write-Info ("[{0}/{1}] Processing platform '{2}' (ID={3})" -f $idx, $restPlatforms.Count, $name, $id)
-
-        # --- Pull NF* via Get-PASPlatform -PlatformID ---
-        $details = $null
-        try {
-            $full = Get-PASPlatform -PlatformID $id -ErrorAction Stop
-            if ($full -and $full.Details) {
-                $details = $full.Details
-            } else {
-                Write-Warn ("Get-PASPlatform returned no .Details for ID {0} (NF* will be blank)." -f $id)
-            }
-        } catch {
-            Write-Warn ("Get-PASPlatform failed for ID {0}: {1}" -f $id, $_.Exception.Message)
-        }
-
-        # NF* values (null-safe)
-        $NFNotifyPriorExpiration          = $details.NFNotifyPriorExpiration
-        $NFPriorExpirationRecipients      = $details.NFPriorExpirationRecipients
-        $NFNotifyOnPasswordDisable        = $details.NFNotifyOnPasswordDisable
-        $NFOnPasswordDisableRecipients    = $details.NFOnPasswordDisableRecipients
-        $NFNotifyOnVerificationErrors     = $details.NFNotifyOnVerificationErrors
-        $NFOnVerificationErrorsRecipients = $details.NFOnVerificationErrorsRecipients
-        $NFNotifyOnPasswordUsed           = $details.NFNotifyOnPasswordUsed
-        $NFOnPasswordUsedRecipients       = $details.NFOnPasswordUsedRecipients
-
-        # Required / Optional property names from REST payload
-        $reqNames = @()
-        $optNames = @()
-        if ($p.properties -and $p.properties.required) { $reqNames = $p.properties.required.name }
-        if ($p.properties -and $p.properties.optional) { $optNames = $p.properties.optional.name }
-
-        # Flatten row
-        $report += [PSCustomObject]@{
-            # --- General (REST) ---
-            PlatformID     = $p.general.id
-            PlatformName   = $p.general.name
-            Active         = $p.general.active
-            Description    = $p.general.description
-            PlatformBaseID = $p.general.platformBaseID
-            PlatformType   = $p.general.platformType
-            SystemType     = $p.general.systemType
-
-            RequiredProperties = ($reqNames -join '; ')
-            OptionalProperties = ($optNames -join '; ')
-
-            # Linked Accounts (REST)
-            LinkedAccounts = ($p.linkedAccounts.name -join '; ')
-
-            # --- Credentials Management (REST) ---
-            AllowedSafes                          = $p.credentialsManagement.allowedSafes
-            AllowManualChange                     = $p.credentialsManagement.allowManualChange                     -as [string]
-            PerformPeriodicChange                 = $p.credentialsManagement.performPeriodicChange                 -as [string]
-            RequirePasswordChangeEveryXDays       = $p.credentialsManagement.requirePasswordChangeEveryXDays       -as [string]
-            AllowManualVerification               = $p.credentialsManagement.allowManualVerification               -as [string]
-            PerformPeriodicVerification           = $p.credentialsManagement.performPeriodicVerification           -as [string]
-            RequirePasswordVerificationEveryXDays = $p.credentialsManagement.requirePasswordVerificationEveryXDays -as [string]
-            AllowManualReconciliation             = $p.credentialsManagement.allowManualReconciliation             -as [string]
-            AutomaticReconcileWhenUnsynched       = $p.credentialsManagement.automaticReconcileWhenUnsynched       -as [string]
-
-            # --- Session Management (REST) ---
-            RequirePrivilegedSessionMonitoringAndIsolation = $p.sessionManagement.requirePrivilegedSessionMonitoringAndIsolation -as [string]
-            RecordAndSaveSessionActivity                   = $p.sessionManagement.recordAndSaveSessionActivity                   -as [string]
-            PSMServerID                                    = $p.sessionManagement.PSMServerID                                    -as [string]
-
-            # --- Privileged Access Workflows (REST) ---
-            RequireDualControlPasswordAccessApproval = $p.privilegedAccessWorkflows.requireDualControlPasswordAccessApproval -as [string]
-            EnforceCheckinCheckoutExclusiveAccess    = $p.privilegedAccessWorkflows.enforceCheckinCheckoutExclusiveAccess    -as [string]
-            EnforceOnetimePasswordAccess             = $p.privilegedAccessWorkflows.enforceOnetimePasswordAccess             -as [string]
-
-            # --- NF* notification settings (Details from Get-PASPlatform) ---
-            NFNotifyPriorExpiration           = $NFNotifyPriorExpiration
-            NFPriorExpirationRecipients       = $NFPriorExpirationRecipients
-            NFNotifyOnPasswordDisable         = $NFNotifyOnPasswordDisable
-            NFOnPasswordDisableRecipients     = $NFOnPasswordDisableRecipients
-            NFNotifyOnVerificationErrors      = $NFNotifyOnVerificationErrors
-            NFOnVerificationErrorsRecipients  = $NFOnVerificationErrorsRecipients
-            NFNotifyOnPasswordUsed            = $NFNotifyOnPasswordUsed
-            NFOnPasswordUsedRecipients        = $NFOnPasswordUsedRecipients
-        }
-    }
-
-    # 5) Export merged CSV
-    Write-Info "Exporting merged platform report to: $CsvFilePath"
-    $report | Export-Csv -Path $CsvFilePath -NoTypeInformation -Encoding UTF8
-    Write-Ok "CyberArk merged platform report successfully exported to: $CsvFilePath"
+    # 6) Export ONE CSV
+    Write-Info "Exporting report to: $CsvFilePath"
+    $rows | Export-Csv -Path $CsvFilePath -NoTypeInformation -Encoding UTF8
+    Write-Ok ("Export complete: {0} (Rows={1})" -f $CsvFilePath, $rows.Count)
 }
 catch {
     Write-Err $_
