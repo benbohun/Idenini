@@ -1,192 +1,237 @@
-<#
-IND_SafeDeletion_Identity.ps1
+Generate a report of all accounts in CYberArk, then Create a logic that will export report of account that are assigned to Platform that have PerformPeriodicChange set to True or False
+List account account name, safe, platform, username address and all attributes, the reflect PerformPeriodicChange True or False based on their assigned platform
+export report in CSV
+Use the script login below
 
-- Uses SAME login pattern:
-    CCP → Identity Shared Services → Service User
-- Reads Safe names from CSV
-- For each Safe:
-    1) Lists all accounts tied to the Safe
-    2) Prompts for confirmation
-    3) Deletes all accounts
-    4) Deletes the Safe
-- Abort-safe if user declines
+<#
+Get-PCloudPlatformReport_Merged.ps1
+
+- Auth: CCP → Identity Shared Services → ServiceUser (same as your working APP/IND scripts)
+- Step 1: Use psPAS session BaseURI + WebSession to call /API/Platforms (REST)
+          → gives full general/credentials/session/workflow fields
+- Step 2: For each platform, call Get-PASPlatform -PlatformID <general.id>
+          → pull NF* notification settings from .Details
+- Step 3: Export a merged CSV with both sets of fields.
 #>
 
-[CmdletBinding(SupportsShouldProcess = $true)]
+[CmdletBinding()]
 param(
-    [string]$CsvPath = "I:\Script\IDENTITY Script New\csv\safes_to_delete.csv",
+    # ===== Identity / Privilege Cloud (Shared Services) =====
+    [string]$IdentityTenantURL  = "https://aak4521.my.idaptive.app",
+    [string]$PrivilegeCloudURL  = "https://alliantcredit.privilegecloud.cyberark.cloud",
 
-    # ===== Identity / Privilege Cloud =====
-    [string]$IdentityTenantURL = "https://aak4521.my.idaptive.app",
-    [string]$PrivilegeCloudURL = "https://alliantcredit.privilegecloud.cyberark.cloud",
+    # ===== CCP settings (for API Service User stored in Vault) =====
+    [string]$CCPAddress         = "https://aam.alliantcreditunion.com",  # CCP base URL (no trailing slash)
+    [string]$CCPLocation        = "AIMWebService",
+    [string]$CCPAppID           = "ACURestAPI",
+    [string]$CCPSafe            = "ACU-VAULT-API",
+    [string]$CCPObject          = "Application-CyberArkVaultRestAPI-alliantcredit.cyberark.cloud",
+    [bool]  $CCPWindowsAuth     = $false,
 
-    # ===== CCP =====
-    [string]$CCPAddress     = "https://aam.alliantcreditunion.com",
-    [string]$CCPLocation    = "AIMWebService",
-    [string]$CCPAppID       = "ACURestAPI",
-    [string]$CCPSafe        = "ACU-VAULT-API",
-    [string]$CCPObject      = "Application-CyberArkVaultRestAPI-alliantcredit.cyberark.cloud",
-    [bool]  $CCPWindowsAuth = $false
+    # ===== Output =====
+    [string]$CsvFilePath        = ".\CyberArk_FullPlatformReport_Merged.csv"
 )
 
-Import-Module psPAS -ErrorAction Stop
+# --- TLS & modules ---
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+Import-Module psPAS           -ErrorAction Stop
+Import-Module IdentityCommand -ErrorAction Stop
+$ErrorActionPreference = 'Stop'
 
-# ---- Logging helpers ----
+# --- Pretty log helpers ---
 function Write-Info($m){ Write-Host "🛠  $m" -ForegroundColor Cyan }
 function Write-Ok($m){   Write-Host "✅ $m" -ForegroundColor Green }
 function Write-Warn($m){ Write-Host "⚠️  $m" -ForegroundColor Yellow }
 function Write-Err($m){  Write-Host "❌ $m" -ForegroundColor Red }
 
-# ---- CCP Credential Retrieval (same as your creation script) ----
+# --- CCP → PSCredential (API Service User) ---
 function Get-ServiceUserCredentialFromCCP {
+    [CmdletBinding()]
     param(
-        [string]$CCPAddress,
-        [string]$Location,
-        [string]$AppID,
-        [string]$Safe,
-        [string]$Object,
-        [bool]$WindowsAuth
+        [Parameter(Mandatory)][string]$CCPAddress,
+        [Parameter(Mandatory)][string]$Location,
+        [Parameter(Mandatory)][string]$AppID,
+        [Parameter(Mandatory)][string]$Safe,
+        [Parameter(Mandatory)][string]$Object,
+        [bool]$WindowsAuth = $false
     )
 
-    $url = "{0}/{1}/api/Accounts?AppID={2}&Safe={3}&Object={4}" -f `
-        $CCPAddress.TrimEnd('/'),
-        $Location.Trim('/'),
-        $AppID,
-        $Safe,
-        $Object
+    $base = $CCPAddress.TrimEnd('/')
+    $loc  = $Location.Trim('/')
 
-    Write-Info "Retrieving Service User credential from CCP"
-    $resp = Invoke-RestMethod -Uri $url -Method GET -UseDefaultCredentials:$WindowsAuth -ErrorAction Stop
+    $url  = "{0}/{1}/api/Accounts?AppID={2}&Safe={3}&Object={4}" -f $base, $loc, $AppID, $Safe, $Object
+
+    Write-Info "Retrieving **Service User** credential from CCP:"
+    Write-Info "  $url"
+
+    $headers = @{ "Content-Type" = "application/json" }
+
+    $resp = Invoke-RestMethod -Uri $url -Method GET -Headers $headers -UseDefaultCredentials:$WindowsAuth -ErrorAction Stop
 
     if (-not $resp.UserName -or -not $resp.Content) {
-        throw "Invalid CCP response"
+        throw "CCP response missing UserName/Content. Raw: $($resp | ConvertTo-Json -Depth 5)"
     }
 
     Write-Ok "CCP returned service user: $($resp.UserName)"
+
     $sec = ConvertTo-SecureString $resp.Content -AsPlainText -Force
     return [PSCredential]::new($resp.UserName, $sec)
 }
 
-# ---- Confirmation Prompt ----
-function Confirm-Deletion {
-    param(
-        [string]$SafeName,
-        [int]$AccountCount
-    )
-
-    Write-Host ""
-    Write-Warn "Safe: $SafeName"
-    Write-Warn "Accounts found: $AccountCount"
-    Write-Warn "This will DELETE ALL accounts and the Safe."
-    Write-Host ""
-
-    $choice = Read-Host "Type YES to proceed, anything else to abort"
-    return ($choice -eq "YES")
-}
-
-# ---- Process One Safe ----
-function Process-SafeDeletion {
-    param([string]$SafeName)
-
-    Write-Info "Processing Safe: $SafeName"
-
-    # Verify Safe exists
-    $safe = Get-PASSafe -SafeName $SafeName -ErrorAction SilentlyContinue
-    if (-not $safe) {
-        Write-Warn "Safe '$SafeName' not found. Skipping."
-        return
-    }
-
-    # List accounts
-    $accounts = Get-PASAccount -SafeName $SafeName -ErrorAction SilentlyContinue
-    $count = ($accounts | Measure-Object).Count
-
-    if ($count -gt 0) {
-        Write-Info "Accounts tied to '$SafeName':"
-        $accounts | ForEach-Object {
-            Write-Host ("  - {0} @ {1} (ID={2})" -f $_.UserName, $_.Address, $_.id)
-        }
-    }
-    else {
-        Write-Info "No accounts found in '$SafeName'."
-    }
-
-    if (-not (Confirm-Deletion -SafeName $SafeName -AccountCount $count)) {
-        Write-Warn "Deletion aborted by user for '$SafeName'."
-        return
-    }
-
-    # Delete accounts first
-    foreach ($acct in $accounts) {
-        if ($PSCmdlet.ShouldProcess("$($acct.UserName)@$($acct.Address)", "Remove-PASAccount")) {
-            try {
-                Remove-PASAccount -AccountID $acct.id -ErrorAction Stop
-                Write-Ok "Deleted account: $($acct.UserName) @ $($acct.Address)"
-            }
-            catch {
-                Write-Err "Failed deleting account $($acct.UserName): $($_.Exception.Message)"
-                throw
-            }
-        }
-    }
-
-    # Delete Safe
-    if ($PSCmdlet.ShouldProcess($SafeName, "Remove-PASSafe")) {
-        try {
-            Remove-PASSafe -SafeName $SafeName -ErrorAction Stop
-            Write-Ok "Deleted Safe '$SafeName'"
-        }
-        catch {
-            Write-Err "Failed deleting Safe '$SafeName': $($_.Exception.Message)"
-        }
-    }
-}
-
-# ---- MAIN ----
+# --- MAIN ---
 $sessionCreated = $false
 
 try {
-    if (-not (Test-Path $CsvPath)) {
-        throw "CSV not found: $CsvPath"
-    }
-
-    $rows = Import-Csv $CsvPath
-    if (-not $rows) {
-        throw "CSV is empty."
-    }
-
-    $cred = Get-ServiceUserCredentialFromCCP `
+    # 1) Get Service User creds from CCP
+    $serviceCred = Get-ServiceUserCredentialFromCCP `
         -CCPAddress $CCPAddress `
-        -Location $CCPLocation `
-        -AppID $CCPAppID `
-        -Safe $CCPSafe `
-        -Object $CCPObject `
-        -WindowsAuth $CCPWindowsAuth
+        -Location   $CCPLocation `
+        -AppID      $CCPAppID `
+        -Safe       $CCPSafe `
+        -Object     $CCPObject `
+        -WindowsAuth:$CCPWindowsAuth
 
-    Write-Info "Authenticating via Identity Shared Services..."
+    # 2) Authenticate via Identity Shared Services using SERVICE USER
+    Write-Info "Authenticating to Privilege Cloud via Identity (Service User)..."
+
     New-PASSession `
         -IdentityTenantURL $IdentityTenantURL `
         -PrivilegeCloudURL $PrivilegeCloudURL `
-        -Credential $cred `
+        -Credential        $serviceCred `
         -ServiceUser `
         -ErrorAction Stop | Out-Null
 
-    $sessionCreated = $true
-    Write-Ok "Authenticated as service user: $($cred.UserName)"
+    $session = Get-PASSession
+    if (-not $session) { throw "psPAS session not established via ServiceUser." }
 
-    foreach ($row in $rows) {
-        Process-SafeDeletion -SafeName $row.SafeName.Trim()
+    $sessionCreated = $true
+    Write-Ok "Authenticated to $PrivilegeCloudURL as service user: $($serviceCred.UserName)"
+
+    # 3) REST list of platforms (for all non-NF fields)
+    $baseUri    = $session.BaseURI.TrimEnd('/')       # e.g. https://alliantcredit.privilegecloud.cyberark.cloud/PasswordVault
+    $webSession = $session.WebSession
+    $platformsUrl = "$baseUri/API/Platforms"
+
+    Write-Info "Retrieving platform list from: $platformsUrl"
+    $platformsResponse = Invoke-RestMethod -Uri $platformsUrl -Method GET -WebSession $webSession -ErrorAction Stop
+
+    $restPlatforms =
+        if ($platformsResponse.PSObject.Properties.Name -contains 'Platforms') {
+            $platformsResponse.Platforms
+        } else {
+            $platformsResponse
+        }
+
+    if (-not $restPlatforms -or $restPlatforms.Count -eq 0) {
+        throw "No platforms found in /API/Platforms response. Raw: $($platformsResponse | ConvertTo-Json -Depth 5)"
     }
 
-    Write-Ok "Safe deletion processing completed."
+    Write-Ok ("REST /Platforms returned {0} platform(s)." -f $restPlatforms.Count)
+
+    # 4) Build merged report: REST general + psPAS details for NF*
+    $report = @()
+    $idx    = 0
+
+    foreach ($p in $restPlatforms) {
+        $idx++
+        $id   = $p.general.id
+        $name = $p.general.name
+        Write-Info ("[{0}/{1}] Processing platform '{2}' (ID={3})" -f $idx, $restPlatforms.Count, $name, $id)
+
+        # --- Pull NF* via Get-PASPlatform -PlatformID ---
+        $details = $null
+        try {
+            $full = Get-PASPlatform -PlatformID $id -ErrorAction Stop
+            if ($full -and $full.Details) {
+                $details = $full.Details
+            } else {
+                Write-Warn ("Get-PASPlatform returned no .Details for ID {0} (NF* will be blank)." -f $id)
+            }
+        } catch {
+            Write-Warn ("Get-PASPlatform failed for ID {0}: {1}" -f $id, $_.Exception.Message)
+        }
+
+        # NF* values (null-safe)
+        $NFNotifyPriorExpiration          = $details.NFNotifyPriorExpiration
+        $NFPriorExpirationRecipients      = $details.NFPriorExpirationRecipients
+        $NFNotifyOnPasswordDisable        = $details.NFNotifyOnPasswordDisable
+        $NFOnPasswordDisableRecipients    = $details.NFOnPasswordDisableRecipients
+        $NFNotifyOnVerificationErrors     = $details.NFNotifyOnVerificationErrors
+        $NFOnVerificationErrorsRecipients = $details.NFOnVerificationErrorsRecipients
+        $NFNotifyOnPasswordUsed           = $details.NFNotifyOnPasswordUsed
+        $NFOnPasswordUsedRecipients       = $details.NFOnPasswordUsedRecipients
+
+        # Required / Optional property names from REST payload
+        $reqNames = @()
+        $optNames = @()
+        if ($p.properties -and $p.properties.required) { $reqNames = $p.properties.required.name }
+        if ($p.properties -and $p.properties.optional) { $optNames = $p.properties.optional.name }
+
+        # Flatten row
+        $report += [PSCustomObject]@{
+            # --- General (REST) ---
+            PlatformID     = $p.general.id
+            PlatformName   = $p.general.name
+            Active         = $p.general.active
+            Description    = $p.general.description
+            PlatformBaseID = $p.general.platformBaseID
+            PlatformType   = $p.general.platformType
+            SystemType     = $p.general.systemType
+
+            RequiredProperties = ($reqNames -join '; ')
+            OptionalProperties = ($optNames -join '; ')
+
+            # Linked Accounts (REST)
+            LinkedAccounts = ($p.linkedAccounts.name -join '; ')
+
+            # --- Credentials Management (REST) ---
+            AllowedSafes                          = $p.credentialsManagement.allowedSafes
+            AllowManualChange                     = $p.credentialsManagement.allowManualChange                     -as [string]
+            PerformPeriodicChange                 = $p.credentialsManagement.performPeriodicChange                 -as [string]
+            RequirePasswordChangeEveryXDays       = $p.credentialsManagement.requirePasswordChangeEveryXDays       -as [string]
+            AllowManualVerification               = $p.credentialsManagement.allowManualVerification               -as [string]
+            PerformPeriodicVerification           = $p.credentialsManagement.performPeriodicVerification           -as [string]
+            RequirePasswordVerificationEveryXDays = $p.credentialsManagement.requirePasswordVerificationEveryXDays -as [string]
+            AllowManualReconciliation             = $p.credentialsManagement.allowManualReconciliation             -as [string]
+            AutomaticReconcileWhenUnsynched       = $p.credentialsManagement.automaticReconcileWhenUnsynched       -as [string]
+
+            # --- Session Management (REST) ---
+            RequirePrivilegedSessionMonitoringAndIsolation = $p.sessionManagement.requirePrivilegedSessionMonitoringAndIsolation -as [string]
+            RecordAndSaveSessionActivity                   = $p.sessionManagement.recordAndSaveSessionActivity                   -as [string]
+            PSMServerID                                    = $p.sessionManagement.PSMServerID                                    -as [string]
+
+            # --- Privileged Access Workflows (REST) ---
+            RequireDualControlPasswordAccessApproval = $p.privilegedAccessWorkflows.requireDualControlPasswordAccessApproval -as [string]
+            EnforceCheckinCheckoutExclusiveAccess    = $p.privilegedAccessWorkflows.enforceCheckinCheckoutExclusiveAccess    -as [string]
+            EnforceOnetimePasswordAccess             = $p.privilegedAccessWorkflows.enforceOnetimePasswordAccess             -as [string]
+
+            # --- NF* notification settings (Details from Get-PASPlatform) ---
+            NFNotifyPriorExpiration           = $NFNotifyPriorExpiration
+            NFPriorExpirationRecipients       = $NFPriorExpirationRecipients
+            NFNotifyOnPasswordDisable         = $NFNotifyOnPasswordDisable
+            NFOnPasswordDisableRecipients     = $NFOnPasswordDisableRecipients
+            NFNotifyOnVerificationErrors      = $NFNotifyOnVerificationErrors
+            NFOnVerificationErrorsRecipients  = $NFOnVerificationErrorsRecipients
+            NFNotifyOnPasswordUsed            = $NFNotifyOnPasswordUsed
+            NFOnPasswordUsedRecipients        = $NFOnPasswordUsedRecipients
+        }
+    }
+
+    # 5) Export merged CSV
+    Write-Info "Exporting merged platform report to: $CsvFilePath"
+    $report | Export-Csv -Path $CsvFilePath -NoTypeInformation -Encoding UTF8
+    Write-Ok "CyberArk merged platform report successfully exported to: $CsvFilePath"
 }
 catch {
     Write-Err $_
 }
 finally {
     if ($sessionCreated) {
-        Close-PASSession | Out-Null
-        Write-Ok "Logged off."
+        try {
+            Close-PASSession | Out-Null
+            Write-Ok "Logged off."
+        } catch {
+            Write-Warn "Logoff warning: $($_.Exception.Message)"
+        }
     }
 }
