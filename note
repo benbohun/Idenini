@@ -1,22 +1,51 @@
+creatapp script below shows error, kindly fix, do research to see how you can use API call to search the group in AD
+
+PS I:\Script\IDENTITY Script New> .\Create_App_Safe.ps1
+🛠  Retrieving **Service User** credential from CCP:
+🛠    https://aam.alliantcreditunion.com/AIMWebService/api/Accounts?AppID=ACURestAPI&Safe=ACU-VAULT- API&Object=Application-CyberArkVaultRestAPI-alliantcredit.cyberark.cloud
+✅ CCP returned service user: acurestapi_local@alliantcreditunion.admin
+🛠  Authenticating to Privilege Cloud via Identity (Service User)...
+✅ Authenticated to https://alliantcredit.privilegecloud.cyberark.cloud as service user: acurestapi_local@alliantcreditunion.admin
+🛠  Provisioning Safe: APP_SVC_HCPTerraform1
+✅ Safe created: 'APP_SVC_HCPTerraform1' (Retention: 120 days).
+🛠  Adding/updating IAM_ACU_CA_Admins on 'APP_SVC_HCPTerraform1'...
+🛠  Processing member 'IAM_ACU_CA_Admins@alliantcreditunion.com' on 'APP_SVC_HCPTerraform1' (Type=Gr oup)...
+🛠  Member not found; adding via Add-PASSafeMember...
+✅ Added 'IAM_ACU_CA_Admins@alliantcreditunion.com' to 'APP_SVC_HCPTerraform1'.
+✅ IAM_ACU_CA_Admins membership ensured on 'APP_SVC_HCPTerraform1' (full classic rights).
+🛠  Adding/updating owner group 'CARK_ACU_HCPTerraform' with CARK permissions…
+🛠  Processing member 'CARK_ACU_HCPTerraform' on 'APP_SVC_HCPTerraform1' (Type=Group)...
+🛠  Member not found; adding via Add-PASSafeMember...
+❌ Member CARK_ACU_HCPTerraform has not been defined.
+✅ Logged off.
+
 <#
-Get-PCloudAccounts_PeriodicChange_SingleCSV.ps1
+CCP → Identity Service User → Privilege Cloud → Safe + Domain Group Membership
 
-- Auth: CCP → Identity Shared Services → ServiceUser (same as your working scripts)
-- Pull /API/Platforms once and cache PerformPeriodicChange by PlatformID (plus merged platform info)
-- Pull /API/Accounts (paged)
-- Reflect PerformPeriodicChange onto each account based on its PlatformID
-- Export ONE CSV (single output file)
+Flow:
+  1. Retrieve API Service User credential from CCP (UserName + Content)
+  2. Use that credential with New-PASSession -ServiceUser (Identity Shared Services)
+  3. Create APP_/AAM_ Safe (120-day retention)
+  4. Add domain groups only:
+       - IAM_ACU_CA_Admins (full classic permissions)
+       - CARK_* owner group (limited permissions per spec, minus RA1/RA2 for compatibility)
+     Each with an existence check before add/update
+  5. Set description "Safe Managed By <CARK_group>" (no @domain)
 
-“All attributes” approach:
-- AccountRawJson: full (compressed) JSON of the account record
-- PlatformRawJson: full (compressed) JSON of the merged platform record (REST + NF* best-effort)
+Requires:
+  - psPAS module
+  - CCP endpoint configured & reachable
 #>
 
-[CmdletBinding()]
+[CmdletBinding(SupportsShouldProcess=$true)]
 param(
     # ===== Identity / Privilege Cloud (Shared Services) =====
     [string]$IdentityTenantURL  = "https://aak4521.my.idaptive.app",
     [string]$PrivilegeCloudURL  = "https://alliantcredit.privilegecloud.cyberark.cloud",
+
+    # ===== CPM / Safe settings =====
+    [string]$ManagingCPM        = "HQVECYBARK101",
+    [string]$Location           = "\",
 
     # ===== CCP settings (for API Service User stored in Vault) =====
     [string]$CCPAddress         = "https://aam.alliantcreditunion.com",  # CCP base URL (no trailing slash)
@@ -24,20 +53,12 @@ param(
     [string]$CCPAppID           = "ACURestAPI",
     [string]$CCPSafe            = "ACU-VAULT-API",
     [string]$CCPObject          = "Application-CyberArkVaultRestAPI-alliantcredit.cyberark.cloud",
-    [bool]  $CCPWindowsAuth     = $false,
-
-    # ===== Output =====
-    [string]$CsvFilePath        = ".\CyberArk_Accounts_PerformPeriodicChange_Report.csv",
-
-    # Accounts paging
-    [int]   $PageSize           = 1000
+    [bool]  $CCPWindowsAuth     = $false                                # true if CCP uses integrated auth
 )
 
-# --- TLS & modules ---
+# --- Modules & TLS ---
+Import-Module psPAS -ErrorAction Stop
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-Import-Module psPAS           -ErrorAction Stop
-Import-Module IdentityCommand -ErrorAction Stop
-$ErrorActionPreference = 'Stop'
 
 # --- Pretty log helpers ---
 function Write-Info($m){ Write-Host "🛠  $m" -ForegroundColor Cyan }
@@ -45,19 +66,149 @@ function Write-Ok($m){   Write-Host "✅ $m" -ForegroundColor Green }
 function Write-Warn($m){ Write-Host "⚠️  $m" -ForegroundColor Yellow }
 function Write-Err($m){  Write-Host "❌ $m" -ForegroundColor Red }
 
-function Normalize-Bool {
-    param([object]$Value)
-    if ($null -eq $Value) { return $null }
-    if ($Value -is [bool]) { return $Value }
-    $s = $Value.ToString().Trim().ToLower()
-    if ($s -in @('true','1','yes','y'))  { return $true }
-    if ($s -in @('false','0','no','n')) { return $false }
-    return $null
+# --- GUI input helpers (fallback to Read-Host) ---
+Add-Type -AssemblyName System.Windows.Forms | Out-Null
+Add-Type -AssemblyName System.Drawing       | Out-Null
+
+function Show-InputDialog {
+    param(
+        [Parameter(Mandatory)][string]$Title,
+        [Parameter(Mandatory)][string]$Prompt,
+        [Parameter()][string]$Default = '',
+        [Parameter()][scriptblock]$ValidateScript = {$true},
+        [Parameter()][string]$ValidationHint = ''
+    )
+    try {
+        $form                 = New-Object System.Windows.Forms.Form
+        $form.Text            = $Title
+        $form.StartPosition   = 'CenterScreen'
+        $form.TopMost         = $true
+        $form.Size            = New-Object System.Drawing.Size(480,190)
+        $form.FormBorderStyle = 'FixedDialog'
+        $form.MaximizeBox     = $false
+
+        $lbl                  = New-Object System.Windows.Forms.Label
+        $lbl.Text             = $Prompt
+        $lbl.AutoSize         = $true
+        $lbl.Location         = '12,15'
+        $lbl.Font             = New-Object System.Drawing.Font('Segoe UI',10)
+        $form.Controls.Add($lbl)
+
+        $tb                   = New-Object System.Windows.Forms.TextBox
+        $tb.Location          = '16,48'
+        $tb.Width             = 430
+        $tb.Text              = $Default
+        $tb.Font              = New-Object System.Drawing.Font('Consolas',11)
+        $form.Controls.Add($tb)
+
+        $hint                 = New-Object System.Windows.Forms.Label
+        $hint.AutoSize        = $true
+        $hint.ForeColor       = [System.Drawing.Color]::DarkGray
+        $hint.Text            = $ValidationHint
+        $hint.Location        = '16,80'
+        $form.Controls.Add($hint)
+
+        $ok                   = New-Object System.Windows.Forms.Button
+        $ok.Text              = 'Continue'
+        $ok.Location          = '272,110'
+        $ok.Width             = 80
+        $ok.DialogResult      = [System.Windows.Forms.DialogResult]::OK
+        $form.AcceptButton    = $ok
+        $form.Controls.Add($ok)
+
+        $cancel               = New-Object System.Windows.Forms.Button
+        $cancel.Text          = 'Cancel'
+        $cancel.Location      = '366,110'
+        $cancel.Width         = 80
+        $cancel.DialogResult  = [System.Windows.Forms.DialogResult]::Cancel
+        $form.CancelButton    = $cancel
+        $form.Controls.Add($cancel)
+
+        $tb.add_TextChanged({
+            try {
+                if (& $ValidateScript $tb.Text) { $tb.BackColor = [System.Drawing.Color]::White }
+                else                            { $tb.BackColor = [System.Drawing.Color]::MistyRose }
+            } catch {
+                $tb.BackColor = [System.Drawing.Color]::MistyRose
+            }
+        })
+
+        $dialog = $form.ShowDialog()
+        if ($dialog -ne [System.Windows.Forms.DialogResult]::OK) { return $null }
+
+        $val = $tb.Text.Trim()
+        if (-not (& $ValidateScript $val)) {
+            [System.Windows.Forms.MessageBox]::Show(
+                "Value is invalid. Please try again.",
+                "Validation",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Warning
+            ) | Out-Null
+            return Show-InputDialog @PSBoundParameters
+        }
+        return $val
+    } catch {
+        $val = Read-Host "$Title - $Prompt"
+        if (-not (& $ValidateScript $val)) { throw "Input failed validation." }
+        return $val
+    }
 }
 
-function To-JsonCompressed {
-    param([object]$Obj, [int]$Depth = 35)
-    try { return ($Obj | ConvertTo-Json -Depth $Depth -Compress) } catch { return $null }
+# --- Permissions helpers ---
+
+# IAM_ACU_CA_Admins → FULL "classic" permissions (no RA1/RA2 – not supported by this tenant)
+function Get-AdminPerms {
+    @{
+        UseAccounts                             = $true
+        RetrieveAccounts                        = $true
+        ListAccounts                            = $true
+        AddAccounts                             = $true
+        UpdateAccountContent                    = $true
+        UpdateAccountProperties                 = $true
+        InitiateCPMAccountManagementOperations  = $true
+        SpecifyNextAccountContent               = $true
+        RenameAccounts                          = $true
+        DeleteAccounts                          = $true
+        UnlockAccounts                          = $true
+        ManageSafe                              = $true
+        ManageSafeMembers                       = $true
+        BackupSafe                              = $true
+        ViewAuditLog                            = $true
+        ViewSafeMembers                         = $true
+        AccessWithoutConfirmation               = $true
+        CreateFolders                           = $true
+        DeleteFolders                           = $true
+        MoveAccountsAndFolders                  = $true
+        # requestsAuthorizationLevel1 / 2 intentionally omitted for compatibility
+    }
+}
+
+# CARK_* group → limited rights (your spec, but RA1/RA2 omitted for this cloud tenant)
+function Get-CarkPerms {
+    @{
+        UseAccounts                             = $true
+        RetrieveAccounts                        = $true
+        ListAccounts                            = $true
+        AddAccounts                             = $false
+        UpdateAccountContent                    = $true
+        UpdateAccountProperties                 = $false
+        InitiateCPMAccountManagementOperations  = $true
+        SpecifyNextAccountContent               = $true
+        RenameAccounts                          = $false
+        DeleteAccounts                          = $false
+        UnlockAccounts                          = $false
+        ManageSafe                              = $false
+        ManageSafeMembers                       = $false
+        BackupSafe                              = $false
+        ViewAuditLog                            = $true
+        ViewSafeMembers                         = $true
+        AccessWithoutConfirmation               = $true
+        CreateFolders                           = $false
+        DeleteFolders                           = $false
+        MoveAccountsAndFolders                  = $false
+        # requestsAuthorizationLevel1             = $true   # removed to avoid "invalid parameters" in this tenant
+        # requestsAuthorizationLevel2             = $false
+    }
 }
 
 # --- CCP → PSCredential (API Service User) ---
@@ -94,116 +245,57 @@ function Get-ServiceUserCredentialFromCCP {
     return [PSCredential]::new($resp.UserName, $sec)
 }
 
-function Get-AllPlatformsMergedMap {
+# --- Safe member ensure helper (same pattern as your working CSV script) ---
+function Ensure-SafeMember {
+    [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][string]$BaseUri,
-        [Parameter(Mandatory)]$WebSession
+        [Parameter(Mandatory)][string]$SafeName,
+        [Parameter(Mandatory)][string]$MemberName,   # sAM or UPN
+        [Parameter(Mandatory)][ValidateSet('User','Group','Role')][string]$MemberType,
+        [Parameter(Mandatory)][hashtable]$PermFlags
     )
 
-    $platformsUrl = "$BaseUri/API/Platforms"
-    Write-Info "Retrieving platform list from: $platformsUrl"
+    Write-Info "Processing member '$MemberName' on '$SafeName' (Type=$MemberType)..."
 
-    $platformsResponse = Invoke-RestMethod -Uri $platformsUrl -Method GET -WebSession $WebSession -ErrorAction Stop
-    $restPlatforms =
-        if ($platformsResponse.PSObject.Properties.Name -contains 'Platforms') { $platformsResponse.Platforms }
-        else { $platformsResponse }
-
-    if (-not $restPlatforms -or $restPlatforms.Count -eq 0) {
-        throw "No platforms found in /API/Platforms response."
+    # 1) Check if member exists
+    $existing = $null
+    try {
+        $existing = Get-PASSafeMember -SafeName $SafeName -Search $MemberName -ErrorAction SilentlyContinue |
+                    Where-Object { $_.MemberName -eq $MemberName }
+    } catch {
+        # ignore; treat as not found
     }
 
-    Write-Ok ("REST /Platforms returned {0} platform(s)." -f $restPlatforms.Count)
-
-    $map = @{}
-    $idx = 0
-
-    foreach ($p in $restPlatforms) {
-        $idx++
-        $id   = $p.general.id
-        $name = $p.general.name
-        Write-Info ("[{0}/{1}] Caching platform '{2}' (ID={3})" -f $idx, $restPlatforms.Count, $name, $id)
-
-        # Best-effort NF* enrich
-        $details = $null
-        try {
-            $full = Get-PASPlatform -PlatformID $id -ErrorAction Stop
-            if ($full -and $full.Details) { $details = $full.Details }
-        } catch {
-            Write-Warn ("Get-PASPlatform failed for ID {0}: {1}" -f $id, $_.Exception.Message)
-        }
-
-        $merged = [PSCustomObject]@{
-            PlatformID   = $id
-            PlatformName = $name
-
-            # Key field you need:
-            PerformPeriodicChange = Normalize-Bool $p.credentialsManagement.performPeriodicChange
-
-            # Some common platform controls (nice to have)
-            AllowManualChange                     = Normalize-Bool $p.credentialsManagement.allowManualChange
-            RequirePasswordChangeEveryXDays       = $p.credentialsManagement.requirePasswordChangeEveryXDays
-            PerformPeriodicVerification           = Normalize-Bool $p.credentialsManagement.performPeriodicVerification
-            RequirePasswordVerificationEveryXDays = $p.credentialsManagement.requirePasswordVerificationEveryXDays
-            AutomaticReconcileWhenUnsynched       = Normalize-Bool $p.credentialsManagement.automaticReconcileWhenUnsynched
-
-            # NF* from Details (if available)
-            NFNotifyPriorExpiration           = $details.NFNotifyPriorExpiration
-            NFPriorExpirationRecipients       = $details.NFPriorExpirationRecipients
-            NFNotifyOnPasswordDisable         = $details.NFNotifyOnPasswordDisable
-            NFOnPasswordDisableRecipients     = $details.NFOnPasswordDisableRecipients
-            NFNotifyOnVerificationErrors      = $details.NFNotifyOnVerificationErrors
-            NFOnVerificationErrorsRecipients  = $details.NFOnVerificationErrorsRecipients
-            NFNotifyOnPasswordUsed            = $details.NFNotifyOnPasswordUsed
-            NFOnPasswordUsedRecipients        = $details.NFOnPasswordUsedRecipients
-
-            # Raw payloads for “all attributes”
-            PlatformRestJson    = To-JsonCompressed $p
-            PlatformDetailsJson = To-JsonCompressed $details
-        }
-
-        $map[$id] = $merged
+    # Build splat
+    $permParams = @{}
+    foreach ($k in $PermFlags.Keys) {
+        $permParams[$k] = $PermFlags[$k]
     }
 
-    return $map
-}
-
-function Get-AllAccountsPaged {
-    param(
-        [Parameter(Mandatory)][string]$BaseUri,
-        [Parameter(Mandatory)]$WebSession,
-        [int]$Limit = 1000
-    )
-
-    $all = New-Object System.Collections.Generic.List[object]
-    $offset = 0
-
-    while ($true) {
-        $url = "$BaseUri/API/Accounts?limit=$Limit&offset=$offset"
-        Write-Info "Retrieving accounts page: limit=$Limit offset=$offset"
-
-        $resp = Invoke-RestMethod -Uri $url -Method GET -WebSession $WebSession -ErrorAction Stop
-
-        $page =
-            if ($resp.PSObject.Properties.Name -contains 'value') { $resp.value }
-            elseif ($resp.PSObject.Properties.Name -contains 'accounts') { $resp.accounts }
-            else { $resp }
-
-        if (-not $page -or $page.Count -eq 0) { break }
-
-        foreach ($a in $page) { $all.Add($a) }
-
-        if ($page.Count -lt $Limit) { break }
-        $offset += $Limit
+    $splat = @{
+        SafeName   = $SafeName
+        MemberName = $MemberName
+        MemberType = $MemberType
     }
+    $splat += $permParams
 
-    return $all
+    if ($existing) {
+        Write-Info "Member exists; updating permissions via Set-PASSafeMember..."
+        Set-PASSafeMember @splat -ErrorAction Stop | Out-Null
+        Write-Ok  "Updated '$MemberName' on '$SafeName'."
+    }
+    else {
+        Write-Info "Member not found; adding via Add-PASSafeMember..."
+        Add-PASSafeMember @splat -ErrorAction Stop | Out-Null
+        Write-Ok  "Added '$MemberName' to '$SafeName'."
+    }
 }
 
 # --- MAIN ---
 $sessionCreated = $false
 
 try {
-    # 1) Get Service User creds from CCP
+    # 1) Get Shared Services API Service User creds from CCP
     $serviceCred = Get-ServiceUserCredentialFromCCP `
         -CCPAddress $CCPAddress `
         -Location   $CCPLocation `
@@ -228,67 +320,120 @@ try {
     $sessionCreated = $true
     Write-Ok "Authenticated to $PrivilegeCloudURL as service user: $($serviceCred.UserName)"
 
-    $baseUri    = $session.BaseURI.TrimEnd('/')   # includes /PasswordVault
-    $webSession = $session.WebSession
-
-    # 3) Cache platforms
-    $platformMap = Get-AllPlatformsMergedMap -BaseUri $baseUri -WebSession $webSession
-
-    # 4) Get all accounts (paged)
-    $accounts = Get-AllAccountsPaged -BaseUri $baseUri -WebSession $webSession -Limit $PageSize
-    Write-Ok ("Retrieved {0} total account(s)." -f $accounts.Count)
-
-    # 5) Build report rows
-    $rows = New-Object System.Collections.Generic.List[object]
-    $i = 0
-
-    foreach ($a in $accounts) {
-        $i++
-        if (($i % 1000) -eq 0) { Write-Info "Processing account $i / $($accounts.Count)..." }
-
-        $plat = $null
-        if ($a.platformId -and $platformMap.ContainsKey($a.platformId)) {
-            $plat = $platformMap[$a.platformId]
+    # 3) Prompt for Safe name (APP_/AAM_)
+    $safeName = Show-InputDialog -Title "New Safe" `
+        -Prompt "Enter the Safe name (must start with APP_ or AAM_):" `
+        -Default "APP_" `
+        -ValidationHint "Examples: APP_MyApp_Prod, AAM_MySvc_NonProd" `
+        -ValidateScript {
+            param($x)
+            $t = $x.Trim()
+            if ([string]::IsNullOrWhiteSpace($t)) { return $false }
+            return ($t.StartsWith('APP_') -or $t.StartsWith('AAM_'))
         }
 
-        $rows.Add([PSCustomObject]@{
-            # --- Required columns ---
-            AccountName  = $a.name
-            SafeName     = $a.safeName
-            PlatformID   = $a.platformId
-            PlatformName = if ($plat) { $plat.PlatformName } else { $null }
-            UserName     = $a.userName
-            Address      = $a.address
-
-            # --- Reflected platform setting ---
-            PerformPeriodicChange = if ($plat) { $plat.PerformPeriodicChange } else { $null }
-
-            # --- Common account fields (best-effort) ---
-            AccountID     = $a.id
-            SecretType    = $a.secretType
-            CPMDisabled   = $a.cpmDisabled
-            AutomaticManagementEnabled = $a.automaticManagementEnabled
-            CreatedTime   = $a.createdTime
-            LastChangeTime= $a.lastChangeTime
-            LastVerifiedTime = $a.lastVerifiedTime
-
-            # --- Helpful platform controls (best-effort) ---
-            Platform_AllowManualChange                     = if ($plat) { $plat.AllowManualChange } else { $null }
-            Platform_RequirePasswordChangeEveryXDays       = if ($plat) { $plat.RequirePasswordChangeEveryXDays } else { $null }
-            Platform_PerformPeriodicVerification           = if ($plat) { $plat.PerformPeriodicVerification } else { $null }
-            Platform_RequirePasswordVerificationEveryXDays = if ($plat) { $plat.RequirePasswordVerificationEveryXDays } else { $null }
-            Platform_AutomaticReconcileWhenUnsynched       = if ($plat) { $plat.AutomaticReconcileWhenUnsynched } else { $null }
-
-            # --- “All attributes” capture ---
-            AccountRawJson  = To-JsonCompressed $a
-            PlatformRawJson = if ($plat) { To-JsonCompressed $plat } else { $null }
-        })
+    if (-not $safeName) {
+        Write-Warn "Safe name entry cancelled."
+        return
     }
 
-    # 6) Export ONE CSV
-    Write-Info "Exporting report to: $CsvFilePath"
-    $rows | Export-Csv -Path $CsvFilePath -NoTypeInformation -Encoding UTF8
-    Write-Ok ("Export complete: {0} (Rows={1})" -f $CsvFilePath, $rows.Count)
+    Write-Info "Provisioning Safe: $safeName"
+
+    # 4) Create/ensure safe with 120-day retention
+    $exists = $null
+    try {
+        $exists = Get-PASSafe -SafeName $safeName -ErrorAction SilentlyContinue
+    } catch {}
+
+    if (-not $exists) {
+        $splat = @{
+            SafeName              = $safeName
+            Description           = ""          # will set after owner is known
+            ManagingCPM           = $ManagingCPM
+            NumberOfDaysRetention = 120
+            location              = $Location
+        }
+        if ($PSCmdlet.ShouldProcess($safeName, "Add-PASSafe")) {
+            Add-PASSafe @splat -ErrorAction Stop | Out-Null
+            Write-Ok "Safe created: '$safeName' (Retention: 120 days)."
+        }
+    }
+    else {
+        Write-Warn "Safe '$safeName' already exists; enforcing retention=120."
+        try {
+            Set-PASSafe -SafeName $safeName -NumberOfDaysRetention 120 -ErrorAction Stop | Out-Null
+            Write-Ok "Retention updated on existing Safe."
+        } catch {
+            Write-Warn "Could not update existing Safe retention: $($_.Exception.Message)"
+        }
+    }
+
+    # 5) Permissions payloads
+    $permAdmin = Get-AdminPerms
+    $permCark  = Get-CarkPerms
+
+    # 6) Add IAM_ACU_CA_Admins – try UPN first, then sAM on invalid parameters
+    $iamUpn = 'IAM_ACU_CA_Admins@alliantcreditunion.com'
+    $iamSam = 'IAM_ACU_CA_Admins'
+
+    Write-Info "Adding/updating IAM_ACU_CA_Admins on '$safeName'..."
+
+    $iamDone = $false
+
+    try {
+        Ensure-SafeMember -SafeName $safeName -MemberName $iamUpn -MemberType Group -PermFlags $permAdmin
+        $iamDone = $true
+    }
+    catch {
+        $msg = $_.Exception.Message
+        Write-Warn "UPN '$iamUpn' failed: $msg"
+
+        if ($msg -match 'invalid parameters') {
+            Write-Info "Retrying IAM group with sAMAccountName '$iamSam'..."
+            Ensure-SafeMember -SafeName $safeName -MemberName $iamSam -MemberType Group -PermFlags $permAdmin
+            $iamDone = $true
+        }
+        else {
+            throw
+        }
+    }
+
+    if ($iamDone) {
+        Write-Ok "IAM_ACU_CA_Admins membership ensured on '$safeName' (full classic rights)."
+    }
+
+    # 7) Prompt for CARK_* owner group (you can enter sAM or UPN; script uses it as-is)
+    $ownerGroup = Show-InputDialog -Title "Safe Owner (CARK_ Group)" `
+        -Prompt "Enter the AD group that will own the Safe (sAM or UPN, must start with CARK_):" `
+        -Default "CARK_" `
+        -ValidationHint "Examples: CARK_AppTeam_Prod or CARK_AppTeam_Prod@alliantcreditunion.com" `
+        -ValidateScript {
+            param($x)
+            $t = $x.Trim()
+            if ([string]::IsNullOrWhiteSpace($t)) { return $false }
+            return $t.StartsWith('CARK_')
+        }
+
+    if (-not $ownerGroup) {
+        Write-Warn "Owner group entry cancelled; skipping owner assignment and description."
+    }
+    else {
+        Write-Info "Adding/updating owner group '$ownerGroup' with CARK permissions…"
+        Ensure-SafeMember -SafeName $safeName -MemberName $ownerGroup -MemberType Group -PermFlags $permCark
+
+        # Strip domain from CARK group for description
+        $ownerNameNoDomain = $ownerGroup.Split('@')[0]
+
+        try {
+            $desc = "Safe Managed By $ownerNameNoDomain"
+            Set-PASSafe -SafeName $safeName -Description $desc -ErrorAction Stop | Out-Null
+            Write-Ok "Description set: '$desc'"
+        } catch {
+            Write-Warn "Could not set description: $($_.Exception.Message)"
+        }
+    }
+
+    Write-Ok "Provisioning complete for '$safeName'."
 }
 catch {
     Write-Err $_
