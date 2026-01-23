@@ -1,40 +1,16 @@
-creatapp script below shows error, kindly fix, do research to see how you can use API call to search the group in AD
-
-PS I:\Script\IDENTITY Script New> .\Create_App_Safe.ps1
-🛠  Retrieving **Service User** credential from CCP:
-🛠    https://aam.alliantcreditunion.com/AIMWebService/api/Accounts?AppID=ACURestAPI&Safe=ACU-VAULT- API&Object=Application-CyberArkVaultRestAPI-alliantcredit.cyberark.cloud
-✅ CCP returned service user: acurestapi_local@alliantcreditunion.admin
-🛠  Authenticating to Privilege Cloud via Identity (Service User)...
-✅ Authenticated to https://alliantcredit.privilegecloud.cyberark.cloud as service user: acurestapi_local@alliantcreditunion.admin
-🛠  Provisioning Safe: APP_SVC_HCPTerraform1
-✅ Safe created: 'APP_SVC_HCPTerraform1' (Retention: 120 days).
-🛠  Adding/updating IAM_ACU_CA_Admins on 'APP_SVC_HCPTerraform1'...
-🛠  Processing member 'IAM_ACU_CA_Admins@alliantcreditunion.com' on 'APP_SVC_HCPTerraform1' (Type=Gr oup)...
-🛠  Member not found; adding via Add-PASSafeMember...
-✅ Added 'IAM_ACU_CA_Admins@alliantcreditunion.com' to 'APP_SVC_HCPTerraform1'.
-✅ IAM_ACU_CA_Admins membership ensured on 'APP_SVC_HCPTerraform1' (full classic rights).
-🛠  Adding/updating owner group 'CARK_ACU_HCPTerraform' with CARK permissions…
-🛠  Processing member 'CARK_ACU_HCPTerraform' on 'APP_SVC_HCPTerraform1' (Type=Group)...
-🛠  Member not found; adding via Add-PASSafeMember...
-❌ Member CARK_ACU_HCPTerraform has not been defined.
-✅ Logged off.
-
 <#
 CCP → Identity Service User → Privilege Cloud → Safe + Domain Group Membership
 
-Flow:
-  1. Retrieve API Service User credential from CCP (UserName + Content)
-  2. Use that credential with New-PASSession -ServiceUser (Identity Shared Services)
-  3. Create APP_/AAM_ Safe (120-day retention)
-  4. Add domain groups only:
-       - IAM_ACU_CA_Admins (full classic permissions)
-       - CARK_* owner group (limited permissions per spec, minus RA1/RA2 for compatibility)
-     Each with an existence check before add/update
-  5. Set description "Safe Managed By <CARK_group>" (no @domain)
+Fixes:
+  - Handles "Member <group> has not been defined" by:
+      * Searching Privilege Cloud Groups (Directory) first
+      * Using -SearchIn with the correct LDAP directory name (if applicable)
+      * Retrying with UPN (group@domain) when only sAM was supplied
+      * Optional: LDAP lookup in on-prem AD to confirm the group exists there
 
-Requires:
-  - psPAS module
-  - CCP endpoint configured & reachable
+Refs:
+  - Add-PASSafeMember supports -SearchIn for LDAP directories :contentReference[oaicite:2]{index=2}
+  - Get-PASGroup supports -search and -groupType Directory :contentReference[oaicite:3]{index=3}
 #>
 
 [CmdletBinding(SupportsShouldProcess=$true)]
@@ -48,12 +24,19 @@ param(
     [string]$Location           = "\",
 
     # ===== CCP settings (for API Service User stored in Vault) =====
-    [string]$CCPAddress         = "https://aam.alliantcreditunion.com",  # CCP base URL (no trailing slash)
+    [string]$CCPAddress         = "https://aam.alliantcreditunion.com",
     [string]$CCPLocation        = "AIMWebService",
     [string]$CCPAppID           = "ACURestAPI",
     [string]$CCPSafe            = "ACU-VAULT-API",
     [string]$CCPObject          = "Application-CyberArkVaultRestAPI-alliantcredit.cyberark.cloud",
-    [bool]  $CCPWindowsAuth     = $false                                # true if CCP uses integrated auth
+    [bool]  $CCPWindowsAuth     = $false,
+
+    # ===== Directory behavior =====
+    [string]$DefaultUPNSuffix   = "alliantcreditunion.com",
+
+    # OPTIONAL: If your PVWA LDAP Integration directory name is known, set it here (example: "cybr.lab")
+    # If blank, the script will TRY to discover via Get-PASDirectory (requires Vault Admin rights).
+    [string]$PreferredLDAPDirectoryName = ""
 )
 
 # --- Modules & TLS ---
@@ -83,7 +66,7 @@ function Show-InputDialog {
         $form.Text            = $Title
         $form.StartPosition   = 'CenterScreen'
         $form.TopMost         = $true
-        $form.Size            = New-Object System.Drawing.Size(480,190)
+        $form.Size            = New-Object System.Drawing.Size(520,200)
         $form.FormBorderStyle = 'FixedDialog'
         $form.MaximizeBox     = $false
 
@@ -96,7 +79,7 @@ function Show-InputDialog {
 
         $tb                   = New-Object System.Windows.Forms.TextBox
         $tb.Location          = '16,48'
-        $tb.Width             = 430
+        $tb.Width             = 470
         $tb.Text              = $Default
         $tb.Font              = New-Object System.Drawing.Font('Consolas',11)
         $form.Controls.Add($tb)
@@ -110,7 +93,7 @@ function Show-InputDialog {
 
         $ok                   = New-Object System.Windows.Forms.Button
         $ok.Text              = 'Continue'
-        $ok.Location          = '272,110'
+        $ok.Location          = '312,120'
         $ok.Width             = 80
         $ok.DialogResult      = [System.Windows.Forms.DialogResult]::OK
         $form.AcceptButton    = $ok
@@ -118,19 +101,16 @@ function Show-InputDialog {
 
         $cancel               = New-Object System.Windows.Forms.Button
         $cancel.Text          = 'Cancel'
-        $cancel.Location      = '366,110'
+        $cancel.Location      = '406,120'
         $cancel.Width         = 80
         $cancel.DialogResult  = [System.Windows.Forms.DialogResult]::Cancel
         $form.CancelButton    = $cancel
         $form.Controls.Add($cancel)
 
         $tb.add_TextChanged({
-            try {
-                if (& $ValidateScript $tb.Text) { $tb.BackColor = [System.Drawing.Color]::White }
-                else                            { $tb.BackColor = [System.Drawing.Color]::MistyRose }
-            } catch {
-                $tb.BackColor = [System.Drawing.Color]::MistyRose
-            }
+            try { if (& $ValidateScript $tb.Text) { $tb.BackColor = [System.Drawing.Color]::White }
+                  else                            { $tb.BackColor = [System.Drawing.Color]::MistyRose } }
+            catch { $tb.BackColor = [System.Drawing.Color]::MistyRose }
         })
 
         $dialog = $form.ShowDialog()
@@ -156,7 +136,6 @@ function Show-InputDialog {
 
 # --- Permissions helpers ---
 
-# IAM_ACU_CA_Admins → FULL "classic" permissions (no RA1/RA2 – not supported by this tenant)
 function Get-AdminPerms {
     @{
         UseAccounts                             = $true
@@ -179,11 +158,9 @@ function Get-AdminPerms {
         CreateFolders                           = $true
         DeleteFolders                           = $true
         MoveAccountsAndFolders                  = $true
-        # requestsAuthorizationLevel1 / 2 intentionally omitted for compatibility
     }
 }
 
-# CARK_* group → limited rights (your spec, but RA1/RA2 omitted for this cloud tenant)
 function Get-CarkPerms {
     @{
         UseAccounts                             = $true
@@ -206,8 +183,6 @@ function Get-CarkPerms {
         CreateFolders                           = $false
         DeleteFolders                           = $false
         MoveAccountsAndFolders                  = $false
-        # requestsAuthorizationLevel1             = $true   # removed to avoid "invalid parameters" in this tenant
-        # requestsAuthorizationLevel2             = $false
     }
 }
 
@@ -245,19 +220,99 @@ function Get-ServiceUserCredentialFromCCP {
     return [PSCredential]::new($resp.UserName, $sec)
 }
 
-# --- Safe member ensure helper (same pattern as your working CSV script) ---
+# --- Discover LDAP directory name (for -SearchIn) ---
+function Get-EffectiveLDAPDirectoryName {
+    param([string]$Preferred)
+
+    if ($Preferred -and $Preferred.Trim()) {
+        Write-Info "Using configured LDAP directory name for -SearchIn: '$Preferred'"
+        return $Preferred.Trim()
+    }
+
+    # Try to discover (requires Vault Admin rights)
+    try {
+        $dirs = Get-PASDirectory -ErrorAction Stop
+        if ($dirs) {
+            # Heuristic: match your UPN suffix if possible, else just take the first directory name/id
+            $match = $dirs | Where-Object {
+                ($_.DomainName -and $_.DomainName -like "*$DefaultUPNSuffix*") -or
+                ($_.id -and $_.id -like "*$DefaultUPNSuffix*") -or
+                ($_.DomainName -and $_.DomainName -like "*alliant*")
+            } | Select-Object -First 1
+
+            if (-not $match) { $match = $dirs | Select-Object -First 1 }
+
+            if ($match) {
+                $name = $match.id
+                Write-Info "Auto-discovered LDAP directory name for -SearchIn: '$name'"
+                return $name
+            }
+        }
+    } catch {
+        Write-Warn "Could not auto-discover LDAP directory name (Get-PASDirectory may require Vault Admin). We'll still try without -SearchIn."
+    }
+
+    return $null
+}
+
+# --- Search Privilege Cloud for a directory group (API-backed via Get-PASGroup) ---
+function Find-DirectoryGroupInVault {
+    param([Parameter(Mandatory)][string]$GroupNameNoDomain)
+
+    try {
+        $hits = Get-PASGroup -groupType Directory -search $GroupNameNoDomain -ErrorAction Stop
+        if ($hits) {
+            # Return best exact match if present
+            $exact = $hits | Where-Object { $_.groupName -eq $GroupNameNoDomain } | Select-Object -First 1
+            if ($exact) { return $exact }
+            return ($hits | Select-Object -First 1)
+        }
+    } catch {
+        # ignore
+    }
+    return $null
+}
+
+# --- Optional: LDAP query to check group exists in on-prem AD (no RSAT needed) ---
+function Test-GroupExistsInADViaLDAP {
+    param([Parameter(Mandatory)][string]$GroupSam)
+
+    try {
+        Add-Type -AssemblyName System.DirectoryServices -ErrorAction Stop
+        $root = New-Object System.DirectoryServices.DirectoryEntry("LDAP://RootDSE")
+        $baseDN = $root.Properties["defaultNamingContext"][0]
+        if (-not $baseDN) { return $false }
+
+        $searchRoot = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$baseDN")
+        $ds = New-Object System.DirectoryServices.DirectorySearcher($searchRoot)
+        $ds.Filter = "(&(objectCategory=group)(sAMAccountName=$GroupSam))"
+        $ds.PageSize = 200
+        $res = $ds.FindOne()
+        return [bool]$res
+    } catch {
+        return $false
+    }
+}
+
+# --- Safe member ensure helper (now supports -SearchIn + retry logic) ---
 function Ensure-SafeMember {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$SafeName,
         [Parameter(Mandatory)][string]$MemberName,   # sAM or UPN
         [Parameter(Mandatory)][ValidateSet('User','Group','Role')][string]$MemberType,
-        [Parameter(Mandatory)][hashtable]$PermFlags
+        [Parameter(Mandatory)][hashtable]$PermFlags,
+        [Parameter()][string]$SearchIn
     )
 
-    Write-Info "Processing member '$MemberName' on '$SafeName' (Type=$MemberType)..."
+    $cmdAdd = Get-Command Add-PASSafeMember -ErrorAction Stop
+    $cmdSet = Get-Command Set-PASSafeMember -ErrorAction Stop
+    $supportsMemberType = $cmdAdd.Parameters.ContainsKey('MemberType')
+    $supportsSearchIn   = $cmdAdd.Parameters.ContainsKey('SearchIn')
 
-    # 1) Check if member exists
+    Write-Info "Processing member '$MemberName' on '$SafeName' (Type=$MemberType)$(if($SearchIn){"; SearchIn=$SearchIn"}else{""})..."
+
+    # 1) Check if member exists (best-effort)
     $existing = $null
     try {
         $existing = Get-PASSafeMember -SafeName $SafeName -Search $MemberName -ErrorAction SilentlyContinue |
@@ -266,22 +321,26 @@ function Ensure-SafeMember {
         # ignore; treat as not found
     }
 
-    # Build splat
+    # Build permission splat
     $permParams = @{}
-    foreach ($k in $PermFlags.Keys) {
-        $permParams[$k] = $PermFlags[$k]
-    }
+    foreach ($k in $PermFlags.Keys) { $permParams[$k] = $PermFlags[$k] }
 
     $splat = @{
         SafeName   = $SafeName
         MemberName = $MemberName
-        MemberType = $MemberType
     }
+    if ($supportsMemberType) { $splat.MemberType = $MemberType }
+    if ($supportsSearchIn -and $SearchIn) { $splat.SearchIn = $SearchIn }
     $splat += $permParams
 
     if ($existing) {
         Write-Info "Member exists; updating permissions via Set-PASSafeMember..."
-        Set-PASSafeMember @splat -ErrorAction Stop | Out-Null
+        # Set-PASSafeMember may not support MemberType/SearchIn; remove if not present
+        $setSplat = @{} + $splat
+        if (-not $cmdSet.Parameters.ContainsKey('MemberType')) { $setSplat.Remove('MemberType') | Out-Null }
+        if (-not $cmdSet.Parameters.ContainsKey('SearchIn'))   { $setSplat.Remove('SearchIn')   | Out-Null }
+
+        Set-PASSafeMember @setSplat -ErrorAction Stop | Out-Null
         Write-Ok  "Updated '$MemberName' on '$SafeName'."
     }
     else {
@@ -320,6 +379,9 @@ try {
     $sessionCreated = $true
     Write-Ok "Authenticated to $PrivilegeCloudURL as service user: $($serviceCred.UserName)"
 
+    # Determine LDAP directory name for -SearchIn (if possible)
+    $ldapDirName = Get-EffectiveLDAPDirectoryName -Preferred $PreferredLDAPDirectoryName
+
     # 3) Prompt for Safe name (APP_/AAM_)
     $safeName = Show-InputDialog -Title "New Safe" `
         -Prompt "Enter the Safe name (must start with APP_ or AAM_):" `
@@ -332,23 +394,18 @@ try {
             return ($t.StartsWith('APP_') -or $t.StartsWith('AAM_'))
         }
 
-    if (-not $safeName) {
-        Write-Warn "Safe name entry cancelled."
-        return
-    }
+    if (-not $safeName) { Write-Warn "Safe name entry cancelled."; return }
 
     Write-Info "Provisioning Safe: $safeName"
 
     # 4) Create/ensure safe with 120-day retention
     $exists = $null
-    try {
-        $exists = Get-PASSafe -SafeName $safeName -ErrorAction SilentlyContinue
-    } catch {}
+    try { $exists = Get-PASSafe -SafeName $safeName -ErrorAction SilentlyContinue } catch {}
 
     if (-not $exists) {
         $splat = @{
             SafeName              = $safeName
-            Description           = ""          # will set after owner is known
+            Description           = ""
             ManagingCPM           = $ManagingCPM
             NumberOfDaysRetention = 120
             location              = $Location
@@ -357,8 +414,7 @@ try {
             Add-PASSafe @splat -ErrorAction Stop | Out-Null
             Write-Ok "Safe created: '$safeName' (Retention: 120 days)."
         }
-    }
-    else {
+    } else {
         Write-Warn "Safe '$safeName' already exists; enforcing retention=120."
         try {
             Set-PASSafe -SafeName $safeName -NumberOfDaysRetention 120 -ErrorAction Stop | Out-Null
@@ -372,37 +428,32 @@ try {
     $permAdmin = Get-AdminPerms
     $permCark  = Get-CarkPerms
 
-    # 6) Add IAM_ACU_CA_Admins – try UPN first, then sAM on invalid parameters
-    $iamUpn = 'IAM_ACU_CA_Admins@alliantcreditunion.com'
-    $iamSam = 'IAM_ACU_CA_Admins'
+    # 6) Add IAM_ACU_CA_Admins (try UPN then sAM; also try with -SearchIn if available)
+    $iamUpn = "IAM_ACU_CA_Admins@$DefaultUPNSuffix"
+    $iamSam = "IAM_ACU_CA_Admins"
 
     Write-Info "Adding/updating IAM_ACU_CA_Admins on '$safeName'..."
-
     $iamDone = $false
 
-    try {
-        Ensure-SafeMember -SafeName $safeName -MemberName $iamUpn -MemberType Group -PermFlags $permAdmin
-        $iamDone = $true
-    }
-    catch {
-        $msg = $_.Exception.Message
-        Write-Warn "UPN '$iamUpn' failed: $msg"
-
-        if ($msg -match 'invalid parameters') {
-            Write-Info "Retrying IAM group with sAMAccountName '$iamSam'..."
-            Ensure-SafeMember -SafeName $safeName -MemberName $iamSam -MemberType Group -PermFlags $permAdmin
+    foreach ($try in @(
+        @{ Name=$iamUpn; SearchIn=$ldapDirName },
+        @{ Name=$iamUpn; SearchIn=$null      },
+        @{ Name=$iamSam; SearchIn=$ldapDirName },
+        @{ Name=$iamSam; SearchIn=$null      }
+    )) {
+        if ($iamDone) { break }
+        try {
+            Ensure-SafeMember -SafeName $safeName -MemberName $try.Name -MemberType Group -PermFlags $permAdmin -SearchIn $try.SearchIn
             $iamDone = $true
-        }
-        else {
-            throw
+        } catch {
+            Write-Warn "IAM add attempt failed for '$($try.Name)'$(if($try.SearchIn){" (SearchIn=$($try.SearchIn))"}else{""}): $($_.Exception.Message)"
         }
     }
 
-    if ($iamDone) {
-        Write-Ok "IAM_ACU_CA_Admins membership ensured on '$safeName' (full classic rights)."
-    }
+    if (-not $iamDone) { throw "Failed to add IAM_ACU_CA_Admins by all methods." }
+    Write-Ok "IAM_ACU_CA_Admins membership ensured on '$safeName' (full classic rights)."
 
-    # 7) Prompt for CARK_* owner group (you can enter sAM or UPN; script uses it as-is)
+    # 7) Prompt for CARK_* owner group
     $ownerGroup = Show-InputDialog -Title "Safe Owner (CARK_ Group)" `
         -Prompt "Enter the AD group that will own the Safe (sAM or UPN, must start with CARK_):" `
         -Default "CARK_" `
@@ -418,14 +469,50 @@ try {
         Write-Warn "Owner group entry cancelled; skipping owner assignment and description."
     }
     else {
-        Write-Info "Adding/updating owner group '$ownerGroup' with CARK permissions…"
-        Ensure-SafeMember -SafeName $safeName -MemberName $ownerGroup -MemberType Group -PermFlags $permCark
+        $ownerNoDomain = $ownerGroup.Split('@')[0]
+        $ownerUpn = if ($ownerGroup -match '@') { $ownerGroup } else { "$ownerGroup@$DefaultUPNSuffix" }
 
-        # Strip domain from CARK group for description
-        $ownerNameNoDomain = $ownerGroup.Split('@')[0]
+        Write-Info "Adding/updating owner group '$ownerGroup' with CARK permissions…"
+
+        # Pre-search in Privilege Cloud directory groups (API-backed)
+        $vaultHit = Find-DirectoryGroupInVault -GroupNameNoDomain $ownerNoDomain
+        if ($vaultHit) {
+            Write-Info "Privilege Cloud directory search found a matching group: '$($vaultHit.groupName)' (Directory=$($vaultHit.directory))"
+        } else {
+            Write-Warn "Privilege Cloud directory search did NOT find '$ownerNoDomain' as a directory group."
+            $adExists = Test-GroupExistsInADViaLDAP -GroupSam $ownerNoDomain
+            if ($adExists) {
+                Write-Warn "AD LDAP lookup: group EXISTS in AD, but is NOT visible in Privilege Cloud. This usually means LDAP Integration / mapping / sync is missing for that group."
+            } else {
+                Write-Warn "AD LDAP lookup: group NOT found (or LDAP lookup not available on this host). Double-check the group name."
+            }
+        }
+
+        # Retry logic to avoid "has not been defined"
+        $ownerDone = $false
+        foreach ($try in @(
+            @{ Name=$ownerGroup; SearchIn=$ldapDirName },
+            @{ Name=$ownerUpn;   SearchIn=$ldapDirName },
+            @{ Name=$ownerGroup; SearchIn=$null      },
+            @{ Name=$ownerUpn;   SearchIn=$null      }
+        )) {
+            if ($ownerDone) { break }
+            try {
+                Ensure-SafeMember -SafeName $safeName -MemberName $try.Name -MemberType Group -PermFlags $permCark -SearchIn $try.SearchIn
+                $ownerDone = $true
+            } catch {
+                $msg = $_.Exception.Message
+                Write-Warn "Owner add attempt failed for '$($try.Name)'$(if($try.SearchIn){" (SearchIn=$($try.SearchIn))"}else{""}): $msg"
+                # continue trying
+            }
+        }
+
+        if (-not $ownerDone) {
+            throw "Owner group could not be added. Most likely it is not synced/defined in Privilege Cloud (LDAP Integration / directory mapping)."
+        }
 
         try {
-            $desc = "Safe Managed By $ownerNameNoDomain"
+            $desc = "Safe Managed By $ownerNoDomain"
             Set-PASSafe -SafeName $safeName -Description $desc -ErrorAction Stop | Out-Null
             Write-Ok "Description set: '$desc'"
         } catch {
@@ -440,11 +527,7 @@ catch {
 }
 finally {
     if ($sessionCreated) {
-        try {
-            Close-PASSession | Out-Null
-            Write-Ok "Logged off."
-        } catch {
-            Write-Warn "Logoff warning: $($_.Exception.Message)"
-        }
+        try { Close-PASSession | Out-Null; Write-Ok "Logged off." }
+        catch { Write-Warn "Logoff warning: $($_.Exception.Message)" }
     }
 }
