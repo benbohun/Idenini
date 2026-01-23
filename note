@@ -1,8 +1,3 @@
-The string is missing the terminator: ".
-    + CategoryInfo          : ParserError: (:) [], ParentContainsErrorRecordException
-    + FullyQualifiedErrorId : TerminatorExpectedAtEndOfString
-
-
 <#
 CCP → Identity Service User → Privilege Cloud → Safe + Domain Group Membership
 
@@ -13,9 +8,10 @@ Fixes:
       * Retrying with UPN (group@domain) when only sAM was supplied
       * Optional: LDAP lookup in on-prem AD to confirm the group exists there
 
-Refs:
-  - Add-PASSafeMember supports -SearchIn for LDAP directories :contentReference[oaicite:2]{index=2}
-  - Get-PASGroup supports -search and -groupType Directory :contentReference[oaicite:3]{index=3}
+Notes:
+  - Parser error fixed by removing nested quotes inside a double-quoted string
+  - PreferredLDAPDirectoryName should be the PVWA LDAP directory "name/id" (not the domain)
+    Example values are often like: "alliantcreditunion" / "ACU" / "corp.local" depending on LDAP Integration config
 #>
 
 [CmdletBinding(SupportsShouldProcess=$true)]
@@ -39,7 +35,7 @@ param(
     # ===== Directory behavior =====
     [string]$DefaultUPNSuffix   = "alliantcreditunion.com",
 
-    # OPTIONAL: If your PVWA LDAP Integration directory name is known, set it here (example: "cybr.lab")
+    # OPTIONAL: If your PVWA LDAP Integration directory name/id is known, set it here.
     # If blank, the script will TRY to discover via Get-PASDirectory (requires Vault Admin rights).
     [string]$PreferredLDAPDirectoryName = "alliantcreditunion.com"
 )
@@ -113,9 +109,12 @@ function Show-InputDialog {
         $form.Controls.Add($cancel)
 
         $tb.add_TextChanged({
-            try { if (& $ValidateScript $tb.Text) { $tb.BackColor = [System.Drawing.Color]::White }
-                  else                            { $tb.BackColor = [System.Drawing.Color]::MistyRose } }
-            catch { $tb.BackColor = [System.Drawing.Color]::MistyRose }
+            try {
+                if (& $ValidateScript $tb.Text) { $tb.BackColor = [System.Drawing.Color]::White }
+                else                            { $tb.BackColor = [System.Drawing.Color]::MistyRose }
+            } catch {
+                $tb.BackColor = [System.Drawing.Color]::MistyRose
+            }
         })
 
         $dialog = $form.ShowDialog()
@@ -140,7 +139,6 @@ function Show-InputDialog {
 }
 
 # --- Permissions helpers ---
-
 function Get-AdminPerms {
     @{
         UseAccounts                             = $true
@@ -234,11 +232,9 @@ function Get-EffectiveLDAPDirectoryName {
         return $Preferred.Trim()
     }
 
-    # Try to discover (requires Vault Admin rights)
     try {
         $dirs = Get-PASDirectory -ErrorAction Stop
         if ($dirs) {
-            # Heuristic: match your UPN suffix if possible, else just take the first directory name/id
             $match = $dirs | Where-Object {
                 ($_.DomainName -and $_.DomainName -like "*$DefaultUPNSuffix*") -or
                 ($_.id -and $_.id -like "*$DefaultUPNSuffix*") -or
@@ -267,14 +263,11 @@ function Find-DirectoryGroupInVault {
     try {
         $hits = Get-PASGroup -groupType Directory -search $GroupNameNoDomain -ErrorAction Stop
         if ($hits) {
-            # Return best exact match if present
             $exact = $hits | Where-Object { $_.groupName -eq $GroupNameNoDomain } | Select-Object -First 1
             if ($exact) { return $exact }
             return ($hits | Select-Object -First 1)
         }
-    } catch {
-        # ignore
-    }
+    } catch { }
     return $null
 }
 
@@ -299,7 +292,7 @@ function Test-GroupExistsInADViaLDAP {
     }
 }
 
-# --- Safe member ensure helper (now supports -SearchIn + retry logic) ---
+# --- Safe member ensure helper (supports -SearchIn + retry logic) ---
 function Ensure-SafeMember {
     [CmdletBinding()]
     param(
@@ -315,18 +308,16 @@ function Ensure-SafeMember {
     $supportsMemberType = $cmdAdd.Parameters.ContainsKey('MemberType')
     $supportsSearchIn   = $cmdAdd.Parameters.ContainsKey('SearchIn')
 
-    Write-Info "Processing member '$MemberName' on '$SafeName' (Type=$MemberType)$(if($SearchIn){"; SearchIn=$SearchIn"}else{""})..."
+    # ✅ FIX: avoid nested quotes inside a double-quoted string (prevents parser error)
+    $searchMsg = if ($SearchIn) { "; SearchIn=$SearchIn" } else { "" }
+    Write-Info ("Processing member '{0}' on '{1}' (Type={2}){3}..." -f $MemberName, $SafeName, $MemberType, $searchMsg)
 
-    # 1) Check if member exists (best-effort)
     $existing = $null
     try {
         $existing = Get-PASSafeMember -SafeName $SafeName -Search $MemberName -ErrorAction SilentlyContinue |
                     Where-Object { $_.MemberName -eq $MemberName }
-    } catch {
-        # ignore; treat as not found
-    }
+    } catch { }
 
-    # Build permission splat
     $permParams = @{}
     foreach ($k in $PermFlags.Keys) { $permParams[$k] = $PermFlags[$k] }
 
@@ -340,7 +331,6 @@ function Ensure-SafeMember {
 
     if ($existing) {
         Write-Info "Member exists; updating permissions via Set-PASSafeMember..."
-        # Set-PASSafeMember may not support MemberType/SearchIn; remove if not present
         $setSplat = @{} + $splat
         if (-not $cmdSet.Parameters.ContainsKey('MemberType')) { $setSplat.Remove('MemberType') | Out-Null }
         if (-not $cmdSet.Parameters.ContainsKey('SearchIn'))   { $setSplat.Remove('SearchIn')   | Out-Null }
@@ -359,7 +349,6 @@ function Ensure-SafeMember {
 $sessionCreated = $false
 
 try {
-    # 1) Get Shared Services API Service User creds from CCP
     $serviceCred = Get-ServiceUserCredentialFromCCP `
         -CCPAddress $CCPAddress `
         -Location   $CCPLocation `
@@ -368,7 +357,6 @@ try {
         -Object     $CCPObject `
         -WindowsAuth:$CCPWindowsAuth
 
-    # 2) Authenticate via Identity Shared Services using SERVICE USER
     Write-Info "Authenticating to Privilege Cloud via Identity (Service User)..."
 
     New-PASSession `
@@ -384,10 +372,8 @@ try {
     $sessionCreated = $true
     Write-Ok "Authenticated to $PrivilegeCloudURL as service user: $($serviceCred.UserName)"
 
-    # Determine LDAP directory name for -SearchIn (if possible)
     $ldapDirName = Get-EffectiveLDAPDirectoryName -Preferred $PreferredLDAPDirectoryName
 
-    # 3) Prompt for Safe name (APP_/AAM_)
     $safeName = Show-InputDialog -Title "New Safe" `
         -Prompt "Enter the Safe name (must start with APP_ or AAM_):" `
         -Default "APP_" `
@@ -403,7 +389,6 @@ try {
 
     Write-Info "Provisioning Safe: $safeName"
 
-    # 4) Create/ensure safe with 120-day retention
     $exists = $null
     try { $exists = Get-PASSafe -SafeName $safeName -ErrorAction SilentlyContinue } catch {}
 
@@ -419,7 +404,8 @@ try {
             Add-PASSafe @splat -ErrorAction Stop | Out-Null
             Write-Ok "Safe created: '$safeName' (Retention: 120 days)."
         }
-    } else {
+    }
+    else {
         Write-Warn "Safe '$safeName' already exists; enforcing retention=120."
         try {
             Set-PASSafe -SafeName $safeName -NumberOfDaysRetention 120 -ErrorAction Stop | Out-Null
@@ -429,11 +415,9 @@ try {
         }
     }
 
-    # 5) Permissions payloads
     $permAdmin = Get-AdminPerms
     $permCark  = Get-CarkPerms
 
-    # 6) Add IAM_ACU_CA_Admins (try UPN then sAM; also try with -SearchIn if available)
     $iamUpn = "IAM_ACU_CA_Admins@$DefaultUPNSuffix"
     $iamSam = "IAM_ACU_CA_Admins"
 
@@ -451,14 +435,14 @@ try {
             Ensure-SafeMember -SafeName $safeName -MemberName $try.Name -MemberType Group -PermFlags $permAdmin -SearchIn $try.SearchIn
             $iamDone = $true
         } catch {
-            Write-Warn "IAM add attempt failed for '$($try.Name)'$(if($try.SearchIn){" (SearchIn=$($try.SearchIn))"}else{""}): $($_.Exception.Message)"
+            $si = if ($try.SearchIn) { " (SearchIn=$($try.SearchIn))" } else { "" }
+            Write-Warn ("IAM add attempt failed for '{0}'{1}: {2}" -f $try.Name, $si, $_.Exception.Message)
         }
     }
 
     if (-not $iamDone) { throw "Failed to add IAM_ACU_CA_Admins by all methods." }
     Write-Ok "IAM_ACU_CA_Admins membership ensured on '$safeName' (full classic rights)."
 
-    # 7) Prompt for CARK_* owner group
     $ownerGroup = Show-InputDialog -Title "Safe Owner (CARK_ Group)" `
         -Prompt "Enter the AD group that will own the Safe (sAM or UPN, must start with CARK_):" `
         -Default "CARK_" `
@@ -479,10 +463,9 @@ try {
 
         Write-Info "Adding/updating owner group '$ownerGroup' with CARK permissions…"
 
-        # Pre-search in Privilege Cloud directory groups (API-backed)
         $vaultHit = Find-DirectoryGroupInVault -GroupNameNoDomain $ownerNoDomain
         if ($vaultHit) {
-            Write-Info "Privilege Cloud directory search found a matching group: '$($vaultHit.groupName)' (Directory=$($vaultHit.directory))"
+            Write-Info ("Privilege Cloud directory search found a matching group: '{0}' (Directory={1})" -f $vaultHit.groupName, $vaultHit.directory)
         } else {
             Write-Warn "Privilege Cloud directory search did NOT find '$ownerNoDomain' as a directory group."
             $adExists = Test-GroupExistsInADViaLDAP -GroupSam $ownerNoDomain
@@ -493,7 +476,6 @@ try {
             }
         }
 
-        # Retry logic to avoid "has not been defined"
         $ownerDone = $false
         foreach ($try in @(
             @{ Name=$ownerGroup; SearchIn=$ldapDirName },
@@ -506,9 +488,8 @@ try {
                 Ensure-SafeMember -SafeName $safeName -MemberName $try.Name -MemberType Group -PermFlags $permCark -SearchIn $try.SearchIn
                 $ownerDone = $true
             } catch {
-                $msg = $_.Exception.Message
-                Write-Warn "Owner add attempt failed for '$($try.Name)'$(if($try.SearchIn){" (SearchIn=$($try.SearchIn))"}else{""}): $msg"
-                # continue trying
+                $si = if ($try.SearchIn) { " (SearchIn=$($try.SearchIn))" } else { "" }
+                Write-Warn ("Owner add attempt failed for '{0}'{1}: {2}" -f $try.Name, $si, $_.Exception.Message)
             }
         }
 
@@ -528,11 +509,15 @@ try {
     Write-Ok "Provisioning complete for '$safeName'."
 }
 catch {
-    Write-Err $_
+    Write-Err $_.Exception.Message
 }
 finally {
     if ($sessionCreated) {
-        try { Close-PASSession | Out-Null; Write-Ok "Logged off." }
-        catch { Write-Warn "Logoff warning: $($_.Exception.Message)" }
+        try {
+            Close-PASSession | Out-Null
+            Write-Ok "Logged off."
+        } catch {
+            Write-Warn "Logoff warning: $($_.Exception.Message)"
+        }
     }
 }
