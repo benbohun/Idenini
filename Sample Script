@@ -1,20 +1,48 @@
-Use the same script to login,
-search for all failed accounts with error that contain "Reason: This user can't sign in because this account is currently disabled. (winRc=1331). "
-Update the account platform to Disabled_Domain_Account
-Lets make this script detect just 1 account with this error first, then we will modify continious
+<# =====================================================================
+CCP -> Identity Header -> psPAS
+Find FIRST failed account whose activity contains:
+  "Reason: This user can't sign in because this account is currently disabled. (winRc=1331)."
+Then update platformId to: Disabled_Domain_Account
 
-# ============================================
-# CCP -> psPAS (no prompts) -> Safe Membership Report
-# ============================================
+Safe approach:
+- Uses Saved Filters (FailedVerify/FailedChange/FailedReconcile) to reduce scope
+- Stops after 1 match (per your request)
+- Uses PATCH-style update via Set-PASAccount (does NOT wipe other fields)
+
+Run test mode:
+  .\Fix-DisabledAccounts_FirstMatch.ps1 -WhatIf
+===================================================================== #>
+
+[CmdletBinding(SupportsShouldProcess = $true)]
+param(
+    [string]$TargetPlatformId = "Disabled_Domain_Account",
+
+    # Exact substring you provided (note: single-quote escaping handled below)
+    [string]$ErrorNeedle = "Reason: This user can't sign in because this account is currently disabled. (winRc=1331).",
+
+    # Stop after finding/updating 1 account
+    [int]$MaxMatches = 1,
+
+    # Paging for Get Accounts API (max 1000 per CyberArk docs)
+    [ValidateRange(1,1000)]
+    [int]$PageSize = 200,
+
+    # Safety guard to avoid runaway loops
+    [int]$MaxAccountsToInspect = 10000
+)
+
+# =========================
+# Baseline / Logging
+# =========================
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'
 
 Import-Module psPAS -Force
 
-# ---------- Minimal logger (no secrets) ----------
-$LogFile = "E:\Installation Media\Script\OnboardScript\data\SafeMembershipReport.log"
+$LogFile = "E:\Installation Media\Script\OnboardScript\data\DisabledAccountPlatformUpdate.log"
 New-Item -ItemType File -Force -Path $LogFile | Out-Null
+
 function Write-Log {
     param([string]$Message, [ConsoleColor]$Color = 'White')
     $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
@@ -23,7 +51,9 @@ function Write-Log {
     Add-Content -Path $LogFile -Value $line
 }
 
-# ---------- CCP / Identity config ----------
+# =========================
+# CCP / Identity config (your existing values)
+# =========================
 $CCPAddress    = "https://vskau1p1231.cna.com"
 $location      = "AIMWebService"
 $application   = "PAMDiscovery"
@@ -34,10 +64,9 @@ $headers       = @{ 'Content-Type' = 'application/json' }
 $IdentityTenantURL = "aat4012.id.cyberark.cloud"
 $PCloudSubdomain   = "cna-prod"
 
-# Output CSV
-$CsvFilePath = "E:\Installation Media\Script\OnboardScript\data\SafeMembershipReport.csv"
-
-# ---------- Login helper: CCP (Object) -> psPAS header ----------
+# =========================
+# Login helper (UNCHANGED from your working pattern)
+# =========================
 function Start-PASSessionFromCCP {
     param(
         [Parameter(Mandatory)] [string]$ObjectName,  # e.g., cna.com-CA_PAMDiscovery_SVC
@@ -53,101 +82,191 @@ function Start-PASSessionFromCCP {
     }
     Write-Log "CCP returned username for service principal." 'Green'
 
-    # Build PSCredential (do not print secrets)
     $secPass = ConvertTo-SecureString -String $resp.Content -AsPlainText -Force
     $upCred  = [PSCredential]::new($UPUser, $secPass)
 
     Write-Log "Requesting Identity header for '$IdentityTenantURL' (subdomain '$PCloudSubdomain')." 'Cyan'
     $hdr = Get-IdentityHeader -IdentityTenantURL $IdentityTenantURL -psPASFormat -PCloudSubdomain $PCloudSubdomain -UPCreds $upCred
+
     Use-PASSession $hdr
     if (-not (Get-PASSession)) { throw "psPAS session not established." }
 
-    # Minimize plaintext exposure
     $resp.Content = $null
     Write-Log "PAS session established (no prompts)." 'Green'
 }
 
-# ---------- Authenticate (service: CA_PAMDiscovery_SVC) ----------
-Start-PASSessionFromCCP -ObjectName "cna.com-CA_PAMDiscovery_SVC" -UPUser "CA_PAMDiscovery_SVC"
-
-# ---------- Step 2: Retrieve All Safes ----------
-Write-Log "Retrieving list of Safes..." 'Yellow'
-try {
-    $Safes = Get-PASSafe -ErrorAction Stop
-    Write-Log "✅ Retrieved $($Safes.Count) Safes." 'Green'
-} catch {
-    Write-Log "❌ ERROR: Failed to retrieve Safes - $($_.Exception.Message)" 'Red'
-    exit 1
-}
-
-# ---------- Step 3: Retrieve Safe Members & Permissions ----------
-$SafeMembersReport = New-Object System.Collections.Generic.List[object]
-
-foreach ($Safe in $Safes) {
-    $SafeName = $Safe.safeName
-    Write-Log "🔹 Retrieving members for Safe: $SafeName" 'Cyan'
-
+# =========================
+# Helper: robust “contains text” check across objects
+# =========================
+function Test-ObjectContainsText {
+    param(
+        [Parameter(Mandatory)] [object]$Object,
+        [Parameter(Mandatory)] [string]$Needle
+    )
     try {
-        $SafeMembers = Get-PASSafeMember -SafeName $SafeName -ErrorAction Stop
-
-        # Normalize to array
-        if ($null -eq $SafeMembers) { $SafeMembers = @() }
-        elseif ($SafeMembers -isnot [System.Collections.IEnumerable]) { $SafeMembers = @($SafeMembers) }
-
-        if ($SafeMembers.Count -eq 0) {
-            Write-Log "⚠️ No members found for Safe: $SafeName" 'Yellow'
-        }
-
-        foreach ($Member in $SafeMembers) {
-            $perm = $Member.Permissions
-
-            $SafeMembersReport.Add([PSCustomObject]@{
-                SafeName                                   = $SafeName
-                Member                                     = $Member.MemberName
-                MemberType                                 = $Member.MemberType
-                UseAccounts                                = $perm.useAccounts
-                RetrieveAccounts                           = $perm.retrieveAccounts
-                ListAccounts                               = $perm.listAccounts
-                AddAccounts                                = $perm.addAccounts
-                UpdateAccountContent                       = $perm.updateAccountContent
-                UpdateAccountProperties                    = $perm.updateAccountProperties
-                InitiateCPMAccountManagementOperations     = $perm.initiateCPMAccountManagementOperations
-                SpecifyNextAccountContent                  = $perm.specifyNextAccountContent
-                RenameAccounts                             = $perm.renameAccounts
-                DeleteAccounts                             = $perm.deleteAccounts
-                UnlockAccounts                             = $perm.unlockAccounts
-                ManageSafe                                 = $perm.manageSafe
-                ManageSafeMembers                          = $perm.manageSafeMembers
-                BackupSafe                                 = $perm.backupSafe
-                ViewAuditLog                               = $perm.viewAuditLog
-                ViewSafeMembers                            = $perm.viewSafeMembers
-                AccessWithoutConfirmation                  = $perm.accessWithoutConfirmation
-                CreateFolders                              = $perm.createFolders
-                DeleteFolders                              = $perm.deleteFolders
-                MoveAccountsAndFolders                     = $perm.moveAccountsAndFolders
-                RequestsAuthorizationLevel1                = $perm.requestsAuthorizationLevel1
-                RequestsAuthorizationLevel2                = $perm.requestsAuthorizationLevel2
-            })
-        }
-        Write-Log "✅ Retrieved $($SafeMembers.Count) members for Safe: $SafeName" 'Green'
+        $json = $Object | ConvertTo-Json -Depth 30 -Compress
+        return ($json -like ("*" + $Needle + "*"))
     } catch {
-        Write-Log "❌ ERROR: Failed to retrieve members for Safe: $SafeName - $($_.Exception.Message)" 'Red'
+        # Fallback: string cast
+        return ([string]$Object -like ("*" + $Needle + "*"))
     }
 }
 
-# ---------- Step 4: Export to CSV ----------
-# Ensure output directory exists
-$dir = Split-Path -Path $CsvFilePath -Parent
-if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+# =========================
+# Helper: Get accounts by Saved Filter (manual paging; STOP EARLY)
+# =========================
+function Get-AccountsPageBySavedFilter {
+    param(
+        [Parameter(Mandatory)] [string]$SavedFilter,
+        [Parameter(Mandatory)] [int]$Offset,
+        [Parameter(Mandatory)] [int]$Limit
+    )
 
-try {
-    $SafeMembersReport | Export-Csv -Path $CsvFilePath -NoTypeInformation -Encoding UTF8
-    Write-Log "✅ Safe Member Report successfully exported to: $CsvFilePath" 'Green'
-    Write-Log "🔹 Safe Member Report generation completed." 'Green'
-} catch {
-    Write-Log "❌ ERROR: Failed to export CSV - $($_.Exception.Message)" 'Red'
-    exit 1
+    $sess = Get-PASSession
+    if (-not $sess -or -not $sess.BaseURI -or -not $sess.WebSession) {
+        throw "PAS session missing BaseURI/WebSession. Ensure Start-PASSessionFromCCP succeeded."
+    }
+
+    $uri = "{0}/API/Accounts?savedFilter={1}&offset={2}&limit={3}" -f `
+        $sess.BaseURI, ([uri]::EscapeDataString($SavedFilter)), $Offset, $Limit
+
+    return (Invoke-RestMethod -Method GET -Uri $uri -WebSession $sess.WebSession)
 }
 
-# Optional: close session
+# =========================
+# Authenticate
+# =========================
+Start-PASSessionFromCCP -ObjectName "cna.com-CA_PAMDiscovery_SVC" -UPUser "CA_PAMDiscovery_SVC"
+
+# =========================
+# Pre-check: confirm target platform exists (fail fast)
+# =========================
+Write-Log "Validating target platform exists: $TargetPlatformId" 'Yellow'
+try {
+    $plat = Get-PASPlatform -PlatformID $TargetPlatformId -ErrorAction Stop
+    Write-Log "✅ Platform found: $($plat.General.PlatformID)" 'Green'
+} catch {
+    Write-Log "❌ Target platform '$TargetPlatformId' not found/accessible. Aborting. Error: $($_.Exception.Message)" 'Red'
+    throw
+}
+
+# =========================
+# Find FIRST matching failed account
+# =========================
+$SavedFiltersToCheck = @("FailedVerify", "FailedChange", "FailedReconcile")
+Write-Log "Searching failed accounts via Saved Filters: $($SavedFiltersToCheck -join ', ')" 'Yellow'
+Write-Log "Looking for activity substring: $ErrorNeedle" 'Yellow'
+
+$matches = 0
+$inspected = 0
+$foundAccount = $null
+
+foreach ($sf in $SavedFiltersToCheck) {
+    $offset = 0
+
+    while ($true) {
+        if ($inspected -ge $MaxAccountsToInspect) {
+            Write-Log "⚠️ Safety stop reached: inspected $inspected accounts (MaxAccountsToInspect=$MaxAccountsToInspect)." 'Yellow'
+            break
+        }
+
+        Write-Log "Fetching accounts page: savedFilter=$sf offset=$offset limit=$PageSize" 'Cyan'
+        try {
+            $resp = Get-AccountsPageBySavedFilter -SavedFilter $sf -Offset $offset -Limit $PageSize
+        } catch {
+            Write-Log "❌ Failed fetching accounts for savedFilter=$sf offset=$offset. Error: $($_.Exception.Message)" 'Red'
+            break
+        }
+
+        $page = @()
+        if ($resp -and $resp.value) { $page = @($resp.value) }
+
+        if ($page.Count -eq 0) {
+            Write-Log "No more accounts returned for savedFilter=$sf (offset=$offset)." 'Gray'
+            break
+        }
+
+        foreach ($acct in $page) {
+            $inspected++
+
+            # Skip if already on target platform
+            if ($acct.platformId -eq $TargetPlatformId) { continue }
+
+            # Optional quick gate: only look at explicit failures (if present)
+            if ($acct.secretManagement -and $acct.secretManagement.status -and ($acct.secretManagement.status.ToString().ToLower() -ne "failure")) {
+                continue
+            }
+
+            # Pull account activity and search for the needle
+            try {
+                $activity = Get-PASAccountActivity -AccountID $acct.id -ErrorAction Stop
+            } catch {
+                Write-Log "⚠️ Unable to read activity for AccountID=$($acct.id). Error: $($_.Exception.Message)" 'Yellow'
+                continue
+            }
+
+            if ($null -ne $activity -and (Test-ObjectContainsText -Object $activity -Needle $ErrorNeedle)) {
+                $foundAccount = $acct
+                Write-Log "✅ MATCH FOUND (FIRST): AccountID=$($acct.id) Safe=$($acct.safeName) User=$($acct.userName) Address=$($acct.address) Platform=$($acct.platformId)" 'Green'
+                break
+            }
+
+            if ($inspected % 250 -eq 0) {
+                Write-Log "Progress: inspected=$inspected, current savedFilter=$sf" 'Gray'
+            }
+        }
+
+        if ($foundAccount) { break }
+
+        # Next page
+        $offset += $PageSize
+    }
+
+    if ($foundAccount) { break }
+}
+
+if (-not $foundAccount) {
+    Write-Log "❌ No matching account found (needle not seen in activities) after inspecting $inspected accounts." 'Red'
+    try { Close-PASSession | Out-Null } catch {}
+    return
+}
+
+# =========================
+# Update platform for FIRST match only
+# =========================
+$acctId = $foundAccount.id
+$oldPlat = $foundAccount.platformId
+
+if ($PSCmdlet.ShouldProcess("AccountID=$acctId", "Update platformId from '$oldPlat' to '$TargetPlatformId'")) {
+
+    Write-Log "Updating platform for AccountID=$acctId -> $TargetPlatformId" 'Yellow'
+
+    # Prefer canonical path: /platformId
+    $updated = $false
+    try {
+        Set-PASAccount -AccountID $acctId -op replace -path "/platformId" -value $TargetPlatformId -ErrorAction Stop | Out-Null
+        $updated = $true
+    } catch {
+        Write-Log "⚠️ Update failed using path '/platformId'. Will retry with '/platformID'. Error: $($_.Exception.Message)" 'Yellow'
+    }
+
+    if (-not $updated) {
+        try {
+            Set-PASAccount -AccountID $acctId -op replace -path "/platformID" -value $TargetPlatformId -ErrorAction Stop | Out-Null
+            $updated = $true
+        } catch {
+            Write-Log "❌ Update failed using both '/platformId' and '/platformID'. Error: $($_.Exception.Message)" 'Red'
+            throw
+        }
+    }
+
+    Write-Log "✅ Platform updated: AccountID=$acctId '$oldPlat' -> '$TargetPlatformId'" 'Green'
+} else {
+    Write-Log "WHATIF: Would update AccountID=$acctId '$oldPlat' -> '$TargetPlatformId'" 'Cyan'
+}
+
+# =========================
+# Close session
+# =========================
 try { Close-PASSession | Out-Null } catch {}
+Write-Log "Done." 'Green'
