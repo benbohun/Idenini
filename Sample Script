@@ -1,234 +1,153 @@
-# IND_SafeCreation.ps1
-# Creates/ensures IND_<Samaccountname>_<employeeID> safes, enforces 7-day retention,
-# and adds members with correct SearchIn (directory vs Vault).
-# Owner (email) gets ONLY the limited permissions requested.
-# NOTE: No Set-PASSafeMember usage; on "already exists" we just log and continue.
+Use the same script to login,
+search for all failed accounts with error that contain "Reason: This user can't sign in because this account is currently disabled. (winRc=1331). "
+Update the account platform to Disabled_Domain_Account
+Lets make this script detect just 1 account with this error first, then we will modify continious
 
-[CmdletBinding(SupportsShouldProcess=$true)]
-param(
-  [ValidateScript({ Test-Path $_ })]
-  [string]$CsvPath   = "I:\Script\REPORTS\owners.csv",
-  [string]$BaseURI   = "https://alliantcredit.privilegecloud.cyberark.com",
-  [ValidateSet('CyberArk','LDAP','RADIUS','Windows','SAML','Shared')]
-  [string]$AuthType  = 'CyberArk',
-  [string]$ManagingCPM = 'HQVECYBARK101',
-  [string]$Location  = "\",
-  # Directory integration (exact "Search in" value as configured in PVWA)
-  [string]$DirLocation = 'HQVACUDC101.alliantcreditunion.com'
-)
-
-Import-Module psPAS -ErrorAction Stop
+# ============================================
+# CCP -> psPAS (no prompts) -> Safe Membership Report
+# ============================================
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-$ErrorActionPreference = 'Continue'
+$ErrorActionPreference = 'Stop'
+$ProgressPreference    = 'SilentlyContinue'
 
-function Write-Info($m){ Write-Host "[*] $m" -ForegroundColor Cyan }
-function Write-Ok($m){   Write-Host "[OK] $m" -ForegroundColor Green }
-function Write-Warn($m){ Write-Host "[!] $m" -ForegroundColor Yellow }
-function Write-Err($m){  Write-Host "[X] $m" -ForegroundColor Red }
+Import-Module psPAS -Force
 
-# --- clear any conflicting helpers from the session ---
-foreach($f in 'Add-INDMemberSmart','Ensure-Member','Ensure-SafeMember','Add-CAKSafeMember'){
-  if (Get-Command $f -ErrorAction SilentlyContinue) { Remove-Item "function:$f" -ErrorAction SilentlyContinue }
+# ---------- Minimal logger (no secrets) ----------
+$LogFile = "E:\Installation Media\Script\OnboardScript\data\SafeMembershipReport.log"
+New-Item -ItemType File -Force -Path $LogFile | Out-Null
+function Write-Log {
+    param([string]$Message, [ConsoleColor]$Color = 'White')
+    $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $line = "$ts - $Message"
+    Write-Host $line -ForegroundColor $Color
+    Add-Content -Path $LogFile -Value $line
 }
 
-# Only the flags Add-PASSafeMember supports (and Set-, but we aren't using Set- here)
-$AllowedPermKeys = @(
-  'UseAccounts','RetrieveAccounts','ListAccounts','AddAccounts',
-  'UpdateAccountContent','UpdateAccountProperties',
-  'InitiateCPMAccountManagementOperations','SpecifyNextAccountContent',
-  'ViewAuditLog','ViewSafeMembers','AccessWithoutConfirmation',
-  'ManageSafe','ManageSafeMembers'
-)
+# ---------- CCP / Identity config ----------
+$CCPAddress    = "https://vskau1p1231.cna.com"
+$location      = "AIMWebService"
+$application   = "PAMDiscovery"
+$safeCCP       = "CA_PCloud_Admins"
+$windowsAuth   = $false
+$headers       = @{ 'Content-Type' = 'application/json' }
 
-function Select-PermParams([hashtable]$h) {
-  $out = @{}
-  foreach ($k in $AllowedPermKeys) { if ($h.ContainsKey($k)) { $out[$k] = [bool]$h[$k] } }
-  $out
-}
+$IdentityTenantURL = "aat4012.id.cyberark.cloud"
+$PCloudSubdomain   = "cna-prod"
 
-function Get-AllPermFlags {
-  @{
-    UseAccounts                            = $true
-    RetrieveAccounts                       = $true
-    ListAccounts                           = $true
-    AddAccounts                            = $true
-    UpdateAccountContent                   = $true
-    UpdateAccountProperties                = $true
-    InitiateCPMAccountManagementOperations = $true
-    SpecifyNextAccountContent              = $true
-    ViewAuditLog                           = $true
-    ViewSafeMembers                        = $true
-    AccessWithoutConfirmation              = $true
-    ManageSafe                             = $true
-    ManageSafeMembers                      = $true
-  }
-}
+# Output CSV
+$CsvFilePath = "E:\Installation Media\Script\OnboardScript\data\SafeMembershipReport.csv"
 
-# OWNER (email) -> ONLY the 7 you asked for
-function Get-OwnerPermFlags {
-  @{
-    ListAccounts                           = $true
-    UseAccounts                            = $true
-    RetrieveAccounts                       = $true
-    InitiateCPMAccountManagementOperations = $true
-    ViewSafeMembers                        = $true
-    ViewAuditLog                           = $true
-    AccessWithoutConfirmation              = $true
+# ---------- Login helper: CCP (Object) -> psPAS header ----------
+function Start-PASSessionFromCCP {
+    param(
+        [Parameter(Mandatory)] [string]$ObjectName,  # e.g., cna.com-CA_PAMDiscovery_SVC
+        [Parameter(Mandatory)] [string]$UPUser       # e.g., CA_PAMDiscovery_SVC
+    )
 
-    AddAccounts                            = $false
-    UpdateAccountContent                   = $false
-    UpdateAccountProperties                = $false
-    SpecifyNextAccountContent              = $false
-    ManageSafe                             = $false
-    ManageSafeMembers                      = $false
-  }
-}
+    $ccpUrl = "$CCPAddress/$location/api/Accounts?AppID=$application&Safe=$safeCCP&Object=$ObjectName"
+    Write-Log "Retrieving CCP credential for '$UPUser' via Object..." 'Cyan'
 
-# Build name variants for directory lookups
-# For inputs like "name@domain", try sAM (left-of-@) FIRST, then UPN.
-# For "name$", also try "name$@DirLocation".
-function Get-NameVariants([string]$MemberName, [string]$DirLocation) {
-  $list = [System.Collections.Generic.List[string]]::new()
-  $t = ($MemberName | ForEach-Object { $_.ToString() }).Trim(); if (-not $t) { return $list }
-
-  if ($t -like '*@*') {
-    $left = $t.Split('@')[0]
-    if ($left) { $list.Add($left) }        # sAM first
-    if (-not $list.Contains($t)) { $list.Add($t) }  # then the given UPN
-  } else {
-    $list.Add($t)
-    $upn = "$t@$DirLocation"
-    if (-not $list.Contains($upn)) { $list.Add($upn) }
-  }
-
-  if ($t.EndsWith('$')) {
-    $machUpn = "$t@$DirLocation"
-    if (-not $list.Contains($machUpn)) { $list.Add($machUpn) }
-  }
-  return $list
-}
-
-# Helper to classify common directory "not found" errors so we just continue
-function Is-DirNotFound([string]$msg){
-  if (-not $msg) { return $false }
-  return (
-    $msg -match '\[404\]' -or
-    $msg -match '\bFailed to find user\b' -or
-    $msg -match '\bwas not found\b' -or
-    $msg -match '\bhas not been defined\b' -or
-    $msg -match '\bin ldap mapping\b' -or
-    $msg -match '\bNo such object\b' -or
-    $msg -match '\bobject does not exist\b'
-  )
-}
-
-# NEW unique helper: adds a member (NO Set-PASSafeMember on "exists").
-# NOTE: psPAS does NOT accept MemberType, so we DO NOT pass it. We keep -Type only for logs.
-# IMPORTANT: This version NEVER throws; it logs and continues.
-function Add-CAKSafeMember {
-  [CmdletBinding()]
-  param(
-    [Parameter(Mandatory)][string]$SafeName,
-    [Parameter(Mandatory)][string]$MemberName,
-    [Parameter(Mandatory)][ValidateSet('User','Group','Role')][string]$Type,  # log only
-    [Parameter(Mandatory)][hashtable]$PermFlags,
-    [Parameter(Mandatory)][string]$SearchIn,
-    [switch]$DirectoryPrincipal
-  )
-
-  $perm = Select-PermParams $PermFlags
-  $namesToTry = if ($DirectoryPrincipal) { Get-NameVariants -MemberName $MemberName -DirLocation $SearchIn } else { [System.Collections.Generic.List[string]]@($MemberName.Trim()) }
-
-  foreach ($n in $namesToTry) {
-    try {
-      $params = @{ SafeName = $SafeName; MemberName = $n; SearchIn = $SearchIn }
-      $params += $perm
-      Add-PASSafeMember @params -ErrorAction Stop | Out-Null
-      Write-Ok "Added $Type '$n' (SearchIn='$SearchIn') to '$SafeName'."
-      return
-    } catch {
-      $msg = $_.Exception.Message
-
-      if ($msg -match 'already exists' -or $msg -match '409') {
-        Write-Info "$Type '$n' already exists on '$SafeName' — skipping update."
-        return
-      }
-
-      $retryableNotFound = ($DirectoryPrincipal -and (Is-DirNotFound $msg))
-      if ($retryableNotFound) {
-        Write-Warn "Directory principal '$n' not found in '$SearchIn'. Trying next variant..."
-        continue
-      } else {
-        Write-Err "Member '$n' failed on '$SafeName' : $msg"
-        # DO NOT throw; just continue to next variant or next member/user
-        continue
-      }
+    $resp = Invoke-RestMethod -Uri $ccpUrl -Method GET -Headers $headers -UseDefaultCredentials:$windowsAuth
+    if (-not $resp -or -not $resp.Content -or -not $resp.Username) {
+        throw "CCP response missing Content/Username."
     }
-  }
-  Write-Warn "Exhausted variants; could not add '$MemberName' (Type=$Type, SearchIn='$SearchIn') to '$SafeName'. Continuing…"
+    Write-Log "CCP returned username for service principal." 'Green'
+
+    # Build PSCredential (do not print secrets)
+    $secPass = ConvertTo-SecureString -String $resp.Content -AsPlainText -Force
+    $upCred  = [PSCredential]::new($UPUser, $secPass)
+
+    Write-Log "Requesting Identity header for '$IdentityTenantURL' (subdomain '$PCloudSubdomain')." 'Cyan'
+    $hdr = Get-IdentityHeader -IdentityTenantURL $IdentityTenantURL -psPASFormat -PCloudSubdomain $PCloudSubdomain -UPCreds $upCred
+    Use-PASSession $hdr
+    if (-not (Get-PASSession)) { throw "psPAS session not established." }
+
+    # Minimize plaintext exposure
+    $resp.Content = $null
+    Write-Log "PAS session established (no prompts)." 'Green'
 }
 
-# ---------- Logon ----------
-$cred = Get-Credential -Message "Enter your CyberArk ($AuthType) credential"
+# ---------- Authenticate (service: CA_PAMDiscovery_SVC) ----------
+Start-PASSessionFromCCP -ObjectName "cna.com-CA_PAMDiscovery_SVC" -UPUser "CA_PAMDiscovery_SVC"
+
+# ---------- Step 2: Retrieve All Safes ----------
+Write-Log "Retrieving list of Safes..." 'Yellow'
 try {
-  New-PASSession -Credential $cred -BaseURI $BaseURI -Type $AuthType | Out-Null
-  Write-Ok "Authenticated to $BaseURI."
+    $Safes = Get-PASSafe -ErrorAction Stop
+    Write-Log "✅ Retrieved $($Safes.Count) Safes." 'Green'
 } catch {
-  Write-Err "Authentication failed: $($_.Exception.Message)"; return
+    Write-Log "❌ ERROR: Failed to retrieve Safes - $($_.Exception.Message)" 'Red'
+    exit 1
 }
+
+# ---------- Step 3: Retrieve Safe Members & Permissions ----------
+$SafeMembersReport = New-Object System.Collections.Generic.List[object]
+
+foreach ($Safe in $Safes) {
+    $SafeName = $Safe.safeName
+    Write-Log "🔹 Retrieving members for Safe: $SafeName" 'Cyan'
+
+    try {
+        $SafeMembers = Get-PASSafeMember -SafeName $SafeName -ErrorAction Stop
+
+        # Normalize to array
+        if ($null -eq $SafeMembers) { $SafeMembers = @() }
+        elseif ($SafeMembers -isnot [System.Collections.IEnumerable]) { $SafeMembers = @($SafeMembers) }
+
+        if ($SafeMembers.Count -eq 0) {
+            Write-Log "⚠️ No members found for Safe: $SafeName" 'Yellow'
+        }
+
+        foreach ($Member in $SafeMembers) {
+            $perm = $Member.Permissions
+
+            $SafeMembersReport.Add([PSCustomObject]@{
+                SafeName                                   = $SafeName
+                Member                                     = $Member.MemberName
+                MemberType                                 = $Member.MemberType
+                UseAccounts                                = $perm.useAccounts
+                RetrieveAccounts                           = $perm.retrieveAccounts
+                ListAccounts                               = $perm.listAccounts
+                AddAccounts                                = $perm.addAccounts
+                UpdateAccountContent                       = $perm.updateAccountContent
+                UpdateAccountProperties                    = $perm.updateAccountProperties
+                InitiateCPMAccountManagementOperations     = $perm.initiateCPMAccountManagementOperations
+                SpecifyNextAccountContent                  = $perm.specifyNextAccountContent
+                RenameAccounts                             = $perm.renameAccounts
+                DeleteAccounts                             = $perm.deleteAccounts
+                UnlockAccounts                             = $perm.unlockAccounts
+                ManageSafe                                 = $perm.manageSafe
+                ManageSafeMembers                          = $perm.manageSafeMembers
+                BackupSafe                                 = $perm.backupSafe
+                ViewAuditLog                               = $perm.viewAuditLog
+                ViewSafeMembers                            = $perm.viewSafeMembers
+                AccessWithoutConfirmation                  = $perm.accessWithoutConfirmation
+                CreateFolders                              = $perm.createFolders
+                DeleteFolders                              = $perm.deleteFolders
+                MoveAccountsAndFolders                     = $perm.moveAccountsAndFolders
+                RequestsAuthorizationLevel1                = $perm.requestsAuthorizationLevel1
+                RequestsAuthorizationLevel2                = $perm.requestsAuthorizationLevel2
+            })
+        }
+        Write-Log "✅ Retrieved $($SafeMembers.Count) members for Safe: $SafeName" 'Green'
+    } catch {
+        Write-Log "❌ ERROR: Failed to retrieve members for Safe: $SafeName - $($_.Exception.Message)" 'Red'
+    }
+}
+
+# ---------- Step 4: Export to CSV ----------
+# Ensure output directory exists
+$dir = Split-Path -Path $CsvFilePath -Parent
+if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
 
 try {
-  $rows = Import-Csv -Path $CsvPath
-  if (-not $rows) { Write-Err "No rows in CSV ($CsvPath)."; return }
-
-  $permAll   = Get-AllPermFlags
-  $permOwner = Get-OwnerPermFlags
-
-  foreach ($row in $rows) {
-    $sam  = ($row.Samaccountname).ToString().Trim()
-    $eid  = ($row.employeeID).ToString().Trim()
-    $mail = ($row.email).ToString().Trim()
-
-    if ([string]::IsNullOrWhiteSpace($sam) -or [string]::IsNullOrWhiteSpace($eid) -or [string]::IsNullOrWhiteSpace($mail)) {
-      Write-Warn "Skipping row with missing fields: $($row | ConvertTo-Json -Compress)"; continue
-    }
-
-    # IND_<sam>_<eid>
-    $safeName = "IND_{0}_{1}" -f $sam, $eid
-    Write-Info "Processing Safe: $safeName (Owner=$mail)"
-
-    # Create Safe if missing; ensure 7-day retention
-    $exists = $null; try { $exists = Get-PASSafe -SafeName $safeName -ErrorAction SilentlyContinue } catch {}
-    if (-not $exists) {
-      $splat = @{
-        SafeName              = $safeName
-        Description           = "Individual safe for $sam ($eid)"
-        ManagingCPM           = $ManagingCPM
-        NumberOfDaysRetention = 7
-        location              = $Location
-      }
-      if ($PSCmdlet.ShouldProcess($safeName, "Add-PASSafe")) {
-        try { Add-PASSafe @splat -ErrorAction Stop | Out-Null; Write-Ok "Created Safe '$safeName'." }
-        catch { Write-Err "Failed to create Safe '$safeName' : $($_.Exception.Message)"; continue }
-      }
-    } else {
-      Write-Warn "Safe '$safeName' already exists; ensuring retention & members."
-      try { Set-PASSafe -SafeName $safeName -NumberOfDaysRetention 7 -ErrorAction SilentlyContinue | Out-Null; Write-Ok "Ensured 7-day retention on '$safeName'." }
-      catch { Write-Warn "Could not set retention on existing '$safeName': $($_.Exception.Message)" }
-    }
-
-    # --- Members (original working flow; -SearchIn only; no Set-) ---
-    # Vault users
-    Add-CAKSafeMember -SafeName $safeName -MemberName 'ACURestAPI_Local'                     -Type User  -PermFlags $permAll   -SearchIn 'Vault'
-    Add-CAKSafeMember -SafeName $safeName -MemberName 'identity-privilege-integration-user$' -Type User  -PermFlags $permAll   -SearchIn 'Vault'
-
-    # Directory group (try sAM first, then UPN) & Owner (email) — search in DirLocation
-    Add-CAKSafeMember -SafeName $safeName -MemberName 'IAM_ACU_CA_Admins@alliantcreditunion.com' -Type Group -PermFlags $permAll   -SearchIn $DirLocation -DirectoryPrincipal
-    Add-CAKSafeMember -SafeName $safeName -MemberName $mail                                      -Type User  -PermFlags $permOwner -SearchIn $DirLocation -DirectoryPrincipal
-  }
-
-  Write-Ok "All rows processed."
+    $SafeMembersReport | Export-Csv -Path $CsvFilePath -NoTypeInformation -Encoding UTF8
+    Write-Log "✅ Safe Member Report successfully exported to: $CsvFilePath" 'Green'
+    Write-Log "🔹 Safe Member Report generation completed." 'Green'
+} catch {
+    Write-Log "❌ ERROR: Failed to export CSV - $($_.Exception.Message)" 'Red'
+    exit 1
 }
-finally {
-  try { Close-PASSession | Out-Null; Write-Ok "Logged off." } catch { Write-Warn "Logoff warning: $($_.Exception.Message)" }
-}
+
+# Optional: close session
+try { Close-PASSession | Out-Null } catch {}
