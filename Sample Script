@@ -1,68 +1,18 @@
-<# =====================================================================
-DisabledAccountMoveScript.ps1
+# ============================================
+# CCP -> Identity -> psPAS
+# Find 1 account failing with winRc=1331, disable CPM auto-management,
+# then output instructions to move it to Safe: Domain_Account_Disabled
+# ============================================
 
-Goal:
-- Login via CCP -> Identity Header -> psPAS (same pattern you provided)
-- Find FIRST account whose Account Activity contains:
-    "Reason: This user can't sign in because this account is currently disabled. (winRc=1331)."
-  (plus a broader regex fallback to catch minor variations)
-- Update platformId to Disabled_Domain_Account (or Disabled_Domain_Accounts)
-- Stop after 1 match (per request)
-
-Notes:
-- Fixes PowerShell $PID collision by NOT using $pid as a variable name.
-- Uses inventory-style paging against /API/Accounts if saved filters return 0.
-- Uses Get-PASAccountActivity (Gen2) with fallback to Gen1.
-
-Run test:
-  .\DisabledAccountMoveScript.ps1 -WhatIf
-
-===================================================================== #>
-
-[CmdletBinding(SupportsShouldProcess = $true)]
-param(
-    # Candidates (script will resolve whichever exists)
-    [string[]]$TargetPlatformCandidates = @("Disabled_Domain_Account", "Disabled_Domain_Accounts"),
-
-    # Your exact message (string match)
-    [string]$ExactNeedle = "Reason: This user can't sign in because this account is currently disabled. (winRc=1331).",
-
-    # Broader match to catch message variations in activity payloads
-    [string]$NeedleRegex = "(?i)winRc\s*=\s*1331|account\s+is\s+currently\s+disabled",
-
-    # Stop after this many matches (keep 1 for now)
-    [ValidateRange(1,100)]
-    [int]$MaxMatches = 1,
-
-    # Candidate selection knobs
-    [ValidateRange(1,1000)]
-    [int]$PageSize = 200,
-
-    # Safety guardrails
-    [ValidateRange(1,1000000)]
-    [int]$MaxAccountsToInspect = 20000,
-
-    [ValidateRange(1,500)]
-    [int]$MaxActivitiesToInspect = 80
-)
-
-# =========================
-# Baseline
-# =========================
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'
 
 Import-Module psPAS -Force
 
-# =========================
-# Logger
-# =========================
-$LogFile = "E:\Installation Media\Script\OnboardScript\data\DisabledAccountRemediation.log"
-$logDir = Split-Path -Path $LogFile -Parent
-if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
+# ---------- Minimal logger (no secrets) ----------
+$LogFile = "E:\Installation Media\Script\OnboardScript\data\DisabledAccountMoveScript.log"
 New-Item -ItemType File -Force -Path $LogFile | Out-Null
-
 function Write-Log {
     param([string]$Message, [ConsoleColor]$Color = 'White')
     $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
@@ -71,9 +21,7 @@ function Write-Log {
     Add-Content -Path $LogFile -Value $line
 }
 
-# =========================
-# CCP / Identity config (your existing values)
-# =========================
+# ---------- CCP / Identity config ----------
 $CCPAddress    = "https://vskau1p1231.cna.com"
 $location      = "AIMWebService"
 $application   = "PAMDiscovery"
@@ -84,13 +32,21 @@ $headers       = @{ 'Content-Type' = 'application/json' }
 $IdentityTenantURL = "aat4012.id.cyberark.cloud"
 $PCloudSubdomain   = "cna-prod"
 
-# =========================
-# Login helper: CCP (Object) -> psPAS header
-# =========================
+# ---------- Target safe to move into (manual PVWA move step) ----------
+$TargetSafeName = "Domain_Account_Disabled"
+
+# ---------- Needle patterns (DON'T include the literal "Reason:" prefix) ----------
+$NeedlePatterns = @(
+    "winrc=1331",
+    "account is currently disabled",
+    "error_account_disabled"
+)
+
+# ---------- Login helper: CCP (Object) -> psPAS header ----------
 function Start-PASSessionFromCCP {
     param(
-        [Parameter(Mandatory)] [string]$ObjectName,
-        [Parameter(Mandatory)] [string]$UPUser
+        [Parameter(Mandatory)] [string]$ObjectName,  # e.g., cna.com-CA_PAMDiscovery_SVC
+        [Parameter(Mandatory)] [string]$UPUser       # e.g., CA_PAMDiscovery_SVC
     )
 
     $ccpUrl = "$CCPAddress/$location/api/Accounts?AppID=$application&Safe=$safeCCP&Object=$ObjectName"
@@ -102,296 +58,205 @@ function Start-PASSessionFromCCP {
     }
     Write-Log "CCP returned username for service principal." 'Green'
 
+    # Build PSCredential (do not print secrets)
     $secPass = ConvertTo-SecureString -String $resp.Content -AsPlainText -Force
     $upCred  = [PSCredential]::new($UPUser, $secPass)
 
     Write-Log "Requesting Identity header for '$IdentityTenantURL' (subdomain '$PCloudSubdomain')." 'Cyan'
     $hdr = Get-IdentityHeader -IdentityTenantURL $IdentityTenantURL -psPASFormat -PCloudSubdomain $PCloudSubdomain -UPCreds $upCred
-
     Use-PASSession $hdr
     if (-not (Get-PASSession)) { throw "psPAS session not established." }
 
-    # minimize plaintext exposure
+    # Minimize plaintext exposure
     $resp.Content = $null
     Write-Log "PAS session established (no prompts)." 'Green'
 }
 
-# =========================
-# Helpers
-# =========================
-function Get-PASContext {
+function Get-BaseURI {
     $sess = Get-PASSession
-    if (-not $sess -or -not $sess.BaseURI -or -not $sess.WebSession) {
-        throw "PAS session missing BaseURI/WebSession. Ensure login succeeded."
-    }
-    return $sess
+    if (-not $sess) { throw "No PAS session. Call Start-PASSessionFromCCP first." }
+
+    $base = $sess.BaseURI
+    if (-not $base) { throw "psPAS session missing BaseURI." }
+
+    return $base.TrimEnd('/')
 }
 
-function Resolve-TargetPlatformId {
-    param([string[]]$Candidates)
-
-    foreach ($PlatformIdCandidate in $Candidates) {
-        try {
-            $plat = Get-PASPlatform -PlatformID $PlatformIdCandidate -ErrorAction Stop
-            # Return the candidate itself (most reliable), but log a hint if properties exist
-            $hint = $null
-            try {
-                if ($plat.General.PlatformID) { $hint = $plat.General.PlatformID }
-                elseif ($plat.General.ID)     { $hint = $plat.General.ID }
-            } catch { }
-            if ($hint) {
-                Write-Log "✅ Platform exists: $PlatformIdCandidate (hint: $hint)" 'Green'
-            } else {
-                Write-Log "✅ Platform exists: $PlatformIdCandidate" 'Green'
-            }
-            return $PlatformIdCandidate
-        } catch {
-            # continue
-        }
-    }
-
-    throw "None of the target platform IDs exist or are accessible: $($Candidates -join ', ')"
+function Normalize-ToArray {
+    param($Value)
+    if ($null -eq $Value) { return @() }
+    if ($Value -is [string]) { return @($Value) }
+    if ($Value -is [System.Collections.IEnumerable]) { return @($Value) }
+    return @($Value)
 }
 
-function Get-AccountsBySavedFilterPaged {
+function Get-AccountsPage {
     param(
         [Parameter(Mandatory)] [string]$SavedFilter,
-        [Parameter(Mandatory)] [int]$Limit
+        [int]$Offset = 0,
+        [int]$Limit  = 200
     )
 
-    $sess = Get-PASContext
-    $offset = 0
-    $all = New-Object System.Collections.Generic.List[object]
+    $base = Get-BaseURI
 
-    while ($true) {
-        $uri = "{0}/API/Accounts?savedFilter={1}&offset={2}&limit={3}" -f `
-            $sess.BaseURI, ([uri]::EscapeDataString($SavedFilter)), $offset, $Limit
+    # Using documented endpoint shape; case is generally not sensitive
+    $uri = "$base/api/Accounts?savedFilter=$([uri]::EscapeDataString($SavedFilter))&offset=$Offset&limit=$Limit"
 
-        $resp = Invoke-RestMethod -Method GET -Uri $uri -WebSession $sess.WebSession
-        $page = @()
-        if ($resp -and $resp.value) { $page = @($resp.value) }
+    Write-Log "Fetching accounts page: savedFilter=$SavedFilter offset=$Offset limit=$Limit" 'DarkCyan'
+    $resp = Invoke-PASRestMethod -Uri $uri -Method GET
 
-        if ($page.Count -eq 0) { break }
+    # Handle both shapes:
+    # - Some environments return { value: [ ... ], count: N }
+    # - Others may return array directly
+    if ($null -ne $resp.value) { return (Normalize-ToArray $resp.value) }
+    return (Normalize-ToArray $resp)
+}
 
-        foreach ($a in $page) { $all.Add($a) }
+function Get-AccountActivities {
+    param([Parameter(Mandatory)] [string]$AccountId)
 
-        $offset += $Limit
+    $base = Get-BaseURI
+    $uri  = "$base/api/Accounts/$([uri]::EscapeDataString($AccountId))/Activities/"
 
-        # Stop if fewer than limit returned (common paging end)
-        if ($page.Count -lt $Limit) { break }
+    $resp = Invoke-PASRestMethod -Uri $uri -Method GET
+    if ($null -ne $resp.Activities) { return (Normalize-ToArray $resp.Activities) }
+    if ($null -ne $resp.activities) { return (Normalize-ToArray $resp.activities) }
 
-        # Safety guard
-        if ($all.Count -ge $MaxAccountsToInspect) { break }
+    return @()
+}
+
+function Activity-MatchesNeedle {
+    param(
+        [Parameter(Mandatory)] $Activity,
+        [Parameter(Mandatory)] [string[]]$Patterns
+    )
+
+    $hay = @(
+        [string]$Activity.Reason
+        [string]$Activity.MoreInfo
+        [string]$Activity.Action
+        [string]$Activity.User
+        [string]$Activity.ClientID
+    ) -join " | "
+
+    foreach ($p in $Patterns) {
+        if ($hay -match [regex]::Escape($p)) { return $true }
     }
-
-    return $all
-}
-
-function Get-AllAccountsInventoryPaged {
-    param([int]$Limit)
-
-    $sess = Get-PASContext
-    $offset = 0
-    $all = New-Object System.Collections.Generic.List[object]
-
-    while ($true) {
-        $uri = "{0}/API/Accounts?offset={1}&limit={2}" -f $sess.BaseURI, $offset, $Limit
-        $resp = Invoke-RestMethod -Method GET -Uri $uri -WebSession $sess.WebSession
-
-        $page = @()
-        if ($resp -and $resp.value) { $page = @($resp.value) }
-
-        if ($page.Count -eq 0) { break }
-
-        foreach ($a in $page) { $all.Add($a) }
-
-        $offset += $Limit
-
-        if ($page.Count -lt $Limit) { break }
-        if ($all.Count -ge $MaxAccountsToInspect) { break }
-    }
-
-    return $all
-}
-
-function LooksLikeFailureCandidate {
-    param([object]$Account)
-
-    # Try multiple “likely” fields; if none exist, return $true to avoid missing candidates.
-    try {
-        if ($Account.secretManagement -and $Account.secretManagement.status) {
-            return ($Account.secretManagement.status.ToString() -match '(?i)fail')
-        }
-        if ($Account.secretManagement -and $Account.secretManagement.lastTask -and $Account.secretManagement.lastTask.status) {
-            return ($Account.secretManagement.lastTask.status.ToString() -match '(?i)fail')
-        }
-        if ($Account.status) {
-            return ($Account.status.ToString() -match '(?i)fail')
-        }
-    } catch { }
-
-    return $true
-}
-
-function Get-AccountActivitiesSafe {
-    param([string]$AccountID)
-
-    try {
-        return Get-PASAccountActivity -AccountID $AccountID -ErrorAction Stop
-    } catch {
-        # fallback
-        return Get-PASAccountActivity -AccountID $AccountID -useGen1API -ErrorAction Stop
-    }
-}
-
-function ActivityMatchesNeedle {
-    param([object]$ActivityItem)
-
-    $text = $null
-    try { $text = $ActivityItem | ConvertTo-Json -Depth 12 -Compress } catch { $text = [string]$ActivityItem }
-
-    if ($text -like "*$ExactNeedle*") { return $true }
-    if ($text -match $NeedleRegex)    { return $true }
-
     return $false
 }
 
-function Update-AccountPlatformSafe {
+function Test-TargetSafeExists {
+    param([Parameter(Mandatory)] [string]$SafeName)
+
+    Write-Log "Validating target safe exists: $SafeName" 'Yellow'
+
+    try {
+        # Some psPAS versions support -SafeName; fallback included
+        $safeObj = $null
+        try { $safeObj = Get-PASSafe -SafeName $SafeName -ErrorAction Stop } catch { $safeObj = $null }
+
+        if (-not $safeObj) {
+            $safeObj = Get-PASSafe -ErrorAction Stop | Where-Object { $_.SafeName -eq $SafeName }
+        }
+
+        if (-not $safeObj) { throw "Safe not found: $SafeName" }
+
+        Write-Log "✅ Safe found: $SafeName" 'Green'
+        return $true
+    }
+    catch {
+        Write-Log "❌ Target safe validation failed: $($_.Exception.Message)" 'Red'
+        return $false
+    }
+}
+
+function Find-FirstDisabledWinRc1331Account {
     param(
-        [Parameter(Mandatory)][string]$AccountID,
-        [Parameter(Mandatory)][string]$PlatformID
+        [string[]]$SavedFiltersToTry,
+        [int]$PageLimit = 200,
+        [int]$MaxAccountsToInspect = 1000
     )
 
-    # prefer /platformId then fallback to /platformID
-    try {
-        Set-PASAccount -AccountID $AccountID -op replace -path "/platformId" -value $PlatformID -ErrorAction Stop | Out-Null
-        return
-    } catch {
-        Write-Log "⚠️ Update via /platformId failed, retrying /platformID. Error: $($_.Exception.Message)" 'Yellow'
-    }
+    $inspected = 0
 
-    Set-PASAccount -AccountID $AccountID -op replace -path "/platformID" -value $PlatformID -ErrorAction Stop | Out-Null
-}
+    foreach ($sf in $SavedFiltersToTry) {
+        $offset = 0
 
-# =========================
-# MAIN
-# =========================
-try {
-    Start-PASSessionFromCCP -ObjectName "cna.com-CA_PAMDiscovery_SVC" -UPUser "CA_PAMDiscovery_SVC"
-
-    Write-Log "Resolving target platform ID..." 'Yellow'
-    $TargetPlatformId = Resolve-TargetPlatformId -Candidates $TargetPlatformCandidates
-    Write-Log "Target platform selected: $TargetPlatformId" 'Green'
-
-    $SavedFiltersToCheck = @("FailedVerify", "FailedChange", "FailedReconcile")
-
-    # -------- Stage 1: SavedFilter candidates --------
-    $candidates = New-Object System.Collections.Generic.List[object]
-    foreach ($sf in $SavedFiltersToCheck) {
-        Write-Log "Fetching candidates via savedFilter=$sf ..." 'Cyan'
-        $list = Get-AccountsBySavedFilterPaged -SavedFilter $sf -Limit $PageSize
-        if ($list -and $list.Count -gt 0) {
-            Write-Log "✅ savedFilter=$sf returned $($list.Count) account(s)" 'Green'
-            foreach ($a in $list) { $candidates.Add($a) }
-        } else {
-            Write-Log "No accounts returned for savedFilter=$sf" 'DarkYellow'
-        }
-    }
-
-    # De-dup by id
-    $candidates = @($candidates | Group-Object id | ForEach-Object { $_.Group | Select-Object -First 1 })
-
-    # -------- Stage 2: Inventory fallback --------
-    if (-not $candidates -or $candidates.Count -eq 0) {
-        Write-Log "Saved filters returned 0 accounts. Falling back to inventory sweep..." 'Yellow'
-        $inventory = Get-AllAccountsInventoryPaged -Limit $PageSize
-        Write-Log "✅ Inventory pulled $($inventory.Count) account(s) (capped by MaxAccountsToInspect=$MaxAccountsToInspect)" 'Green'
-
-        # Filter to likely failures
-        $candidates = @($inventory | Where-Object { LooksLikeFailureCandidate $_ })
-        Write-Log "✅ Failure-like candidates after narrowing: $($candidates.Count)" 'Green'
-    }
-
-    if (-not $candidates -or $candidates.Count -eq 0) {
-        Write-Log "❌ No candidates found to inspect." 'Red'
-        exit 2
-    }
-
-    Write-Log "Looking for activity match (exact needle OR regex):" 'Yellow'
-    Write-Log "  Exact: $ExactNeedle" 'Yellow'
-    Write-Log "  Regex: $NeedleRegex" 'Yellow'
-
-    # -------- Stage 3: Inspect activity and act on FIRST match --------
-    $matchCount = 0
-    $inspected  = 0
-
-    foreach ($acct in $candidates) {
-        $inspected++
-        if ($inspected -gt $MaxAccountsToInspect) {
-            Write-Log "⚠️ Safety stop: inspected capped at $MaxAccountsToInspect accounts." 'Yellow'
-            break
-        }
-
-        # Skip if already on target platform
-        if ($acct.platformId -eq $TargetPlatformId) { continue }
-
-        $acctId = $acct.id
-        $safe   = $acct.safeName
-        $user   = $acct.userName
-        $addr   = $acct.address
-        $plat   = $acct.platformId
-
-        Write-Log ("Inspecting AccountID={0} Safe={1} User={2} Address={3} Platform={4}" -f $acctId,$safe,$user,$addr,$plat) 'Cyan'
-
-        $acts = $null
-        try {
-            $acts = Get-AccountActivitiesSafe -AccountID $acctId
-        } catch {
-            Write-Log ("⚠️ Cannot read activity for AccountID={0}: {1}" -f $acctId, $_.Exception.Message) 'DarkYellow'
-            continue
-        }
-
-        if (-not $acts) { continue }
-
-        $toCheck = @($acts | Select-Object -First $MaxActivitiesToInspect)
-        $isMatch = $false
-
-        foreach ($act in $toCheck) {
-            if (ActivityMatchesNeedle -ActivityItem $act) {
-                $isMatch = $true
+        while ($true) {
+            $accounts = Get-AccountsPage -SavedFilter $sf -Offset $offset -Limit $PageLimit
+            if (-not $accounts -or $accounts.Count -eq 0) {
+                Write-Log "No more accounts returned for savedFilter=$sf (offset=$offset)." 'DarkGray'
                 break
             }
-        }
 
-        if (-not $isMatch) { continue }
+            foreach ($acct in $accounts) {
+                $inspected++
+                if ($inspected -gt $MaxAccountsToInspect) {
+                    Write-Log "Reached MaxAccountsToInspect=$MaxAccountsToInspect; stopping search." 'Yellow'
+                    return $null
+                }
 
-        Write-Log ("✅ MATCH FOUND: AccountID={0} Safe={1} User={2} Address={3} Platform={4}" -f $acctId,$safe,$user,$addr,$plat) 'Green'
-
-        if ($PSCmdlet.ShouldProcess("AccountID=$acctId", "Update platformId -> $TargetPlatformId")) {
-            try {
-                Update-AccountPlatformSafe -AccountID $acctId -PlatformID $TargetPlatformId
-                Write-Log ("✅ UPDATED: AccountID={0} platformId '{1}' -> '{2}'" -f $acctId, $plat, $TargetPlatformId) 'Green'
-            } catch {
-                Write-Log ("❌ UPDATE FAILED: AccountID={0} Error: {1}" -f $acctId, $_.Exception.Message) 'Red'
-                throw
+                # Pull activities and search for winRc=1331 indicators
+                $acts = Get-AccountActivities -AccountId $acct.id
+                foreach ($a in $acts) {
+                    if (Activity-MatchesNeedle -Activity $a -Patterns $NeedlePatterns) {
+                        Write-Log "✅ Match found in activities: AccountId=$($acct.id) Safe=$($acct.safeName) Name=$($acct.name)" 'Green'
+                        return $acct
+                    }
+                }
             }
-        } else {
-            Write-Log ("WHATIF: Would update AccountID={0} '{1}' -> '{2}'" -f $acctId, $plat, $TargetPlatformId) 'Cyan'
-        }
 
-        $matchCount++
-        if ($matchCount -ge $MaxMatches) {
-            Write-Log "Stopping after $matchCount match(es) as requested." 'Yellow'
-            break
+            $offset += $PageLimit
         }
     }
 
-    if ($matchCount -eq 0) {
-        Write-Log "❌ No matching accounts found (activity did not contain needle/regex)." 'Red'
-        exit 3
-    }
-
-} finally {
-    try { Close-PASSession | Out-Null } catch { }
-    Write-Log "Done." 'Green'
+    Write-Log "❌ No matching account found after inspecting $inspected accounts." 'Red'
+    return $null
 }
+
+# -------------------- MAIN --------------------
+
+# 1) Authenticate (service: CA_PAMDiscovery_SVC)
+Start-PASSessionFromCCP -ObjectName "cna.com-CA_PAMDiscovery_SVC" -UPUser "CA_PAMDiscovery_SVC"
+
+# 2) Validate target safe exists
+if (-not (Test-TargetSafeExists -SafeName $TargetSafeName)) {
+    throw "Target safe '$TargetSafeName' does not exist (or cannot be read)."
+}
+
+# 3) Search for 1 matching failed account (start narrow, then broaden)
+Write-Log "Searching candidate accounts via Saved Filters..." 'Yellow'
+$Filters = @(
+    "FailedVerify",
+    "FailedChange",
+    "FailedReconcile",
+    "PolicyFailures",
+    "Recently"
+)
+
+Write-Log "Looking for activity patterns: $($NeedlePatterns -join ', ')" 'Cyan'
+$match = Find-FirstDisabledWinRc1331Account -SavedFiltersToTry $Filters -PageLimit 200 -MaxAccountsToInspect 1200
+
+if (-not $match) {
+    Write-Log "Nothing to quarantine right now." 'Yellow'
+    try { Close-PASSession | Out-Null } catch {}
+    exit 0
+}
+
+# 4) Quarantine immediately: disable CPM auto-management (stops repeated failures/noise)
+try {
+    $reason = "Quarantine: AD account disabled (winRc=1331). Move to safe '$TargetSafeName'."
+    Write-Log "Disabling CPM auto-management on AccountId=$($match.id) ..." 'Yellow'
+    Disable-PASCPMAutoManagement -AccountID $match.id -Reason $reason | Out-Null
+    Write-Log "✅ CPM auto-management disabled for AccountId=$($match.id)." 'Green'
+}
+catch {
+    Write-Log "❌ Failed to disable CPM auto-management: $($_.Exception.Message)" 'Red'
+}
+
+# 5) Move to different SAFE (supported via PVWA Classic UI; not exposed as public REST)
+Write-Log "NEXT STEP (manual PVWA Classic): Move the account to safe '$TargetSafeName'." 'Magenta'
+Write-Log "Account details: Id=$($match.id) | Safe=$($match.safeName) | Name=$($match.name) | Address=$($match.address) | User=$($match.userName) | Platform=$($match.platformId)" 'Magenta'
+
+# Optional: close session
+try { Close-PASSession | Out-Null } catch {}
