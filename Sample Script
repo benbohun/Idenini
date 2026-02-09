@@ -1,15 +1,266 @@
-2026-02-09 14:57:16 - PAS session established (no prompts).
-2026-02-09 14:57:16 - Validating target safe exists: Domain_Account_Disabled
-2026-02-09 14:57:16 - ✅ Safe found: Domain_Account_Disabled
-2026-02-09 14:57:16 - Searching candidate accounts via Saved Filters...
-2026-02-09 14:57:16 - Looking for activity patterns: winrc=1331, account is currently disabled, error_account_disabled
-2026-02-09 14:57:16 - Fetching accounts page: savedFilter=FailedVerify offset=0 limit=200
-Get-AccountsPage : The term 'Invoke-PASRestMethod' is not recognized as the name of a cmdlet, function, script file, or operable program. Check the spelling of the name, or if a path was included, 
-verify that the path is correct and try again.
-At E:\Installation Media\Script\OnboardScript\DisabledAccountMoveScript.ps1:186 char:25
-+ ... $accounts = Get-AccountsPage -SavedFilter $sf -Offset $offset -Limit  ...
-+                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    + CategoryInfo          : ObjectNotFound: (Invoke-PASRestMethod:String) [Get-AccountsPage], CommandNotFoundException
-    + FullyQualifiedErrorId : CommandNotFoundException,Get-AccountsPage
+<# =====================================================================
+DisabledAccountDetectWinRc1331.ps1
 
-Since we are not moving, no need to discover safe
+- Uses CCP -> Identity Header -> psPAS session (your same login approach)
+- Finds FIRST account whose activities indicate winRc=1331 / account disabled
+- DOES NOT validate safe / DOES NOT move anything
+- Optional: disable CPM auto-management to stop noise
+
+Run:
+  .\DisabledAccountDetectWinRc1331.ps1
+  .\DisabledAccountDetectWinRc1331.ps1 -DisableAutoMgmt
+
+===================================================================== #>
+
+[CmdletBinding()]
+param(
+    [ValidateRange(1,1000)]
+    [int]$PageSize = 200,
+
+    [ValidateRange(1,200000)]
+    [int]$MaxAccountsToInspect = 5000,
+
+    [ValidateRange(1,500)]
+    [int]$MaxActivitiesToInspect = 80,
+
+    [switch]$DisableAutoMgmt
+)
+
+# =========================
+# Baseline
+# =========================
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$ErrorActionPreference = 'Stop'
+$ProgressPreference    = 'SilentlyContinue'
+
+Import-Module psPAS -Force
+
+# =========================
+# Logger
+# =========================
+$LogFile = "E:\Installation Media\Script\OnboardScript\data\DisabledAccountDetectWinRc1331.log"
+$logDir = Split-Path -Path $LogFile -Parent
+if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
+New-Item -ItemType File -Force -Path $LogFile | Out-Null
+
+function Write-Log {
+    param([string]$Message, [ConsoleColor]$Color = 'White')
+    $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $line = "$ts - $Message"
+    Write-Host $line -ForegroundColor $Color
+    Add-Content -Path $LogFile -Value $line
+}
+
+# =========================
+# CCP / Identity config (your values)
+# =========================
+$CCPAddress    = "https://vskau1p1231.cna.com"
+$location      = "AIMWebService"
+$application   = "PAMDiscovery"
+$safeCCP       = "CA_PCloud_Admins"
+$windowsAuth   = $false
+$headers       = @{ 'Content-Type' = 'application/json' }
+
+$IdentityTenantURL = "aat4012.id.cyberark.cloud"
+$PCloudSubdomain   = "cna-prod"
+
+# =========================
+# Match logic (do NOT include literal "Reason:" prefix)
+# =========================
+$NeedleRegex = "(?i)winRc\s*=\s*1331|account\s+is\s+currently\s+disabled|error_account_disabled"
+
+# =========================
+# Login helper: CCP -> Identity header -> psPAS
+# =========================
+function Start-PASSessionFromCCP {
+    param(
+        [Parameter(Mandatory)] [string]$ObjectName,
+        [Parameter(Mandatory)] [string]$UPUser
+    )
+
+    $ccpUrl = "$CCPAddress/$location/api/Accounts?AppID=$application&Safe=$safeCCP&Object=$ObjectName"
+    Write-Log "Retrieving CCP credential for '$UPUser' via Object..." 'Cyan'
+
+    $resp = Invoke-RestMethod -Uri $ccpUrl -Method GET -Headers $headers -UseDefaultCredentials:$windowsAuth
+    if (-not $resp -or -not $resp.Content -or -not $resp.Username) {
+        throw "CCP response missing Content/Username."
+    }
+    Write-Log "CCP returned username for service principal." 'Green'
+
+    $secPass = ConvertTo-SecureString -String $resp.Content -AsPlainText -Force
+    $upCred  = [PSCredential]::new($UPUser, $secPass)
+
+    Write-Log "Requesting Identity header for '$IdentityTenantURL' (subdomain '$PCloudSubdomain')." 'Cyan'
+    $hdr = Get-IdentityHeader -IdentityTenantURL $IdentityTenantURL -psPASFormat -PCloudSubdomain $PCloudSubdomain -UPCreds $upCred
+
+    Use-PASSession $hdr
+    if (-not (Get-PASSession)) { throw "psPAS session not established." }
+
+    $resp.Content = $null
+    Write-Log "PAS session established (no prompts)." 'Green'
+}
+
+function Cmd-HasParam {
+    param([string]$CommandName, [string]$ParamName)
+    $c = Get-Command $CommandName -ErrorAction Stop
+    return $c.Parameters.ContainsKey($ParamName)
+}
+
+function Get-AccountsPaged {
+    param(
+        [string]$SavedFilter,
+        [int]$Limit = 200
+    )
+
+    $all = New-Object System.Collections.Generic.List[object]
+    $offset = 0
+
+    $hasSavedFilter = Cmd-HasParam -CommandName "Get-PASAccount" -ParamName "savedFilter"
+    $hasOffset      = Cmd-HasParam -CommandName "Get-PASAccount" -ParamName "offset"
+    $hasLimit       = Cmd-HasParam -CommandName "Get-PASAccount" -ParamName "limit"
+
+    while ($true) {
+        $params = @{}
+
+        if ($SavedFilter -and $hasSavedFilter) { $params["savedFilter"] = $SavedFilter }
+        if ($hasLimit)  { $params["limit"]  = $Limit }
+        if ($hasOffset) { $params["offset"] = $offset }
+
+        # If module lacks -offset, we can only call once (avoid infinite loop)
+        if (-not $hasOffset -and $offset -gt 0) { break }
+
+        $page = @()
+        try {
+            $page = @(Get-PASAccount @params -ErrorAction Stop)
+        } catch {
+            # Fallback: if savedFilter param not supported, call without it.
+            if ($SavedFilter -and -not $hasSavedFilter) {
+                $page = @(Get-PASAccount -ErrorAction Stop)
+            } else {
+                throw
+            }
+        }
+
+        if ($page.Count -eq 0) { break }
+
+        foreach ($a in $page) { $all.Add($a) }
+
+        # End conditions
+        if (-not $hasOffset) { break }
+        if ($page.Count -lt $Limit) { break }
+        if ($all.Count -ge $MaxAccountsToInspect) { break }
+
+        $offset += $Limit
+    }
+
+    # De-dup by id
+    return @($all | Group-Object id | ForEach-Object { $_.Group | Select-Object -First 1 })
+}
+
+function Get-ActivitiesSafe {
+    param([string]$AccountId)
+
+    if (Get-Command Get-PASAccountActivity -ErrorAction SilentlyContinue) {
+        try {
+            return @(Get-PASAccountActivity -AccountID $AccountId -ErrorAction Stop)
+        } catch {
+            # fallback to Gen1 if supported
+            return @(Get-PASAccountActivity -AccountID $AccountId -useGen1API -ErrorAction Stop)
+        }
+    }
+
+    throw "Get-PASAccountActivity is not available in this psPAS version. Update psPAS or use raw REST fallback."
+}
+
+function ActivityMatches {
+    param($Activity)
+
+    $text = $null
+    try { $text = $Activity | ConvertTo-Json -Depth 12 -Compress } catch { $text = [string]$Activity }
+    return ($text -match $NeedleRegex)
+}
+
+# =========================
+# MAIN
+# =========================
+try {
+    Start-PASSessionFromCCP -ObjectName "cna.com-CA_PAMDiscovery_SVC" -UPUser "CA_PAMDiscovery_SVC"
+
+    Write-Log "Searching for 1 account with disabled-login error (winRc=1331)..." 'Yellow'
+    Write-Log "NeedleRegex: $NeedleRegex" 'DarkYellow'
+
+    $filtersToTry = @("FailedVerify","FailedChange","FailedReconcile")
+
+    $candidates = New-Object System.Collections.Generic.List[object]
+
+    foreach ($sf in $filtersToTry) {
+        Write-Log "Pulling candidates via savedFilter='$sf' (PageSize=$PageSize)..." 'Cyan'
+        $page = Get-AccountsPaged -SavedFilter $sf -Limit $PageSize
+        Write-Log "savedFilter '$sf' returned $($page.Count) account(s)." 'Green'
+        foreach ($a in $page) { $candidates.Add($a) }
+    }
+
+    # De-dup
+    $candidates = @($candidates | Group-Object id | ForEach-Object { $_.Group | Select-Object -First 1 })
+
+    if ($candidates.Count -eq 0) {
+        Write-Log "SavedFilters returned 0 candidates. Falling back to inventory paging (no savedFilter)..." 'Yellow'
+        $candidates = @(Get-AccountsPaged -SavedFilter $null -Limit $PageSize)
+        Write-Log "Inventory paging returned $($candidates.Count) account(s) (capped by MaxAccountsToInspect=$MaxAccountsToInspect)." 'Green'
+    }
+
+    $inspected = 0
+    foreach ($acct in $candidates) {
+        $inspected++
+        if ($inspected -gt $MaxAccountsToInspect) {
+            Write-Log "Safety stop: inspected $MaxAccountsToInspect accounts." 'Yellow'
+            break
+        }
+
+        Write-Log ("Inspecting AccountID={0} Safe={1} Name={2} User={3} Address={4} Platform={5}" -f `
+            $acct.id, $acct.safeName, $acct.name, $acct.userName, $acct.address, $acct.platformId) 'DarkCyan'
+
+        $acts = @()
+        try { $acts = Get-ActivitiesSafe -AccountId $acct.id } catch {
+            Write-Log ("⚠️ Could not read activities for AccountID={0}: {1}" -f $acct.id, $_.Exception.Message) 'DarkYellow'
+            continue
+        }
+
+        $toCheck = @($acts | Select-Object -First $MaxActivitiesToInspect)
+        foreach ($act in $toCheck) {
+            if (ActivityMatches -Activity $act) {
+                Write-Log ("✅ MATCH FOUND: AccountID={0}" -f $acct.id) 'Green'
+
+                $result = [PSCustomObject]@{
+                    AccountID   = $acct.id
+                    SafeName    = $acct.safeName
+                    Name        = $acct.name
+                    UserName    = $acct.userName
+                    Address     = $acct.address
+                    PlatformId  = $acct.platformId
+                }
+
+                $result | Format-List | Out-String | ForEach-Object { Write-Log $_ 'Magenta' }
+
+                if ($DisableAutoMgmt -and (Get-Command Disable-PASCPMAutoManagement -ErrorAction SilentlyContinue)) {
+                    try {
+                        $reason = "Quarantine: AD account disabled (winRc=1331). Pending move to Domain_Account_Disabled."
+                        Disable-PASCPMAutoManagement -AccountID $acct.id -Reason $reason | Out-Null
+                        Write-Log "✅ CPM auto-management disabled for AccountID=$($acct.id)." 'Green'
+                    } catch {
+                        Write-Log "❌ Failed to disable CPM auto-management: $($_.Exception.Message)" 'Red'
+                    }
+                }
+
+                # stop after first match
+                return
+            }
+        }
+    }
+
+    Write-Log "❌ No matching accounts found in inspected set." 'Red'
+}
+finally {
+    try { Close-PASSession | Out-Null } catch {}
+    Write-Log "Done." 'Green'
+}
