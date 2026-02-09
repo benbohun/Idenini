@@ -1,13 +1,265 @@
-Identity Token Set Successfully
-2026-02-06 14:56:36 - PAS session established (no prompts).
-2026-02-06 14:56:36 - Validating target platform exists: Disabled_Domain_Accounts
-2026-02-06 14:56:36 - ✅ Platform found: 
-2026-02-06 14:56:36 - Searching failed accounts via Saved Filters: FailedVerify, FailedChange, FailedReconcile
-2026-02-06 14:56:36 - Looking for activity substring: Reason: This user can't sign in because this account is currently disabled. (winRc=1331).
-2026-02-06 14:56:36 - Fetching accounts page: savedFilter=FailedVerify offset=0 limit=200
-2026-02-06 14:56:36 - No more accounts returned for savedFilter=FailedVerify (offset=0).
-2026-02-06 14:56:36 - Fetching accounts page: savedFilter=FailedChange offset=0 limit=200
-2026-02-06 14:56:36 - No more accounts returned for savedFilter=FailedChange (offset=0).
-2026-02-06 14:56:36 - Fetching accounts page: savedFilter=FailedReconcile offset=0 limit=200
-2026-02-06 14:56:36 - No more accounts returned for savedFilter=FailedReconcile (offset=0).
-2026-02-06 14:56:36 - ❌ No matching account found (needle not seen in activities) after inspecting 0 accounts.
+# ============================================
+# CCP -> psPAS -> Find 1 failed account w/ winRc=1331 -> Move to Disabled platform
+# ============================================
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$ErrorActionPreference = 'Stop'
+$ProgressPreference    = 'SilentlyContinue'
+
+Import-Module psPAS -Force
+
+# ---------- Minimal logger (no secrets) ----------
+$LogFile = "E:\Installation Media\Script\OnboardScript\data\DisabledAccountRemediation.log"
+New-Item -ItemType File -Force -Path $LogFile | Out-Null
+function Write-Log {
+    param([string]$Message, [ConsoleColor]$Color = 'White')
+    $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $line = "$ts - $Message"
+    Write-Host $line -ForegroundColor $Color
+    Add-Content -Path $LogFile -Value $line
+}
+
+# ---------- CCP / Identity config ----------
+$CCPAddress    = "https://vskau1p1231.cna.com"
+$location      = "AIMWebService"
+$application   = "PAMDiscovery"
+$safeCCP       = "CA_PCloud_Admins"
+$windowsAuth   = $false
+$headers       = @{ 'Content-Type' = 'application/json' }
+
+$IdentityTenantURL = "aat4012.id.cyberark.cloud"
+$PCloudSubdomain   = "cna-prod"
+
+# ---------- Matching criteria ----------
+$Needle = "Reason: This user can't sign in because this account is currently disabled. (winRc=1331)."
+
+# Search window + activity scan depth (keeps it “inventory-like” but controlled)
+$LookbackDays          = 30
+$MaxActivitiesToInspect = 60
+
+# Target platform ID (supports either singular/plural variant)
+$TargetPlatformCandidates = @(
+    "Disabled_Domain_Account",
+    "Disabled_Domain_Accounts"
+)
+
+# ---------- Login helper: CCP (Object) -> psPAS header ----------
+function Start-PASSessionFromCCP {
+    param(
+        [Parameter(Mandatory)] [string]$ObjectName,  # e.g., cna.com-CA_PAMDiscovery_SVC
+        [Parameter(Mandatory)] [string]$UPUser       # e.g., CA_PAMDiscovery_SVC
+    )
+
+    $ccpUrl = "$CCPAddress/$location/api/Accounts?AppID=$application&Safe=$safeCCP&Object=$ObjectName"
+    Write-Log "Retrieving CCP credential for '$UPUser' via Object..." 'Cyan'
+
+    $resp = Invoke-RestMethod -Uri $ccpUrl -Method GET -Headers $headers -UseDefaultCredentials:$windowsAuth
+    if (-not $resp -or -not $resp.Content -or -not $resp.Username) {
+        throw "CCP response missing Content/Username."
+    }
+    Write-Log "CCP returned username for service principal." 'Green'
+
+    # Build PSCredential (do not print secrets)
+    $secPass = ConvertTo-SecureString -String $resp.Content -AsPlainText -Force
+    $upCred  = [PSCredential]::new($UPUser, $secPass)
+
+    Write-Log "Requesting Identity header for '$IdentityTenantURL' (subdomain '$PCloudSubdomain')." 'Cyan'
+    $hdr = Get-IdentityHeader -IdentityTenantURL $IdentityTenantURL -psPASFormat -PCloudSubdomain $PCloudSubdomain -UPCreds $upCred
+    Use-PASSession $hdr
+    if (-not (Get-PASSession)) { throw "psPAS session not established." }
+
+    # Minimize plaintext exposure
+    $resp.Content = $null
+    Write-Log "PAS session established (no prompts)." 'Green'
+}
+
+function Resolve-TargetPlatformId {
+    param([string[]]$Candidates)
+
+    foreach ($pid in $Candidates) {
+        try {
+            # Will throw if not found/accessible
+            $null = Get-PASPlatform -PlatformID $pid -ErrorAction Stop
+            return $pid
+        } catch { }
+    }
+
+    # Helpful “search” hint if direct ID lookup fails
+    try {
+        $hits = Get-PASPlatform -Search ($Candidates[0].Substring(0, [Math]::Min(12, $Candidates[0].Length))) -PlatformType Regular -ErrorAction SilentlyContinue
+        if ($hits) {
+            Write-Log ("PlatformID direct lookup failed; nearby matches: {0}" -f (($hits | Select-Object -First 5 | ForEach-Object { $_.general.id }) -join ", ")) 'Yellow'
+        }
+    } catch { }
+
+    throw "None of the target platform IDs exist or are accessible: $($Candidates -join ', ')"
+}
+
+function Get-CandidatesFromSavedFilters {
+    param(
+        [string[]]$SavedFilters,
+        [datetime]$ModifiedAfter
+    )
+
+    $all = New-Object System.Collections.Generic.List[object]
+
+    foreach ($sf in $SavedFilters) {
+        try {
+            Write-Log "Searching candidates via psPAS savedFilter='$sf'..." 'Yellow'
+            # psPAS supports savedFilter; paging is handled when -limit is used
+            $res = Get-PASAccount -savedFilter $sf -modificationTime $ModifiedAfter -limit 1000 -ErrorAction Stop
+            if ($res) {
+                foreach ($a in @($res)) { $all.Add($a) }
+                Write-Log "✅ savedFilter '$sf' returned $(@($res).Count) account(s)." 'Green'
+            } else {
+                Write-Log "No accounts returned for savedFilter '$sf'." 'DarkYellow'
+            }
+        } catch {
+            Write-Log "⚠️ savedFilter '$sf' query failed: $($_.Exception.Message)" 'DarkYellow'
+        }
+    }
+
+    # Unique by id
+    return $all | Group-Object id | ForEach-Object { $_.Group | Select-Object -First 1 }
+}
+
+function Get-CandidatesFromInventory {
+    param([datetime]$ModifiedAfter)
+
+    Write-Log "SavedFilter returned 0 candidates. Switching to inventory sweep (modified after $ModifiedAfter)..." 'Yellow'
+
+    $all = $null
+    try {
+        # Inventory-style pull; psPAS pages in 1000s with -limit 1000
+        $all = Get-PASAccount -modificationTime $ModifiedAfter -limit 1000 -ErrorAction Stop
+    } catch {
+        # Fallback if modificationTime is unsupported in this environment/version
+        Write-Log "⚠️ modificationTime filtering failed; falling back to full inventory pull. ($($_.Exception.Message))" 'DarkYellow'
+        $all = Get-PASAccount -limit 1000 -ErrorAction Stop
+    }
+
+    $allCount = @($all).Count
+    Write-Log "✅ Inventory pulled $allCount account(s)." 'Green'
+
+    # Narrow to accounts that look “failed” from secretManagement status
+    $failed = @($all | Where-Object {
+        $s = $_.secretManagement.status
+        $s -and ($s.ToString() -match '(?i)fail')   # matches Failure / Failed / failing, etc.
+    })
+
+    Write-Log "✅ Inventory failure candidates: $($failed.Count)" 'Green'
+    return $failed
+}
+
+function ActivityContainsNeedle {
+    param([object]$Activity, [string]$Needle)
+
+    try {
+        return (($Activity | ConvertTo-Json -Depth 10 -Compress) -like "*$Needle*")
+    } catch {
+        return ($Activity.ToString() -like "*$Needle*")
+    }
+}
+
+function Get-AccountActivitiesSafe {
+    param([string]$AccountID)
+
+    try {
+        return Get-PASAccountActivity -AccountID $AccountID -ErrorAction Stop
+    } catch {
+        # Some environments return richer data via Gen1
+        return Get-PASAccountActivity -AccountID $AccountID -useGen1API -ErrorAction Stop
+    }
+}
+
+function Find-FirstMatchingAccount {
+    param(
+        [object[]]$Candidates,
+        [string]$Needle,
+        [int]$MaxActivitiesToInspect
+    )
+
+    $inspected = 0
+
+    foreach ($a in @($Candidates)) {
+        $inspected++
+
+        $acctId   = $a.id
+        $safe     = $a.safeName
+        $user     = $a.userName
+        $addr     = $a.address
+        $plat     = $a.platformId
+
+        Write-Log ("Inspecting AccountID={0} Safe={1} User={2} Address={3} Platform={4}" -f $acctId,$safe,$user,$addr,$plat) 'Cyan'
+
+        $acts = $null
+        try {
+            $acts = Get-AccountActivitiesSafe -AccountID $acctId
+        } catch {
+            Write-Log ("⚠️ Could not retrieve activities for AccountID={0}: {1}" -f $acctId, $_.Exception.Message) 'DarkYellow'
+            continue
+        }
+
+        if (-not $acts) { continue }
+
+        $toCheck = @($acts | Select-Object -First $MaxActivitiesToInspect)
+        foreach ($act in $toCheck) {
+            if (ActivityContainsNeedle -Activity $act -Needle $Needle) {
+                Write-Log ("✅ MATCH FOUND (needle in activity). AccountID={0}" -f $acctId) 'Green'
+                return $a
+            }
+        }
+    }
+
+    Write-Log ("❌ No matching account found after inspecting {0} candidate account(s)." -f $inspected) 'Red'
+    return $null
+}
+
+# ---------- Authenticate ----------
+Start-PASSessionFromCCP -ObjectName "cna.com-CA_PAMDiscovery_SVC" -UPUser "CA_PAMDiscovery_SVC"
+
+# ---------- Resolve & validate target platform ----------
+Write-Log "Resolving target platform ID..." 'Yellow'
+$TargetPlatformId = Resolve-TargetPlatformId -Candidates $TargetPlatformCandidates
+Write-Log "✅ Target platform resolved: $TargetPlatformId" 'Green'
+
+# ---------- Candidate discovery ----------
+$modifiedAfter = (Get-Date).AddDays(-$LookbackDays)
+
+$SavedFilters = @("FailedVerify","FailedChange","FailedReconcile")
+$candidates = Get-CandidatesFromSavedFilters -SavedFilters $SavedFilters -ModifiedAfter $modifiedAfter
+
+if (-not $candidates -or @($candidates).Count -eq 0) {
+    $candidates = Get-CandidatesFromInventory -ModifiedAfter $modifiedAfter
+}
+
+if (-not $candidates -or @($candidates).Count -eq 0) {
+    Write-Log "❌ No candidates found (savedFilter + inventory sweep both returned 0)." 'Red'
+    try { Close-PASSession | Out-Null } catch {}
+    exit 2
+}
+
+Write-Log ("Total candidates to inspect: {0}" -f @($candidates).Count) 'Yellow'
+Write-Log ("Looking for activity substring: {0}" -f $Needle) 'Yellow'
+
+# ---------- Find 1 match ----------
+$match = Find-FirstMatchingAccount -Candidates $candidates -Needle $Needle -MaxActivitiesToInspect $MaxActivitiesToInspect
+
+if (-not $match) {
+    try { Close-PASSession | Out-Null } catch {}
+    exit 3
+}
+
+# ---------- Update platform (1 account only) ----------
+try {
+    Write-Log ("Updating AccountID={0}: platformId -> {1}" -f $match.id, $TargetPlatformId) 'Yellow'
+
+    # PATCH operation per CyberArk Update Account API: replace /platformId
+    Set-PASAccount -AccountID $match.id -op replace -path "/platformId" -value $TargetPlatformId -ErrorAction Stop | Out-Null
+
+    Write-Log ("✅ Updated AccountID={0} to platformId={1}. Stopping after first match." -f $match.id, $TargetPlatformId) 'Green'
+} catch {
+    Write-Log ("❌ Failed to update AccountID={0}: {1}" -f $match.id, $_.Exception.Message) 'Red'
+    throw
+} finally {
+    try { Close-PASSession | Out-Null } catch {}
+}
