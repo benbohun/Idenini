@@ -1,141 +1,57 @@
-# Import required module
-Import-Module psPAS
+<#
+Get-PCloudPlatformReport_CCPIdentity.ps1
 
-# Define Log File
-$LogFile = "CyberArk_PlatformReportLog.txt"
-Function Write-Log {
-    Param ([string]$Message)
-    $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $LogEntry = "$Timestamp - $Message"
-    Add-Content -Path $LogFile -Value $LogEntry
-    Write-Output $LogEntry
-}
+AUTH (Primary):
+  CCP -> Service User Secret -> Get-IdentityHeader (psPASFormat) -> Use-PASSession
 
-# Step 1: Authenticate with CyberArk API
-$IdentityTenantID = "aat4012"
-$PCloudSubdomain = "cna-prod"
-$ClientID = Read-Host "Enter your CyberArk API Client ID"
-$ClientSecret = Read-Host "Enter your CyberArk API Client Secret" -AsSecureString
-$ClientSecret = [System.Net.NetworkCredential]::new("", $ClientSecret).Password
+AUTH (Fallback):
+  New-PASSession -IdentityTenantURL ... -PrivilegeCloudURL ... -ServiceUser
 
-# Authenticate
-$TokenURL = "https://$IdentityTenantID.id.cyberark.cloud/oauth2/platformtoken"
-$TokenBody = @{
-    grant_type    = "client_credentials"
-    client_id     = $ClientID
-    client_secret = $ClientSecret
-}
-$headers = @{
-    "Content-Type" = "application/x-www-form-urlencoded"
-}
+OUTPUTS (in -OutDir):
+  1) Platforms_Report.csv                (main platform configuration report)
+  2) Platforms_Raw.json                  (raw /API/Platforms response)
+  3) Platforms_InactiveOnly.csv          (inactive platforms quick list)
+  4) Platforms_Summary_SystemType.csv    (counts by systemType)
+  5) Platforms_Summary_PlatformType.csv  (counts by platformType)
+  6) (Optional) Accounts_CountByPlatform.csv
+  7) (Optional) Accounts_CountBySafe.csv
+  8) (Optional) Accounts_SecretMgmtStatus.csv
 
-try {
-    $TokenResponse = Invoke-RestMethod -Uri $TokenURL -Method Post -Headers $headers -Body $TokenBody
-    $BearerToken = [string]$TokenResponse.access_token
+NOTES:
+  - Account-based reports can be heavy in large tenants (requires paging through /API/Accounts).
+  - Avoid nested quote parser issues by using format strings (-f) instead of "$(if(){""}{""})" patterns.
+#>
 
-    if ([string]::IsNullOrEmpty($BearerToken) -or $BearerToken.Length -lt 100) {
-        Write-Log "ERROR: Received an invalid token. Exiting..."
-        exit
-    }
-    Write-Log "Authentication successful."
-} catch {
-    Write-Log "ERROR: Authentication failed - $_"
-    exit
-}
+[CmdletBinding()]
+param(
+    # ===================== OUTPUT =====================
+    [Parameter()][string]$OutDir  = "E:\Installation Media\RemovePendingAccount",
+    [Parameter()][string]$LogPath = "E:\Installation Media\Script\OnboardScript\data\CyberArk_PlatformReport.log",
 
-# Define API Headers and Endpoint
-$headers = @{
-    "Authorization" = "Bearer $BearerToken"
-    "Content-Type"  = "application/json"
-}
+    # ===================== AUTH: Identity / PCloud =====================
+    [Parameter()][string]$IdentityTenantURL = "https://aat4012.id.cyberark.cloud",
+    [Parameter()][string]$PCloudSubdomain   = "cna-prod",
 
-# Define API Endpoints for All Platforms & Filtered Platforms
-$AllPlatformsEndpoint = "https://$PCloudSubdomain.privilegecloud.cyberark.cloud/PasswordVault/api/Platforms/"
-$ActivePlatformsEndpoint = "https://$PCloudSubdomain.privilegecloud.cyberark.cloud/PasswordVault/api/Platforms/?Active=True"
+    # ===================== AUTH: CCP =====================
+    [Parameter()][string]$CCPAddress   = "https://vskau1p1231.cna.com",
+    [Parameter()][string]$CCPLocation  = "AIMWebService",
+    [Parameter()][string]$CCPAppID     = "PAMDiscovery",
+    [Parameter()][string]$CCPSafe      = "CA_PCloud_Admins",
+    [Parameter()][string]$CCPObject    = "cna.com-CA_PAMDiscovery_SVC",
+    [Parameter()][string]$ServiceUPUser= "CA_PAMDiscovery_SVC",
+    [Parameter()][bool]  $CCPWindowsAuth = $false,
 
-# Choose which endpoint to use
-$UseFiltered = Read-Host "Do you want to filter by active platforms only? (yes/no)"
-if ($UseFiltered -eq "yes") {
-    $APIEndpoint = $ActivePlatformsEndpoint
-    Write-Log "Fetching only active platforms..."
-} else {
-    $APIEndpoint = $AllPlatformsEndpoint
-    Write-Log "Fetching all platforms..."
-}
+    # ===================== REPORT OPTIONS =====================
+    [Parameter()][bool]$ActiveOnly              = $false,
+    [Parameter()][ValidateSet("All","Regular","Group")][string]$PlatformTypeFilter = "All",
+    [Parameter()][string]$PlatformNameSearch    = "",
 
-# Fetch Platforms
-try {
-    $PlatformsResponse = Invoke-RestMethod -Uri $APIEndpoint -Method Get -Headers $headers -ErrorAction Stop
+    # Optional account-based reports (can be heavy)
+    [Parameter()][bool]$IncludeAccountReports   = $false,
+    [Parameter()][int] $AccountsPageSize        = 1000
+)
 
-    # Save Debug File
-    $DebugFile = "E:\Installation Media\RemovePendingAccount\CyberArk_Platforms_Debug.json"
-    $PlatformsResponse | ConvertTo-Json -Depth 3 | Out-File $DebugFile
-    Write-Output "Raw API Response saved to: $DebugFile"
-
-    # Extract platforms correctly
-    if ($null -eq $PlatformsResponse.Platforms -or $PlatformsResponse.Platforms.Count -eq 0) {
-        Write-Log "ERROR: No platforms found. Check API permissions."
-        exit
-    }
-
-    Write-Log "Retrieved $(($PlatformsResponse.Platforms | Measure-Object).Count) platforms."
-} catch {
-    Write-Log "ERROR: Failed to retrieve platform list - $_"
-    exit
-}
-
-# Export Path
-$CsvFilePath = "E:\Installation Media\RemovePendingAccount\CyberArk_Platforms.csv"
-
-# Process Data with Correct JSON Structure
-$ProcessedPlatforms = $PlatformsResponse.Platforms | ForEach-Object {
-    [PSCustomObject]@{
-        PlatformID    = $_.general.id
-        PlatformName  = $_.general.name
-        Active        = $_.general.active
-        Description   = $_.general.description
-        PlatformBaseID = $_.general.platformBaseID
-        PlatformType  = $_.general.platformType
-        SystemType    = $_.general.systemType
-
-        # Required Properties
-        RequiredProperties = ($_.properties.required.name -join "; ")
-        OptionalProperties = ($_.properties.optional.name -join "; ")
-
-        # Linked Accounts
-        LinkedAccounts = ($_.linkedAccounts.name -join "; ")
-
-        # Credentials Management
-        AllowedSafes                       = $_.credentialsManagement.allowedSafes
-        AllowManualChange                  = $_.credentialsManagement.allowManualChange -as [string]
-        PerformPeriodicChange              = $_.credentialsManagement.performPeriodicChange -as [string]
-        RequirePasswordChangeEveryXDays    = $_.credentialsManagement.requirePasswordChangeEveryXDays -as [string]
-        AllowManualVerification            = $_.credentialsManagement.allowManualVerification -as [string]
-        PerformPeriodicVerification        = $_.credentialsManagement.performPeriodicVerification -as [string]
-        RequirePasswordVerificationEveryXDays = $_.credentialsManagement.requirePasswordVerificationEveryXDays -as [string]
-        AllowManualReconciliation          = $_.credentialsManagement.allowManualReconciliation -as [string]
-        AutomaticReconcileWhenUnsynched    = $_.credentialsManagement.automaticReconcileWhenUnsynched -as [string]
-
-        # Session Management
-        RequirePrivilegedSessionMonitoringAndIsolation = $_.sessionManagement.requirePrivilegedSessionMonitoringAndIsolation -as [string]
-        RecordAndSaveSessionActivity       = $_.sessionManagement.recordAndSaveSessionActivity -as [string]
-        PSMServerID                        = $_.sessionManagement.PSMServerID -as [string]
-
-        # Privileged Access Workflows
-        RequireDualControlPasswordAccessApproval = $_.privilegedAccessWorkflows.requireDualControlPasswordAccessApproval -as [string]
-        EnforceCheckinCheckoutExclusiveAccess    = $_.privilegedAccessWorkflows.enforceCheckinCheckoutExclusiveAccess -as [string]
-        EnforceOnetimePasswordAccess             = $_.privilegedAccessWorkflows.enforceOnetimePasswordAccess -as [string]
-    }
-}
-
-# Export to CSV
-$ProcessedPlatforms | Export-Csv -Path $CsvFilePath -NoTypeInformation
-
-Write-Log "✅ CyberArk platform report has been successfully exported to: $CsvFilePath"
-:::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
-
-
-# --- Allow this process to load unsigned modules & unblock psPAS files (silent) ---
+# ---------------- Execution policy & unblock psPAS ----------------
 try { Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force -ErrorAction Stop } catch {}
 
 $psPASDirs = @(
@@ -147,28 +63,27 @@ foreach ($dir in $psPASDirs) {
   try { Get-ChildItem -Path $dir -Recurse -File | Unblock-File -ErrorAction SilentlyContinue } catch {}
 }
 
-# --- Logging Utility ---
-$LogPath = "E:\Installation Media\Script\OnboardScript\data\accountonboarding.txt"
-Function Write-Log {
-    param([string]$Message, [string]$Color = "White")
-    $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $LogEntry = "$Timestamp - $Message"
-    try { Write-Host $LogEntry -ForegroundColor $Color } catch { Write-Host $LogEntry }
-    try { Add-Content -Path $LogPath -Value $LogEntry } catch {}
+# ---------------- Logging ----------------
+function Write-Log {
+    param(
+        [Parameter(Mandatory)][string]$Message,
+        [Parameter()][ValidateSet("White","Green","Yellow","Red","Cyan","Gray")][string]$Color = "White"
+    )
+    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $line = "{0} - {1}" -f $ts, $Message
+    try { Write-Host $line -ForegroundColor $Color } catch { Write-Host $line }
+    try {
+        $parent = Split-Path -Parent $LogPath
+        if ($parent -and -not (Test-Path $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+        Add-Content -Path $LogPath -Value $line
+    } catch {}
 }
 
-# --- Console "box" helper (for fallback dialog text) ---
-Function Show-Box {
-    param([string]$Title, [string]$BodyLine1 = "", [string]$BodyLine2 = "")
-    $line = ('=' * 72)
-    Write-Host $line -ForegroundColor DarkGray
-    if ($Title)    { Write-Host ("[ " + $Title + " ]") -ForegroundColor Gray }
-    if ($BodyLine1){ Write-Host $BodyLine1 -ForegroundColor Gray }
-    if ($BodyLine2){ Write-Host $BodyLine2 -ForegroundColor Gray }
-    Write-Host $line -ForegroundColor DarkGray
+function Ensure-Dir([string]$Path) {
+    if (-not (Test-Path $Path)) { New-Item -ItemType Directory -Path $Path -Force | Out-Null }
 }
 
-# --- Load psPAS ---
+# ---------------- Load psPAS ----------------
 try {
     Import-Module psPAS -Force -ErrorAction Stop
     $mod = Get-Module psPAS
@@ -178,58 +93,332 @@ try {
     exit 1
 }
 
-# --- Try to import AD module for OU validation (non-fatal if missing) ---
-$ADModuleLoaded = $false
-try {
-    Import-Module ActiveDirectory -ErrorAction Stop
-    $ADModuleLoaded = $true
-} catch {
-    Write-Log "⚠️ ActiveDirectory module not available; will still try to add group by UPN." "Yellow"
+# ---------------- CCP -> credential ----------------
+function Get-CCPCredential {
+    param(
+        [Parameter(Mandatory)][string]$ObjectName,
+        [Parameter(Mandatory)][string]$UPUser
+    )
+
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $headers = @{ "Content-Type" = "application/json" }
+
+    $ccpUrl = "{0}/{1}/api/Accounts?AppID={2}&Safe={3}&Object={4}" -f $CCPAddress.TrimEnd('/'), $CCPLocation.Trim('/'), $CCPAppID, $CCPSafe, $ObjectName
+    Write-Log ("Retrieving CyberArk API credentials from CCP (Object={0})..." -f $ObjectName) "Cyan"
+    Write-Log ("CCP URL: {0}" -f $ccpUrl) "Gray"
+
+    $resp = Invoke-RestMethod -Uri $ccpUrl -Method GET -Headers $headers -UseDefaultCredentials:$CCPWindowsAuth -ErrorAction Stop
+
+    # CCP can return UserName or Username depending on version/casing
+    $u = $resp.UserName
+    if (-not $u) { $u = $resp.Username }
+
+    if (-not $resp -or -not $resp.Content) { throw "Empty CCP response (missing Content)." }
+    if (-not $u) { Write-Log "⚠️ CCP response missing username field; proceeding with provided UPUser." "Yellow" }
+
+    Write-Log ("✅ CCP secret retrieved successfully.") "Green"
+
+    $sec  = ConvertTo-SecureString $resp.Content -AsPlainText -Force
+    $cred = [PSCredential]::new($UPUser, $sec)
+
+    return $cred
 }
 
-# --- CCP parameters (shared) ---
-$CCPAddress = "https://vskau1p1231.cna.com"
-$location   = "AIMWebService"
-$application= "PAMDiscovery"
-$safeCCP    = "CA_PCloud_Admins"
-$headers    = @{ "Content-Type" = "application/json" }
-$windowsAuth = $false
-
-# --- Helper: start a PAS session from CCP creds using the SAME psPAS Identity method ---
-Function Start-PASSessionFromCCP {
+# ---------------- Auth: CCP -> Identity header -> Use-PASSession ----------------
+function Start-PASSessionFromCCP {
     param(
-        [Parameter(Mandatory)] [string]$ObjectName,   # e.g. cna.com-CA_PAMDiscovery_SVC
-        [Parameter(Mandatory)] [string]$UPUser        # e.g. CA_PAMDiscovery_SVC
+        [Parameter(Mandatory)][string]$ObjectName,
+        [Parameter(Mandatory)][string]$UPUser
     )
-    $ccpUrl = "$CCPAddress/$location/api/Accounts?AppID=$application&Safe=$safeCCP&Object=$ObjectName"
-    Write-Log ("Retrieving CyberArk API credentials from CCP ({0}) via Object method..." -f $UPUser)
-    try {
-        $resp = Invoke-RestMethod $ccpUrl -Method 'GET' -Headers $headers -UseDefaultCredentials:$windowsAuth
-        if (-not $resp -or -not $resp.Content) { throw "Empty CCP response" }
-        Write-Log ("✅ Successfully retrieved credentials for user: {0}" -f $resp.Username) "Green"
-    } catch {
-        Write-Log ("❌ ERROR: CCP credential fetch failed - {0}" -f $_) "Red"
-        throw
-    }
 
-    try {
-        Write-Log ("Requesting CyberArk PAS authentication (psPAS Identity header) as {0}..." -f $UPUser)
-        $UPPass = ConvertTo-SecureString $resp.Content -AsPlainText -Force
-        $UPCred = [PSCredential]::new($UPUser, $UPPass)
+    $UPCred = Get-CCPCredential -ObjectName $ObjectName -UPUser $UPUser
 
-        $header = Get-IdentityHeader `
-            -IdentityTenantURL "aat4012.id.cyberark.cloud" `
+    # Primary: your method (Get-IdentityHeader -> Use-PASSession)
+    $identityHeaderCmd = Get-Command Get-IdentityHeader -ErrorAction SilentlyContinue
+    if ($identityHeaderCmd) {
+        Write-Log ("Authenticating (Identity header) as {0}..." -f $UPUser) "Cyan"
+
+        $headerSession = Get-IdentityHeader `
+            -IdentityTenantURL $IdentityTenantURL `
             -psPASFormat `
-            -PCloudSubdomain "cna-prod" `
+            -PCloudSubdomain $PCloudSubdomain `
             -UPCreds $UPCred
 
-        Use-PASSession $header
-        if (-not (Get-PASSession)) { throw "psPAS session not established" }
-        Write-Log ("✅ Authentication successful, PAS session established ({0})." -f $UPUser) "Green"
-    } catch {
-        Write-Log ("❌ Failed to authenticate via psPAS Identity header: {0}" -f $_.Exception.Message) "Red"
-        throw
+        Use-PASSession -Session $headerSession
+
+        if (-not (Get-PASSession)) { throw "psPAS session not established (Identity header method)." }
+        Write-Log ("✅ Authentication successful (Identity header), PAS session established ({0})." -f $UPUser) "Green"
+        return
     }
 
-    return $resp   # return CCP record (may be useful later)
+    # Fallback: psPAS native shared-services auth
+    Write-Log "⚠️ Get-IdentityHeader not found. Falling back to New-PASSession -ServiceUser." "Yellow"
+    $pcloudUrl = "https://{0}.privilegecloud.cyberark.cloud" -f $PCloudSubdomain
+
+    New-PASSession `
+        -IdentityTenantURL $IdentityTenantURL `
+        -PrivilegeCloudURL $pcloudUrl `
+        -Credential $UPCred `
+        -ServiceUser `
+        -ErrorAction Stop | Out-Null
+
+    if (-not (Get-PASSession)) { throw "psPAS session not established (fallback method)." }
+    Write-Log ("✅ Authentication successful (fallback), PAS session established ({0})." -f $UPUser) "Green"
+}
+
+# ---------------- Helper: call REST using session BaseURI/WebSession ----------------
+function Invoke-PASGet {
+    param(
+        [Parameter(Mandatory)][string]$RelativePath  # e.g. "Platforms?Active=True"
+    )
+
+    $s = Get-PASSession
+    if (-not $s -or -not $s.BaseURI -or -not $s.WebSession) {
+        throw "No active psPAS session found (BaseURI/WebSession missing)."
+    }
+
+    $base = $s.BaseURI.TrimEnd('/')
+    $uri  = "{0}/{1}" -f $base, $RelativePath.TrimStart('/')
+
+    return Invoke-RestMethod -Uri $uri -Method GET -WebSession $s.WebSession -ErrorAction Stop
+}
+
+# ---------------- Flatten helpers ----------------
+function Join-Names($arr) {
+    if (-not $arr) { return "" }
+    try { return ($arr | ForEach-Object { $_.name } | Where-Object { $_ } | Sort-Object -Unique) -join "; " } catch { return "" }
+}
+function Join-PropNames($arr) {
+    if (-not $arr) { return "" }
+    try { return ($arr | ForEach-Object { $_.name } | Where-Object { $_ } | Sort-Object -Unique) -join "; " } catch { return "" }
+}
+
+# ---------------- MAIN ----------------
+try {
+    Ensure-Dir $OutDir
+
+    $csvPlatforms     = Join-Path $OutDir "Platforms_Report.csv"
+    $jsonPlatformsRaw = Join-Path $OutDir "Platforms_Raw.json"
+    $csvInactive      = Join-Path $OutDir "Platforms_InactiveOnly.csv"
+    $csvSysSummary    = Join-Path $OutDir "Platforms_Summary_SystemType.csv"
+    $csvTypeSummary   = Join-Path $OutDir "Platforms_Summary_PlatformType.csv"
+
+    Write-Log "===== START Platform Report =====" "Gray"
+    Start-PASSessionFromCCP -ObjectName $CCPObject -UPUser $ServiceUPUser
+
+    # Build Platforms query string
+    $qs = @()
+    if ($ActiveOnly) { $qs += "Active=True" }
+    if ($PlatformTypeFilter -ne "All") { $qs += ("PlatformType={0}" -f $PlatformTypeFilter) }
+    if ($PlatformNameSearch.Trim()) { $qs += ("Search={0}" -f [Uri]::EscapeDataString($PlatformNameSearch.Trim())) }
+
+    $relative = "Platforms"
+    if ($qs.Count -gt 0) { $relative = "Platforms?{0}" -f ($qs -join "&") }
+
+    Write-Log ("Fetching platforms via /API/{0} ..." -f $relative) "Cyan"
+
+    $platformResp = Invoke-PASGet -RelativePath $relative
+
+    # Save raw response
+    try {
+        $platformResp | ConvertTo-Json -Depth 8 | Out-File -LiteralPath $jsonPlatformsRaw -Encoding utf8
+        Write-Log ("Raw Platforms API response saved: {0}" -f $jsonPlatformsRaw) "Green"
+    } catch {
+        Write-Log ("⚠️ Could not save raw JSON: {0}" -f $_.Exception.Message) "Yellow"
+    }
+
+    # Normalize platforms array
+    $platforms = $null
+    if ($platformResp.Platforms) { $platforms = $platformResp.Platforms }
+    elseif ($platformResp.platforms) { $platforms = $platformResp.platforms }
+    elseif ($platformResp.value) { $platforms = $platformResp.value }
+    elseif ($platformResp -is [System.Collections.IEnumerable]) { $platforms = $platformResp }
+    else { $platforms = @() }
+
+    if (-not $platforms -or $platforms.Count -eq 0) {
+        throw "No platforms returned. Verify API permissions and filters."
+    }
+
+    Write-Log ("Retrieved {0} platforms." -f $platforms.Count) "Green"
+
+    # Build main report
+    $processed = foreach ($p in $platforms) {
+        # Some tenants use lowercase; normalize
+        $g = $p.general
+        if (-not $g) { $g = $p.General }
+
+        $props = $p.properties
+        if (-not $props) { $props = $p.Properties }
+
+        $cred = $p.credentialsManagement
+        if (-not $cred) { $cred = $p.CredentialsManagement }
+
+        $sess = $p.sessionManagement
+        if (-not $sess) { $sess = $p.SessionManagement }
+
+        $wf = $p.privilegedAccessWorkflows
+        if (-not $wf) { $wf = $p.PrivilegedAccessWorkflows }
+
+        $linked = $p.linkedAccounts
+        if (-not $linked) { $linked = $p.LinkedAccounts }
+
+        [PSCustomObject]@{
+            PlatformID       = $g.id
+            PlatformName     = $g.name
+            Active           = $g.active
+            Description      = $g.description
+            PlatformBaseID   = $g.platformBaseID
+            PlatformType     = $g.platformType
+            SystemType       = $g.systemType
+
+            RequiredProperties = (Join-PropNames $props.required)
+            OptionalProperties = (Join-PropNames $props.optional)
+
+            LinkedAccounts     = (Join-Names $linked)
+
+            AllowedSafes                       = $cred.allowedSafes
+            AllowManualChange                  = [string]$cred.allowManualChange
+            PerformPeriodicChange              = [string]$cred.performPeriodicChange
+            RequirePasswordChangeEveryXDays    = [string]$cred.requirePasswordChangeEveryXDays
+            AllowManualVerification            = [string]$cred.allowManualVerification
+            PerformPeriodicVerification        = [string]$cred.performPeriodicVerification
+            RequirePasswordVerificationEveryXDays = [string]$cred.requirePasswordVerificationEveryXDays
+            AllowManualReconciliation          = [string]$cred.allowManualReconciliation
+            AutomaticReconcileWhenUnsynched    = [string]$cred.automaticReconcileWhenUnsynched
+
+            RequirePrivilegedSessionMonitoringAndIsolation = [string]$sess.requirePrivilegedSessionMonitoringAndIsolation
+            RecordAndSaveSessionActivity       = [string]$sess.recordAndSaveSessionActivity
+            PSMServerID                        = [string]$sess.PSMServerID
+
+            RequireDualControlPasswordAccessApproval = [string]$wf.requireDualControlPasswordAccessApproval
+            EnforceCheckinCheckoutExclusiveAccess    = [string]$wf.enforceCheckinCheckoutExclusiveAccess
+            EnforceOnetimePasswordAccess             = [string]$wf.enforceOnetimePasswordAccess
+        }
+    }
+
+    $processed | Export-Csv -LiteralPath $csvPlatforms -NoTypeInformation -Encoding utf8
+    Write-Log ("✅ Platforms report exported: {0}" -f $csvPlatforms) "Green"
+
+    # Inactive-only list
+    $inactive = $processed | Where-Object { $_.Active -ne $true }
+    $inactive | Export-Csv -LiteralPath $csvInactive -NoTypeInformation -Encoding utf8
+    Write-Log ("Inactive platforms exported: {0} (Count={1})" -f $csvInactive, ($inactive.Count)) "Green"
+
+    # Summary: systemType + platformType
+    $processed |
+        Group-Object SystemType |
+        Sort-Object Count -Descending |
+        ForEach-Object { [PSCustomObject]@{ SystemType=$_.Name; Count=$_.Count } } |
+        Export-Csv -LiteralPath $csvSysSummary -NoTypeInformation -Encoding utf8
+
+    Write-Log ("SystemType summary exported: {0}" -f $csvSysSummary) "Green"
+
+    $processed |
+        Group-Object PlatformType |
+        Sort-Object Count -Descending |
+        ForEach-Object { [PSCustomObject]@{ PlatformType=$_.Name; Count=$_.Count } } |
+        Export-Csv -LiteralPath $csvTypeSummary -NoTypeInformation -Encoding utf8
+
+    Write-Log ("PlatformType summary exported: {0}" -f $csvTypeSummary) "Green"
+
+    # ---------------- Optional: Account-based reports ----------------
+    if ($IncludeAccountReports) {
+        if ($AccountsPageSize -gt 1000) { $AccountsPageSize = 1000 }
+        if ($AccountsPageSize -lt 50)   { $AccountsPageSize = 50 }
+
+        $csvAccByPlat  = Join-Path $OutDir "Accounts_CountByPlatform.csv"
+        $csvAccBySafe  = Join-Path $OutDir "Accounts_CountBySafe.csv"
+        $csvAccStatus  = Join-Path $OutDir "Accounts_SecretMgmtStatus.csv"
+
+        Write-Log "IncludeAccountReports=True -> paging /API/Accounts (this can take time in large tenants)..." "Yellow"
+
+        $all = New-Object System.Collections.Generic.List[object]
+        $offset = 0
+
+        while ($true) {
+            $rel = "Accounts?offset={0}&limit={1}" -f $offset, $AccountsPageSize
+            Write-Log ("Fetching accounts page (offset={0}, limit={1})..." -f $offset, $AccountsPageSize) "Gray"
+
+            $resp = Invoke-PASGet -RelativePath $rel
+
+            # Normalize accounts list
+            $items = $null
+            if ($resp.value) { $items = $resp.value }
+            elseif ($resp.accounts) { $items = $resp.accounts }
+            elseif ($resp.Accounts) { $items = $resp.Accounts }
+            elseif ($resp -is [System.Collections.IEnumerable]) { $items = $resp }
+            else { $items = @() }
+
+            if (-not $items -or $items.Count -eq 0) { break }
+
+            foreach ($a in $items) { $all.Add($a) }
+
+            # Stop when last page < page size
+            if ($items.Count -lt $AccountsPageSize) { break }
+            $offset += $AccountsPageSize
+        }
+
+        Write-Log ("Total accounts collected: {0}" -f $all.Count) "Green"
+
+        # Count by platformId
+        $all |
+            Group-Object platformId |
+            Sort-Object Count -Descending |
+            ForEach-Object { [PSCustomObject]@{ PlatformID=$_.Name; AccountCount=$_.Count } } |
+            Export-Csv -LiteralPath $csvAccByPlat -NoTypeInformation -Encoding utf8
+
+        Write-Log ("Accounts by Platform exported: {0}" -f $csvAccByPlat) "Green"
+
+        # Count by safeName
+        $all |
+            Group-Object safeName |
+            Sort-Object Count -Descending |
+            ForEach-Object { [PSCustomObject]@{ SafeName=$_.Name; AccountCount=$_.Count } } |
+            Export-Csv -LiteralPath $csvAccBySafe -NoTypeInformation -Encoding utf8
+
+        Write-Log ("Accounts by Safe exported: {0}" -f $csvAccBySafe) "Green"
+
+        # Secret management status summary (automaticManagementEnabled + status)
+        $all |
+            ForEach-Object {
+                $sm = $_.secretManagement
+                if (-not $sm) { $sm = $_.SecretManagement }
+                [PSCustomObject]@{
+                    automaticManagementEnabled = $sm.automaticManagementEnabled
+                    status                     = $sm.status
+                }
+            } |
+            Group-Object automaticManagementEnabled, status |
+            Sort-Object Count -Descending |
+            ForEach-Object {
+                $parts = $_.Name -split ","
+                [PSCustomObject]@{
+                    automaticManagementEnabled = ($parts[0]).Trim()
+                    status                     = ($parts[1]).Trim()
+                    Count                      = $_.Count
+                }
+            } |
+            Export-Csv -LiteralPath $csvAccStatus -NoTypeInformation -Encoding utf8
+
+        Write-Log ("SecretManagement status summary exported: {0}" -f $csvAccStatus) "Green"
+    }
+    else {
+        Write-Log "IncludeAccountReports=False (skipping account-based reports)." "Gray"
+    }
+
+    Write-Log "===== DONE Platform Report =====" "Green"
+}
+catch {
+    Write-Log ("❌ ERROR: {0}" -f $_.Exception.Message) "Red"
+    throw
+}
+finally {
+    try {
+        if (Get-PASSession) {
+            Close-PASSession | Out-Null
+            Write-Log "Logged off (Close-PASSession)." "Green"
+        }
+    } catch {
+        Write-Log ("⚠️ Logoff warning: {0}" -f $_.Exception.Message) "Yellow"
+    }
 }
