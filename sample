@@ -10,9 +10,13 @@ UPDATED:
   - Includes ReconcileAccountSafe
   - Includes ReconcileAccountName
 
-NOTE:
-  Get-Platforms returns summary fields.
-  ReconcileAccountSafe / ReconcileAccountName are pulled from Get-PlatformDetails -> Properties.
+NOTES:
+  - Get-Platforms returns summary fields.
+  - ReconcileAccountSafe / ReconcileAccountName are pulled from Get-PlatformDetails -> Properties.
+  - Properties may return as:
+      1) Hashtable / dictionary
+      2) Array of objects (Key/Value or Name/Value)
+      3) Array of strings like: ReconcileAccountSafe=SafeName
 #>
 
 # ---- Execution policy & unblock psPAS (silent) ----
@@ -186,10 +190,8 @@ function Get-PlatformDetails {
         throw "No psPAS WebSession found. Auth failed or session not set."
     }
 
-    # Use platform unique ID from Get-Platforms.general.id
     $encodedPlatformID = [uri]::EscapeDataString($PlatformID)
 
-    # Keep trailing slash to be safe for values that include dots.
     $u1 = "https://{0}.privilegecloud.cyberark.cloud/PasswordVault/API/Platforms/{1}/" -f $PCloudSubdomain, $encodedPlatformID
     $u2 = "https://{0}.privilegecloud.cyberark.cloud/PasswordVault/api/Platforms/{1}/" -f $PCloudSubdomain, $encodedPlatformID
 
@@ -212,7 +214,6 @@ function Get-CaseInsensitiveMemberValue {
 
     if ($null -eq $InputObject) { return $null }
 
-    # Hashtable / dictionary
     if ($InputObject -is [System.Collections.IDictionary]) {
         foreach ($n in $Names) {
             foreach ($k in $InputObject.Keys) {
@@ -224,7 +225,6 @@ function Get-CaseInsensitiveMemberValue {
         return $null
     }
 
-    # PSCustomObject / object with properties
     $propNames = @($InputObject.PSObject.Properties.Name)
     foreach ($n in $Names) {
         $match = $propNames | Where-Object { $_ -ieq $n } | Select-Object -First 1
@@ -239,31 +239,54 @@ function Get-CaseInsensitiveMemberValue {
 function Get-PlatformPropertyValue {
     param(
         [Parameter(Mandatory)]$PlatformDetails,
-        [Parameter(Mandatory)][string]$PropertyName
+        [Parameter(Mandatory)][string[]]$PropertyNames
     )
 
     $props = Get-CaseInsensitiveMemberValue -InputObject $PlatformDetails -Names @('Properties','properties')
     if ($null -eq $props) { return "" }
 
-    # Case 1: dictionary / hashtable-like
+    # Case 1: Properties is a dictionary / hashtable
     if ($props -is [System.Collections.IDictionary]) {
-        $direct = Get-CaseInsensitiveMemberValue -InputObject $props -Names @($PropertyName)
-        if ($null -ne $direct) {
-            return [string]$direct
+        foreach ($wanted in $PropertyNames) {
+            $direct = Get-CaseInsensitiveMemberValue -InputObject $props -Names @($wanted)
+            if ($null -ne $direct -and -not [string]::IsNullOrWhiteSpace([string]$direct)) {
+                return [string]$direct
+            }
         }
     }
 
-    # Case 2: list of objects like:
-    # @{ Key='ReconcileAccountSafe'; Value='Safe1' }
-    # @{ Name='ReconcileAccountSafe'; Value='Safe1' }
+    # Case 2: Properties is a list / array
     foreach ($entry in @($props)) {
         if ($null -eq $entry) { continue }
 
+        # Most common case: string line like "ReconcileAccountSafe=SafeName"
+        if ($entry -is [string]) {
+            $line = $entry.Trim()
+
+            if ($line -match '^\s*([^=]+?)\s*=\s*(.*)$') {
+                $key   = $matches[1].Trim()
+                $value = $matches[2]
+
+                foreach ($wanted in $PropertyNames) {
+                    if ($key -ieq $wanted) {
+                        return [string]$value
+                    }
+                }
+            }
+
+            continue
+        }
+
+        # Object case: @{ Key='X'; Value='Y' } or @{ Name='X'; Value='Y' }
         $entryName = Get-CaseInsensitiveMemberValue -InputObject $entry -Names @('Key','Name','key','name')
-        if ([string]$entryName -ieq $PropertyName) {
-            $entryValue = Get-CaseInsensitiveMemberValue -InputObject $entry -Names @('Value','value')
-            if ($null -ne $entryValue) {
-                return [string]$entryValue
+        if ($null -ne $entryName) {
+            foreach ($wanted in $PropertyNames) {
+                if ([string]$entryName -ieq $wanted) {
+                    $entryValue = Get-CaseInsensitiveMemberValue -InputObject $entry -Names @('Value','value')
+                    if ($null -ne $entryValue) {
+                        return [string]$entryValue
+                    }
+                }
             }
         }
     }
@@ -318,7 +341,6 @@ try {
 
     Write-Log ("Platforms returned: {0}" -f $platforms.Count) "Green"
 
-    # Build SINGLE report with extended attributes
     $ProcessedPlatforms = foreach ($p in $platforms) {
 
         $g      = $p.general
@@ -328,21 +350,23 @@ try {
         $sess   = $p.sessionManagement
         $wf     = $p.privilegedAccessWorkflows
 
-        # Try direct access first (future-proof in case these appear in summary payload later)
+        # Future-proof: if the summary payload ever includes them directly
         $reconcileSafe = [string](Get-CaseInsensitiveMemberValue -InputObject $cred -Names @('ReconcileAccountSafe','reconcileAccountSafe'))
         $reconcileName = [string](Get-CaseInsensitiveMemberValue -InputObject $cred -Names @('ReconcileAccountName','reconcileAccountName'))
 
-        # Current summary payload normally does not include these values; pull from platform details
         if ([string]::IsNullOrWhiteSpace($reconcileSafe) -or [string]::IsNullOrWhiteSpace($reconcileName)) {
             try {
                 $detail = Get-PlatformDetails -PlatformID $g.id
 
+                # Optional debug:
+                # Write-Log ("First 5 raw properties for [{0}]: {1}" -f $g.id, ((@($detail.Properties) | Select-Object -First 5) -join " | ")) "Gray"
+
                 if ([string]::IsNullOrWhiteSpace($reconcileSafe)) {
-                    $reconcileSafe = Get-PlatformPropertyValue -PlatformDetails $detail -PropertyName 'ReconcileAccountSafe'
+                    $reconcileSafe = Get-PlatformPropertyValue -PlatformDetails $detail -PropertyNames @('ReconcileAccountSafe')
                 }
 
                 if ([string]::IsNullOrWhiteSpace($reconcileName)) {
-                    $reconcileName = Get-PlatformPropertyValue -PlatformDetails $detail -PropertyName 'ReconcileAccountName'
+                    $reconcileName = Get-PlatformPropertyValue -PlatformDetails $detail -PropertyNames @('ReconcileAccountName')
                 }
             }
             catch {
