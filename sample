@@ -9,12 +9,14 @@ EXPORTS:
 UPDATED:
   - Includes ReconcileAccountSafe
   - Includes ReconcileAccountName
+  - Includes LogonAccountSafe
+  - Includes LogonAccountName
 
 NOTES:
   - Get-Platforms returns summary fields only.
   - Get-PlatformDetails returns the platform Policy INI key/value list.
-  - If ReconcileAccountSafe / ReconcileAccountName are still blank there,
-    this script falls back to Export Platform ZIP and parses the CPM INI / PVWA XML.
+  - If values are still blank there, this script falls back to Export Platform ZIP
+    and parses the CPM INI / PVWA XML.
   - Export Platform requires Vault Admin rights.
 #>
 
@@ -191,7 +193,7 @@ function Get-PlatformDetails {
 
     $encodedPlatformID = [uri]::EscapeDataString($PlatformID)
 
-    # CyberArk notes that if the URL includes a dot, add a trailing slash.
+    # Trailing slash helps when the platform name contains dots
     $u1 = "https://{0}.privilegecloud.cyberark.cloud/PasswordVault/API/Platforms/{1}/" -f $PCloudSubdomain, $encodedPlatformID
     $u2 = "https://{0}.privilegecloud.cyberark.cloud/PasswordVault/api/Platforms/{1}/" -f $PCloudSubdomain, $encodedPlatformID
 
@@ -222,7 +224,6 @@ function Get-PlatformExportZip {
     $null = New-Item -ItemType Directory -Path $tempRoot -Force
     $zipPath = Join-Path $tempRoot ($PlatformID + ".zip")
 
-    # Export platform endpoint is POST and returns a zip file stream
     $u1 = "https://{0}.privilegecloud.cyberark.cloud/PasswordVault/API/Platforms/{1}/Export/" -f $PCloudSubdomain, $encodedPlatformID
     $u2 = "https://{0}.privilegecloud.cyberark.cloud/PasswordVault/api/Platforms/{1}/Export/" -f $PCloudSubdomain, $encodedPlatformID
 
@@ -251,7 +252,6 @@ function Get-CaseInsensitiveMemberValue {
 
     if ($null -eq $InputObject) { return $null }
 
-    # Hashtable / dictionary
     if ($InputObject -is [System.Collections.IDictionary]) {
         foreach ($n in $Names) {
             foreach ($k in $InputObject.Keys) {
@@ -263,7 +263,6 @@ function Get-CaseInsensitiveMemberValue {
         return $null
     }
 
-    # Regular object / PSCustomObject
     $propNames = @($InputObject.PSObject.Properties.Name)
     foreach ($n in $Names) {
         $match = $propNames | Where-Object { $_ -ieq $n } | Select-Object -First 1
@@ -284,7 +283,7 @@ function Get-PlatformPropertyValue {
     $props = Get-CaseInsensitiveMemberValue -InputObject $PlatformDetails -Names @('Properties','properties')
     if ($null -eq $props) { return "" }
 
-    # Case 1: Properties is a dictionary
+    # Case 1: dictionary
     if ($props -is [System.Collections.IDictionary]) {
         foreach ($wanted in $PropertyNames) {
             $direct = Get-CaseInsensitiveMemberValue -InputObject $props -Names @($wanted)
@@ -294,11 +293,11 @@ function Get-PlatformPropertyValue {
         }
     }
 
-    # Case 2: Properties is a list/array
+    # Case 2: list / array
     foreach ($entry in @($props)) {
         if ($null -eq $entry) { continue }
 
-        # String case: "ReconcileAccountSafe=MySafe"
+        # String case: Key=Value
         if ($entry -is [string]) {
             $line = $entry.Trim()
 
@@ -316,7 +315,7 @@ function Get-PlatformPropertyValue {
             continue
         }
 
-        # Object case: @{ Key='X'; Value='Y' } or @{ Name='X'; Value='Y' }
+        # Object case: @{ Key='X'; Value='Y' } / @{ Name='X'; Value='Y' }
         $entryName = Get-CaseInsensitiveMemberValue -InputObject $entry -Names @('Key','Name','key','name')
         if ($null -ne $entryName) {
             foreach ($wanted in $PropertyNames) {
@@ -361,7 +360,7 @@ function Get-TextKeyValue {
     return ""
 }
 
-function Get-ReconcileValuesFromExport {
+function Get-PlatformLinkedValuesFromExport {
     param(
         [Parameter(Mandatory)][string]$PlatformID
     )
@@ -383,6 +382,9 @@ function Get-ReconcileValuesFromExport {
         $reconcileSafe   = ""
         $reconcileFolder = ""
         $reconcileName   = ""
+        $logonSafe       = ""
+        $logonFolder     = ""
+        $logonName       = ""
 
         foreach ($file in $files) {
             $raw = Get-Content -LiteralPath $file.FullName -Raw -ErrorAction SilentlyContinue
@@ -400,8 +402,22 @@ function Get-ReconcileValuesFromExport {
                 $reconcileName = Get-TextKeyValue -Text $raw -Key 'ReconcileAccountName'
             }
 
-            if (-not [string]::IsNullOrWhiteSpace($reconcileSafe) -and
-                -not [string]::IsNullOrWhiteSpace($reconcileName)) {
+            if ([string]::IsNullOrWhiteSpace($logonSafe)) {
+                $logonSafe = Get-TextKeyValue -Text $raw -Key 'LogonAccountSafe'
+            }
+
+            if ([string]::IsNullOrWhiteSpace($logonFolder)) {
+                $logonFolder = Get-TextKeyValue -Text $raw -Key 'LogonAccountFolder'
+            }
+
+            if ([string]::IsNullOrWhiteSpace($logonName)) {
+                $logonName = Get-TextKeyValue -Text $raw -Key 'LogonAccountName'
+            }
+
+            $haveReconcile = (-not [string]::IsNullOrWhiteSpace($reconcileSafe) -and -not [string]::IsNullOrWhiteSpace($reconcileName))
+            $haveLogon     = (-not [string]::IsNullOrWhiteSpace($logonSafe) -and -not [string]::IsNullOrWhiteSpace($logonName))
+
+            if ($haveReconcile -and $haveLogon) {
                 break
             }
         }
@@ -410,6 +426,9 @@ function Get-ReconcileValuesFromExport {
             ReconcileAccountSafe   = $reconcileSafe
             ReconcileAccountFolder = $reconcileFolder
             ReconcileAccountName   = $reconcileName
+            LogonAccountSafe       = $logonSafe
+            LogonAccountFolder     = $logonFolder
+            LogonAccountName       = $logonName
         }
     }
     finally {
@@ -475,12 +494,18 @@ try {
         $sess   = $p.sessionManagement
         $wf     = $p.privilegedAccessWorkflows
 
-        # Future-proof in case CyberArk ever exposes these directly in summary response
+        # Future-proof direct reads if CyberArk ever exposes them in summary payload
         $reconcileSafe = [string](Get-CaseInsensitiveMemberValue -InputObject $cred -Names @('ReconcileAccountSafe','reconcileAccountSafe'))
         $reconcileName = [string](Get-CaseInsensitiveMemberValue -InputObject $cred -Names @('ReconcileAccountName','reconcileAccountName'))
 
-        # First attempt: Get-PlatformDetails (Policy INI key/value list)
-        if ([string]::IsNullOrWhiteSpace($reconcileSafe) -or [string]::IsNullOrWhiteSpace($reconcileName)) {
+        $logonSafe = [string](Get-CaseInsensitiveMemberValue -InputObject $sess -Names @('LogonAccountSafe','logonAccountSafe'))
+        $logonName = [string](Get-CaseInsensitiveMemberValue -InputObject $sess -Names @('LogonAccountName','logonAccountName'))
+
+        # First attempt: Get-PlatformDetails
+        if ([string]::IsNullOrWhiteSpace($reconcileSafe) -or
+            [string]::IsNullOrWhiteSpace($reconcileName) -or
+            [string]::IsNullOrWhiteSpace($logonSafe) -or
+            [string]::IsNullOrWhiteSpace($logonName)) {
             try {
                 $detail = Get-PlatformDetails -PlatformID $g.id
 
@@ -491,16 +516,27 @@ try {
                 if ([string]::IsNullOrWhiteSpace($reconcileName)) {
                     $reconcileName = Get-PlatformPropertyValue -PlatformDetails $detail -PropertyNames @('ReconcileAccountName')
                 }
+
+                if ([string]::IsNullOrWhiteSpace($logonSafe)) {
+                    $logonSafe = Get-PlatformPropertyValue -PlatformDetails $detail -PropertyNames @('LogonAccountSafe')
+                }
+
+                if ([string]::IsNullOrWhiteSpace($logonName)) {
+                    $logonName = Get-PlatformPropertyValue -PlatformDetails $detail -PropertyNames @('LogonAccountName')
+                }
             }
             catch {
                 Write-Log ("WARNING: Could not retrieve Get-PlatformDetails for [{0}]: {1}" -f $g.id, $_.Exception.Message) "Yellow"
             }
         }
 
-        # Fallback: Export platform ZIP and parse CPM INI / PVWA XML
-        if ([string]::IsNullOrWhiteSpace($reconcileSafe) -or [string]::IsNullOrWhiteSpace($reconcileName)) {
+        # Fallback: Export Platform ZIP and parse CPM INI / PVWA XML
+        if ([string]::IsNullOrWhiteSpace($reconcileSafe) -or
+            [string]::IsNullOrWhiteSpace($reconcileName) -or
+            [string]::IsNullOrWhiteSpace($logonSafe) -or
+            [string]::IsNullOrWhiteSpace($logonName)) {
             try {
-                $exportVals = Get-ReconcileValuesFromExport -PlatformID $g.id
+                $exportVals = Get-PlatformLinkedValuesFromExport -PlatformID $g.id
 
                 if ([string]::IsNullOrWhiteSpace($reconcileSafe)) {
                     $reconcileSafe = [string]$exportVals.ReconcileAccountSafe
@@ -508,6 +544,14 @@ try {
 
                 if ([string]::IsNullOrWhiteSpace($reconcileName)) {
                     $reconcileName = [string]$exportVals.ReconcileAccountName
+                }
+
+                if ([string]::IsNullOrWhiteSpace($logonSafe)) {
+                    $logonSafe = [string]$exportVals.LogonAccountSafe
+                }
+
+                if ([string]::IsNullOrWhiteSpace($logonName)) {
+                    $logonName = [string]$exportVals.LogonAccountName
                 }
             }
             catch {
@@ -541,6 +585,9 @@ try {
 
             ReconcileAccountSafe                  = $reconcileSafe
             ReconcileAccountName                  = $reconcileName
+
+            LogonAccountSafe                      = $logonSafe
+            LogonAccountName                      = $logonName
 
             RequirePrivilegedSessionMonitoringAndIsolation = [string]$sess.requirePrivilegedSessionMonitoringAndIsolation
             RecordAndSaveSessionActivity                  = [string]$sess.recordAndSaveSessionActivity
