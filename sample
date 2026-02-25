@@ -11,12 +11,11 @@ UPDATED:
   - Includes ReconcileAccountName
 
 NOTES:
-  - Get-Platforms returns summary fields.
-  - ReconcileAccountSafe / ReconcileAccountName are pulled from Get-PlatformDetails -> Properties.
-  - Properties may return as:
-      1) Hashtable / dictionary
-      2) Array of objects (Key/Value or Name/Value)
-      3) Array of strings like: ReconcileAccountSafe=SafeName
+  - Get-Platforms returns summary fields only.
+  - Get-PlatformDetails returns the platform Policy INI key/value list.
+  - If ReconcileAccountSafe / ReconcileAccountName are still blank there,
+    this script falls back to Export Platform ZIP and parses the CPM INI / PVWA XML.
+  - Export Platform requires Vault Admin rights.
 #>
 
 # ---- Execution policy & unblock psPAS (silent) ----
@@ -192,6 +191,7 @@ function Get-PlatformDetails {
 
     $encodedPlatformID = [uri]::EscapeDataString($PlatformID)
 
+    # CyberArk notes that if the URL includes a dot, add a trailing slash.
     $u1 = "https://{0}.privilegecloud.cyberark.cloud/PasswordVault/API/Platforms/{1}/" -f $PCloudSubdomain, $encodedPlatformID
     $u2 = "https://{0}.privilegecloud.cyberark.cloud/PasswordVault/api/Platforms/{1}/" -f $PCloudSubdomain, $encodedPlatformID
 
@@ -206,6 +206,43 @@ function Get-PlatformDetails {
     }
 }
 
+function Get-PlatformExportZip {
+    param(
+        [Parameter(Mandatory)][string]$PlatformID
+    )
+
+    $s = Get-PASSession
+    if (-not $s -or -not $s.WebSession) {
+        throw "No psPAS WebSession found. Auth failed or session not set."
+    }
+
+    $encodedPlatformID = [uri]::EscapeDataString($PlatformID)
+
+    $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("CA_PlatformExport_" + [guid]::NewGuid().ToString("N"))
+    $null = New-Item -ItemType Directory -Path $tempRoot -Force
+    $zipPath = Join-Path $tempRoot ($PlatformID + ".zip")
+
+    # Export platform endpoint is POST and returns a zip file stream
+    $u1 = "https://{0}.privilegecloud.cyberark.cloud/PasswordVault/API/Platforms/{1}/Export/" -f $PCloudSubdomain, $encodedPlatformID
+    $u2 = "https://{0}.privilegecloud.cyberark.cloud/PasswordVault/api/Platforms/{1}/Export/" -f $PCloudSubdomain, $encodedPlatformID
+
+    try {
+        Write-Log ("Exporting platform package: {0}" -f $u1) "Gray"
+        Invoke-WebRequest -Uri $u1 -Method POST -WebSession $s.WebSession -OutFile $zipPath -ErrorAction Stop | Out-Null
+    }
+    catch {
+        Write-Log ("Platform export (uppercase path) failed for [{0}], trying lowercase path. Reason: {1}" -f $PlatformID, $_.Exception.Message) "Yellow"
+        Write-Log ("Exporting platform package: {0}" -f $u2) "Gray"
+        Invoke-WebRequest -Uri $u2 -Method POST -WebSession $s.WebSession -OutFile $zipPath -ErrorAction Stop | Out-Null
+    }
+
+    if (-not (Test-Path $zipPath)) {
+        throw "Platform export did not produce a ZIP file."
+    }
+
+    return $zipPath
+}
+
 function Get-CaseInsensitiveMemberValue {
     param(
         [Parameter(Mandatory)]$InputObject,
@@ -214,6 +251,7 @@ function Get-CaseInsensitiveMemberValue {
 
     if ($null -eq $InputObject) { return $null }
 
+    # Hashtable / dictionary
     if ($InputObject -is [System.Collections.IDictionary]) {
         foreach ($n in $Names) {
             foreach ($k in $InputObject.Keys) {
@@ -225,6 +263,7 @@ function Get-CaseInsensitiveMemberValue {
         return $null
     }
 
+    # Regular object / PSCustomObject
     $propNames = @($InputObject.PSObject.Properties.Name)
     foreach ($n in $Names) {
         $match = $propNames | Where-Object { $_ -ieq $n } | Select-Object -First 1
@@ -245,7 +284,7 @@ function Get-PlatformPropertyValue {
     $props = Get-CaseInsensitiveMemberValue -InputObject $PlatformDetails -Names @('Properties','properties')
     if ($null -eq $props) { return "" }
 
-    # Case 1: Properties is a dictionary / hashtable
+    # Case 1: Properties is a dictionary
     if ($props -is [System.Collections.IDictionary]) {
         foreach ($wanted in $PropertyNames) {
             $direct = Get-CaseInsensitiveMemberValue -InputObject $props -Names @($wanted)
@@ -255,11 +294,11 @@ function Get-PlatformPropertyValue {
         }
     }
 
-    # Case 2: Properties is a list / array
+    # Case 2: Properties is a list/array
     foreach ($entry in @($props)) {
         if ($null -eq $entry) { continue }
 
-        # Most common case: string line like "ReconcileAccountSafe=SafeName"
+        # String case: "ReconcileAccountSafe=MySafe"
         if ($entry -is [string]) {
             $line = $entry.Trim()
 
@@ -292,6 +331,92 @@ function Get-PlatformPropertyValue {
     }
 
     return ""
+}
+
+function Get-TextKeyValue {
+    param(
+        [Parameter(Mandatory)][string]$Text,
+        [Parameter(Mandatory)][string]$Key
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Text)) { return "" }
+
+    $escaped = [regex]::Escape($Key)
+
+    $patterns = @(
+        "(?im)^\s*$escaped\s*=\s*(.+?)\s*$",
+        "(?is)(?:Name|Key)\s*=\s*[`"']$escaped[`"'][^>]*?(?:Value|value)\s*=\s*[`"']([^`"']*)[`"']",
+        "(?is)(?:Value|value)\s*=\s*[`"']([^`"']*)[`"'][^>]*?(?:Name|Key)\s*=\s*[`"']$escaped[`"']",
+        "(?is)<$escaped>\s*([^<]*)\s*</$escaped>",
+        "(?is)<add[^>]*\bkey\s*=\s*[`"']$escaped[`"'][^>]*\bvalue\s*=\s*[`"']([^`"']*)[`"']"
+    )
+
+    foreach ($pattern in $patterns) {
+        $m = [regex]::Match($Text, $pattern)
+        if ($m.Success) {
+            return $m.Groups[1].Value.Trim()
+        }
+    }
+
+    return ""
+}
+
+function Get-ReconcileValuesFromExport {
+    param(
+        [Parameter(Mandatory)][string]$PlatformID
+    )
+
+    $zipPath  = $null
+    $tempRoot = $null
+    $expandTo = $null
+
+    try {
+        $zipPath  = Get-PlatformExportZip -PlatformID $PlatformID
+        $tempRoot = Split-Path -Path $zipPath -Parent
+        $expandTo = Join-Path $tempRoot "expanded"
+
+        Expand-Archive -LiteralPath $zipPath -DestinationPath $expandTo -Force
+
+        $files = Get-ChildItem -Path $expandTo -Recurse -File -ErrorAction SilentlyContinue |
+                 Where-Object { $_.Extension -in @('.ini', '.xml') }
+
+        $reconcileSafe   = ""
+        $reconcileFolder = ""
+        $reconcileName   = ""
+
+        foreach ($file in $files) {
+            $raw = Get-Content -LiteralPath $file.FullName -Raw -ErrorAction SilentlyContinue
+            if ([string]::IsNullOrWhiteSpace($raw)) { continue }
+
+            if ([string]::IsNullOrWhiteSpace($reconcileSafe)) {
+                $reconcileSafe = Get-TextKeyValue -Text $raw -Key 'ReconcileAccountSafe'
+            }
+
+            if ([string]::IsNullOrWhiteSpace($reconcileFolder)) {
+                $reconcileFolder = Get-TextKeyValue -Text $raw -Key 'ReconcileAccountFolder'
+            }
+
+            if ([string]::IsNullOrWhiteSpace($reconcileName)) {
+                $reconcileName = Get-TextKeyValue -Text $raw -Key 'ReconcileAccountName'
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace($reconcileSafe) -and
+                -not [string]::IsNullOrWhiteSpace($reconcileName)) {
+                break
+            }
+        }
+
+        return [PSCustomObject]@{
+            ReconcileAccountSafe   = $reconcileSafe
+            ReconcileAccountFolder = $reconcileFolder
+            ReconcileAccountName   = $reconcileName
+        }
+    }
+    finally {
+        if ($tempRoot -and (Test-Path $tempRoot)) {
+            Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
 }
 
 # ---------------- MAIN ----------------
@@ -350,16 +475,14 @@ try {
         $sess   = $p.sessionManagement
         $wf     = $p.privilegedAccessWorkflows
 
-        # Future-proof: if the summary payload ever includes them directly
+        # Future-proof in case CyberArk ever exposes these directly in summary response
         $reconcileSafe = [string](Get-CaseInsensitiveMemberValue -InputObject $cred -Names @('ReconcileAccountSafe','reconcileAccountSafe'))
         $reconcileName = [string](Get-CaseInsensitiveMemberValue -InputObject $cred -Names @('ReconcileAccountName','reconcileAccountName'))
 
+        # First attempt: Get-PlatformDetails (Policy INI key/value list)
         if ([string]::IsNullOrWhiteSpace($reconcileSafe) -or [string]::IsNullOrWhiteSpace($reconcileName)) {
             try {
                 $detail = Get-PlatformDetails -PlatformID $g.id
-
-                # Optional debug:
-                # Write-Log ("First 5 raw properties for [{0}]: {1}" -f $g.id, ((@($detail.Properties) | Select-Object -First 5) -join " | ")) "Gray"
 
                 if ([string]::IsNullOrWhiteSpace($reconcileSafe)) {
                     $reconcileSafe = Get-PlatformPropertyValue -PlatformDetails $detail -PropertyNames @('ReconcileAccountSafe')
@@ -370,7 +493,25 @@ try {
                 }
             }
             catch {
-                Write-Log ("WARNING: Could not retrieve detail for platform [{0}]: {1}" -f $g.id, $_.Exception.Message) "Yellow"
+                Write-Log ("WARNING: Could not retrieve Get-PlatformDetails for [{0}]: {1}" -f $g.id, $_.Exception.Message) "Yellow"
+            }
+        }
+
+        # Fallback: Export platform ZIP and parse CPM INI / PVWA XML
+        if ([string]::IsNullOrWhiteSpace($reconcileSafe) -or [string]::IsNullOrWhiteSpace($reconcileName)) {
+            try {
+                $exportVals = Get-ReconcileValuesFromExport -PlatformID $g.id
+
+                if ([string]::IsNullOrWhiteSpace($reconcileSafe)) {
+                    $reconcileSafe = [string]$exportVals.ReconcileAccountSafe
+                }
+
+                if ([string]::IsNullOrWhiteSpace($reconcileName)) {
+                    $reconcileName = [string]$exportVals.ReconcileAccountName
+                }
+            }
+            catch {
+                Write-Log ("WARNING: Could not export/parse platform package for [{0}]: {1}" -f $g.id, $_.Exception.Message) "Yellow"
             }
         }
 
