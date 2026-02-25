@@ -1,24 +1,334 @@
-I have a list of CyberArk report with the table located below
-I:\Script\IDENTITY Script New\csv\CyberArk_Report.csv
+<#
+Compare-ADServiceAccounts-To-CyberArk_3Reports.ps1
 
-Target system user name	
-Target system address	
-Safe	
-Platform ID
+PURPOSE
+- Compare AD service accounts against a CyberArk export
+- Export 3 CSV reports:
+    1) Present_Exact_Match.csv
+    2) Present_Username_Only_Address_Different.csv
+    3) Not_Present_In_CyberArk.csv
 
-I also have a list of AD service account with table located below
+MATCH LOGIC
+- Primary match = username/service account
+- Secondary match = address
+- Result categories:
+    * Exact Match: username exists in CyberArk AND address matches
+    * Username Only / Address Different: username exists in CyberArk BUT address does not match
+    * Not Present: username does not exist in CyberArk
 
-I:\Script\IDENTITY Script New\csv\AD_ServiceAcct.csv
+INPUT FILES
+- CyberArk CSV:
+    I:\Script\IDENTITY Script New\csv\CyberArk_Report.csv
 
-Service Account
-Address
+  Required headers:
+    - Target system user name
+    - Target system address
+    - Safe
+    - Platform ID
 
-I want filter service account and address in AD report and export out the once that are present in the CyberArk report.
-List the report result in seperate csv
+- AD Service Account CSV:
+    I:\Script\IDENTITY Script New\csv\AD_ServiceAcct.csv
 
-Present in CyberArk
-Not Present in CyberArk
+  Required headers:
+    - Service Account
+    - Address
 
-take into consideration that Some might be present in CyberArk based on their Username but have different address
+OUTPUT FILES
+- I:\Script\IDENTITY Script New\csv\Present_Exact_Match.csv
+- I:\Script\IDENTITY Script New\csv\Present_Username_Only_Address_Different.csv
+- I:\Script\IDENTITY Script New\csv\Not_Present_In_CyberArk.csv
+#>
 
-Create me a script for this, also suggest best alternatives
+[CmdletBinding()]
+param(
+    [string]$CyberArkCsvPath = "I:\Script\IDENTITY Script New\csv\CyberArk_Report.csv",
+    [string]$AdCsvPath       = "I:\Script\IDENTITY Script New\csv\AD_ServiceAcct.csv",
+    [string]$OutputDir       = "I:\Script\IDENTITY Script New\csv"
+)
+
+$ErrorActionPreference = 'Stop'
+
+function Normalize-Text {
+    param(
+        [AllowNull()]
+        [string]$Value
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return ""
+    }
+
+    return $Value.Trim().ToLowerInvariant()
+}
+
+function Normalize-Address {
+    param(
+        [AllowNull()]
+        [string]$Address
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Address)) {
+        return ""
+    }
+
+    $a = $Address.Trim().ToLowerInvariant()
+
+    # Remove common protocol prefix if present
+    $a = $a -replace '^(https?|ssh|rdp|sftp|ftp)://', ''
+
+    # Remove trailing slash
+    $a = $a.TrimEnd('/')
+
+    return $a
+}
+
+function Get-UserAliases {
+    param(
+        [AllowNull()]
+        [string]$UserName
+    )
+
+    $aliases = New-Object 'System.Collections.Generic.HashSet[string]'
+
+    if ([string]::IsNullOrWhiteSpace($UserName)) {
+        return @()
+    }
+
+    $u = $UserName.Trim().ToLowerInvariant()
+    [void]$aliases.Add($u)
+
+    # If DOMAIN\user format, also add user
+    if ($u -match '\\') {
+        $afterSlash = ($u -split '\\')[-1]
+        if (-not [string]::IsNullOrWhiteSpace($afterSlash)) {
+            [void]$aliases.Add($afterSlash)
+        }
+    }
+
+    # If user@domain format, also add user
+    if ($u -match '@') {
+        $beforeAt = ($u -split '@')[0]
+        if (-not [string]::IsNullOrWhiteSpace($beforeAt)) {
+            [void]$aliases.Add($beforeAt)
+        }
+    }
+
+    # If DOMAIN\user@domain format, also add the left side of @ after slash
+    if ($u -match '\\' -and $u -match '@') {
+        $afterSlash = ($u -split '\\')[-1]
+        if ($afterSlash -match '@') {
+            $beforeAt = ($afterSlash -split '@')[0]
+            if (-not [string]::IsNullOrWhiteSpace($beforeAt)) {
+                [void]$aliases.Add($beforeAt)
+            }
+        }
+    }
+
+    return @($aliases)
+}
+
+function Join-UniqueValues {
+    param(
+        [AllowNull()]
+        [object[]]$Values,
+        [string]$Separator = '; '
+    )
+
+    if (-not $Values) {
+        return ""
+    }
+
+    $clean = $Values |
+        Where-Object { $_ -ne $null -and "$_".Trim() -ne "" } |
+        ForEach-Object { "$_".Trim() } |
+        Sort-Object -Unique
+
+    if (-not $clean) {
+        return ""
+    }
+
+    return ($clean -join $Separator)
+}
+
+function Test-RequiredHeaders {
+    param(
+        [Parameter(Mandatory)]
+        [object[]]$Rows,
+
+        [Parameter(Mandatory)]
+        [string[]]$RequiredHeaders,
+
+        [Parameter(Mandatory)]
+        [string]$FileLabel
+    )
+
+    if (-not $Rows -or $Rows.Count -eq 0) {
+        throw "$FileLabel contains no rows."
+    }
+
+    $headers = @($Rows[0].PSObject.Properties.Name)
+
+    $missing = foreach ($h in $RequiredHeaders) {
+        if ($headers -notcontains $h) {
+            $h
+        }
+    }
+
+    if ($missing) {
+        throw "$FileLabel is missing required header(s): $($missing -join ', ')"
+    }
+}
+
+Write-Host "Loading CSV files..." -ForegroundColor Cyan
+
+if (-not (Test-Path -LiteralPath $CyberArkCsvPath)) {
+    throw "CyberArk CSV not found: $CyberArkCsvPath"
+}
+
+if (-not (Test-Path -LiteralPath $AdCsvPath)) {
+    throw "AD Service Account CSV not found: $AdCsvPath"
+}
+
+if (-not (Test-Path -LiteralPath $OutputDir)) {
+    New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
+}
+
+$cyberArkRows = Import-Csv -LiteralPath $CyberArkCsvPath
+$adRows       = Import-Csv -LiteralPath $AdCsvPath
+
+Test-RequiredHeaders -Rows $cyberArkRows -RequiredHeaders @(
+    'Target system user name',
+    'Target system address',
+    'Safe',
+    'Platform ID'
+) -FileLabel 'CyberArk_Report.csv'
+
+Test-RequiredHeaders -Rows $adRows -RequiredHeaders @(
+    'Service Account',
+    'Address'
+) -FileLabel 'AD_ServiceAcct.csv'
+
+Write-Host "Building CyberArk lookup by username..." -ForegroundColor Cyan
+
+# alias username -> list of CyberArk records
+$cyberArkLookup = @{}
+
+foreach ($row in $cyberArkRows) {
+    $caUser     = [string]$row.'Target system user name'
+    $caAddress  = [string]$row.'Target system address'
+    $caSafe     = [string]$row.'Safe'
+    $caPlatform = [string]$row.'Platform ID'
+
+    $record = [PSCustomObject]@{
+        UserName          = $caUser
+        NormalizedUser    = Normalize-Text $caUser
+        Address           = $caAddress
+        NormalizedAddress = Normalize-Address $caAddress
+        Safe              = $caSafe
+        PlatformID        = $caPlatform
+        UniqueKey         = "{0}|{1}|{2}|{3}" -f (Normalize-Text $caUser), (Normalize-Address $caAddress), (Normalize-Text $caSafe), (Normalize-Text $caPlatform)
+    }
+
+    $aliases = Get-UserAliases -UserName $caUser
+
+    foreach ($alias in $aliases) {
+        if (-not $cyberArkLookup.ContainsKey($alias)) {
+            $cyberArkLookup[$alias] = New-Object System.Collections.ArrayList
+        }
+
+        [void]$cyberArkLookup[$alias].Add($record)
+    }
+}
+
+Write-Host "Comparing AD service accounts to CyberArk..." -ForegroundColor Cyan
+
+$exactMatches         = New-Object System.Collections.ArrayList
+$usernameOnlyMatches  = New-Object System.Collections.ArrayList
+$notPresentMatches    = New-Object System.Collections.ArrayList
+
+foreach ($adRow in $adRows) {
+    $svcAcct  = [string]$adRow.'Service Account'
+    $svcAddr  = [string]$adRow.'Address'
+    $normAddr = Normalize-Address $svcAddr
+
+    $svcAliases = Get-UserAliases -UserName $svcAcct
+
+    $matchedRecords = @()
+    $seenKeys = New-Object 'System.Collections.Generic.HashSet[string]'
+
+    foreach ($alias in $svcAliases) {
+        if ($cyberArkLookup.ContainsKey($alias)) {
+            foreach ($match in $cyberArkLookup[$alias]) {
+                if ($seenKeys.Add($match.UniqueKey)) {
+                    $matchedRecords += $match
+                }
+            }
+        }
+    }
+
+    if ($matchedRecords.Count -gt 0) {
+        $exactAddressMatches = @(
+            $matchedRecords | Where-Object { $_.NormalizedAddress -eq $normAddr }
+        )
+
+        if ($exactAddressMatches.Count -gt 0) {
+            [void]$exactMatches.Add([PSCustomObject]@{
+                'Service Account'            = $svcAcct
+                'AD Address'                 = $svcAddr
+                'Match Status'               = 'Exact Match'
+                'Exact Match Count'          = $exactAddressMatches.Count
+                'Matched CyberArk User Name' = Join-UniqueValues ($exactAddressMatches | Select-Object -ExpandProperty UserName)
+                'Matched CyberArk Address'   = Join-UniqueValues ($exactAddressMatches | Select-Object -ExpandProperty Address)
+                'Safe'                       = Join-UniqueValues ($exactAddressMatches | Select-Object -ExpandProperty Safe)
+                'Platform ID'                = Join-UniqueValues ($exactAddressMatches | Select-Object -ExpandProperty PlatformID)
+            })
+        }
+        else {
+            [void]$usernameOnlyMatches.Add([PSCustomObject]@{
+                'Service Account'                 = $svcAcct
+                'AD Address'                      = $svcAddr
+                'Match Status'                    = 'Username Match Only - Address Different'
+                'Matched Record Count'            = $matchedRecords.Count
+                'Matched CyberArk User Name'      = Join-UniqueValues ($matchedRecords | Select-Object -ExpandProperty UserName)
+                'Matched CyberArk Address'        = Join-UniqueValues ($matchedRecords | Select-Object -ExpandProperty Address)
+                'Safe'                            = Join-UniqueValues ($matchedRecords | Select-Object -ExpandProperty Safe)
+                'Platform ID'                     = Join-UniqueValues ($matchedRecords | Select-Object -ExpandProperty PlatformID)
+                'Note'                            = 'Username exists in CyberArk, but AD address does not exactly match any CyberArk address for that username.'
+            })
+        }
+    }
+    else {
+        [void]$notPresentMatches.Add([PSCustomObject]@{
+            'Service Account' = $svcAcct
+            'AD Address'      = $svcAddr
+            'Match Status'    = 'Not Present in CyberArk'
+        })
+    }
+}
+
+$exactCsvPath        = Join-Path -Path $OutputDir -ChildPath 'Present_Exact_Match.csv'
+$usernameOnlyCsvPath = Join-Path -Path $OutputDir -ChildPath 'Present_Username_Only_Address_Different.csv'
+$notPresentCsvPath   = Join-Path -Path $OutputDir -ChildPath 'Not_Present_In_CyberArk.csv'
+
+$exactMatches |
+    Sort-Object 'Service Account', 'AD Address' |
+    Export-Csv -LiteralPath $exactCsvPath -NoTypeInformation -Encoding UTF8
+
+$usernameOnlyMatches |
+    Sort-Object 'Service Account', 'AD Address' |
+    Export-Csv -LiteralPath $usernameOnlyCsvPath -NoTypeInformation -Encoding UTF8
+
+$notPresentMatches |
+    Sort-Object 'Service Account', 'AD Address' |
+    Export-Csv -LiteralPath $notPresentCsvPath -NoTypeInformation -Encoding UTF8
+
+Write-Host ""
+Write-Host "Comparison completed successfully." -ForegroundColor Green
+Write-Host "Exact Matches                  : $($exactMatches.Count)" -ForegroundColor Green
+Write-Host "Username Only / Addr Different : $($usernameOnlyMatches.Count)" -ForegroundColor Yellow
+Write-Host "Not Present                    : $($notPresentMatches.Count)" -ForegroundColor Red
+Write-Host ""
+Write-Host "Output files:" -ForegroundColor Cyan
+Write-Host " - $exactCsvPath"
+Write-Host " - $usernameOnlyCsvPath"
+Write-Host " - $notPresentCsvPath"
