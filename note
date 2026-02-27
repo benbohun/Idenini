@@ -2,7 +2,7 @@
 IND_SafeCreation_Identity.ps1
 
 What this script does
-- Logs in using CCP → Identity Shared Services → ServiceUser (same as your APP script).
+- Logs in using CCP -> Identity Shared Services -> ServiceUser (same as your APP script).
 - Mode:
     - CSV   : reads owners from CSV (Samaccountname, employeeID, email).
     - Single: prompts for one owner and creates a single IND_ safe.
@@ -11,13 +11,15 @@ What this script does
     - IAM_ACU_CA_Admins with full classic permissions.
     - Owner (CSV email) with limited "CARK-style" permissions (no RA1/RA2).
 - Description:
-    "Individual safe for <sam> (<employeeID>) – Managed By <OwnerNameNoDomain>".
+    "Individual safe for <sam> (<employeeID>) - Managed By <OwnerNameNoDomain>".
 - After Safe creation, onboards an Admin account:
     - Address  = user-selected domain (alliantcreditunion.com | gdeacu.com | extacu.local)
     - PlatformID + LogonDomain + Username format are driven by the selected AdminAddressDomain:
-        * alliantcreditunion.com → WIN_P_DM_ACU_ADM_OTP_CICO_30D / LogonDomain=ACU / UserName=A_<Samaccountname>
-        * extacu.local           → WIN_P_DM_EXT_ADM_OTP_CICO_30D / LogonDomain=extacu.local / UserName=<Samaccountname>
-        * gdeacu.com             → WIN_P_DM_GDE_ADM_OTP_CICO_30D / LogonDomain=gdeacu.com / UserName=<Samaccountname>
+        * alliantcreditunion.com -> WIN_P_DM_ACU_ADM_OTP_CICO_30D / LogonDomain=ACU / UserName=A_<Samaccountname>
+        * extacu.local           -> WIN_P_DM_EXT_ADM_OTP_CICO_30D / LogonDomain=extacu.local / UserName=<Samaccountname>
+        * gdeacu.com             -> WIN_P_DM_GDE_ADM_OTP_CICO_30D / LogonDomain=gdeacu.com / UserName=<Samaccountname>
+- NEW:
+    - Immediately initiates CPM Reconcile on the newly onboarded admin account.
 
 Fixes included
 1) "MemberType" error when safe/member exists:
@@ -26,6 +28,11 @@ Fixes included
 
 2) Script continues to next CSV row on first row error:
    - Row-level try/catch prevents terminating the whole run/session.
+
+3) Post-onboard reconcile:
+   - After Add-PASAccount succeeds, script resolves Account ID and calls:
+     POST /API/Accounts/{id}/Reconcile
+   - If account already exists, onboard is skipped and reconcile is not auto-triggered.
 #>
 
 [CmdletBinding(SupportsShouldProcess=$true)]
@@ -170,7 +177,6 @@ function Get-AdminAddressDomain {
 }
 
 # --- Permissions helpers ---
-
 function Get-AdminPerms {
     @{
         UseAccounts                             = $true
@@ -221,7 +227,7 @@ function Get-OwnerPerms {
     }
 }
 
-# --- CCP → PSCredential (API Service User) ---
+# --- CCP -> PSCredential (API Service User) ---
 function Get-ServiceUserCredentialFromCCP {
     [CmdletBinding()]
     param(
@@ -351,7 +357,6 @@ function Ensure-SafeMember {
             $addSplat['SearchIn'] = $cand
         }
         if ($addSupportsMemberType -and $MemberType) {
-            # psPAS often uses "memberType" (case-insensitive)
             $addSplat['memberType'] = $MemberType
         }
 
@@ -377,9 +382,59 @@ function Ensure-SafeMember {
     return $false
 }
 
+# --- Resolve Account ID safely from object / lookup ---
+function Get-PASAccountIdValue {
+    [CmdletBinding()]
+    param(
+        [Parameter()][object]$AccountObject
+    )
+
+    if (-not $AccountObject) { return $null }
+
+    foreach ($propName in @('id','ID','AccountID','AccountId')) {
+        $p = $AccountObject.PSObject.Properties[$propName]
+        if ($p -and -not [string]::IsNullOrWhiteSpace([string]$p.Value)) {
+            return [string]$p.Value
+        }
+    }
+
+    return $null
+}
+
+# --- Reconcile helper ---
+function Invoke-AccountReconcile {
+    [CmdletBinding(SupportsShouldProcess=$true)]
+    param(
+        [Parameter(Mandatory)][string]$AccountId,
+        [Parameter(Mandatory)][string]$AccountName,
+        [Parameter(Mandatory)][string]$SafeName
+    )
+
+    if ([string]::IsNullOrWhiteSpace($AccountId)) {
+        Write-Warn "Reconcile skipped for '$AccountName' in '$SafeName': Account ID is empty."
+        return $false
+    }
+
+    $uri = "API/Accounts/$AccountId/Reconcile"
+
+    if ($PSCmdlet.ShouldProcess("$SafeName/$AccountName [$AccountId]", "POST $uri")) {
+        try {
+            Invoke-PASRestMethod -Uri $uri -Method POST -Body '{}' -ErrorAction Stop | Out-Null
+            Write-Ok "Reconcile initiated for account '$AccountName' in Safe '$SafeName' (AccountID=$AccountId)."
+            return $true
+        }
+        catch {
+            Write-Err "Failed to initiate reconcile for '$AccountName' in '$SafeName' (AccountID=$AccountId): $($_.Exception.Message)"
+            return $false
+        }
+    }
+
+    return $true
+}
+
 # --- Admin account onboarding helper ---
 function Onboard-AdminAccount {
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess=$true)]
     param(
         [Parameter(Mandatory)][string]$SafeName,
         [Parameter(Mandatory)][string]$SamAccountName,
@@ -429,11 +484,12 @@ function Onboard-AdminAccount {
     $existingAcct = $null
     try {
         $existingAcct = Get-PASAccount -SafeName $SafeName -Search $adminUser -ErrorAction SilentlyContinue |
-                        Where-Object { $_.UserName -eq $adminUser -and $_.Address -eq $addr }
+                        Where-Object { $_.UserName -eq $adminUser -and $_.Address -eq $addr } |
+                        Select-Object -First 1
     } catch {}
 
     if ($existingAcct) {
-        Write-Warn ("Admin account '{0}' already exists in Safe '{1}' with Address '{2}' – skipping onboard." -f $adminUser, $SafeName, $addr)
+        Write-Warn ("Admin account '{0}' already exists in Safe '{1}' with Address '{2}' - skipping onboard and auto-reconcile." -f $adminUser, $SafeName, $addr)
         return
     }
 
@@ -452,8 +508,32 @@ function Onboard-AdminAccount {
 
     if ($PSCmdlet.ShouldProcess(("{0}/{1}" -f $SafeName, $adminUser), "Add-PASAccount")) {
         try {
-            Add-PASAccount @acctSplat -ErrorAction Stop | Out-Null
+            $newAccount = Add-PASAccount @acctSplat -ErrorAction Stop
             Write-Ok ("Onboarded admin account '{0}' in Safe '{1}' (Platform={2}, Address={3}, LogonDomain={4})." -f $adminUser, $SafeName, $platformId, $addr, $logonDomain)
+
+            # Resolve Account ID from response first
+            $accountId = Get-PASAccountIdValue -AccountObject $newAccount
+
+            # Fallback lookup if Add-PASAccount did not return ID/object
+            if (-not $accountId) {
+                Write-Warn "Add-PASAccount did not return an Account ID directly. Performing lookup..."
+                Start-Sleep -Seconds 2
+                try {
+                    $lookup = Get-PASAccount -SafeName $SafeName -Search $adminUser -ErrorAction Stop |
+                              Where-Object { $_.UserName -eq $adminUser -and $_.Address -eq $addr } |
+                              Select-Object -First 1
+                    $accountId = Get-PASAccountIdValue -AccountObject $lookup
+                }
+                catch {
+                    Write-Warn "Lookup after onboard failed for '$adminUser' in '$SafeName': $($_.Exception.Message)"
+                }
+            }
+
+            if ($accountId) {
+                Invoke-AccountReconcile -AccountId $accountId -AccountName $adminUser -SafeName $SafeName | Out-Null
+            } else {
+                Write-Warn "Account '$adminUser' was onboarded, but Account ID could not be resolved. Auto-reconcile was skipped."
+            }
         }
         catch {
             Write-Err ("Failed to onboard admin account '{0}' in Safe '{1}': {2}" -f $adminUser, $SafeName, $_.Exception.Message)
@@ -547,7 +627,7 @@ function Process-INDRow {
     if ($okOwner) {
         $ownerNoDomain = $mail.Split('@')[0]
         try {
-            $desc = "Individual safe for $sam ($eid) – Managed By $ownerNoDomain"
+            $desc = "Individual safe for $sam ($eid) - Managed By $ownerNoDomain"
             Set-PASSafe -SafeName $safeName -Description $desc -ErrorAction Stop | Out-Null
             Write-Ok "Description set on '$safeName': '$desc'"
         } catch {
