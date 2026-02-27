@@ -1,25 +1,28 @@
-Generate report of service account with
-winRc=1326 Reason: The user name or password is incorrect
-Use the alliant login pattern
+<#
+=====================================================================
+AccountFailureDetect_1326_1331_FAST.ps1
 
-use the method from the script below
-
-
-
-
-<# =====================================================================
-DisabledAccountDetectAllWinRc1331_FAST.ps1
-
-- CCP -> Identity Header -> psPAS (same login approach)
-- Find ALL accounts that match winRc=1331 / account disabled
+- CCP -> Service User credential -> New-PASSession (Alliant Shared Services pattern)
+- Finds:
+    1) winRc=1326 / invalid username-password  -> separate CSV
+    2) winRc=1331 / account disabled          -> separate CSV
 - Faster approach:
-    1) FAST-PATH: match on account-level secretManagement/lastTask fields (no activity call)
-    2) SLOW-PATH: only for likely failures, pull limited activities and match Reason/MoreInfo/Message/Details (no ConvertTo-Json)
+    1) FAST-PATH: match on account-level secretManagement/lastTask fields
+    2) SLOW-PATH: only for likely failures, pull limited activities and match
+       Reason / MoreInfo / Message / Details (no ConvertTo-Json)
 
 Outputs:
+  E:\Installation Media\Script\OnboardScript\data\BadPassword_Service_Account.csv
   E:\Installation Media\Script\OnboardScript\data\Disabled_Account.csv
-  E:\Installation Media\Script\OnboardScript\data\Disabled_Account.log
-===================================================================== #>
+  E:\Installation Media\Script\OnboardScript\data\AccountFailure_1326_1331.log
+
+Notes:
+- 1326 report applies ServiceAccountsOnly filter by default.
+- 1331 report defaults to ALL accounts.
+- If you want 1331 to also be service-accounts-only, set:
+    -ApplyServiceAccountFilterTo1331
+=====================================================================
+#>
 
 [CmdletBinding()]
 param(
@@ -33,7 +36,16 @@ param(
     [int]$MaxActivitiesToInspect = 60,
 
     # If you want speed over coverage, set this to skip full inventory fallback
-    [switch]$SkipInventoryFallback
+    [switch]$SkipInventoryFallback,
+
+    # 1326 report scope
+    [bool]$ServiceAccountsOnly = $true,
+
+    # Tune for your environment if needed
+    [string]$ServiceAccountRegex = '(?i)(^svc[_\-]?|[_\-]svc$|service|batch|app[_\-]?|sa[_\-]?|sql|oracle|db2|iis|tomcat|splunk|cyberark)',
+
+    # 1331 report scope
+    [switch]$ApplyServiceAccountFilterTo1331
 )
 
 # =========================
@@ -49,10 +61,14 @@ Import-Module psPAS -Force
 # Output paths
 # =========================
 $OutDir = "E:\Installation Media\Script\OnboardScript\data"
-if (-not (Test-Path $OutDir)) { New-Item -ItemType Directory -Path $OutDir -Force | Out-Null }
+if (-not (Test-Path $OutDir)) {
+    New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
+}
 
-$LogFile = Join-Path $OutDir "Disabled_Account.log"
-$CsvFile = Join-Path $OutDir "Disabled_Account.csv"
+$LogFile      = Join-Path $OutDir "AccountFailure_1326_1331.log"
+$CsvFile1326  = Join-Path $OutDir "BadPassword_Service_Account.csv"
+$CsvFile1331  = Join-Path $OutDir "Disabled_Account.csv"
+
 New-Item -ItemType File -Force -Path $LogFile | Out-Null
 
 function Write-Log {
@@ -64,54 +80,87 @@ function Write-Log {
 }
 
 # =========================
-# CCP / Identity config (your values)
+# Alliant CCP / Identity config
 # =========================
-$CCPAddress    = "https://vskau1p1231.cna.com"
-$location      = "AIMWebService"
-$application   = "PAMDiscovery"
-$safeCCP       = "CA_PCloud_Admins"
-$windowsAuth   = $false
-$headers       = @{ 'Content-Type' = 'application/json' }
+$CCPAddress        = "https://aam.alliantcreditunion.com"
+$CCPLocation       = "AIMWebService"
+$CCPAppID          = "ACURestAPI"
+$CCPSafe           = "ACU-VAULT-API"
+$CCPObject         = "Application-CyberArkVaultRestAPI-alliantcredit.cyberark.cloud"
+$CCPWindowsAuth    = $false
 
-$IdentityTenantURL = "aat4012.id.cyberark.cloud"
-$PCloudSubdomain   = "cna-prod"
-
-# =========================
-# Match logic (regex catches variations)
-# =========================
-$NeedleRegex = "(?i)winRc\s*=\s*1331|account\s+is\s+currently\s+disabled|error_account_disabled"
+$IdentityTenantURL = "https://aak4521.my.idaptive.app"
+$PrivilegeCloudURL = "https://alliantcredit.privilegecloud.cyberark.cloud"
 
 # =========================
-# Login helper: CCP -> Identity header -> psPAS
+# Match logic
 # =========================
-function Start-PASSessionFromCCP {
+$NeedleRegex1326 = '(?i)winRc\s*=\s*1326|the\s+user\s+name\s+or\s+password\s+is\s+incorrect|logon\s+failure\s*:\s*unknown\s+user\s+name\s+or\s+bad\s+password|unknown\s+user\s+name\s+or\s+bad\s+password'
+$NeedleRegex1331 = '(?i)winRc\s*=\s*1331|account\s+is\s+currently\s+disabled|error_account_disabled'
+
+# =========================
+# Login helper: CCP -> ServiceUser -> New-PASSession
+# =========================
+function Get-ServiceUserCredentialFromCCP {
+    [CmdletBinding()]
     param(
-        [Parameter(Mandatory)] [string]$ObjectName,
-        [Parameter(Mandatory)] [string]$UPUser
+        [Parameter(Mandatory)][string]$CCPAddress,
+        [Parameter(Mandatory)][string]$Location,
+        [Parameter(Mandatory)][string]$AppID,
+        [Parameter(Mandatory)][string]$Safe,
+        [Parameter(Mandatory)][string]$Object,
+        [bool]$WindowsAuth = $false
     )
 
-    $ccpUrl = "$CCPAddress/$location/api/Accounts?AppID=$application&Safe=$safeCCP&Object=$ObjectName"
-    Write-Log "Retrieving CCP credential for '$UPUser' via Object..." 'Cyan'
+    $base = $CCPAddress.TrimEnd('/')
+    $loc  = $Location.Trim('/')
 
-    $resp = Invoke-RestMethod -Uri $ccpUrl -Method GET -Headers $headers -UseDefaultCredentials:$windowsAuth
-    if (-not $resp -or -not $resp.Content -or -not $resp.Username) {
-        throw "CCP response missing Content/Username."
+    $url = "{0}/{1}/api/Accounts?AppID={2}&Safe={3}&Object={4}" -f $base, $loc, $AppID, $Safe, $Object
+
+    Write-Log "Retrieving Service User credential from CCP..." 'Cyan'
+    Write-Log "CCP URL: $url" 'DarkGray'
+
+    $headers = @{ 'Content-Type' = 'application/json' }
+    $resp = Invoke-RestMethod -Uri $url -Method GET -Headers $headers -UseDefaultCredentials:$WindowsAuth -ErrorAction Stop
+
+    if (-not $resp.UserName -or -not $resp.Content) {
+        throw "CCP response missing UserName/Content."
     }
-    Write-Log "CCP returned username for service principal." 'Green'
 
-    $secPass = ConvertTo-SecureString -String $resp.Content -AsPlainText -Force
-    $upCred  = [PSCredential]::new($UPUser, $secPass)
+    Write-Log "CCP returned service user: $($resp.UserName)" 'Green'
 
-    Write-Log "Requesting Identity header for '$IdentityTenantURL' (subdomain '$PCloudSubdomain')." 'Cyan'
-    $hdr = Get-IdentityHeader -IdentityTenantURL $IdentityTenantURL -psPASFormat -PCloudSubdomain $PCloudSubdomain -UPCreds $upCred
-
-    Use-PASSession $hdr
-    if (-not (Get-PASSession)) { throw "psPAS session not established." }
-
-    $resp.Content = $null
-    Write-Log "PAS session established (no prompts)." 'Green'
+    $sec = ConvertTo-SecureString $resp.Content -AsPlainText -Force
+    return [PSCredential]::new($resp.UserName, $sec)
 }
 
+function Start-PASSessionFromCCP {
+    $serviceCred = Get-ServiceUserCredentialFromCCP `
+        -CCPAddress  $CCPAddress `
+        -Location    $CCPLocation `
+        -AppID       $CCPAppID `
+        -Safe        $CCPSafe `
+        -Object      $CCPObject `
+        -WindowsAuth $CCPWindowsAuth
+
+    Write-Log "Authenticating to Privilege Cloud using Alliant Shared Services pattern..." 'Cyan'
+
+    New-PASSession `
+        -IdentityTenantURL $IdentityTenantURL `
+        -PrivilegeCloudURL $PrivilegeCloudURL `
+        -Credential        $serviceCred `
+        -ServiceUser `
+        -ErrorAction Stop | Out-Null
+
+    if (-not (Get-PASSession)) {
+        throw "psPAS session not established."
+    }
+
+    Write-Log "PAS session established successfully." 'Green'
+}
+
+# =========================
+# Helpers
+# =========================
 function Cmd-HasParam {
     param([string]$CommandName, [string]$ParamName)
     $c = Get-Command $CommandName -ErrorAction Stop
@@ -137,7 +186,6 @@ function Get-AccountsPaged {
         if ($hasLimit)  { $params["limit"]  = $Limit }
         if ($hasOffset) { $params["offset"] = $offset }
 
-        # If module lacks -offset, we can only call once
         if (-not $hasOffset -and $offset -gt 0) { break }
 
         $page = @()
@@ -175,11 +223,25 @@ function Get-ActivitiesSafe {
     }
 }
 
-# -------- FAST-PATH: check account object fields without activity call --------
-function AccountMatchesFast {
+function Is-ServiceAccountCandidate {
     param([object]$Acct)
 
-    # Pull only likely fields (cheap). Different tenants may shape these differently.
+    $parts = @()
+
+    try { if ($Acct.userName)   { $parts += [string]$Acct.userName } } catch {}
+    try { if ($Acct.name)       { $parts += [string]$Acct.name } } catch {}
+    try { if ($Acct.safeName)   { $parts += [string]$Acct.safeName } } catch {}
+    try { if ($Acct.platformId) { $parts += [string]$Acct.platformId } } catch {}
+
+    if ($parts.Count -eq 0) { return $false }
+
+    $hay = $parts -join " | "
+    return ($hay -match $ServiceAccountRegex)
+}
+
+function Get-SecretManagementText {
+    param([object]$Acct)
+
     $parts = New-Object System.Collections.Generic.List[string]
 
     try { if ($Acct.secretManagement) { $parts.Add(($Acct.secretManagement | Out-String)) } } catch {}
@@ -192,18 +254,13 @@ function AccountMatchesFast {
     try { if ($Acct.secretManagement.lastTask.error) { $parts.Add([string]$Acct.secretManagement.lastTask.error) } } catch {}
     try { if ($Acct.secretManagement.lastTask.moreInfo) { $parts.Add([string]$Acct.secretManagement.lastTask.moreInfo) } } catch {}
 
-    if ($parts.Count -eq 0) { return $false }
-
-    $hay = ($parts -join " | ")
-    return ($hay -match $NeedleRegex)
+    if ($parts.Count -eq 0) { return $null }
+    return ($parts -join " | ")
 }
 
-# -------- Narrow which accounts deserve slow-path activity calls --------
 function ShouldScanActivities {
     param([object]$Acct)
 
-    # If the account doesn't show any hint of failure in secretManagement, skip activity scan.
-    # (This is the biggest performance lever.)
     try {
         if ($Acct.secretManagement -and $Acct.secretManagement.status) {
             return ([string]$Acct.secretManagement.status -match '(?i)fail|error')
@@ -216,9 +273,11 @@ function ShouldScanActivities {
     return $false
 }
 
-# -------- Faster activity match (no ConvertTo-Json) --------
-function ActivityMatchesFast {
-    param($Activity)
+function ActivityMatchesPattern {
+    param(
+        $Activity,
+        [string]$Regex
+    )
 
     $fields = @()
     foreach ($n in @("Reason","MoreInfo","Message","Details","Action","Error","Status","Description")) {
@@ -231,19 +290,58 @@ function ActivityMatchesFast {
     if ($fields.Count -eq 0) { return $false }
 
     $hay = ($fields -join " | ")
-    return ($hay -match $NeedleRegex)
+    return ($hay -match $Regex)
+}
+
+function Add-MatchRow {
+    param(
+        [Parameter(Mandatory)][object]$Acct,
+        [Parameter(Mandatory)][string]$MatchSource,
+        [Parameter(Mandatory)][string]$FailurePattern,
+        [Parameter(Mandatory)]$ResultList,
+        [Parameter(Mandatory)]$MatchedIdSet
+    )
+
+    $id = [string]$Acct.id
+    if ([string]::IsNullOrWhiteSpace($id)) { return }
+
+    if ($MatchedIdSet.Contains($id)) { return }
+
+    $null = $MatchedIdSet.Add($id)
+
+    $row = [PSCustomObject]@{
+        AccountID      = $Acct.id
+        SafeName       = $Acct.safeName
+        Name           = $Acct.name
+        UserName       = $Acct.userName
+        Address        = $Acct.address
+        PlatformId     = $Acct.platformId
+        MatchSource    = $MatchSource
+        FailurePattern = $FailurePattern
+    }
+
+    $ResultList.Add($row) | Out-Null
 }
 
 # =========================
 # MAIN
 # =========================
 try {
-    Start-PASSessionFromCCP -ObjectName "cna.com-CA_PAMDiscovery_SVC" -UPUser "CA_PAMDiscovery_SVC"
+    Start-PASSessionFromCCP
 
-    Write-Log "Searching for ALL accounts with disabled-login error (winRc=1331)..." 'Yellow'
-    Write-Log "NeedleRegex: $NeedleRegex" 'DarkYellow'
+    Write-Log "Searching for account failures (1326 + 1331)..." 'Yellow'
+    Write-Log "1326 Regex: $NeedleRegex1326" 'DarkYellow'
+    Write-Log "1331 Regex: $NeedleRegex1331" 'DarkYellow'
+    if ($ServiceAccountsOnly) {
+        Write-Log "1326 ServiceAccountRegex: $ServiceAccountRegex" 'DarkYellow'
+    }
+    if ($ApplyServiceAccountFilterTo1331) {
+        Write-Log "1331 will also use ServiceAccountRegex filter." 'DarkYellow'
+    } else {
+        Write-Log "1331 will scan all candidate accounts." 'DarkYellow'
+    }
 
-    # 1) Pull candidates from saved filters (fast)
+    # 1) Pull candidates from saved filters
     $filtersToTry = @("FailedVerify","FailedChange","FailedReconcile")
 
     $candidatesList = New-Object System.Collections.Generic.List[object]
@@ -256,7 +354,7 @@ try {
 
     $candidates = @($candidatesList | Group-Object id | ForEach-Object { $_.Group | Select-Object -First 1 })
 
-    # 2) Optional inventory fallback (slow for huge tenants)
+    # 2) Optional inventory fallback
     if ($candidates.Count -eq 0 -and -not $SkipInventoryFallback) {
         Write-Log "SavedFilters returned 0. Falling back to inventory paging..." 'Yellow'
         $candidates = @(Get-AccountsPaged -SavedFilter $null -Limit $PageSize)
@@ -268,14 +366,21 @@ try {
         Write-Log "Total unique candidates from saved filters: $($candidates.Count)" 'Yellow'
     }
 
-    $results = New-Object System.Collections.Generic.List[object]
-    $toActivityScan = New-Object System.Collections.Generic.List[object]
+    # 3) Prepare results
+    $results1326 = New-Object System.Collections.Generic.List[object]
+    $results1331 = New-Object System.Collections.Generic.List[object]
+
+    $matched1326 = New-Object 'System.Collections.Generic.HashSet[string]'
+    $matched1331 = New-Object 'System.Collections.Generic.HashSet[string]'
+
+    $activityQueue = New-Object System.Collections.Generic.List[object]
 
     $inspected = 0
-    $fastHits  = 0
     $queuedForActivity = 0
+    $fastHits1326 = 0
+    $fastHits1331 = 0
 
-    # 3) First pass: FAST PATH (no activity calls)
+    # 4) First pass: FAST PATH
     foreach ($acct in $candidates) {
         $inspected++
         if ($inspected -gt $MaxAccountsToInspect) {
@@ -284,85 +389,165 @@ try {
         }
 
         if ($inspected % 500 -eq 0) {
-            Write-Log "Progress (pass1): inspected $inspected / $($candidates.Count). FastHits=$fastHits, QueuedForActivity=$queuedForActivity" 'DarkGray'
+            Write-Log "Progress (pass1): inspected $inspected / $($candidates.Count). Fast1326=$fastHits1326 Fast1331=$fastHits1331 Queued=$queuedForActivity" 'DarkGray'
         }
 
-        if (AccountMatchesFast -Acct $acct) {
-            $fastHits++
+        $inScope1326 = $true
+        if ($ServiceAccountsOnly) {
+            $inScope1326 = Is-ServiceAccountCandidate -Acct $acct
+        }
 
-            $row = [PSCustomObject]@{
-                AccountID  = $acct.id
-                SafeName   = $acct.safeName
-                Name       = $acct.name
-                UserName   = $acct.userName
-                Address    = $acct.address
-                PlatformId = $acct.platformId
+        $inScope1331 = $true
+        if ($ApplyServiceAccountFilterTo1331) {
+            $inScope1331 = Is-ServiceAccountCandidate -Acct $acct
+        }
+
+        if (-not $inScope1326 -and -not $inScope1331) {
+            continue
+        }
+
+        $secretText = Get-SecretManagementText -Acct $acct
+
+        $matchedFast1326 = $false
+        $matchedFast1331 = $false
+
+        if ($secretText) {
+            if ($inScope1326 -and ($secretText -match $NeedleRegex1326)) {
+                Add-MatchRow -Acct $acct `
+                    -MatchSource "FastPath" `
+                    -FailurePattern "winRc=1326 / Invalid username or password" `
+                    -ResultList $results1326 `
+                    -MatchedIdSet $matched1326
+                $fastHits1326++
+
+                $matchedFast1326 = $true
+                Write-Log ("MATCH FAST 1326: AccountID={0} Safe={1} User={2} Address={3} Platform={4}" -f `
+                    $acct.id, $acct.safeName, $acct.userName, $acct.address, $acct.platformId) 'Green'
             }
 
-            $results.Add($row) | Out-Null
-            Write-Log ("✅ FAST MATCH: AccountID={0} Safe={1} User={2} Address={3} Platform={4}" -f `
-                $row.AccountID, $row.SafeName, $row.UserName, $row.Address, $row.PlatformId) 'Green'
-            continue
+            if ($inScope1331 -and ($secretText -match $NeedleRegex1331)) {
+                Add-MatchRow -Acct $acct `
+                    -MatchSource "FastPath" `
+                    -FailurePattern "winRc=1331 / Account disabled" `
+                    -ResultList $results1331 `
+                    -MatchedIdSet $matched1331
+                $fastHits1331++
+
+                $matchedFast1331 = $true
+                Write-Log ("MATCH FAST 1331: AccountID={0} Safe={1} User={2} Address={3} Platform={4}" -f `
+                    $acct.id, $acct.safeName, $acct.userName, $acct.address, $acct.platformId) 'Green'
+            }
         }
 
-        if (ShouldScanActivities -Acct $acct) {
+        $needActivity1326 = $inScope1326 -and (-not $matchedFast1326)
+        $needActivity1331 = $inScope1331 -and (-not $matchedFast1331)
+
+        if (($needActivity1326 -or $needActivity1331) -and (ShouldScanActivities -Acct $acct)) {
             $queuedForActivity++
-            $toActivityScan.Add($acct) | Out-Null
+            $activityQueue.Add([PSCustomObject]@{
+                Account  = $acct
+                Need1326 = $needActivity1326
+                Need1331 = $needActivity1331
+            }) | Out-Null
         }
     }
 
-    Write-Log "Pass1 complete. FastHits=$fastHits. ActivityScanQueue=$($toActivityScan.Count)." 'Yellow'
+    Write-Log "Pass1 complete. FastHits1326=$fastHits1326 FastHits1331=$fastHits1331 ActivityQueue=$($activityQueue.Count)." 'Yellow'
 
-    # 4) Second pass: SLOW PATH (activity calls ONLY for failure-like accounts)
+    # 5) Second pass: SLOW PATH
     $scanned = 0
-    foreach ($acct in $toActivityScan) {
+    foreach ($item in $activityQueue) {
         $scanned++
+        $acct = $item.Account
 
         if ($scanned % 250 -eq 0) {
-            Write-Log "Progress (pass2): scanned $scanned / $($toActivityScan.Count) activity-eligible accounts. TotalMatches=$($results.Count)" 'DarkGray'
+            Write-Log "Progress (pass2): scanned $scanned / $($activityQueue.Count). Total1326=$($results1326.Count) Total1331=$($results1331.Count)" 'DarkGray'
         }
 
-        # Avoid re-checking accounts already in results (in case of duplicates)
-        if ($results.Where({ $_.AccountID -eq $acct.id }).Count -gt 0) { continue }
-
         $acts = @()
-        try { $acts = Get-ActivitiesSafe -AccountId $acct.id }
-        catch {
-            Write-Log ("⚠️ Could not read activities for AccountID={0}: {1}" -f $acct.id, $_.Exception.Message) 'DarkYellow'
+        try {
+            $acts = Get-ActivitiesSafe -AccountId $acct.id
+        } catch {
+            Write-Log ("Could not read activities for AccountID={0}: {1}" -f $acct.id, $_.Exception.Message) 'DarkYellow'
             continue
         }
 
-        $matched = $false
+        $matchedAct1326 = $false
+        $matchedAct1331 = $false
+
         foreach ($act in ($acts | Select-Object -First $MaxActivitiesToInspect)) {
-            if (ActivityMatchesFast -Activity $act) { $matched = $true; break }
+            if ($item.Need1326 -and -not $matchedAct1326) {
+                if (ActivityMatchesPattern -Activity $act -Regex $NeedleRegex1326) {
+                    Add-MatchRow -Acct $acct `
+                        -MatchSource "Activity" `
+                        -FailurePattern "winRc=1326 / Invalid username or password" `
+                        -ResultList $results1326 `
+                        -MatchedIdSet $matched1326
+
+                    $matchedAct1326 = $true
+                    Write-Log ("MATCH ACTIVITY 1326: AccountID={0} Safe={1} User={2} Address={3} Platform={4}" -f `
+                        $acct.id, $acct.safeName, $acct.userName, $acct.address, $acct.platformId) 'Green'
+                }
+            }
+
+            if ($item.Need1331 -and -not $matchedAct1331) {
+                if (ActivityMatchesPattern -Activity $act -Regex $NeedleRegex1331) {
+                    Add-MatchRow -Acct $acct `
+                        -MatchSource "Activity" `
+                        -FailurePattern "winRc=1331 / Account disabled" `
+                        -ResultList $results1331 `
+                        -MatchedIdSet $matched1331
+
+                    $matchedAct1331 = $true
+                    Write-Log ("MATCH ACTIVITY 1331: AccountID={0} Safe={1} User={2} Address={3} Platform={4}" -f `
+                        $acct.id, $acct.safeName, $acct.userName, $acct.address, $acct.platformId) 'Green'
+                }
+            }
+
+            if ((-not $item.Need1326 -or $matchedAct1326) -and (-not $item.Need1331 -or $matchedAct1331)) {
+                break
+            }
         }
-
-        if (-not $matched) { continue }
-
-        $row = [PSCustomObject]@{
-            AccountID  = $acct.id
-            SafeName   = $acct.safeName
-            Name       = $acct.name
-            UserName   = $acct.userName
-            Address    = $acct.address
-            PlatformId = $acct.platformId
-        }
-
-        $results.Add($row) | Out-Null
-        Write-Log ("✅ ACTIVITY MATCH: AccountID={0} Safe={1} User={2} Address={3} Platform={4}" -f `
-            $row.AccountID, $row.SafeName, $row.UserName, $row.Address, $row.PlatformId) 'Green'
     }
 
-    # 5) Export
-    if ($results.Count -gt 0) {
-        $results |
+    # 6) Export 1326 report
+    if ($results1326.Count -gt 0) {
+        $results1326 |
             Sort-Object SafeName, Address, UserName |
-            Export-Csv -Path $CsvFile -NoTypeInformation -Encoding UTF8
-        Write-Log "✅ Exported $($results.Count) matching account(s) to: $CsvFile" 'Green'
+            Export-Csv -Path $CsvFile1326 -NoTypeInformation -Encoding UTF8
+        Write-Log "Exported $($results1326.Count) 1326 matching account(s) to: $CsvFile1326" 'Green'
     } else {
-        Write-Log "No matching accounts found." 'Yellow'
-        @([PSCustomObject]@{AccountID="";SafeName="";Name="";UserName="";Address="";PlatformId=""}) |
-            Export-Csv -Path $CsvFile -NoTypeInformation -Encoding UTF8
+        Write-Log "No 1326 matching accounts found." 'Yellow'
+        @([PSCustomObject]@{
+            AccountID      = ""
+            SafeName       = ""
+            Name           = ""
+            UserName       = ""
+            Address        = ""
+            PlatformId     = ""
+            MatchSource    = ""
+            FailurePattern = ""
+        }) | Export-Csv -Path $CsvFile1326 -NoTypeInformation -Encoding UTF8
+    }
+
+    # 7) Export 1331 report
+    if ($results1331.Count -gt 0) {
+        $results1331 |
+            Sort-Object SafeName, Address, UserName |
+            Export-Csv -Path $CsvFile1331 -NoTypeInformation -Encoding UTF8
+        Write-Log "Exported $($results1331.Count) 1331 matching account(s) to: $CsvFile1331" 'Green'
+    } else {
+        Write-Log "No 1331 matching accounts found." 'Yellow'
+        @([PSCustomObject]@{
+            AccountID      = ""
+            SafeName       = ""
+            Name           = ""
+            UserName       = ""
+            Address        = ""
+            PlatformId     = ""
+            MatchSource    = ""
+            FailurePattern = ""
+        }) | Export-Csv -Path $CsvFile1331 -NoTypeInformation -Encoding UTF8
     }
 
 } finally {
