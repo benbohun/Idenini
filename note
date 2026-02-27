@@ -1,359 +1,670 @@
-CyberArk Identity (Secure Access)
-
-Bad-password capability
-
-Can block weak/common passwords using built-in “weak password” checking.
-
-Can block passwords containing your custom excluded words (company name, product names, common terms, etc.).
-
-Limitation
-
-The custom “excluded words” list is limited to 200 characters total (so it’s a short list, not hundreds of entries).
-
-CyberArk Privilege Cloud
-
-Bad-password capability
-
-Does not provide a “bad password list/blacklist” feature like “deny these exact passwords/words.”
-
-Instead, it prevents “bad” passwords through password generation rules (length/complexity) and forbidden characters (exclude characters target systems don’t accept).
-
-Limitation
-
-Since it’s rule-based, there’s no “how many bad passwords can be added” limit—because you’re not adding a bad-password list.
-
-CyberArk documents password length up to 256 characters; a hard numeric limit for the forbidden characters field is not clearly published (it’s constrained by the UI/field).
 <#
-Compare-ADServiceAccounts-To-CyberArk_3Reports.ps1
+IND_SafeCreation_Identity.ps1
 
-PURPOSE
-- Compare AD service accounts against a CyberArk export
-- Export 3 CSV reports:
-    1) Present_Exact_Match.csv
-    2) Present_Username_Only_Address_Different.csv
-    3) Not_Present_In_CyberArk.csv
+What this script does
+- Logs in using CCP → Identity Shared Services → ServiceUser (same as your APP script).
+- Mode:
+    - CSV   : reads owners from CSV (Samaccountname, employeeID, email).
+    - Single: prompts for one owner and creates a single IND_ safe.
+- Creates/ensures IND_<Samaccountname>_<employeeID> safes with 7-day retention.
+- Adds:
+    - IAM_ACU_CA_Admins with full classic permissions.
+    - Owner (CSV email) with limited "CARK-style" permissions (no RA1/RA2).
+- Description:
+    "Individual safe for <sam> (<employeeID>) – Managed By <OwnerNameNoDomain>".
+- After Safe creation, onboards an Admin account:
+    - Address  = user-selected domain (alliantcreditunion.com | gdeacu.com | extacu.local)
+    - PlatformID + LogonDomain + Username format are driven by the selected AdminAddressDomain:
+        * alliantcreditunion.com → WIN_P_DM_ACU_ADM_OTP_CICO_30D / LogonDomain=ACU / UserName=A_<Samaccountname>
+        * extacu.local           → WIN_P_DM_EXT_ADM_OTP_CICO_30D / LogonDomain=extacu.local / UserName=<Samaccountname>
+        * gdeacu.com             → WIN_P_DM_GDE_ADM_OTP_CICO_30D / LogonDomain=gdeacu.com / UserName=<Samaccountname>
 
-MATCH LOGIC
-- Primary match = username/service account
-- Secondary match = address
-- Result categories:
-    * Exact Match: username exists in CyberArk AND address matches
-    * Username Only / Address Different: username exists in CyberArk BUT address does not match
-    * Not Present: username does not exist in CyberArk
+Fixes included
+1) "MemberType" error when safe/member exists:
+   - Set-PASSafeMember does NOT support -MemberType, so we never pass it on update.
+   - Add-PASSafeMember may/may not support memberType/SearchIn depending on psPAS version; we detect dynamically.
 
-INPUT FILES
-- CyberArk CSV:
-    I:\Script\IDENTITY Script New\csv\CyberArk_Report.csv
-
-  Required headers:
-    - Target system user name
-    - Target system address
-    - Safe
-    - Platform ID
-
-- AD Service Account CSV:
-    I:\Script\IDENTITY Script New\csv\AD_ServiceAcct.csv
-
-  Required headers:
-    - Service Account
-    - Address
-
-OUTPUT FILES
-- I:\Script\IDENTITY Script New\csv\Present_Exact_Match.csv
-- I:\Script\IDENTITY Script New\csv\Present_Username_Only_Address_Different.csv
-- I:\Script\IDENTITY Script New\csv\Not_Present_In_CyberArk.csv
+2) Script continues to next CSV row on first row error:
+   - Row-level try/catch prevents terminating the whole run/session.
 #>
 
-[CmdletBinding()]
+[CmdletBinding(SupportsShouldProcess=$true)]
 param(
-    [string]$CyberArkCsvPath = "I:\Script\IDENTITY Script New\csv\CyberArk_Report.csv",
-    [string]$AdCsvPath       = "I:\Script\IDENTITY Script New\csv\AD_ServiceAcct.csv",
-    [string]$OutputDir       = "I:\Script\IDENTITY Script New\csv"
+    [ValidateSet('CSV','Single')]
+    [string]$Mode       = 'CSV',
+
+    [string]$CsvPath    = "I:\Script\IDENTITY Script New\csv\owners.csv",
+
+    # ===== Identity / Privilege Cloud (Shared Services) =====
+    [string]$IdentityTenantURL  = "https://aak4521.my.idaptive.app",
+    [string]$PrivilegeCloudURL  = "https://alliantcredit.privilegecloud.cyberark.cloud",
+
+    # ===== CPM / Safe settings =====
+    [string]$ManagingCPM        = "HQVECYBARK101",
+    [string]$Location           = "\",
+
+    # ===== CCP settings (for API Service User stored in Vault) =====
+    [string]$CCPAddress         = "https://aam.alliantcreditunion.com",
+    [string]$CCPLocation        = "AIMWebService",
+    [string]$CCPAppID           = "ACURestAPI",
+    [string]$CCPSafe            = "ACU-VAULT-API",
+    [string]$CCPObject          = "Application-CyberArkVaultRestAPI-alliantcredit.cyberark.cloud",
+    [bool]  $CCPWindowsAuth     = $false
 )
 
-$ErrorActionPreference = 'Stop'
+# --- Modules & TLS ---
+Import-Module psPAS -ErrorAction Stop
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$ErrorActionPreference = 'Continue'
 
-function Normalize-Text {
+# --- Pretty log helpers ---
+function Write-Info($m){ Write-Host "🛠  $m" -ForegroundColor Cyan }
+function Write-Ok($m){   Write-Host "✅ $m" -ForegroundColor Green }
+function Write-Warn($m){ Write-Host "⚠️  $m" -ForegroundColor Yellow }
+function Write-Err($m){  Write-Host "❌ $m" -ForegroundColor Red }
+
+# --- GUI input helper (for Single mode & prompts) ---
+Add-Type -AssemblyName System.Windows.Forms | Out-Null
+Add-Type -AssemblyName System.Drawing       | Out-Null
+
+function Show-InputDialog {
     param(
-        [AllowNull()]
-        [string]$Value
+        [Parameter(Mandatory)][string]$Title,
+        [Parameter(Mandatory)][string]$Prompt,
+        [Parameter()][string]$Default = '',
+        [Parameter()][scriptblock]$ValidateScript = {$true},
+        [Parameter()][string]$ValidationHint = ''
     )
+    try {
+        $form                 = New-Object System.Windows.Forms.Form
+        $form.Text            = $Title
+        $form.StartPosition   = 'CenterScreen'
+        $form.TopMost         = $true
+        $form.Size            = New-Object System.Drawing.Size(480,190)
+        $form.FormBorderStyle = 'FixedDialog'
+        $form.MaximizeBox     = $false
 
-    if ([string]::IsNullOrWhiteSpace($Value)) {
-        return ""
+        $lbl                  = New-Object System.Windows.Forms.Label
+        $lbl.Text             = $Prompt
+        $lbl.AutoSize         = $true
+        $lbl.Location         = '12,15'
+        $lbl.Font             = New-Object System.Drawing.Font('Segoe UI',10)
+        $form.Controls.Add($lbl)
+
+        $tb                   = New-Object System.Windows.Forms.TextBox
+        $tb.Location          = '16,48'
+        $tb.Width             = 430
+        $tb.Text              = $Default
+        $tb.Font              = New-Object System.Drawing.Font('Consolas',11)
+        $form.Controls.Add($tb)
+
+        $hint                 = New-Object System.Windows.Forms.Label
+        $hint.AutoSize        = $true
+        $hint.ForeColor       = [System.Drawing.Color]::DarkGray
+        $hint.Text            = $ValidationHint
+        $hint.Location        = '16,80'
+        $form.Controls.Add($hint)
+
+        $ok                   = New-Object System.Windows.Forms.Button
+        $ok.Text              = 'Continue'
+        $ok.Location          = '272,110'
+        $ok.Width             = 80
+        $ok.DialogResult      = [System.Windows.Forms.DialogResult]::OK
+        $form.AcceptButton    = $ok
+        $form.Controls.Add($ok)
+
+        $cancel               = New-Object System.Windows.Forms.Button
+        $cancel.Text          = 'Cancel'
+        $cancel.Location      = '366,110'
+        $cancel.Width         = 80
+        $cancel.DialogResult  = [System.Windows.Forms.DialogResult]::Cancel
+        $form.CancelButton    = $cancel
+        $form.Controls.Add($cancel)
+
+        $tb.add_TextChanged({
+            try {
+                if (& $ValidateScript $tb.Text) { $tb.BackColor = [System.Drawing.Color]::White }
+                else                            { $tb.BackColor = [System.Drawing.Color]::MistyRose }
+            } catch {
+                $tb.BackColor = [System.Drawing.Color]::MistyRose
+            }
+        })
+
+        $dialog = $form.ShowDialog()
+        if ($dialog -ne [System.Windows.Forms.DialogResult]::OK) { return $null }
+
+        $val = $tb.Text.Trim()
+        if (-not (& $ValidateScript $val)) {
+            [System.Windows.Forms.MessageBox]::Show(
+                "Value is invalid. Please try again.",
+                "Validation",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Warning
+            ) | Out-Null
+            return Show-InputDialog @PSBoundParameters
+        }
+        return $val
+    } catch {
+        $val = Read-Host "$Title - $Prompt"
+        if (-not (& $ValidateScript $val)) { throw "Input failed validation." }
+        return $val
     }
-
-    return $Value.Trim().ToLowerInvariant()
 }
 
-function Normalize-Address {
-    param(
-        [AllowNull()]
-        [string]$Address
-    )
+function Get-AdminAddressDomain {
+    $valid = @('alliantcreditunion.com','gdeacu.com','extacu.local')
+    $msg   = "Enter Address domain for Admin account (" + ($valid -join ' | ') + ")"
 
-    if ([string]::IsNullOrWhiteSpace($Address)) {
-        return ""
-    }
+    $domain = Show-InputDialog -Title "Admin Account Address Domain" `
+        -Prompt $msg `
+        -Default "alliantcreditunion.com" `
+        -ValidationHint "Must be one of: alliantcreditunion.com, gdeacu.com, extacu.local" `
+        -ValidateScript {
+            param($x)
+            $t = $x.Trim().ToLower()
+            return ($t -in @('alliantcreditunion.com','gdeacu.com','extacu.local'))
+        }
 
-    $a = $Address.Trim().ToLowerInvariant()
-
-    # Remove common protocol prefix if present
-    $a = $a -replace '^(https?|ssh|rdp|sftp|ftp)://', ''
-
-    # Remove trailing slash
-    $a = $a.TrimEnd('/')
-
-    return $a
+    if (-not $domain) { throw "Admin Address domain selection cancelled." }
+    return $domain.Trim().ToLower()
 }
 
-function Get-UserAliases {
+# --- Permissions helpers ---
+
+function Get-AdminPerms {
+    @{
+        UseAccounts                             = $true
+        RetrieveAccounts                        = $true
+        ListAccounts                            = $true
+        AddAccounts                             = $true
+        UpdateAccountContent                    = $true
+        UpdateAccountProperties                 = $true
+        InitiateCPMAccountManagementOperations  = $true
+        SpecifyNextAccountContent               = $true
+        RenameAccounts                          = $true
+        DeleteAccounts                          = $true
+        UnlockAccounts                          = $true
+        ManageSafe                              = $true
+        ManageSafeMembers                       = $true
+        BackupSafe                              = $true
+        ViewAuditLog                            = $true
+        ViewSafeMembers                         = $true
+        AccessWithoutConfirmation               = $true
+        CreateFolders                           = $true
+        DeleteFolders                           = $true
+        MoveAccountsAndFolders                  = $true
+    }
+}
+
+function Get-OwnerPerms {
+    @{
+        UseAccounts                             = $true
+        RetrieveAccounts                        = $true
+        ListAccounts                            = $true
+        AddAccounts                             = $false
+        UpdateAccountContent                    = $true
+        UpdateAccountProperties                 = $false
+        InitiateCPMAccountManagementOperations  = $true
+        SpecifyNextAccountContent               = $true
+        RenameAccounts                          = $false
+        DeleteAccounts                          = $false
+        UnlockAccounts                          = $false
+        ManageSafe                              = $false
+        ManageSafeMembers                       = $false
+        BackupSafe                              = $false
+        ViewAuditLog                            = $true
+        ViewSafeMembers                         = $true
+        AccessWithoutConfirmation               = $true
+        CreateFolders                           = $false
+        DeleteFolders                           = $false
+        MoveAccountsAndFolders                  = $false
+    }
+}
+
+# --- CCP → PSCredential (API Service User) ---
+function Get-ServiceUserCredentialFromCCP {
+    [CmdletBinding()]
     param(
-        [AllowNull()]
-        [string]$UserName
+        [Parameter(Mandatory)][string]$CCPAddress,
+        [Parameter(Mandatory)][string]$Location,
+        [Parameter(Mandatory)][string]$AppID,
+        [Parameter(Mandatory)][string]$Safe,
+        [Parameter(Mandatory)][string]$Object,
+        [bool]$WindowsAuth = $false
     )
 
-    $aliases = New-Object 'System.Collections.Generic.HashSet[string]'
+    $base = $CCPAddress.TrimEnd('/')
+    $loc  = $Location.Trim('/')
 
-    if ([string]::IsNullOrWhiteSpace($UserName)) {
-        return @()
+    $url  = "{0}/{1}/api/Accounts?AppID={2}&Safe={3}&Object={4}" -f $base, $loc, $AppID, $Safe, $Object
+
+    Write-Info "Retrieving **Service User** credential from CCP:"
+    Write-Info "  $url"
+
+    $headers = @{ "Content-Type" = "application/json" }
+    $resp = Invoke-RestMethod -Uri $url -Method GET -Headers $headers -UseDefaultCredentials:$WindowsAuth -ErrorAction Stop
+
+    if (-not $resp.UserName -or -not $resp.Content) {
+        throw "CCP response missing UserName/Content. Raw: $($resp | ConvertTo-Json -Depth 5)"
     }
 
-    $u = $UserName.Trim().ToLowerInvariant()
-    [void]$aliases.Add($u)
+    Write-Ok "CCP returned service user: $($resp.UserName)"
 
-    # If DOMAIN\user format, also add user
-    if ($u -match '\\') {
-        $afterSlash = ($u -split '\\')[-1]
-        if (-not [string]::IsNullOrWhiteSpace($afterSlash)) {
-            [void]$aliases.Add($afterSlash)
+    $sec = ConvertTo-SecureString $resp.Content -AsPlainText -Force
+    return [PSCredential]::new($resp.UserName, $sec)
+}
+
+# --- Version-safe parameter detection ---
+function Test-CommandHasParameter {
+    param(
+        [Parameter(Mandatory)][string]$CommandName,
+        [Parameter(Mandatory)][string]$ParameterName
+    )
+    try {
+        $cmd = Get-Command $CommandName -ErrorAction Stop
+        return ($cmd.Parameters.Keys | Where-Object { $_ -ieq $ParameterName } | Measure-Object).Count -gt 0
+    } catch {
+        return $false
+    }
+}
+
+# --- Safe member ensure helper (no MemberType passed to Set-PASSafeMember) ---
+function Ensure-SafeMember {
+    [CmdletBinding(SupportsShouldProcess=$true)]
+    param(
+        [Parameter(Mandatory)][string]$SafeName,
+        [Parameter(Mandatory)][string]$MemberName,
+        [Parameter()][ValidateSet('User','Group','Role')][string]$MemberType = $null,
+        [Parameter(Mandatory)][hashtable]$PermFlags,
+        [Parameter()][string]$SearchIn = $null
+    )
+
+    Write-Info "Processing member '$MemberName' on '$SafeName'..."
+
+    # Build permission splat
+    $permParams = @{}
+    foreach ($k in $PermFlags.Keys) { $permParams[$k] = $PermFlags[$k] }
+
+    # Detect existing membership
+    $existing = $null
+    try {
+        if (Test-CommandHasParameter -CommandName 'Get-PASSafeMember' -ParameterName 'MemberName') {
+            try { $existing = Get-PASSafeMember -SafeName $SafeName -MemberName $MemberName -ErrorAction Stop } catch {}
         }
-    }
-
-    # If user@domain format, also add user
-    if ($u -match '@') {
-        $beforeAt = ($u -split '@')[0]
-        if (-not [string]::IsNullOrWhiteSpace($beforeAt)) {
-            [void]$aliases.Add($beforeAt)
+        if (-not $existing) {
+            $all = Get-PASSafeMember -SafeName $SafeName -ErrorAction Stop
+            $existing = $all | Where-Object {
+                ($_.MemberName -eq $MemberName) -or ($_.memberName -eq $MemberName) -or ($_.UserName -eq $MemberName)
+            } | Select-Object -First 1
         }
+    } catch {
+        $existing = $null
     }
 
-    # If DOMAIN\user@domain format, also add the left side of @ after slash
-    if ($u -match '\\' -and $u -match '@') {
-        $afterSlash = ($u -split '\\')[-1]
-        if ($afterSlash -match '@') {
-            $beforeAt = ($afterSlash -split '@')[0]
-            if (-not [string]::IsNullOrWhiteSpace($beforeAt)) {
-                [void]$aliases.Add($beforeAt)
+    if ($existing) {
+        # UPDATE (NO MemberType parameter here)
+        $setSplat = @{
+            SafeName   = $SafeName
+            MemberName = $MemberName
+        }
+        $setSplat += $permParams
+
+        if ($PSCmdlet.ShouldProcess("$SafeName/$MemberName", "Set-PASSafeMember")) {
+            try {
+                Set-PASSafeMember @setSplat -ErrorAction Stop | Out-Null
+                Write-Ok "Updated '$MemberName' on '$SafeName'."
+                return $true
+            } catch {
+                Write-Err "Update failed for '$MemberName' on '$SafeName': $($_.Exception.Message)"
+                return $false
             }
         }
+        return $true
     }
 
-    return @($aliases)
-}
+    # ADD (optional parameters depend on psPAS version)
+    $addSupportsSearchIn   = Test-CommandHasParameter -CommandName 'Add-PASSafeMember' -ParameterName 'SearchIn'
+    $addSupportsMemberType = (Test-CommandHasParameter -CommandName 'Add-PASSafeMember' -ParameterName 'memberType') -or
+                             (Test-CommandHasParameter -CommandName 'Add-PASSafeMember' -ParameterName 'MemberType')
 
-function Join-UniqueValues {
-    param(
-        [AllowNull()]
-        [object[]]$Values,
-        [string]$Separator = '; '
-    )
-
-    if (-not $Values) {
-        return ""
-    }
-
-    $clean = $Values |
-        Where-Object { $_ -ne $null -and "$_".Trim() -ne "" } |
-        ForEach-Object { "$_".Trim() } |
-        Sort-Object -Unique
-
-    if (-not $clean) {
-        return ""
-    }
-
-    return ($clean -join $Separator)
-}
-
-function Test-RequiredHeaders {
-    param(
-        [Parameter(Mandatory)]
-        [object[]]$Rows,
-
-        [Parameter(Mandatory)]
-        [string[]]$RequiredHeaders,
-
-        [Parameter(Mandatory)]
-        [string]$FileLabel
-    )
-
-    if (-not $Rows -or $Rows.Count -eq 0) {
-        throw "$FileLabel contains no rows."
-    }
-
-    $headers = @($Rows[0].PSObject.Properties.Name)
-
-    $missing = foreach ($h in $RequiredHeaders) {
-        if ($headers -notcontains $h) {
-            $h
+    $searchCandidates = New-Object System.Collections.Generic.List[string]
+    if ($SearchIn) {
+        $searchCandidates.Add($SearchIn)
+    } else {
+        $searchCandidates.Add('Vault')
+        if ($MemberName -like '*@*') {
+            $domainPart = ($MemberName.Split('@')[-1]).Trim()
+            if ($domainPart) { $searchCandidates.Add($domainPart) }
         }
+        $searchCandidates.Add($null)  # fallback: no SearchIn
     }
 
-    if ($missing) {
-        throw "$FileLabel is missing required header(s): $($missing -join ', ')"
-    }
-}
+    $lastErr = $null
+    foreach ($cand in $searchCandidates) {
+        $addSplat = @{
+            SafeName   = $SafeName
+            MemberName = $MemberName
+        }
+        $addSplat += $permParams
 
-Write-Host "Loading CSV files..." -ForegroundColor Cyan
-
-if (-not (Test-Path -LiteralPath $CyberArkCsvPath)) {
-    throw "CyberArk CSV not found: $CyberArkCsvPath"
-}
-
-if (-not (Test-Path -LiteralPath $AdCsvPath)) {
-    throw "AD Service Account CSV not found: $AdCsvPath"
-}
-
-if (-not (Test-Path -LiteralPath $OutputDir)) {
-    New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
-}
-
-$cyberArkRows = Import-Csv -LiteralPath $CyberArkCsvPath
-$adRows       = Import-Csv -LiteralPath $AdCsvPath
-
-Test-RequiredHeaders -Rows $cyberArkRows -RequiredHeaders @(
-    'Target system user name',
-    'Target system address',
-    'Safe',
-    'Platform ID'
-) -FileLabel 'CyberArk_Report.csv'
-
-Test-RequiredHeaders -Rows $adRows -RequiredHeaders @(
-    'Service Account',
-    'Address'
-) -FileLabel 'AD_ServiceAcct.csv'
-
-Write-Host "Building CyberArk lookup by username..." -ForegroundColor Cyan
-
-# alias username -> list of CyberArk records
-$cyberArkLookup = @{}
-
-foreach ($row in $cyberArkRows) {
-    $caUser     = [string]$row.'Target system user name'
-    $caAddress  = [string]$row.'Target system address'
-    $caSafe     = [string]$row.'Safe'
-    $caPlatform = [string]$row.'Platform ID'
-
-    $record = [PSCustomObject]@{
-        UserName          = $caUser
-        NormalizedUser    = Normalize-Text $caUser
-        Address           = $caAddress
-        NormalizedAddress = Normalize-Address $caAddress
-        Safe              = $caSafe
-        PlatformID        = $caPlatform
-        UniqueKey         = "{0}|{1}|{2}|{3}" -f (Normalize-Text $caUser), (Normalize-Address $caAddress), (Normalize-Text $caSafe), (Normalize-Text $caPlatform)
-    }
-
-    $aliases = Get-UserAliases -UserName $caUser
-
-    foreach ($alias in $aliases) {
-        if (-not $cyberArkLookup.ContainsKey($alias)) {
-            $cyberArkLookup[$alias] = New-Object System.Collections.ArrayList
+        if ($addSupportsSearchIn -and $cand) {
+            $addSplat['SearchIn'] = $cand
+        }
+        if ($addSupportsMemberType -and $MemberType) {
+            # psPAS often uses "memberType" (case-insensitive)
+            $addSplat['memberType'] = $MemberType
         }
 
-        [void]$cyberArkLookup[$alias].Add($record)
-    }
-}
+        $hint = if ($cand) { "SearchIn=$cand" } else { "SearchIn=<none>" }
+        Write-Info "Adding member '$MemberName' to '$SafeName' ($hint)..."
 
-Write-Host "Comparing AD service accounts to CyberArk..." -ForegroundColor Cyan
-
-$exactMatches         = New-Object System.Collections.ArrayList
-$usernameOnlyMatches  = New-Object System.Collections.ArrayList
-$notPresentMatches    = New-Object System.Collections.ArrayList
-
-foreach ($adRow in $adRows) {
-    $svcAcct  = [string]$adRow.'Service Account'
-    $svcAddr  = [string]$adRow.'Address'
-    $normAddr = Normalize-Address $svcAddr
-
-    $svcAliases = Get-UserAliases -UserName $svcAcct
-
-    $matchedRecords = @()
-    $seenKeys = New-Object 'System.Collections.Generic.HashSet[string]'
-
-    foreach ($alias in $svcAliases) {
-        if ($cyberArkLookup.ContainsKey($alias)) {
-            foreach ($match in $cyberArkLookup[$alias]) {
-                if ($seenKeys.Add($match.UniqueKey)) {
-                    $matchedRecords += $match
-                }
+        if ($PSCmdlet.ShouldProcess("$SafeName/$MemberName", "Add-PASSafeMember")) {
+            try {
+                Add-PASSafeMember @addSplat -ErrorAction Stop | Out-Null
+                Write-Ok "Added '$MemberName' to '$SafeName' ($hint)."
+                return $true
+            } catch {
+                $lastErr = $_.Exception.Message
+                Write-Warn "Add attempt failed for '$MemberName' ($hint): $lastErr"
+                continue
             }
+        } else {
+            return $true
         }
     }
 
-    if ($matchedRecords.Count -gt 0) {
-        $exactAddressMatches = @(
-            $matchedRecords | Where-Object { $_.NormalizedAddress -eq $normAddr }
-        )
+    Write-Err "Failed to add '$MemberName' to '$SafeName'. Last error: $lastErr"
+    return $false
+}
 
-        if ($exactAddressMatches.Count -gt 0) {
-            [void]$exactMatches.Add([PSCustomObject]@{
-                'Service Account'            = $svcAcct
-                'AD Address'                 = $svcAddr
-                'Match Status'               = 'Exact Match'
-                'Exact Match Count'          = $exactAddressMatches.Count
-                'Matched CyberArk User Name' = Join-UniqueValues ($exactAddressMatches | Select-Object -ExpandProperty UserName)
-                'Matched CyberArk Address'   = Join-UniqueValues ($exactAddressMatches | Select-Object -ExpandProperty Address)
-                'Safe'                       = Join-UniqueValues ($exactAddressMatches | Select-Object -ExpandProperty Safe)
-                'Platform ID'                = Join-UniqueValues ($exactAddressMatches | Select-Object -ExpandProperty PlatformID)
-            })
+# --- Admin account onboarding helper ---
+function Onboard-AdminAccount {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$SafeName,
+        [Parameter(Mandatory)][string]$SamAccountName,
+        [Parameter(Mandatory)][string]$OwnerEmail,          # kept for logging only; not used for mapping
+        [Parameter(Mandatory)][string]$AdminAddressDomain   # drives mapping
+    )
+
+    $sam   = $SamAccountName.Trim()
+    $email = $OwnerEmail.Trim()
+    $addr  = $AdminAddressDomain.Trim().ToLower()
+
+    if (-not $sam -or -not $addr) {
+        Write-Warn "Admin onboarding skipped: missing SamAccountName or AdminAddressDomain."
+        return
+    }
+
+    # Mapping based on selected Admin Address domain (NOT CSV email)
+    $platformId  = $null
+    $logonDomain = $null
+    $adminUser   = $null
+
+    switch ($addr) {
+        'alliantcreditunion.com' {
+            $platformId  = "WIN_P_DM_ACU_ADM_OTP_CICO_30D"
+            $logonDomain = "ACU"
+            $adminUser   = "A_{0}" -f $sam
         }
-        else {
-            [void]$usernameOnlyMatches.Add([PSCustomObject]@{
-                'Service Account'                 = $svcAcct
-                'AD Address'                      = $svcAddr
-                'Match Status'                    = 'Username Match Only - Address Different'
-                'Matched Record Count'            = $matchedRecords.Count
-                'Matched CyberArk User Name'      = Join-UniqueValues ($matchedRecords | Select-Object -ExpandProperty UserName)
-                'Matched CyberArk Address'        = Join-UniqueValues ($matchedRecords | Select-Object -ExpandProperty Address)
-                'Safe'                            = Join-UniqueValues ($matchedRecords | Select-Object -ExpandProperty Safe)
-                'Platform ID'                     = Join-UniqueValues ($matchedRecords | Select-Object -ExpandProperty PlatformID)
-                'Note'                            = 'Username exists in CyberArk, but AD address does not exactly match any CyberArk address for that username.'
-            })
+        'extacu.local' {
+            $platformId  = "WIN_P_DM_EXT_ADM_OTP_CICO_30D"
+            $logonDomain = "extacu.local"
+            $adminUser   = $sam
+        }
+        'gdeacu.com' {
+            $platformId  = "WIN_P_DM_GDE_ADM_OTP_CICO_30D"
+            $logonDomain = "gdeacu.com"
+            $adminUser   = $sam
+        }
+        default {
+            Write-Warn "Admin onboarding skipped: unknown AdminAddressDomain '$addr'."
+            return
+        }
+    }
+
+    Write-Info ("Preparing to onboard Admin account '{0}' to Safe '{1}' (Platform={2}, Address={3}, LogonDomain={4})..." -f $adminUser, $SafeName, $platformId, $addr, $logonDomain)
+
+    # Check if account already exists in this Safe
+    $existingAcct = $null
+    try {
+        $existingAcct = Get-PASAccount -SafeName $SafeName -Search $adminUser -ErrorAction SilentlyContinue |
+                        Where-Object { $_.UserName -eq $adminUser -and $_.Address -eq $addr }
+    } catch {}
+
+    if ($existingAcct) {
+        Write-Warn ("Admin account '{0}' already exists in Safe '{1}' with Address '{2}' – skipping onboard." -f $adminUser, $SafeName, $addr)
+        return
+    }
+
+    $platformProps = @{
+        LogonDomain  = $logonDomain
+        LogonAccount = $logonDomain
+    }
+
+    $acctSplat = @{
+        SafeName                  = $SafeName
+        PlatformID                = $platformId
+        Address                   = $addr
+        UserName                  = $adminUser
+        PlatformAccountProperties = $platformProps
+    }
+
+    if ($PSCmdlet.ShouldProcess(("{0}/{1}" -f $SafeName, $adminUser), "Add-PASAccount")) {
+        try {
+            Add-PASAccount @acctSplat -ErrorAction Stop | Out-Null
+            Write-Ok ("Onboarded admin account '{0}' in Safe '{1}' (Platform={2}, Address={3}, LogonDomain={4})." -f $adminUser, $SafeName, $platformId, $addr, $logonDomain)
+        }
+        catch {
+            Write-Err ("Failed to onboard admin account '{0}' in Safe '{1}': {2}" -f $adminUser, $SafeName, $_.Exception.Message)
+        }
+    }
+}
+
+# --- Core row processor: one IND_ safe + memberships + admin account ---
+function Process-INDRow {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$SamAccountName,
+        [Parameter(Mandatory)][string]$EmployeeID,
+        [Parameter(Mandatory)][string]$OwnerEmail,
+        [Parameter(Mandatory)][string]$AdminAddressDomain
+    )
+
+    $sam  = $SamAccountName.Trim()
+    $eid  = $EmployeeID.Trim()
+    $mail = $OwnerEmail.Trim()
+
+    if ([string]::IsNullOrWhiteSpace($sam) -or
+        [string]::IsNullOrWhiteSpace($eid) -or
+        [string]::IsNullOrWhiteSpace($mail)) {
+        Write-Warn "Skipping row with missing fields: Sam='$sam' EmployeeID='$eid' Email='$mail'"
+        return
+    }
+
+    $safeName = "IND_{0}_{1}" -f $sam, $eid
+    Write-Info "Processing Safe: $safeName (Owner=$mail)"
+
+    # Create Safe if missing; ensure 7-day retention
+    $exists = $null
+    try { $exists = Get-PASSafe -SafeName $safeName -ErrorAction SilentlyContinue } catch {}
+
+    if (-not $exists) {
+        $splat = @{
+            SafeName              = $safeName
+            Description           = "Individual safe for $sam ($eid)"
+            ManagingCPM           = $ManagingCPM
+            NumberOfDaysRetention = 7
+            Location              = $Location
+        }
+        if ($PSCmdlet.ShouldProcess($safeName, "Add-PASSafe")) {
+            try {
+                Add-PASSafe @splat -ErrorAction Stop | Out-Null
+                Write-Ok "Created Safe '$safeName'."
+            } catch {
+                Write-Err "Failed to create Safe '$safeName' : $($_.Exception.Message)"
+                return
+            }
         }
     }
     else {
-        [void]$notPresentMatches.Add([PSCustomObject]@{
-            'Service Account' = $svcAcct
-            'AD Address'      = $svcAddr
-            'Match Status'    = 'Not Present in CyberArk'
-        })
+        Write-Warn "Safe '$safeName' already exists; ensuring retention & members."
+        try {
+            Set-PASSafe -SafeName $safeName -NumberOfDaysRetention 7 -ErrorAction SilentlyContinue | Out-Null
+            Write-Ok "Ensured 7-day retention on '$safeName'."
+        } catch {
+            Write-Warn "Could not set retention on existing '$safeName': $($_.Exception.Message)"
+        }
     }
+
+    # Permissions payloads
+    $permAdmin = Get-AdminPerms
+    $permOwner = Get-OwnerPerms
+
+    # IAM group membership: try UPN then sAM (no throw; continue)
+    $iamUpn = 'IAM_ACU_CA_Admins@alliantcreditunion.com'
+    $iamSam = 'IAM_ACU_CA_Admins'
+
+    Write-Info "Ensuring IAM_ACU_CA_Admins membership on '$safeName'..."
+    $okIam = Ensure-SafeMember -SafeName $safeName -MemberName $iamUpn -MemberType Group -PermFlags $permAdmin
+    if (-not $okIam) {
+        Write-Warn "Retrying IAM group with sAMAccountName '$iamSam'..."
+        $okIam = Ensure-SafeMember -SafeName $safeName -MemberName $iamSam -MemberType Group -PermFlags $permAdmin
+    }
+    if ($okIam) { Write-Ok "IAM_ACU_CA_Admins membership ensured on '$safeName'." }
+    else        { Write-Warn "IAM_ACU_CA_Admins could not be ensured on '$safeName' (continuing...)." }
+
+    # Owner membership: CSV email stays as membership regardless of onboarding domain
+    Write-Info "Ensuring Owner '$mail' membership on '$safeName'..."
+    $okOwner = Ensure-SafeMember -SafeName $safeName -MemberName $mail -MemberType User -PermFlags $permOwner
+
+    if (-not $okOwner -and $mail -like '*@*') {
+        $ownerSam = $mail.Split('@')[0]
+        Write-Warn "Retrying Owner with sAM '$ownerSam'..."
+        $okOwner = Ensure-SafeMember -SafeName $safeName -MemberName $ownerSam -MemberType User -PermFlags $permOwner
+    }
+
+    if ($okOwner) {
+        $ownerNoDomain = $mail.Split('@')[0]
+        try {
+            $desc = "Individual safe for $sam ($eid) – Managed By $ownerNoDomain"
+            Set-PASSafe -SafeName $safeName -Description $desc -ErrorAction Stop | Out-Null
+            Write-Ok "Description set on '$safeName': '$desc'"
+        } catch {
+            Write-Warn "Could not set description on '$safeName': $($_.Exception.Message)"
+        }
+    } else {
+        Write-Warn "Owner membership could not be ensured on '$safeName' (continuing...)."
+    }
+
+    # Onboard Admin account (domain mapping driven by selected AdminAddressDomain)
+    Onboard-AdminAccount -SafeName $safeName -SamAccountName $sam -OwnerEmail $mail -AdminAddressDomain $AdminAddressDomain
+
+    Write-Ok "Completed processing '$safeName'."
 }
 
-$exactCsvPath        = Join-Path -Path $OutputDir -ChildPath 'Present_Exact_Match.csv'
-$usernameOnlyCsvPath = Join-Path -Path $OutputDir -ChildPath 'Present_Username_Only_Address_Different.csv'
-$notPresentCsvPath   = Join-Path -Path $OutputDir -ChildPath 'Not_Present_In_CyberArk.csv'
+# --- MAIN ---
+$sessionCreated     = $false
+$AdminAddressDomain = $null
+$runSummary         = New-Object System.Collections.Generic.List[object]
 
-$exactMatches |
-    Sort-Object 'Service Account', 'AD Address' |
-    Export-Csv -LiteralPath $exactCsvPath -NoTypeInformation -Encoding UTF8
+try {
+    # 1) Get Shared Services API Service User creds from CCP
+    $serviceCred = Get-ServiceUserCredentialFromCCP `
+        -CCPAddress $CCPAddress `
+        -Location   $CCPLocation `
+        -AppID      $CCPAppID `
+        -Safe       $CCPSafe `
+        -Object     $CCPObject `
+        -WindowsAuth:$CCPWindowsAuth
 
-$usernameOnlyMatches |
-    Sort-Object 'Service Account', 'AD Address' |
-    Export-Csv -LiteralPath $usernameOnlyCsvPath -NoTypeInformation -Encoding UTF8
+    # 2) Authenticate via Identity Shared Services using SERVICE USER
+    Write-Info "Authenticating to Privilege Cloud via Identity (Service User)..."
 
-$notPresentMatches |
-    Sort-Object 'Service Account', 'AD Address' |
-    Export-Csv -LiteralPath $notPresentCsvPath -NoTypeInformation -Encoding UTF8
+    New-PASSession `
+        -IdentityTenantURL $IdentityTenantURL `
+        -PrivilegeCloudURL $PrivilegeCloudURL `
+        -Credential        $serviceCred `
+        -ServiceUser `
+        -ErrorAction Stop | Out-Null
 
-Write-Host ""
-Write-Host "Comparison completed successfully." -ForegroundColor Green
-Write-Host "Exact Matches                  : $($exactMatches.Count)" -ForegroundColor Green
-Write-Host "Username Only / Addr Different : $($usernameOnlyMatches.Count)" -ForegroundColor Yellow
-Write-Host "Not Present                    : $($notPresentMatches.Count)" -ForegroundColor Red
-Write-Host ""
-Write-Host "Output files:" -ForegroundColor Cyan
-Write-Host " - $exactCsvPath"
-Write-Host " - $usernameOnlyCsvPath"
-Write-Host " - $notPresentCsvPath"
+    $session = Get-PASSession
+    if (-not $session) { throw "psPAS session not established via ServiceUser." }
+
+    $sessionCreated = $true
+    Write-Ok "Authenticated to $PrivilegeCloudURL as service user: $($serviceCred.UserName)"
+
+    # 3) Prompt once for Admin Address domain (used for onboarding mapping)
+    $AdminAddressDomain = Get-AdminAddressDomain
+    Write-Ok "Admin Address domain set to: $AdminAddressDomain"
+
+    # 4) Process based on Mode
+    if ($Mode -eq 'CSV') {
+        Write-Info "Mode = CSV. Loading: $CsvPath"
+        if (-not (Test-Path $CsvPath)) { throw "CSV not found: $CsvPath" }
+
+        $rows = Import-Csv -Path $CsvPath
+        if (-not $rows -or $rows.Count -eq 0) { throw "CSV '$CsvPath' has no rows." }
+
+        foreach ($row in $rows) {
+            $sam  = ($row.Samaccountname).ToString()
+            $eid  = ($row.employeeID).ToString()
+            $mail = ($row.email).ToString()
+
+            try {
+                Process-INDRow -SamAccountName $sam -EmployeeID $eid -OwnerEmail $mail -AdminAddressDomain $AdminAddressDomain
+                $runSummary.Add([pscustomobject]@{ Sam=$sam; EmployeeID=$eid; Email=$mail; Status='OK'; Error='' })
+            }
+            catch {
+                # Row-level catch: keep going (do not terminate the whole run)
+                $err = $_.Exception.Message
+                Write-Err "Row failed (Sam='$sam', EmployeeID='$eid', Email='$mail'): $err"
+                $runSummary.Add([pscustomobject]@{ Sam=$sam; EmployeeID=$eid; Email=$mail; Status='FAILED'; Error=$err })
+                continue
+            }
+        }
+
+        $okCount  = ($runSummary | Where-Object Status -eq 'OK').Count
+        $badCount = ($runSummary | Where-Object Status -eq 'FAILED').Count
+        Write-Ok "CSV processing completed. OK=$okCount FAILED=$badCount Total=$($runSummary.Count)"
+    }
+    else {
+        Write-Info "Mode = Single. Prompting for one IND_ Safe owner..."
+
+        $sam = Show-InputDialog -Title "IND Safe Owner" `
+            -Prompt "Enter SamAccountName (e.g. jdoe)" `
+            -Default "" `
+            -ValidationHint "SamAccountName only" `
+            -ValidateScript { param($x) -not [string]::IsNullOrWhiteSpace($x.Trim()) }
+        if (-not $sam) { Write-Warn "Cancelled (SamAccountName)."; return }
+
+        $eid = Show-InputDialog -Title "IND Safe Owner" `
+            -Prompt "Enter employeeID" `
+            -Default "" `
+            -ValidationHint "HR/AD employeeID" `
+            -ValidateScript { param($x) -not [string]::IsNullOrWhiteSpace($x.Trim()) }
+        if (-not $eid) { Write-Warn "Cancelled (employeeID)."; return }
+
+        $mail = Show-InputDialog -Title "IND Safe Owner" `
+            -Prompt "Enter owner email (UPN)" `
+            -Default "" `
+            -ValidationHint "Example: user@alliantcreditunion.com" `
+            -ValidateScript { param($x) -not [string]::IsNullOrWhiteSpace($x.Trim()) }
+        if (-not $mail) { Write-Warn "Cancelled (email)."; return }
+
+        Process-INDRow -SamAccountName $sam -EmployeeID $eid -OwnerEmail $mail -AdminAddressDomain $AdminAddressDomain
+    }
+}
+catch {
+    Write-Err $_.Exception.Message
+}
+finally {
+    if ($sessionCreated) {
+        try {
+            Close-PASSession | Out-Null
+            Write-Ok "Logged off."
+        } catch {
+            Write-Warn "Logoff warning: $($_.Exception.Message)"
+        }
+    }
+}
