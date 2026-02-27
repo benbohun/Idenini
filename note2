@@ -8,19 +8,20 @@ AccountFailureDetect_1326_1331_FAST.ps1
     2) winRc=1331 / account disabled          -> separate CSV
 - Faster approach:
     1) FAST-PATH: match on account-level secretManagement/lastTask fields
-    2) SLOW-PATH: only for likely failures, pull limited activities and match
-       Reason / MoreInfo / Message / Details (no ConvertTo-Json)
+    2) SLOW-PATH:
+       - 1326: ALWAYS scan activity for in-scope failed candidates (important fix)
+       - 1331: scan activity only for likely failure-status accounts
+- Exports only two reports:
+    I:\Script\IDENTITY Script New\csv\BadPassword_Service_Account.csv
+    I:\Script\IDENTITY Script New\csv\Disabled_Account.csv
+- Log:
+    I:\Script\IDENTITY Script New\csv\AccountFailure_1326_1331.log
 
-Outputs:
-  I:\Script\IDENTITY Script New\csv\BadPassword_Service_Account.csv
-  I:\Script\IDENTITY Script New\csv\Disabled_Account.csv
-  I:\Script\IDENTITY Script New\csv\AccountFailure_1326_1331.log
-
-Notes:
-- 1326 report applies ServiceAccountsOnly filter by default.
-- 1331 report defaults to ALL accounts.
-- If you want 1331 to also be service-accounts-only, set:
-    -ApplyServiceAccountFilterTo1331
+Why 1326 was missing before:
+- Many 1326 events appear in account activity but do not always set
+  secretManagement.status / lastTask.status to fail|error.
+- The old logic only queued slow-path scan when ShouldScanActivities = $true,
+  so valid 1326 accounts were skipped before activity inspection.
 =====================================================================
 #>
 
@@ -33,19 +34,22 @@ param(
     [int]$MaxAccountsToInspect = 50000,
 
     [ValidateRange(1,500)]
-    [int]$MaxActivitiesToInspect = 60,
+    [int]$MaxActivitiesToInspect = 100,
 
-    # If you want speed over coverage, set this to skip full inventory fallback
     [switch]$SkipInventoryFallback,
 
-    # 1326 report scope
+    # 1326 scope
     [bool]$ServiceAccountsOnly = $true,
 
-    # Tune for your environment if needed
-    [string]$ServiceAccountRegex = '(?i)(^svc[_\-]?|[_\-]svc$|service|batch|app[_\-]?|sa[_\-]?|sql|oracle|db2|iis|tomcat|splunk|cyberark)',
+    # Broader default heuristic for service accounts
+    [string]$ServiceAccountRegex = '(?i)(^svc([_\-\.].*)?$|^sa([_\-\.].*)?$|[_\-\.]svc([_\-\.]|$)|service|batch|app[_\-\.]?|system|sql|oracle|db2|iis|tomcat|splunk|cyberark|ansible|jenkins)',
 
-    # 1331 report scope
-    [switch]$ApplyServiceAccountFilterTo1331
+    # 1331 scope
+    [switch]$ApplyServiceAccountFilterTo1331,
+
+    # IMPORTANT FIX:
+    # For 1326, queue activity scan even if secretManagement status does not say fail/error.
+    [bool]$ForceActivityScanFor1326 = $true
 )
 
 # =========================
@@ -95,7 +99,7 @@ $PrivilegeCloudURL = "https://alliantcredit.privilegecloud.cyberark.cloud"
 # =========================
 # Match logic
 # =========================
-$NeedleRegex1326 = '(?i)winRc\s*=\s*1326|the\s+user\s+name\s+or\s+password\s+is\s+incorrect|logon\s+failure\s*:\s*unknown\s+user\s+name\s+or\s+bad\s+password|unknown\s+user\s+name\s+or\s+bad\s+password'
+$NeedleRegex1326 = '(?i)winRc\s*=\s*1326|the\s+user\s+name\s+or\s+password\s+is\s+incorrect|reason\s*:\s*the\s+user\s+name\s+or\s+password\s+is\s+incorrect|logon\s+failure\s*:\s*unknown\s+user\s+name\s+or\s+bad\s+password|unknown\s+user\s+name\s+or\s+bad\s+password'
 $NeedleRegex1331 = '(?i)winRc\s*=\s*1331|account\s+is\s+currently\s+disabled|error_account_disabled'
 
 # =========================
@@ -219,7 +223,11 @@ function Get-ActivitiesSafe {
     try {
         return @(Get-PASAccountActivity -AccountID $AccountId -ErrorAction Stop)
     } catch {
-        return @(Get-PASAccountActivity -AccountID $AccountId -useGen1API -ErrorAction Stop)
+        try {
+            return @(Get-PASAccountActivity -AccountID $AccountId -useGen1API -ErrorAction Stop)
+        } catch {
+            return @()
+        }
     }
 }
 
@@ -232,6 +240,7 @@ function Is-ServiceAccountCandidate {
     try { if ($Acct.name)       { $parts += [string]$Acct.name } } catch {}
     try { if ($Acct.safeName)   { $parts += [string]$Acct.safeName } } catch {}
     try { if ($Acct.platformId) { $parts += [string]$Acct.platformId } } catch {}
+    try { if ($Acct.address)    { $parts += [string]$Acct.address } } catch {}
 
     if ($parts.Count -eq 0) { return $false }
 
@@ -244,15 +253,19 @@ function Get-SecretManagementText {
 
     $parts = New-Object System.Collections.Generic.List[string]
 
-    try { if ($Acct.secretManagement) { $parts.Add(($Acct.secretManagement | Out-String)) } } catch {}
-    try { if ($Acct.secretManagement.lastTask) { $parts.Add(($Acct.secretManagement.lastTask | Out-String)) } } catch {}
-    try { if ($Acct.secretManagement.lastFailedTask) { $parts.Add(($Acct.secretManagement.lastFailedTask | Out-String)) } } catch {}
-    try { if ($Acct.secretManagement.status) { $parts.Add([string]$Acct.secretManagement.status) } } catch {}
-    try { if ($Acct.secretManagement.lastTask.status) { $parts.Add([string]$Acct.secretManagement.lastTask.status) } } catch {}
-    try { if ($Acct.secretManagement.lastTask.reason) { $parts.Add([string]$Acct.secretManagement.lastTask.reason) } } catch {}
-    try { if ($Acct.secretManagement.lastTask.details) { $parts.Add([string]$Acct.secretManagement.lastTask.details) } } catch {}
-    try { if ($Acct.secretManagement.lastTask.error) { $parts.Add([string]$Acct.secretManagement.lastTask.error) } } catch {}
-    try { if ($Acct.secretManagement.lastTask.moreInfo) { $parts.Add([string]$Acct.secretManagement.lastTask.moreInfo) } } catch {}
+    try { if ($Acct.secretManagement)                     { $parts.Add(($Acct.secretManagement | Out-String)) } } catch {}
+    try { if ($Acct.secretManagement.lastTask)            { $parts.Add(($Acct.secretManagement.lastTask | Out-String)) } } catch {}
+    try { if ($Acct.secretManagement.lastFailedTask)      { $parts.Add(($Acct.secretManagement.lastFailedTask | Out-String)) } } catch {}
+    try { if ($Acct.secretManagement.status)              { $parts.Add([string]$Acct.secretManagement.status) } } catch {}
+    try { if ($Acct.secretManagement.lastTask.status)     { $parts.Add([string]$Acct.secretManagement.lastTask.status) } } catch {}
+    try { if ($Acct.secretManagement.lastTask.reason)     { $parts.Add([string]$Acct.secretManagement.lastTask.reason) } } catch {}
+    try { if ($Acct.secretManagement.lastTask.details)    { $parts.Add([string]$Acct.secretManagement.lastTask.details) } } catch {}
+    try { if ($Acct.secretManagement.lastTask.error)      { $parts.Add([string]$Acct.secretManagement.lastTask.error) } } catch {}
+    try { if ($Acct.secretManagement.lastTask.moreInfo)   { $parts.Add([string]$Acct.secretManagement.lastTask.moreInfo) } } catch {}
+    try { if ($Acct.secretManagement.lastFailedTask.reason)   { $parts.Add([string]$Acct.secretManagement.lastFailedTask.reason) } } catch {}
+    try { if ($Acct.secretManagement.lastFailedTask.details)  { $parts.Add([string]$Acct.secretManagement.lastFailedTask.details) } } catch {}
+    try { if ($Acct.secretManagement.lastFailedTask.error)    { $parts.Add([string]$Acct.secretManagement.lastFailedTask.error) } } catch {}
+    try { if ($Acct.secretManagement.lastFailedTask.moreInfo) { $parts.Add([string]$Acct.secretManagement.lastFailedTask.moreInfo) } } catch {}
 
     if ($parts.Count -eq 0) { return $null }
     return ($parts -join " | ")
@@ -263,14 +276,38 @@ function ShouldScanActivities {
 
     try {
         if ($Acct.secretManagement -and $Acct.secretManagement.status) {
-            return ([string]$Acct.secretManagement.status -match '(?i)fail|error')
+            if ([string]$Acct.secretManagement.status -match '(?i)fail|error') { return $true }
         }
         if ($Acct.secretManagement -and $Acct.secretManagement.lastTask -and $Acct.secretManagement.lastTask.status) {
-            return ([string]$Acct.secretManagement.lastTask.status -match '(?i)fail|error')
+            if ([string]$Acct.secretManagement.lastTask.status -match '(?i)fail|error') { return $true }
         }
-    } catch { }
+        if ($Acct.secretManagement -and $Acct.secretManagement.lastFailedTask) {
+            return $true
+        }
+    } catch {}
 
     return $false
+}
+
+function Get-ActivityText {
+    param($Activity)
+
+    $fields = New-Object System.Collections.Generic.List[string]
+
+    foreach ($n in @(
+        "Reason","MoreInfo","Message","Details","Action","Error","Status","Description",
+        "Activity","ActivityType","Task","Text","AdditionalInfo","ExtendedInfo","Result"
+    )) {
+        try {
+            $v = $Activity.$n
+            if ($null -ne $v -and -not [string]::IsNullOrWhiteSpace([string]$v)) {
+                $fields.Add([string]$v)
+            }
+        } catch {}
+    }
+
+    if ($fields.Count -eq 0) { return $null }
+    return ($fields -join " | ")
 }
 
 function ActivityMatchesPattern {
@@ -279,17 +316,9 @@ function ActivityMatchesPattern {
         [string]$Regex
     )
 
-    $fields = @()
-    foreach ($n in @("Reason","MoreInfo","Message","Details","Action","Error","Status","Description")) {
-        try {
-            $v = $Activity.$n
-            if ($v) { $fields += [string]$v }
-        } catch {}
-    }
+    $hay = Get-ActivityText -Activity $Activity
+    if (-not $hay) { return $false }
 
-    if ($fields.Count -eq 0) { return $false }
-
-    $hay = ($fields -join " | ")
     return ($hay -match $Regex)
 }
 
@@ -304,7 +333,6 @@ function Add-MatchRow {
 
     $id = [string]$Acct.id
     if ([string]::IsNullOrWhiteSpace($id)) { return }
-
     if ($MatchedIdSet.Contains($id)) { return }
 
     $null = $MatchedIdSet.Add($id)
@@ -332,9 +360,12 @@ try {
     Write-Log "Searching for account failures (1326 + 1331)..." 'Yellow'
     Write-Log "1326 Regex: $NeedleRegex1326" 'DarkYellow'
     Write-Log "1331 Regex: $NeedleRegex1331" 'DarkYellow'
+    Write-Log "ForceActivityScanFor1326: $ForceActivityScanFor1326" 'DarkYellow'
+
     if ($ServiceAccountsOnly) {
         Write-Log "1326 ServiceAccountRegex: $ServiceAccountRegex" 'DarkYellow'
     }
+
     if ($ApplyServiceAccountFilterTo1331) {
         Write-Log "1331 will also use ServiceAccountRegex filter." 'DarkYellow'
     } else {
@@ -379,6 +410,8 @@ try {
     $queuedForActivity = 0
     $fastHits1326 = 0
     $fastHits1331 = 0
+    $scope1326Skipped = 0
+    $scope1331Skipped = 0
 
     # 4) First pass: FAST PATH
     foreach ($acct in $candidates) {
@@ -395,11 +428,13 @@ try {
         $inScope1326 = $true
         if ($ServiceAccountsOnly) {
             $inScope1326 = Is-ServiceAccountCandidate -Acct $acct
+            if (-not $inScope1326) { $scope1326Skipped++ }
         }
 
         $inScope1331 = $true
         if ($ApplyServiceAccountFilterTo1331) {
             $inScope1331 = Is-ServiceAccountCandidate -Acct $acct
+            if (-not $inScope1331) { $scope1331Skipped++ }
         }
 
         if (-not $inScope1326 -and -not $inScope1331) {
@@ -407,6 +442,7 @@ try {
         }
 
         $secretText = Get-SecretManagementText -Acct $acct
+        $hasFailureStatus = ShouldScanActivities -Acct $acct
 
         $matchedFast1326 = $false
         $matchedFast1331 = $false
@@ -418,9 +454,10 @@ try {
                     -FailurePattern "winRc=1326 / Invalid username or password" `
                     -ResultList $results1326 `
                     -MatchedIdSet $matched1326
-                $fastHits1326++
 
+                $fastHits1326++
                 $matchedFast1326 = $true
+
                 Write-Log ("MATCH FAST 1326: AccountID={0} Safe={1} User={2} Address={3} Platform={4}" -f `
                     $acct.id, $acct.safeName, $acct.userName, $acct.address, $acct.platformId) 'Green'
             }
@@ -431,9 +468,10 @@ try {
                     -FailurePattern "winRc=1331 / Account disabled" `
                     -ResultList $results1331 `
                     -MatchedIdSet $matched1331
-                $fastHits1331++
 
+                $fastHits1331++
                 $matchedFast1331 = $true
+
                 Write-Log ("MATCH FAST 1331: AccountID={0} Safe={1} User={2} Address={3} Platform={4}" -f `
                     $acct.id, $acct.safeName, $acct.userName, $acct.address, $acct.platformId) 'Green'
             }
@@ -442,17 +480,39 @@ try {
         $needActivity1326 = $inScope1326 -and (-not $matchedFast1326)
         $needActivity1331 = $inScope1331 -and (-not $matchedFast1331)
 
-        if (($needActivity1326 -or $needActivity1331) -and (ShouldScanActivities -Acct $acct)) {
+        $queue1326 = $false
+        $queue1331 = $false
+
+        # IMPORTANT FIX:
+        # 1326 often exists only in activities, so do not require secretManagement fail state.
+        if ($needActivity1326) {
+            if ($ForceActivityScanFor1326) {
+                $queue1326 = $true
+            } elseif ($hasFailureStatus) {
+                $queue1326 = $true
+            }
+        }
+
+        # 1331 stays optimized
+        if ($needActivity1331 -and $hasFailureStatus) {
+            $queue1331 = $true
+        }
+
+        if ($queue1326 -or $queue1331) {
             $queuedForActivity++
             $activityQueue.Add([PSCustomObject]@{
                 Account  = $acct
-                Need1326 = $needActivity1326
-                Need1331 = $needActivity1331
+                Need1326 = $queue1326
+                Need1331 = $queue1331
             }) | Out-Null
         }
     }
 
     Write-Log "Pass1 complete. FastHits1326=$fastHits1326 FastHits1331=$fastHits1331 ActivityQueue=$($activityQueue.Count)." 'Yellow'
+    Write-Log "1326 scope skipped by service-account filter: $scope1326Skipped" 'DarkYellow'
+    if ($ApplyServiceAccountFilterTo1331) {
+        Write-Log "1331 scope skipped by service-account filter: $scope1331Skipped" 'DarkYellow'
+    }
 
     # 5) Second pass: SLOW PATH
     $scanned = 0
@@ -464,18 +524,19 @@ try {
             Write-Log "Progress (pass2): scanned $scanned / $($activityQueue.Count). Total1326=$($results1326.Count) Total1331=$($results1331.Count)" 'DarkGray'
         }
 
-        $acts = @()
-        try {
-            $acts = Get-ActivitiesSafe -AccountId $acct.id
-        } catch {
-            Write-Log ("Could not read activities for AccountID={0}: {1}" -f $acct.id, $_.Exception.Message) 'DarkYellow'
+        $acts = Get-ActivitiesSafe -AccountId $acct.id
+        if (-not $acts -or $acts.Count -eq 0) {
             continue
         }
 
         $matchedAct1326 = $false
         $matchedAct1331 = $false
+        $seen = 0
 
-        foreach ($act in ($acts | Select-Object -First $MaxActivitiesToInspect)) {
+        foreach ($act in $acts) {
+            $seen++
+            if ($seen -gt $MaxActivitiesToInspect) { break }
+
             if ($item.Need1326 -and -not $matchedAct1326) {
                 if (ActivityMatchesPattern -Activity $act -Regex $NeedleRegex1326) {
                     Add-MatchRow -Acct $acct `
