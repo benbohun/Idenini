@@ -1,753 +1,292 @@
+Generate a script to export safe and their parameters for  numberOfDaysRetention or numberOfVersionsRetention, 
+use the longin pattern below and generate a csv with safe, numberOfDaysRetention (True/False), or numberOfVersionsRetention (True/False)
+And show the action figure set of both parameter
+export to location I:\Script\IDENTITY Script New\csv\
+
 <#
-Audit_Reconcile_LinkedAccount_vs_Platform.ps1
+UpdateSafes_NumberOfDaysRetention_CCP.ps1
 
-PURPOSE
-- Find accounts that have a RECONCILE linked account at the account level
-  (IsDefaultFromPolicy = $false)
-- Compare that account-level reconcile link to the platform-level reconcile defaults
-  (ReconcileAccountSafe / ReconcileAccountName)
-- Export:
-    1) Full audit of every account-level reconcile link inspected
-    2) Non-conforming rows only
+AUTH (Automation)
+- CCP -> Service User credential
+- Auth to Privilege Cloud via Identity Shared Services
+  1) Primary: New-PASSession -IdentityTenantURL -PrivilegeCloudURL -Credential -ServiceUser
+  2) Fallback: Get-IdentityHeader -psPASFormat -PCloudSubdomain + Use-PASSession
 
-NON-CONFORMING DEFINITION
-- Reconcile linked account exists on the account
-- The link is NOT inherited from policy (IsDefaultFromPolicy = $false)
-- AND one of the following is true:
-    * Platform has no ReconcileAccountSafe / ReconcileAccountName
-    * Platform has only one of the two values (partial config)
-    * Platform has different Safe/Name than the account-level linked reconcile
-    * Platform value looks dynamic/rule-based and needs manual review
+CSV
+- Required: safeName
+- Optional: NumberOfDaysRetention (or retentionDays)
+- Optional: location, managingCPM, olacEnabled (only applied if present and not blank)
 
-OUTPUTS
-- Reconcile_Audit_Full_<timestamp>.csv
-- Reconcile_Audit_NonConforming_<timestamp>.csv
-- Reconcile_Audit_<timestamp>.log
 #>
 
-[CmdletBinding()]
+[CmdletBinding(SupportsShouldProcess=$true)]
 param(
-    [string]$OutputFolder = "I:\Script\IDENTITY Script New\csv",
+    # ===== Identity / Privilege Cloud =====
+    [string]$IdentityTenantURL  = "https://aak4521.my.idaptive.app",
+    [string]$PrivilegeCloudURL  = "https://alliantcredit.privilegecloud.cyberark.cloud",
 
-    # Page size used by Get-PASAccount
-    [ValidateRange(1,5000)]
-    [int]$AccountPageSize = 1000,
+    # ===== CCP settings (Service User stored in Vault) =====
+    [string]$CCPAddress         = "https://aam.alliantcreditunion.com",
+    [string]$CCPLocation        = "AIMWebService",
+    [string]$CCPAppID           = "ACURestAPI",
+    [string]$CCPSafe            = "ACU-VAULT-API",
+    [string]$CCPObject          = "Application-CyberArkVaultRestAPI-alliantcredit.cyberark.cloud",
+    [bool]  $CCPWindowsAuth     = $false,
 
-    # Fallback only. Script primarily detects reconcile by Descriptor.
-    # If Descriptor is empty, this value is used as the fallback linked slot.
-    [ValidateRange(1,3)]
-    [int]$ReconcileExtraPasswordIndex = 3,
+    # ===== Files =====
+    [string]$CsvFilePath        = "I:\Script\IDENTITY Script New\csv\UpdateRetention.csv",
+    [string]$LogFilePath        = "I:\Script\IDENTITY Script New\logs\UpdateRetention.txt",
 
-    # Optional: if used later, you can filter to a subset of platforms
-    [string[]]$PlatformIDFilter = @(),
-
-    # Optional: include inherited policy reconcile rows in FULL audit
-    [switch]$IncludeInheritedFromPolicy
+    # ===== Default retention if not in CSV =====
+    [int]$DefaultRetentionDays  = 180
 )
 
-# ---------------- BASELINE ----------------
+# --- Modules & TLS ---
+Import-Module psPAS -ErrorAction Stop
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $ErrorActionPreference = 'Stop'
-$ProgressPreference    = 'SilentlyContinue'
 
-# ---------------- OUTPUT / LOG ----------------
-if (-not (Test-Path -LiteralPath $OutputFolder)) {
-    New-Item -ItemType Directory -Path $OutputFolder -Force | Out-Null
-}
+# --- Pretty log helpers ---
+function Write-Info($m){ Write-Host "🛠  $m" -ForegroundColor Cyan }
+function Write-Ok($m){   Write-Host "✅ $m" -ForegroundColor Green }
+function Write-Warn($m){ Write-Host "⚠️  $m" -ForegroundColor Yellow }
+function Write-Err($m){  Write-Host "❌ $m" -ForegroundColor Red }
 
-$TimeStamp = Get-Date -Format "yyyyMMdd_HHmmss"
-$script:LogFile = Join-Path $OutputFolder ("Reconcile_Audit_{0}.log" -f $TimeStamp)
-
-function Write-Log {
+function Write-LogLine {
     param(
         [Parameter(Mandatory)][string]$Message,
-        [string]$Color = "White"
+        [ValidateSet('INFO','SUCCESS','WARN','ERROR')][string]$Level = 'INFO'
     )
-
-    $line = "{0} | {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Message
-
-    try { Add-Content -Path $script:LogFile -Value $line -Encoding UTF8 } catch {}
-    try { Write-Host $line -ForegroundColor $Color } catch { Write-Host $line }
+    $line = "{0} [{1}] {2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level, $Message
+    Write-Output $line
+    Add-Content -Path $LogFilePath -Value $line
 }
 
-# ---------------- LOAD psPAS ----------------
-try {
-    Import-Module psPAS -Force -ErrorAction Stop
-    $mod = Get-Module psPAS
-    Write-Log ("psPAS loaded ({0})." -f $mod.Version) "Green"
-}
-catch {
-    Write-Log ("ERROR: psPAS module not found/loaded: {0}" -f $_.Exception.Message) "Red"
-    exit 1
-}
-
-# ---------------- CCP + IDENTITY SETTINGS ----------------
-$CCPAddress      = "https://vskau1p1231.cna.com"
-$CCPLocation     = "AIMWebService"
-$CCPAppID        = "PAMDiscovery"
-$CCPSafe         = "CA_PCloud_Admins"
-$CCPObject       = "cna.com-CA_PAMDiscovery_SVC"
-$ServiceUPUser   = "CA_PAMDiscovery_SVC"
-$CCPWindowsAuth  = $false
-
-$IdentityTenantURL = "https://aat4012.id.cyberark.cloud"
-$PCloudSubdomain   = "cna-prod"
-
-# ---------------- HELPERS ----------------
-function Get-CaseInsensitiveMemberValue {
-    param(
-        [Parameter(Mandatory)]$InputObject,
-        [Parameter(Mandatory)][string[]]$Names
-    )
-
-    if ($null -eq $InputObject) { return $null }
-
-    if ($InputObject -is [System.Collections.IDictionary]) {
-        foreach ($n in $Names) {
-            foreach ($k in $InputObject.Keys) {
-                if ([string]$k -ieq $n) {
-                    return $InputObject[$k]
-                }
-            }
-        }
-        return $null
+function Get-HostFromUrl {
+    param([Parameter(Mandatory)][string]$Url)
+    try { return ([uri]$Url).Host } catch {
+        return ($Url -replace '^https?://','' -replace '/.*$','').Trim()
     }
-
-    $propNames = @($InputObject.PSObject.Properties.Name)
-    foreach ($n in $Names) {
-        $match = $propNames | Where-Object { $_ -ieq $n } | Select-Object -First 1
-        if ($match) {
-            return $InputObject.$match
-        }
-    }
-
-    return $null
 }
 
-function Convert-ToBool {
-    param($Value)
+function Get-PCloudSubdomainFromUrl {
+    param([Parameter(Mandatory)][string]$PrivilegeCloudURL)
 
-    if ($null -eq $Value) { return $false }
-    if ($Value -is [bool]) { return $Value }
+    # ✅ FIX: Do NOT use $host (conflicts with built-in $Host)
+    $pcloudHost = Get-HostFromUrl $PrivilegeCloudURL
 
-    $s = ([string]$Value).Trim()
-    if ($s -match '^(?i:true|yes|1)$')  { return $true  }
-    if ($s -match '^(?i:false|no|0)$')  { return $false }
-
-    try { return [bool]$Value } catch { return $false }
+    # host like: alliantcredit.privilegecloud.cyberark.cloud -> subdomain alliantcredit
+    return ($pcloudHost.Split('.')[0]).Trim()
 }
 
-function Compare-TextCI {
-    param(
-        [string]$A,
-        [string]$B
-    )
-
-    if ([string]::IsNullOrWhiteSpace($A) -and [string]::IsNullOrWhiteSpace($B)) { return $true }
-    if ([string]::IsNullOrWhiteSpace($A) -or  [string]::IsNullOrWhiteSpace($B)) { return $false }
-
-    return ($A.Trim()).Equals($B.Trim(), [System.StringComparison]::OrdinalIgnoreCase)
-}
-
-function Test-LooksLikeDynamicRule {
+function Convert-ToBoolOrNull {
     param([string]$Value)
-
-    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
-
-    $v = $Value.Trim()
-
-    # Heuristics only; if any hit, we flag for manual review instead of hard mismatch
-    if ($v -match '(?i)\b(rule|dynamic)\b') { return $true }
-    if ($v -match '<[^>]+>')               { return $true }
-    if ($v -match '\{[^}]+\}')             { return $true }
-    if ($v -match '\[[^\]]+\]')            { return $true }
-    if ($v -match '%[^%]+%')               { return $true }
-    if ($v -match '\$[A-Za-z0-9_]+')       { return $true }
-
-    return $false
-}
-
-function Find-FirstKeyValueDeep {
-    param(
-        $Node,
-        [Parameter(Mandatory)][string[]]$Names
-    )
-
-    if ($null -eq $Node) { return $null }
-    if ($Node -is [string]) { return $null }
-    if ($Node -is [ValueType]) { return $null }
-
-    # Direct dictionary lookup first
-    if ($Node -is [System.Collections.IDictionary]) {
-        foreach ($key in $Node.Keys) {
-            foreach ($n in $Names) {
-                if ([string]$key -ieq $n) {
-                    return $Node[$key]
-                }
-            }
-        }
-
-        foreach ($key in $Node.Keys) {
-            $found = Find-FirstKeyValueDeep -Node $Node[$key] -Names $Names
-            if ($null -ne $found -and -not [string]::IsNullOrWhiteSpace([string]$found)) {
-                return $found
-            }
-        }
-
-        return $null
-    }
-
-    # Direct PSCustomObject / object property lookup first
-    foreach ($prop in $Node.PSObject.Properties) {
-        foreach ($n in $Names) {
-            if ($prop.Name -ieq $n) {
-                return $prop.Value
-            }
-        }
-    }
-
-    # Recurse
-    foreach ($prop in $Node.PSObject.Properties) {
-        $value = $prop.Value
-        if ($null -eq $value) { continue }
-
-        if ($value -is [string] -or $value -is [ValueType]) { continue }
-
-        if ($value -is [System.Collections.IEnumerable] -and -not ($value -is [string])) {
-            foreach ($item in $value) {
-                $found = Find-FirstKeyValueDeep -Node $item -Names $Names
-                if ($null -ne $found -and -not [string]::IsNullOrWhiteSpace([string]$found)) {
-                    return $found
-                }
-            }
-        }
-        else {
-            $found = Find-FirstKeyValueDeep -Node $value -Names $Names
-            if ($null -ne $found -and -not [string]::IsNullOrWhiteSpace([string]$found)) {
-                return $found
-            }
-        }
-    }
-
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+    if ($Value -match '^(?i:true|yes|y|1)$')  { return $true }
+    if ($Value -match '^(?i:false|no|n|0)$') { return $false }
     return $null
 }
 
-function Get-TextKeyValueFromFolder {
-    param(
-        [Parameter(Mandatory)][string]$RootPath,
-        [Parameter(Mandatory)][string]$KeyName
-    )
-
-    if (-not (Test-Path -LiteralPath $RootPath)) { return $null }
-
-    $escapedKey = [regex]::Escape($KeyName)
-
-    $patterns = @(
-        "(?im)^\s*$escapedKey\s*=\s*(?<val>.+?)\s*$",
-        "(?im)^\s*$escapedKey\s*:\s*(?<val>.+?)\s*$",
-        "(?is)<$escapedKey>\s*(?<val>.*?)\s*</$escapedKey>"
-    )
-
-    $skipExt = @(".dll",".exe",".png",".jpg",".jpeg",".gif",".bmp",".ico",".zip",".jar",".class",".pdb")
-
-    $files = Get-ChildItem -Path $RootPath -Recurse -File -ErrorAction SilentlyContinue |
-        Where-Object {
-            ($skipExt -notcontains $_.Extension.ToLowerInvariant()) -and
-            $_.Length -lt 5MB
-        }
-
-    foreach ($file in $files) {
-        try {
-            $raw = Get-Content -Path $file.FullName -Raw -ErrorAction Stop
-            if ([string]::IsNullOrWhiteSpace($raw)) { continue }
-
-            foreach ($pattern in $patterns) {
-                $m = [regex]::Match($raw, $pattern)
-                if ($m.Success) {
-                    return $m.Groups["val"].Value.Trim()
-                }
-            }
-        }
-        catch {
-            # Skip unreadable/binary-ish files
-        }
-    }
-
+function Convert-ToIntOrNull {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+    $out = 0
+    if ([int]::TryParse($Value.Trim(), [ref]$out)) { return $out }
     return $null
 }
 
-function Start-PASSessionFromCCP {
+# --- CCP -> PSCredential ---
+function Get-ServiceUserCredentialFromCCP {
+    [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][string]$ObjectName,
-        [Parameter(Mandatory)][string]$UPUser
+        [Parameter(Mandatory)][string]$CCPAddress,
+        [Parameter(Mandatory)][string]$Location,
+        [Parameter(Mandatory)][string]$AppID,
+        [Parameter(Mandatory)][string]$Safe,
+        [Parameter(Mandatory)][string]$Object,
+        [bool]$WindowsAuth = $false
     )
 
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $base = $CCPAddress.TrimEnd('/')
+    $loc  = $Location.Trim('/')
+
+    $url  = "{0}/{1}/api/Accounts?AppID={2}&Safe={3}&Object={4}" -f $base, $loc, $AppID, $Safe, $Object
+
+    Write-Info "Retrieving Service User credential from CCP..."
+    Write-Info "  $url"
 
     $headers = @{ "Content-Type" = "application/json" }
-    $ccpUrl  = "{0}/{1}/api/Accounts?AppID={2}&Safe={3}&Object={4}" -f `
-        $CCPAddress.TrimEnd('/'),
-        $CCPLocation.Trim('/'),
-        $CCPAppID,
-        $CCPSafe,
-        $ObjectName
+    $resp = Invoke-RestMethod -Uri $url -Method GET -Headers $headers -UseDefaultCredentials:$WindowsAuth -ErrorAction Stop
 
-    Write-Log "Retrieving API credentials from CCP..." "Cyan"
-    Write-Log ("CCP URL: {0}" -f $ccpUrl) "Gray"
-
-    $resp = Invoke-RestMethod -Uri $ccpUrl -Method GET -Headers $headers -UseDefaultCredentials:$CCPWindowsAuth -ErrorAction Stop
-    if (-not $resp -or -not $resp.Content) {
-        throw "Empty CCP response (missing Content)."
+    if (-not $resp.UserName -or -not $resp.Content) {
+        throw "CCP response missing UserName/Content."
     }
 
-    Write-Log ("CCP secret retrieved successfully for: {0}" -f $UPUser) "Green"
-
-    $UPPass = ConvertTo-SecureString $resp.Content -AsPlainText -Force
-    $UPCred = [PSCredential]::new($UPUser, $UPPass)
-
-    Write-Log ("Authenticating to Privilege Cloud via Identity header as {0}..." -f $UPUser) "Cyan"
-
-    $headerSession = Get-IdentityHeader `
-        -IdentityTenantURL $IdentityTenantURL `
-        -psPASFormat `
-        -PCloudSubdomain $PCloudSubdomain `
-        -UPCreds $UPCred
-
-    Use-PASSession $headerSession
-
-    if (-not (Get-PASSession)) {
-        throw "psPAS session not established."
-    }
-
-    Write-Log ("PAS session established ({0})." -f $UPUser) "Green"
+    Write-Ok "CCP returned service user: $($resp.UserName)"
+    $sec = ConvertTo-SecureString $resp.Content -AsPlainText -Force
+    return [PSCredential]::new($resp.UserName, $sec)
 }
 
-function Get-PlatformDetails {
+# --- Auth helper: Primary (New-PASSession), Fallback (Get-IdentityHeader/Use-PASSession) ---
+function Connect-PCloudWithServiceUser {
+    [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][string]$PlatformID
+        [Parameter(Mandatory)][string]$IdentityTenantURL,
+        [Parameter(Mandatory)][string]$PrivilegeCloudURL,
+        [Parameter(Mandatory)][pscredential]$ServiceCred
     )
 
-    $s = Get-PASSession
-    if (-not $s -or -not $s.WebSession) {
-        throw "No psPAS WebSession found. Auth failed or session not set."
-    }
+    # Normalize Identity tenant host for fallback Get-IdentityHeader
+    $tenantHost = Get-HostFromUrl $IdentityTenantURL
+    $subdomain  = Get-PCloudSubdomainFromUrl $PrivilegeCloudURL
 
-    $encodedPlatformID = [uri]::EscapeDataString($PlatformID)
-
-    # Trailing slash helps when the platform name contains dots
-    $u1 = "https://{0}.privilegecloud.cyberark.cloud/PasswordVault/API/Platforms/{1}/" -f $PCloudSubdomain, $encodedPlatformID
-    $u2 = "https://{0}.privilegecloud.cyberark.cloud/PasswordVault/api/Platforms/{1}/" -f $PCloudSubdomain, $encodedPlatformID
-
+    Write-Info "Attempting login (Primary): New-PASSession (ServiceUser)..."
     try {
-        return Invoke-RestMethod -Uri $u1 -Method GET -WebSession $s.WebSession -ErrorAction Stop
+        New-PASSession `
+            -IdentityTenantURL $IdentityTenantURL `
+            -PrivilegeCloudURL $PrivilegeCloudURL `
+            -Credential        $ServiceCred `
+            -ServiceUser `
+            -ErrorAction Stop | Out-Null
+
+        $sess = Get-PASSession
+        if (-not $sess) { throw "Get-PASSession returned null after New-PASSession." }
+
+        Write-Ok "Authenticated (Primary) to $PrivilegeCloudURL as $($ServiceCred.UserName)"
+        return
     }
     catch {
-        return Invoke-RestMethod -Uri $u2 -Method GET -WebSession $s.WebSession -ErrorAction Stop
-    }
-}
+        Write-Warn "Primary login failed: $($_.Exception.Message)"
+        Write-Info "Attempting login (Fallback): Get-IdentityHeader + Use-PASSession..."
 
-function Get-PlatformExportZip {
-    param(
-        [Parameter(Mandatory)][string]$PlatformID
-    )
-
-    $s = Get-PASSession
-    if (-not $s -or -not $s.WebSession) {
-        throw "No psPAS WebSession found. Auth failed or session not set."
-    }
-
-    $encodedPlatformID = [uri]::EscapeDataString($PlatformID)
-
-    $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("CA_PlatformExport_" + [guid]::NewGuid().ToString("N"))
-    $null = New-Item -ItemType Directory -Path $tempRoot -Force
-    $zipPath = Join-Path $tempRoot ($PlatformID + ".zip")
-
-    $u1 = "https://{0}.privilegecloud.cyberark.cloud/PasswordVault/API/Platforms/{1}/Export/" -f $PCloudSubdomain, $encodedPlatformID
-    $u2 = "https://{0}.privilegecloud.cyberark.cloud/PasswordVault/api/Platforms/{1}/Export/" -f $PCloudSubdomain, $encodedPlatformID
-
-    try {
-        Invoke-WebRequest -Uri $u1 -Method POST -WebSession $s.WebSession -OutFile $zipPath -ErrorAction Stop | Out-Null
-    }
-    catch {
-        Invoke-WebRequest -Uri $u2 -Method POST -WebSession $s.WebSession -OutFile $zipPath -ErrorAction Stop | Out-Null
-    }
-
-    if (-not (Test-Path -LiteralPath $zipPath)) {
-        throw "Platform export did not produce a ZIP file."
-    }
-
-    return $zipPath
-}
-
-$script:PlatformCache = @{}
-
-function Get-PlatformReconcileDefaults {
-    param(
-        [Parameter(Mandatory)][string]$PlatformID
-    )
-
-    if ($script:PlatformCache.ContainsKey($PlatformID)) {
-        return $script:PlatformCache[$PlatformID]
-    }
-
-    $result = [ordered]@{
-        PlatformID              = $PlatformID
-        PlatformName            = $null
-        PlatformActive          = $null
-        ReconcileAccountSafe    = $null
-        ReconcileAccountName    = $null
-        ReconcileAccountFolder  = $null
-        Source                  = "None"
-        LookupStatus            = "NotFound"
-        LookupError             = $null
-    }
-
-    # Attempt 1: platform details API object
-    try {
-        $details = Get-PlatformDetails -PlatformID $PlatformID
-
-        $result.PlatformName   = Get-CaseInsensitiveMemberValue $details @("name","platformName")
-        $result.PlatformActive = Get-CaseInsensitiveMemberValue $details @("active","isActive")
-
-        $apiSafe   = Find-FirstKeyValueDeep -Node $details -Names @("ReconcileAccountSafe")
-        $apiName   = Find-FirstKeyValueDeep -Node $details -Names @("ReconcileAccountName")
-        $apiFolder = Find-FirstKeyValueDeep -Node $details -Names @("ReconcileAccountFolder")
-
-        if (-not [string]::IsNullOrWhiteSpace([string]$apiSafe) -or
-            -not [string]::IsNullOrWhiteSpace([string]$apiName) -or
-            -not [string]::IsNullOrWhiteSpace([string]$apiFolder)) {
-
-            $result.ReconcileAccountSafe   = [string]$apiSafe
-            $result.ReconcileAccountName   = [string]$apiName
-            $result.ReconcileAccountFolder = [string]$apiFolder
-            $result.Source                 = "PlatformDetails"
-            $result.LookupStatus           = "Found"
+        $cmd = Get-Command Get-IdentityHeader -ErrorAction SilentlyContinue
+        if (-not $cmd) {
+            throw "Fallback login not available (Get-IdentityHeader not found). Primary login failed."
         }
-    }
-    catch {
-        $result.LookupError = $_.Exception.Message
-    }
 
-    # Attempt 2: exported platform package (strong fallback)
-    if ([string]::IsNullOrWhiteSpace([string]$result.ReconcileAccountSafe) -and
-        [string]::IsNullOrWhiteSpace([string]$result.ReconcileAccountName) -and
-        [string]::IsNullOrWhiteSpace([string]$result.ReconcileAccountFolder)) {
+        $header = Get-IdentityHeader `
+            -IdentityTenantURL $tenantHost `
+            -psPASFormat `
+            -PCloudSubdomain $subdomain `
+            -UPCreds $ServiceCred
 
-        $tempRoot = $null
-        try {
-            $zipPath   = Get-PlatformExportZip -PlatformID $PlatformID
-            $tempRoot  = Split-Path -Path $zipPath -Parent
-            $expandDir = Join-Path $tempRoot "expanded"
+        Use-PASSession $header
 
-            Expand-Archive -Path $zipPath -DestinationPath $expandDir -Force
+        $sess2 = Get-PASSession
+        if (-not $sess2) { throw "Get-PASSession returned null after Use-PASSession." }
 
-            $zipSafe   = Get-TextKeyValueFromFolder -RootPath $expandDir -KeyName "ReconcileAccountSafe"
-            $zipName   = Get-TextKeyValueFromFolder -RootPath $expandDir -KeyName "ReconcileAccountName"
-            $zipFolder = Get-TextKeyValueFromFolder -RootPath $expandDir -KeyName "ReconcileAccountFolder"
-
-            if (-not [string]::IsNullOrWhiteSpace($zipSafe) -or
-                -not [string]::IsNullOrWhiteSpace($zipName) -or
-                -not [string]::IsNullOrWhiteSpace($zipFolder)) {
-
-                $result.ReconcileAccountSafe   = $zipSafe
-                $result.ReconcileAccountName   = $zipName
-                $result.ReconcileAccountFolder = $zipFolder
-                $result.Source                 = "PlatformExportZip"
-                $result.LookupStatus           = "Found"
-            }
-        }
-        catch {
-            if ([string]::IsNullOrWhiteSpace($result.LookupError)) {
-                $result.LookupError = $_.Exception.Message
-            }
-            else {
-                $result.LookupError = $result.LookupError + " | " + $_.Exception.Message
-            }
-        }
-        finally {
-            if ($tempRoot -and (Test-Path -LiteralPath $tempRoot)) {
-                try { Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue } catch {}
-            }
-        }
-    }
-
-    if (-not $result.PlatformName) {
-        $result.PlatformName = $PlatformID
-    }
-
-    $obj = [PSCustomObject]$result
-    $script:PlatformCache[$PlatformID] = $obj
-    return $obj
-}
-
-function Get-ReconcileLinkedAccount {
-    param(
-        [Parameter(Mandatory)][string]$AccountID,
-        [ValidateRange(1,3)][int]$FallbackExtraPasswordIndex = 3
-    )
-
-    try {
-        $linked = @(Get-PASLinkedAccount -id $AccountID -ErrorAction Stop)
-    }
-    catch {
-        return $null
-    }
-
-    if (-not $linked -or $linked.Count -eq 0) {
-        return $null
-    }
-
-    # Primary detection = Descriptor says Reconcile
-    $byDescriptor = $linked | Where-Object {
-        $descriptor = [string](Get-CaseInsensitiveMemberValue $_ @("Descriptor"))
-        $descriptor -match '(?i)reconcile'
-    } | Select-Object -First 1
-
-    if ($byDescriptor) { return $byDescriptor }
-
-    # Fallback detection = configured extraPasswordIndex
-    $byIndex = $linked | Where-Object {
-        $idx = Get-CaseInsensitiveMemberValue $_ @("extraPasswordIndex","ExtraPasswordIndex")
-        try { [int]$idx -eq $FallbackExtraPasswordIndex } catch { $false }
-    } | Select-Object -First 1
-
-    return $byIndex
-}
-
-function Write-CsvWithHeader {
-    param(
-        [Parameter(Mandatory)]$Rows,
-        [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][pscustomobject]$Template
-    )
-
-    $count = 0
-    try { $count = $Rows.Count } catch { $count = @($Rows).Count }
-
-    if ($count -gt 0) {
-        $Rows | Export-Csv -Path $Path -NoTypeInformation -Encoding UTF8
-    }
-    else {
-        $header = ($Template | ConvertTo-Csv -NoTypeInformation)[0]
-        Set-Content -Path $Path -Value $header -Encoding UTF8
+        Write-Ok "Authenticated (Fallback) to $PrivilegeCloudURL as $($ServiceCred.UserName)"
+        return
     }
 }
 
-# ---------------- MAIN ----------------
-$fullRows      = New-Object System.Collections.Generic.List[object]
-$exceptionRows = New-Object System.Collections.Generic.List[object]
-
-$templateRow = [PSCustomObject][ordered]@{
-    AccountID                    = ""
-    AccountName                  = ""
-    UserName                     = ""
-    Address                      = ""
-    SafeName                     = ""
-    PlatformID                   = ""
-    PlatformName                 = ""
-    LinkedDescriptor             = ""
-    LinkedExtraPasswordIndex     = ""
-    LinkedAccountID              = ""
-    LinkedAccountSafe            = ""
-    LinkedAccountFolder          = ""
-    LinkedAccountName            = ""
-    LinkedIsDefaultFromPolicy    = ""
-    PlatformReconcileSafe        = ""
-    PlatformReconcileFolder      = ""
-    PlatformReconcileName        = ""
-    PlatformLookupSource         = ""
-    PlatformLookupStatus         = ""
-    PlatformLookupError          = ""
-    ComparisonResult             = ""
-    NonConforming                = ""
-    NonConformingReason          = ""
-}
+# ============================
+# MAIN
+# ============================
+$sessionCreated = $false
 
 try {
-    Start-PASSessionFromCCP -ObjectName $CCPObject -UPUser $ServiceUPUser
+    New-Item -ItemType File -Path $LogFilePath -Force | Out-Null
+    Write-LogLine "Starting retention update run." "INFO"
 
-    Write-Log ("Retrieving accounts (page size: {0})..." -f $AccountPageSize) "Cyan"
-    $accounts = Get-PASAccount -limit $AccountPageSize -ErrorAction Stop
+    if (-not (Test-Path $CsvFilePath)) {
+        throw "CSV not found: $CsvFilePath"
+    }
 
-    $processed = 0
-    $inspected = 0
-    $foundWithReconcile = 0
+    # 1) Get service user from CCP
+    $serviceCred = Get-ServiceUserCredentialFromCCP `
+        -CCPAddress $CCPAddress `
+        -Location   $CCPLocation `
+        -AppID      $CCPAppID `
+        -Safe       $CCPSafe `
+        -Object     $CCPObject `
+        -WindowsAuth:$CCPWindowsAuth
 
-    foreach ($acct in $accounts) {
-        $processed++
+    # 2) Login using service user automation
+    Connect-PCloudWithServiceUser -IdentityTenantURL $IdentityTenantURL -PrivilegeCloudURL $PrivilegeCloudURL -ServiceCred $serviceCred
+    $sessionCreated = $true
+    Write-LogLine "Authenticated successfully." "SUCCESS"
 
-        $accountId   = [string](Get-CaseInsensitiveMemberValue $acct @("id","AccountID"))
-        $accountName = [string](Get-CaseInsensitiveMemberValue $acct @("name","AccountName"))
-        $userName    = [string](Get-CaseInsensitiveMemberValue $acct @("userName","UserName"))
-        $address     = [string](Get-CaseInsensitiveMemberValue $acct @("address","Address"))
-        $safeName    = [string](Get-CaseInsensitiveMemberValue $acct @("safeName","Safe","safe"))
-        $platformId  = [string](Get-CaseInsensitiveMemberValue $acct @("platformId","PlatformID"))
+    # 3) Load CSV rows
+    $rows = Import-Csv -Path $CsvFilePath
+    if (-not $rows -or $rows.Count -eq 0) {
+        throw "CSV '$CsvFilePath' has no rows."
+    }
+    Write-LogLine "Loaded $($rows.Count) row(s) from CSV." "INFO"
 
-        if ([string]::IsNullOrWhiteSpace($accountId)) { continue }
-        if ([string]::IsNullOrWhiteSpace($platformId)) { continue }
+    # 4) Update safes
+    foreach ($row in $rows) {
+        try {
+            if ([string]::IsNullOrWhiteSpace($row.safeName)) {
+                throw "safeName cannot be empty."
+            }
 
-        if ($PlatformIDFilter -and $PlatformIDFilter.Count -gt 0) {
-            if ($PlatformIDFilter -notcontains $platformId) { continue }
+            $safeName = $row.safeName.Trim()
+
+            # Retention from CSV or default
+            $retention = $null
+            if ($row.PSObject.Properties.Name -contains 'NumberOfDaysRetention') {
+                $retention = Convert-ToIntOrNull $row.NumberOfDaysRetention
+            } elseif ($row.PSObject.Properties.Name -contains 'retentionDays') {
+                $retention = Convert-ToIntOrNull $row.retentionDays
+            }
+            if (-not $retention) { $retention = $DefaultRetentionDays }
+
+            # Optional fields (only applied if non-empty)
+            $location    = $null
+            $managingCPM = $null
+            $olac        = $null
+
+            if ($row.PSObject.Properties.Name -contains 'location' -and -not [string]::IsNullOrWhiteSpace($row.location)) {
+                $location = $row.location.Trim()
+            }
+            if ($row.PSObject.Properties.Name -contains 'managingCPM' -and -not [string]::IsNullOrWhiteSpace($row.managingCPM)) {
+                $managingCPM = $row.managingCPM.Trim()
+            }
+            if ($row.PSObject.Properties.Name -contains 'olacEnabled') {
+                $olac = Convert-ToBoolOrNull $row.olacEnabled
+            }
+
+            $params = @{
+                SafeName              = $safeName
+                NumberOfDaysRetention = $retention
+                ErrorAction           = 'Stop'
+            }
+
+            if ($location)       { $params['Location']    = $location }
+            if ($managingCPM)    { $params['ManagingCPM'] = $managingCPM }
+            if ($null -ne $olac) { $params['OLACEnabled'] = $olac }
+
+            if ($PSCmdlet.ShouldProcess($safeName, "Set-PASSafe")) {
+                Set-PASSafe @params | Out-Null
+            }
+
+            $msg = "Safe '$safeName' updated. NumberOfDaysRetention=$retention" +
+                   ($(if ($location) { ", Location='$location'" } else { "" })) +
+                   ($(if ($managingCPM) { ", ManagingCPM='$managingCPM'" } else { "" })) +
+                   ($(if ($null -ne $olac) { ", OLACEnabled=$olac" } else { "" }))
+
+            Write-LogLine $msg "SUCCESS"
         }
-
-        if (($processed % 500) -eq 0) {
-            Write-Log ("Progress: processed {0} accounts..." -f $processed) "Gray"
-        }
-
-        $reconcileLinked = Get-ReconcileLinkedAccount -AccountID $accountId -FallbackExtraPasswordIndex $ReconcileExtraPasswordIndex
-        if (-not $reconcileLinked) { continue }
-
-        $foundWithReconcile++
-
-        $linkedDescriptor = [string](Get-CaseInsensitiveMemberValue $reconcileLinked @("Descriptor"))
-        $linkedIndex      = [string](Get-CaseInsensitiveMemberValue $reconcileLinked @("extraPasswordIndex","ExtraPasswordIndex"))
-        $linkedId         = [string](Get-CaseInsensitiveMemberValue $reconcileLinked @("id","ID","AccountID","accountID"))
-        $linkedSafe       = [string](Get-CaseInsensitiveMemberValue $reconcileLinked @("safe","Safe","safeName","SafeName"))
-        $linkedFolder     = [string](Get-CaseInsensitiveMemberValue $reconcileLinked @("folder","Folder"))
-        $linkedName       = [string](Get-CaseInsensitiveMemberValue $reconcileLinked @("name","Name"))
-        $linkedDefault    = Convert-ToBool (Get-CaseInsensitiveMemberValue $reconcileLinked @("IsDefaultFromPolicy","isDefaultFromPolicy"))
-
-        if (-not $IncludeInheritedFromPolicy -and $linkedDefault) {
-            # Skip inherited policy rows unless requested
+        catch {
+            Write-LogLine "Failed to update safe '$($row.safeName)'. Error: $($_.Exception.Message)" "ERROR"
             continue
         }
-
-        $inspected++
-
-        $plat = Get-PlatformReconcileDefaults -PlatformID $platformId
-
-        $platSafe   = [string]$plat.ReconcileAccountSafe
-        $platFolder = [string]$plat.ReconcileAccountFolder
-        $platName   = [string]$plat.ReconcileAccountName
-
-        $platformHasNothing = [string]::IsNullOrWhiteSpace($platSafe) -and [string]::IsNullOrWhiteSpace($platName)
-        $platformPartial    = (
-            ([string]::IsNullOrWhiteSpace($platSafe) -and -not [string]::IsNullOrWhiteSpace($platName)) -or
-            (-not [string]::IsNullOrWhiteSpace($platSafe) -and [string]::IsNullOrWhiteSpace($platName))
-        )
-
-        $dynamicRuleDetected = (Test-LooksLikeDynamicRule $platSafe) -or (Test-LooksLikeDynamicRule $platName)
-
-        $safeMatches = Compare-TextCI $linkedSafe $platSafe
-        $nameMatches = Compare-TextCI $linkedName $platName
-        $exactMatch  = $safeMatches -and $nameMatches
-
-        $comparisonResult   = $null
-        $nonConforming      = $false
-        $nonConformingReason = $null
-
-        if ($linkedDefault) {
-            if ($platformHasNothing) {
-                $comparisonResult    = "InheritedFlagTrue_ButPlatformMissing"
-                $nonConforming       = $true
-                $nonConformingReason = "Linked object shows IsDefaultFromPolicy=True, but platform reconcile defaults were not found."
-            }
-            elseif ($dynamicRuleDetected) {
-                $comparisonResult    = "InheritedFromDynamicRule_ManualReview"
-                $nonConforming       = $false
-                $nonConformingReason = ""
-            }
-            elseif ($platformPartial) {
-                $comparisonResult    = "InheritedFlagTrue_ButPlatformPartial"
-                $nonConforming       = $true
-                $nonConformingReason = "Platform has only partial reconcile default configuration."
-            }
-            elseif ($exactMatch) {
-                $comparisonResult    = "InheritedFromPlatform"
-                $nonConforming       = $false
-                $nonConformingReason = ""
-            }
-            else {
-                $comparisonResult    = "InheritedFlagTrue_ButResolvedValuesDiffer"
-                $nonConforming       = $true
-                $nonConformingReason = "Linked object is marked as inherited, but linked reconcile safe/name differs from platform defaults."
-            }
-        }
-        else {
-            if ($platformHasNothing) {
-                $comparisonResult    = "PlatformMissingReconcileDefault"
-                $nonConforming       = $true
-                $nonConformingReason = "Account has account-level reconcile link, but platform has no ReconcileAccountSafe/ReconcileAccountName."
-            }
-            elseif ($dynamicRuleDetected) {
-                $comparisonResult    = "DynamicRuleManualReview"
-                $nonConforming       = $true
-                $nonConformingReason = "Platform reconcile default appears rule-based/dynamic; exact literal comparison was not forced."
-            }
-            elseif ($platformPartial) {
-                $comparisonResult    = "PlatformPartialReconcileDefault"
-                $nonConforming       = $true
-                $nonConformingReason = "Platform has only one of ReconcileAccountSafe/ReconcileAccountName."
-            }
-            elseif ($exactMatch) {
-                $comparisonResult    = "AccountOverrideMatchesPlatform"
-                $nonConforming       = $false
-                $nonConformingReason = ""
-            }
-            else {
-                $comparisonResult    = "AccountOverrideDiffersFromPlatform"
-                $nonConforming       = $true
-                $nonConformingReason = "Account-level reconcile linked account differs from platform-level reconcile default."
-            }
-        }
-
-        $row = [PSCustomObject][ordered]@{
-            AccountID                    = $accountId
-            AccountName                  = $accountName
-            UserName                     = $userName
-            Address                      = $address
-            SafeName                     = $safeName
-            PlatformID                   = $platformId
-            PlatformName                 = [string]$plat.PlatformName
-            LinkedDescriptor             = $linkedDescriptor
-            LinkedExtraPasswordIndex     = $linkedIndex
-            LinkedAccountID              = $linkedId
-            LinkedAccountSafe            = $linkedSafe
-            LinkedAccountFolder          = $linkedFolder
-            LinkedAccountName            = $linkedName
-            LinkedIsDefaultFromPolicy    = [string]$linkedDefault
-            PlatformReconcileSafe        = $platSafe
-            PlatformReconcileFolder      = $platFolder
-            PlatformReconcileName        = $platName
-            PlatformLookupSource         = [string]$plat.Source
-            PlatformLookupStatus         = [string]$plat.LookupStatus
-            PlatformLookupError          = [string]$plat.LookupError
-            ComparisonResult             = $comparisonResult
-            NonConforming                = [string]$nonConforming
-            NonConformingReason          = $nonConformingReason
-        }
-
-        $fullRows.Add($row)
-
-        if ($nonConforming) {
-            $exceptionRows.Add($row)
-        }
     }
 
-    $fullCsv = Join-Path $OutputFolder ("Reconcile_Audit_Full_{0}.csv" -f $TimeStamp)
-    $badCsv  = Join-Path $OutputFolder ("Reconcile_Audit_NonConforming_{0}.csv" -f $TimeStamp)
-
-    Write-CsvWithHeader -Rows $fullRows -Path $fullCsv -Template $templateRow
-    Write-CsvWithHeader -Rows $exceptionRows -Path $badCsv -Template $templateRow
-
-    Write-Log ("Accounts processed total: {0}" -f $processed) "Green"
-    Write-Log ("Accounts with reconcile link found: {0}" -f $foundWithReconcile) "Green"
-    Write-Log ("Rows inspected/exported to FULL audit: {0}" -f $fullRows.Count) "Green"
-    Write-Log ("Non-conforming rows: {0}" -f $exceptionRows.Count) "Yellow"
-    Write-Log ("Full audit CSV: {0}" -f $fullCsv) "Cyan"
-    Write-Log ("Non-conforming CSV: {0}" -f $badCsv) "Cyan"
-    Write-Log ("Log file: {0}" -f $script:LogFile) "Cyan"
+    Write-LogLine "Completed processing all rows." "SUCCESS"
 }
 catch {
-    Write-Log ("FATAL ERROR: {0}" -f $_.Exception.Message) "Red"
-    throw
+    Write-LogLine "Fatal error: $($_.Exception.Message)" "ERROR"
+    Write-Err $_.Exception.Message
 }
 finally {
-    try {
-        Close-PASSession | Out-Null
-        Write-Log "PAS session closed." "Gray"
-    }
-    catch {
-        # Ignore close errors
+    if ($sessionCreated) {
+        try {
+            Close-PASSession | Out-Null
+            Write-LogLine "Logged off." "INFO"
+        } catch {
+            Write-LogLine "Logoff warning: $($_.Exception.Message)" "WARN"
+        }
     }
 }
