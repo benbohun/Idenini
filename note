@@ -1,5 +1,5 @@
 <#
-UpdateSafes_NumberOfDaysRetention_CCP.ps1
+UpdateSafes_NumberOfDaysRetention_AllSafes_CCP.ps1
 
 AUTH (Automation)
 - CCP -> Service User credential
@@ -7,14 +7,16 @@ AUTH (Automation)
   1) Primary: New-PASSession -IdentityTenantURL -PrivilegeCloudURL -Credential -ServiceUser
   2) Fallback: Get-IdentityHeader -psPASFormat -PCloudSubdomain + Use-PASSession
 
-CSV
-- Required: safeName
-- Optional: NumberOfDaysRetention (or retentionDays)
-- Optional: location, managingCPM, olacEnabled (only applied if present and not blank)
+ACTION
+- Sets NumberOfDaysRetention = 60 for ALL safes in the environment
+- No CSV required
+- Only outputs safes that FAILED to update (also logged)
 
+LOG
+- I:\Script\IDENTITY Script New\logs\UpdateRetention_AllSafes.txt
 #>
 
-[CmdletBinding(SupportsShouldProcess=$true)]
+[CmdletBinding(SupportsShouldProcess = $true)]
 param(
     # ===== Identity / Privilege Cloud =====
     [string]$IdentityTenantURL  = "https://aak4521.my.idaptive.app",
@@ -28,24 +30,31 @@ param(
     [string]$CCPObject          = "Application-CyberArkVaultRestAPI-alliantcredit.cyberark.cloud",
     [bool]  $CCPWindowsAuth     = $false,
 
-    # ===== Files =====
-    [string]$CsvFilePath        = "I:\Script\IDENTITY Script New\csv\UpdateRetention.csv",
-    [string]$LogFilePath        = "I:\Script\IDENTITY Script New\logs\UpdateRetention.txt",
+    # ===== Target retention for ALL safes =====
+    [ValidateRange(1,3650)]
+    [int]$TargetRetentionDays   = 60,
 
-    # ===== Default retention if not in CSV =====
-    [int]$DefaultRetentionDays  = 180
+    # ===== Logging =====
+    [string]$LogFilePath        = "I:\Script\IDENTITY Script New\logs\UpdateRetention_AllSafes.txt",
+
+    # ===== Paging fallback (API) =====
+    [ValidateRange(50,2000)]
+    [int]$PageSize              = 500
 )
 
 # --- Modules & TLS ---
 Import-Module psPAS -ErrorAction Stop
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $ErrorActionPreference = 'Stop'
+$ProgressPreference    = 'SilentlyContinue'
 
-# --- Pretty log helpers ---
-function Write-Info($m){ Write-Host "🛠  $m" -ForegroundColor Cyan }
-function Write-Ok($m){   Write-Host "✅ $m" -ForegroundColor Green }
-function Write-Warn($m){ Write-Host "⚠️  $m" -ForegroundColor Yellow }
-function Write-Err($m){  Write-Host "❌ $m" -ForegroundColor Red }
+# --- Minimal console output: only failures (and one header line) ---
+function Write-Err($m){ Write-Host "❌ $m" -ForegroundColor Red }
+
+function Ensure-Directory {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path $Path)) { New-Item -ItemType Directory -Path $Path -Force | Out-Null }
+}
 
 function Write-LogLine {
     param(
@@ -53,7 +62,6 @@ function Write-LogLine {
         [ValidateSet('INFO','SUCCESS','WARN','ERROR')][string]$Level = 'INFO'
     )
     $line = "{0} [{1}] {2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level, $Message
-    Write-Output $line
     Add-Content -Path $LogFilePath -Value $line
 }
 
@@ -67,26 +75,19 @@ function Get-HostFromUrl {
 function Get-PCloudSubdomainFromUrl {
     param([Parameter(Mandatory)][string]$PrivilegeCloudURL)
 
-    # ✅ FIX: Do NOT use $host (conflicts with built-in $Host)
+    # ✅ Do NOT use $host (conflicts with built-in $Host)
     $pcloudHost = Get-HostFromUrl $PrivilegeCloudURL
-
-    # host like: alliantcredit.privilegecloud.cyberark.cloud -> subdomain alliantcredit
     return ($pcloudHost.Split('.')[0]).Trim()
 }
 
-function Convert-ToBoolOrNull {
-    param([string]$Value)
-    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
-    if ($Value -match '^(?i:true|yes|y|1)$')  { return $true }
-    if ($Value -match '^(?i:false|no|n|0)$') { return $false }
-    return $null
-}
-
-function Convert-ToIntOrNull {
-    param([string]$Value)
-    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
-    $out = 0
-    if ([int]::TryParse($Value.Trim(), [ref]$out)) { return $out }
+function Get-PropValueCI {
+    param(
+        [Parameter(Mandatory)]$Object,
+        [Parameter(Mandatory)][string]$PropName
+    )
+    if ($null -eq $Object) { return $null }
+    $p = $Object.PSObject.Properties | Where-Object { $_.Name -ieq $PropName } | Select-Object -First 1
+    if ($p) { return $p.Value }
     return $null
 }
 
@@ -107,8 +108,7 @@ function Get-ServiceUserCredentialFromCCP {
 
     $url  = "{0}/{1}/api/Accounts?AppID={2}&Safe={3}&Object={4}" -f $base, $loc, $AppID, $Safe, $Object
 
-    Write-Info "Retrieving Service User credential from CCP..."
-    Write-Info "  $url"
+    Write-LogLine "Retrieving Service User credential from CCP: $url" "INFO"
 
     $headers = @{ "Content-Type" = "application/json" }
     $resp = Invoke-RestMethod -Uri $url -Method GET -Headers $headers -UseDefaultCredentials:$WindowsAuth -ErrorAction Stop
@@ -117,7 +117,7 @@ function Get-ServiceUserCredentialFromCCP {
         throw "CCP response missing UserName/Content."
     }
 
-    Write-Ok "CCP returned service user: $($resp.UserName)"
+    Write-LogLine "CCP returned service user: $($resp.UserName)" "SUCCESS"
     $sec = ConvertTo-SecureString $resp.Content -AsPlainText -Force
     return [PSCredential]::new($resp.UserName, $sec)
 }
@@ -131,11 +131,10 @@ function Connect-PCloudWithServiceUser {
         [Parameter(Mandatory)][pscredential]$ServiceCred
     )
 
-    # Normalize Identity tenant host for fallback Get-IdentityHeader
     $tenantHost = Get-HostFromUrl $IdentityTenantURL
     $subdomain  = Get-PCloudSubdomainFromUrl $PrivilegeCloudURL
 
-    Write-Info "Attempting login (Primary): New-PASSession (ServiceUser)..."
+    Write-LogLine "Attempting login (Primary): New-PASSession (ServiceUser)..." "INFO"
     try {
         New-PASSession `
             -IdentityTenantURL $IdentityTenantURL `
@@ -147,12 +146,12 @@ function Connect-PCloudWithServiceUser {
         $sess = Get-PASSession
         if (-not $sess) { throw "Get-PASSession returned null after New-PASSession." }
 
-        Write-Ok "Authenticated (Primary) to $PrivilegeCloudURL as $($ServiceCred.UserName)"
+        Write-LogLine "Authenticated (Primary) to $PrivilegeCloudURL as $($ServiceCred.UserName)" "SUCCESS"
         return
     }
     catch {
-        Write-Warn "Primary login failed: $($_.Exception.Message)"
-        Write-Info "Attempting login (Fallback): Get-IdentityHeader + Use-PASSession..."
+        Write-LogLine "Primary login failed: $($_.Exception.Message)" "WARN"
+        Write-LogLine "Attempting login (Fallback): Get-IdentityHeader + Use-PASSession..." "INFO"
 
         $cmd = Get-Command Get-IdentityHeader -ErrorAction SilentlyContinue
         if (-not $cmd) {
@@ -170,23 +169,56 @@ function Connect-PCloudWithServiceUser {
         $sess2 = Get-PASSession
         if (-not $sess2) { throw "Get-PASSession returned null after Use-PASSession." }
 
-        Write-Ok "Authenticated (Fallback) to $PrivilegeCloudURL as $($ServiceCred.UserName)"
+        Write-LogLine "Authenticated (Fallback) to $PrivilegeCloudURL as $($ServiceCred.UserName)" "SUCCESS"
         return
     }
+}
+
+# --- API fallback: list safes if Get-PASSafe fails ---
+function Get-AllSafesViaAPI {
+    [CmdletBinding()]
+    param([int]$Limit = 500)
+
+    $offset = 0
+    $all = New-Object System.Collections.Generic.List[object]
+
+    while ($true) {
+        $uri  = "api/Safes?limit=$Limit&offset=$offset"
+        $resp = Invoke-PASRestMethod -Method GET -URI $uri -ErrorAction Stop
+
+        $items = Get-PropValueCI -Object $resp -PropName "value"
+        $count = Get-PropValueCI -Object $resp -PropName "count"
+
+        if ($null -eq $items) {
+            if ($resp -is [System.Collections.IEnumerable]) { $items = $resp } else { $items = @() }
+        }
+
+        foreach ($i in $items) { $all.Add($i) | Out-Null }
+
+        if ($null -ne $count) {
+            $offset += $Limit
+            if ($offset -ge [int]$count) { break }
+        }
+        else {
+            if (($items | Measure-Object).Count -lt $Limit) { break }
+            $offset += $Limit
+        }
+    }
+
+    return ,$all.ToArray()
 }
 
 # ============================
 # MAIN
 # ============================
 $sessionCreated = $false
+$failed = New-Object System.Collections.Generic.List[object]
 
 try {
+    Ensure-Directory -Path (Split-Path $LogFilePath -Parent)
     New-Item -ItemType File -Path $LogFilePath -Force | Out-Null
-    Write-LogLine "Starting retention update run." "INFO"
 
-    if (-not (Test-Path $CsvFilePath)) {
-        throw "CSV not found: $CsvFilePath"
-    }
+    Write-LogLine "Starting retention update run (ALL safes). Target NumberOfDaysRetention=$TargetRetentionDays" "INFO"
 
     # 1) Get service user from CCP
     $serviceCred = Get-ServiceUserCredentialFromCCP `
@@ -202,74 +234,64 @@ try {
     $sessionCreated = $true
     Write-LogLine "Authenticated successfully." "SUCCESS"
 
-    # 3) Load CSV rows
-    $rows = Import-Csv -Path $CsvFilePath
-    if (-not $rows -or $rows.Count -eq 0) {
-        throw "CSV '$CsvFilePath' has no rows."
+    # 3) Get all safes
+    $safes = @()
+    try {
+        $safes = @(Get-PASSafe -ErrorAction Stop)
+        Write-LogLine "Safes retrieved via Get-PASSafe: $($safes.Count)" "INFO"
     }
-    Write-LogLine "Loaded $($rows.Count) row(s) from CSV." "INFO"
+    catch {
+        Write-LogLine "Get-PASSafe failed: $($_.Exception.Message)" "WARN"
+        Write-LogLine "Falling back to API paging (api/Safes)..." "INFO"
+        $safes = @(Get-AllSafesViaAPI -Limit $PageSize)
+        Write-LogLine "Safes retrieved via API: $($safes.Count)" "INFO"
+    }
 
-    # 4) Update safes
-    foreach ($row in $rows) {
+    if (-not $safes -or $safes.Count -eq 0) {
+        throw "No safes returned. Check permissions/service user membership."
+    }
+
+    Write-Host ("Updating NumberOfDaysRetention={0} for {1} safe(s)... (only failures will be shown)" -f $TargetRetentionDays, $safes.Count) -ForegroundColor Cyan
+
+    # 4) Update ALL safes
+    foreach ($s in $safes) {
+        $safeName = $null
         try {
-            if ([string]::IsNullOrWhiteSpace($row.safeName)) {
-                throw "safeName cannot be empty."
+            $safeName = (Get-PropValueCI -Object $s -PropName "safeName")
+            if ([string]::IsNullOrWhiteSpace($safeName)) { $safeName = (Get-PropValueCI -Object $s -PropName "SafeName") }
+            if ([string]::IsNullOrWhiteSpace($safeName)) { throw "Unable to determine safeName from safe object." }
+            $safeName = $safeName.Trim()
+
+            if ($PSCmdlet.ShouldProcess($safeName, "Set-PASSafe NumberOfDaysRetention=$TargetRetentionDays")) {
+                Set-PASSafe -SafeName $safeName -NumberOfDaysRetention $TargetRetentionDays -ErrorAction Stop | Out-Null
             }
 
-            $safeName = $row.safeName.Trim()
-
-            # Retention from CSV or default
-            $retention = $null
-            if ($row.PSObject.Properties.Name -contains 'NumberOfDaysRetention') {
-                $retention = Convert-ToIntOrNull $row.NumberOfDaysRetention
-            } elseif ($row.PSObject.Properties.Name -contains 'retentionDays') {
-                $retention = Convert-ToIntOrNull $row.retentionDays
-            }
-            if (-not $retention) { $retention = $DefaultRetentionDays }
-
-            # Optional fields (only applied if non-empty)
-            $location    = $null
-            $managingCPM = $null
-            $olac        = $null
-
-            if ($row.PSObject.Properties.Name -contains 'location' -and -not [string]::IsNullOrWhiteSpace($row.location)) {
-                $location = $row.location.Trim()
-            }
-            if ($row.PSObject.Properties.Name -contains 'managingCPM' -and -not [string]::IsNullOrWhiteSpace($row.managingCPM)) {
-                $managingCPM = $row.managingCPM.Trim()
-            }
-            if ($row.PSObject.Properties.Name -contains 'olacEnabled') {
-                $olac = Convert-ToBoolOrNull $row.olacEnabled
-            }
-
-            $params = @{
-                SafeName              = $safeName
-                NumberOfDaysRetention = $retention
-                ErrorAction           = 'Stop'
-            }
-
-            if ($location)       { $params['Location']    = $location }
-            if ($managingCPM)    { $params['ManagingCPM'] = $managingCPM }
-            if ($null -ne $olac) { $params['OLACEnabled'] = $olac }
-
-            if ($PSCmdlet.ShouldProcess($safeName, "Set-PASSafe")) {
-                Set-PASSafe @params | Out-Null
-            }
-
-            $msg = "Safe '$safeName' updated. NumberOfDaysRetention=$retention" +
-                   ($(if ($location) { ", Location='$location'" } else { "" })) +
-                   ($(if ($managingCPM) { ", ManagingCPM='$managingCPM'" } else { "" })) +
-                   ($(if ($null -ne $olac) { ", OLACEnabled=$olac" } else { "" }))
-
-            Write-LogLine $msg "SUCCESS"
+            Write-LogLine "Safe '$safeName' updated. NumberOfDaysRetention=$TargetRetentionDays" "SUCCESS"
         }
         catch {
-            Write-LogLine "Failed to update safe '$($row.safeName)'. Error: $($_.Exception.Message)" "ERROR"
+            $err = $_.Exception.Message
+            $failed.Add([PSCustomObject]@{
+                SafeName = $safeName
+                Error    = $err
+            }) | Out-Null
+
+            Write-LogLine "Failed to update safe '$safeName'. Error: $err" "ERROR"
+            Write-Err "Failed to update safe '$safeName' -> $err"
             continue
         }
     }
 
-    Write-LogLine "Completed processing all rows." "SUCCESS"
+    if ($failed.Count -gt 0) {
+        Write-Host ""
+        Write-Host ("FAILED safes: {0}" -f $failed.Count) -ForegroundColor Yellow
+        $failed | Sort-Object SafeName | Format-Table -AutoSize
+    }
+    else {
+        Write-Host ""
+        Write-Host "All safes updated successfully (no failures)." -ForegroundColor Green
+    }
+
+    Write-LogLine "Completed processing all safes. Failures=$($failed.Count)" "SUCCESS"
 }
 catch {
     Write-LogLine "Fatal error: $($_.Exception.Message)" "ERROR"
@@ -285,3 +307,6 @@ finally {
         }
     }
 }
+
+# Return failures as objects (pipeline-friendly)
+$failed
