@@ -1,10 +1,5 @@
-Generate a script to export safe and their parameters for  numberOfDaysRetention or numberOfVersionsRetention, 
-use the longin pattern below and generate a csv with safe, numberOfDaysRetention (True/False), or numberOfVersionsRetention (True/False)
-And show the action figure set of both parameter
-export to location I:\Script\IDENTITY Script New\csv\
-
 <#
-UpdateSafes_NumberOfDaysRetention_CCP.ps1
+ExportSafes_RetentionReport_CCP.ps1
 
 AUTH (Automation)
 - CCP -> Service User credential
@@ -12,14 +7,12 @@ AUTH (Automation)
   1) Primary: New-PASSession -IdentityTenantURL -PrivilegeCloudURL -Credential -ServiceUser
   2) Fallback: Get-IdentityHeader -psPASFormat -PCloudSubdomain + Use-PASSession
 
-CSV
-- Required: safeName
-- Optional: NumberOfDaysRetention (or retentionDays)
-- Optional: location, managingCPM, olacEnabled (only applied if present and not blank)
-
+EXPORT
+- CSV:  I:\Script\IDENTITY Script New\csv\SafeRetention_Report_yyyyMMdd_HHmm.csv
+- LOG:  I:\Script\IDENTITY Script New\logs\SafeRetention_Report.txt
 #>
 
-[CmdletBinding(SupportsShouldProcess=$true)]
+[CmdletBinding()]
 param(
     # ===== Identity / Privilege Cloud =====
     [string]$IdentityTenantURL  = "https://aak4521.my.idaptive.app",
@@ -33,20 +26,25 @@ param(
     [string]$CCPObject          = "Application-CyberArkVaultRestAPI-alliantcredit.cyberark.cloud",
     [bool]  $CCPWindowsAuth     = $false,
 
-    # ===== Files =====
-    [string]$CsvFilePath        = "I:\Script\IDENTITY Script New\csv\UpdateRetention.csv",
-    [string]$LogFilePath        = "I:\Script\IDENTITY Script New\logs\UpdateRetention.txt",
+    # ===== Output =====
+    [string]$ExportDirectory    = "I:\Script\IDENTITY Script New\csv\",
+    [string]$LogFilePath        = "I:\Script\IDENTITY Script New\logs\SafeRetention_Report.txt",
 
-    # ===== Default retention if not in CSV =====
-    [int]$DefaultRetentionDays  = 180
+    # ===== Paging (API fallback) =====
+    [ValidateRange(50,2000)]
+    [int]$PageSize = 500
 )
 
-# --- Modules & TLS ---
+# ---- Execution policy (silent) ----
+try { Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force -ErrorAction Stop } catch {}
+
+# ---- Modules & TLS ----
 Import-Module psPAS -ErrorAction Stop
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $ErrorActionPreference = 'Stop'
+$ProgressPreference    = 'SilentlyContinue'
 
-# --- Pretty log helpers ---
+# ---- Pretty log helpers ----
 function Write-Info($m){ Write-Host "🛠  $m" -ForegroundColor Cyan }
 function Write-Ok($m){   Write-Host "✅ $m" -ForegroundColor Green }
 function Write-Warn($m){ Write-Host "⚠️  $m" -ForegroundColor Yellow }
@@ -60,6 +58,13 @@ function Write-LogLine {
     $line = "{0} [{1}] {2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level, $Message
     Write-Output $line
     Add-Content -Path $LogFilePath -Value $line
+}
+
+function Ensure-Directory {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path $Path)) {
+        New-Item -ItemType Directory -Path $Path -Force | Out-Null
+    }
 }
 
 function Get-HostFromUrl {
@@ -79,19 +84,28 @@ function Get-PCloudSubdomainFromUrl {
     return ($pcloudHost.Split('.')[0]).Trim()
 }
 
-function Convert-ToBoolOrNull {
-    param([string]$Value)
-    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
-    if ($Value -match '^(?i:true|yes|y|1)$')  { return $true }
-    if ($Value -match '^(?i:false|no|n|0)$') { return $false }
-    return $null
+function Convert-ToIntSafe {
+    param($Value)
+    if ($null -eq $Value) { return 0 }
+    $s = [string]$Value
+    if ([string]::IsNullOrWhiteSpace($s)) { return 0 }
+    $out = 0
+    if ([int]::TryParse($s.Trim(), [ref]$out)) { return $out }
+    return 0
 }
 
-function Convert-ToIntOrNull {
-    param([string]$Value)
-    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
-    $out = 0
-    if ([int]::TryParse($Value.Trim(), [ref]$out)) { return $out }
+function Get-PropValueCI {
+    <#
+      Case-insensitive property getter:
+      - Returns $null if not found
+    #>
+    param(
+        [Parameter(Mandatory)]$Object,
+        [Parameter(Mandatory)][string]$PropName
+    )
+    if ($null -eq $Object) { return $null }
+    $p = $Object.PSObject.Properties | Where-Object { $_.Name -ieq $PropName } | Select-Object -First 1
+    if ($p) { return $p.Value }
     return $null
 }
 
@@ -180,18 +194,67 @@ function Connect-PCloudWithServiceUser {
     }
 }
 
+# --- API fallback: list safes (Gen2) + get safe details ---
+function Get-AllSafesViaAPI {
+    [CmdletBinding()]
+    param([int]$Limit = 500)
+
+    $offset = 0
+    $all = New-Object System.Collections.Generic.List[object]
+
+    while ($true) {
+        $uri = "api/Safes?limit=$Limit&offset=$offset"
+        $resp = Invoke-PASRestMethod -Method GET -URI $uri -ErrorAction Stop
+
+        $items = $null
+        $count = $null
+
+        # handle common shapes: { value:[], count:n } or direct array
+        $items = Get-PropValueCI -Object $resp -PropName "value"
+        $count = Get-PropValueCI -Object $resp -PropName "count"
+
+        if ($null -eq $items) {
+            if ($resp -is [System.Collections.IEnumerable]) { $items = $resp } else { $items = @() }
+        }
+
+        foreach ($i in $items) { $all.Add($i) | Out-Null }
+
+        if ($null -ne $count) {
+            $offset += $Limit
+            if ($offset -ge [int]$count) { break }
+        }
+        else {
+            # if no count is provided, stop when we receive less than limit
+            if (($items | Measure-Object).Count -lt $Limit) { break }
+            $offset += $Limit
+        }
+    }
+
+    return ,$all.ToArray()
+}
+
+function Get-SafeDetailsViaAPI {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$SafeName)
+
+    $enc = [uri]::EscapeDataString($SafeName)
+    return (Invoke-PASRestMethod -Method GET -URI ("api/Safes/{0}" -f $enc) -ErrorAction Stop)
+}
+
 # ============================
 # MAIN
 # ============================
 $sessionCreated = $false
 
 try {
-    New-Item -ItemType File -Path $LogFilePath -Force | Out-Null
-    Write-LogLine "Starting retention update run." "INFO"
+    Ensure-Directory -Path (Split-Path $LogFilePath -Parent)
+    Ensure-Directory -Path $ExportDirectory
 
-    if (-not (Test-Path $CsvFilePath)) {
-        throw "CSV not found: $CsvFilePath"
-    }
+    New-Item -ItemType File -Path $LogFilePath -Force | Out-Null
+    Write-LogLine "Starting safe retention export run." "INFO"
+
+    $timestamp = Get-Date -Format "yyyyMMdd_HHmm"
+    $exportCsv = Join-Path $ExportDirectory ("SafeRetention_Report_{0}.csv" -f $timestamp)
 
     # 1) Get service user from CCP
     $serviceCred = Get-ServiceUserCredentialFromCCP `
@@ -207,74 +270,100 @@ try {
     $sessionCreated = $true
     Write-LogLine "Authenticated successfully." "SUCCESS"
 
-    # 3) Load CSV rows
-    $rows = Import-Csv -Path $CsvFilePath
-    if (-not $rows -or $rows.Count -eq 0) {
-        throw "CSV '$CsvFilePath' has no rows."
+    # 3) Get all safes (prefer Get-PASSafe; fallback to API paging)
+    Write-Info "Retrieving safes..."
+    $safes = @()
+
+    try {
+        # Get-PASSafe (default) should return all safes with details on modern PAS/Privilege Cloud :contentReference[oaicite:1]{index=1}
+        $safes = @(Get-PASSafe -ErrorAction Stop)
     }
-    Write-LogLine "Loaded $($rows.Count) row(s) from CSV." "INFO"
+    catch {
+        Write-Warn "Get-PASSafe failed: $($_.Exception.Message)"
+        Write-Info "Falling back to API paging (api/Safes)..."
+        $safes = @(Get-AllSafesViaAPI -Limit $PageSize)
+    }
 
-    # 4) Update safes
-    foreach ($row in $rows) {
+    if (-not $safes -or $safes.Count -eq 0) {
+        throw "No safes returned. Check permissions/service user membership."
+    }
+
+    Write-Ok ("Safes retrieved: {0}" -f $safes.Count)
+    Write-LogLine ("Safes retrieved: {0}" -f $safes.Count) "INFO"
+
+    # Determine if we already have retention fields in the safe objects; if not, pull per-safe details
+    $hasRetentionFields = $false
+    foreach ($s in ($safes | Select-Object -First 25)) {
+        $d = Get-PropValueCI -Object $s -PropName "numberOfDaysRetention"
+        $v = Get-PropValueCI -Object $s -PropName "numberOfVersionsRetention"
+        if ($null -ne $d -or $null -ne $v) { $hasRetentionFields = $true; break }
+    }
+
+    if (-not $hasRetentionFields) {
+        Write-Warn "Safe objects do not include retention fields; retrieving per-safe details via API..."
+        Write-LogLine "Retention fields missing in list results; using per-safe detail calls." "WARN"
+    }
+
+    # 4) Build report
+    $report = New-Object System.Collections.Generic.List[object]
+    $i = 0
+
+    foreach ($s in $safes) {
+        $i++
         try {
-            if ([string]::IsNullOrWhiteSpace($row.safeName)) {
-                throw "safeName cannot be empty."
+            $safeName = (Get-PropValueCI -Object $s -PropName "safeName")
+            if ([string]::IsNullOrWhiteSpace($safeName)) {
+                $safeName = (Get-PropValueCI -Object $s -PropName "SafeName")
+            }
+            if ([string]::IsNullOrWhiteSpace($safeName)) {
+                throw "Unable to determine safeName from object."
+            }
+            $safeName = $safeName.Trim()
+
+            $detail = $s
+            if (-not $hasRetentionFields) {
+                $detail = Get-SafeDetailsViaAPI -SafeName $safeName
             }
 
-            $safeName = $row.safeName.Trim()
+            $daysVal = Convert-ToIntSafe (Get-PropValueCI -Object $detail -PropName "numberOfDaysRetention")
+            if ($daysVal -eq 0) { $daysVal = Convert-ToIntSafe (Get-PropValueCI -Object $detail -PropName "NumberOfDaysRetention") }
 
-            # Retention from CSV or default
-            $retention = $null
-            if ($row.PSObject.Properties.Name -contains 'NumberOfDaysRetention') {
-                $retention = Convert-ToIntOrNull $row.NumberOfDaysRetention
-            } elseif ($row.PSObject.Properties.Name -contains 'retentionDays') {
-                $retention = Convert-ToIntOrNull $row.retentionDays
+            $versVal = Convert-ToIntSafe (Get-PropValueCI -Object $detail -PropName "numberOfVersionsRetention")
+            if ($versVal -eq 0) { $versVal = Convert-ToIntSafe (Get-PropValueCI -Object $detail -PropName "NumberOfVersionsRetention") }
+
+            $daysEnabled = ($daysVal -gt 0)
+            $versEnabled = ($versVal -gt 0)
+
+            $effectiveType  = if ($daysEnabled) { "Days" } elseif ($versEnabled) { "Versions" } else { "None" }
+            $effectiveValue = if ($daysEnabled) { $daysVal } elseif ($versEnabled) { $versVal } else { 0 }
+
+            $report.Add([PSCustomObject]@{
+                SafeName                         = $safeName
+
+                NumberOfDaysRetention_Enabled    = [bool]$daysEnabled
+                NumberOfDaysRetention_Value      = [int]$daysVal
+
+                NumberOfVersionsRetention_Enabled= [bool]$versEnabled
+                NumberOfVersionsRetention_Value  = [int]$versVal
+
+                EffectiveRetentionType           = $effectiveType
+                EffectiveRetentionValue          = [int]$effectiveValue
+            }) | Out-Null
+
+            if (($i % 200) -eq 0) {
+                Write-Info ("Processed {0}/{1} safes..." -f $i, $safes.Count)
             }
-            if (-not $retention) { $retention = $DefaultRetentionDays }
-
-            # Optional fields (only applied if non-empty)
-            $location    = $null
-            $managingCPM = $null
-            $olac        = $null
-
-            if ($row.PSObject.Properties.Name -contains 'location' -and -not [string]::IsNullOrWhiteSpace($row.location)) {
-                $location = $row.location.Trim()
-            }
-            if ($row.PSObject.Properties.Name -contains 'managingCPM' -and -not [string]::IsNullOrWhiteSpace($row.managingCPM)) {
-                $managingCPM = $row.managingCPM.Trim()
-            }
-            if ($row.PSObject.Properties.Name -contains 'olacEnabled') {
-                $olac = Convert-ToBoolOrNull $row.olacEnabled
-            }
-
-            $params = @{
-                SafeName              = $safeName
-                NumberOfDaysRetention = $retention
-                ErrorAction           = 'Stop'
-            }
-
-            if ($location)       { $params['Location']    = $location }
-            if ($managingCPM)    { $params['ManagingCPM'] = $managingCPM }
-            if ($null -ne $olac) { $params['OLACEnabled'] = $olac }
-
-            if ($PSCmdlet.ShouldProcess($safeName, "Set-PASSafe")) {
-                Set-PASSafe @params | Out-Null
-            }
-
-            $msg = "Safe '$safeName' updated. NumberOfDaysRetention=$retention" +
-                   ($(if ($location) { ", Location='$location'" } else { "" })) +
-                   ($(if ($managingCPM) { ", ManagingCPM='$managingCPM'" } else { "" })) +
-                   ($(if ($null -ne $olac) { ", OLACEnabled=$olac" } else { "" }))
-
-            Write-LogLine $msg "SUCCESS"
         }
         catch {
-            Write-LogLine "Failed to update safe '$($row.safeName)'. Error: $($_.Exception.Message)" "ERROR"
+            Write-LogLine ("Safe processing failed. SafeRef='{0}' Error: {1}" -f ($s | Out-String).Trim(), $_.Exception.Message) "ERROR"
             continue
         }
     }
 
-    Write-LogLine "Completed processing all rows." "SUCCESS"
+    # 5) Export CSV
+    $report | Sort-Object SafeName | Export-Csv -Path $exportCsv -NoTypeInformation -Encoding UTF8
+    Write-Ok "Export complete: $exportCsv"
+    Write-LogLine "Export complete: $exportCsv" "SUCCESS"
 }
 catch {
     Write-LogLine "Fatal error: $($_.Exception.Message)" "ERROR"
