@@ -1,25 +1,25 @@
-I amm looking to modulate the script below to generate report of list of account experience the error below
-
-Reason: During a logon attempt, the user's security context accumulated too many security IDs. (winRc=1384). 
-
-Review error logs and activity report even if this has happened in previous activity and now result
-
-Export account details in csv in a list, Account ID, Username, Address, Safe and Platform only.
-
-
-
 <# =====================================================================
-DisabledAccountDetectAllWinRc1331_FAST.ps1
+WinRc1384_Accounts_FAST.ps1
 
 - CCP -> Identity Header -> psPAS (same login approach)
-- Find ALL accounts that match winRc=1331 / account disabled
-- Faster approach:
-    1) FAST-PATH: match on account-level secretManagement/lastTask fields (no activity call)
-    2) SLOW-PATH: only for likely failures, pull limited activities and match Reason/MoreInfo/Message/Details (no ConvertTo-Json)
+- Finds accounts that experienced:
+    During a logon attempt, the user's security context accumulated too many security IDs. (winRc=1384)
+
+FAST / EFFECTIVE APPROACH
+1) Pull full inventory once (cheap) and inspect only account-level fields
+2) Pull failed saved filters (FailedVerify / FailedChange / FailedReconcile)
+3) Only call Get-PASAccountActivity for:
+   - accounts from failed saved filters
+   - accounts whose secretManagement shows failure-like state
+4) Optional -DeepHistory switch:
+   - scans activities for ALL inventoried accounts (slowest but most exhaustive)
+
+Exports ONLY:
+  AccountID, Username, Address, Safe, Platform
 
 Outputs:
-  E:\Installation Media\Script\OnboardScript\data\Disabled_Account.csv
-  E:\Installation Media\Script\OnboardScript\data\Disabled_Account.log
+  E:\Installation Media\Script\OnboardScript\data\WinRc1384_Accounts.csv
+  E:\Installation Media\Script\OnboardScript\data\WinRc1384_Accounts.log
 ===================================================================== #>
 
 [CmdletBinding()]
@@ -30,11 +30,12 @@ param(
     [ValidateRange(1,200000)]
     [int]$MaxAccountsToInspect = 50000,
 
-    [ValidateRange(1,500)]
-    [int]$MaxActivitiesToInspect = 60,
+    [ValidateRange(1,1000)]
+    [int]$MaxActivitiesToInspect = 80,
 
-    # If you want speed over coverage, set this to skip full inventory fallback
-    [switch]$SkipInventoryFallback
+    # When used, scan activities for all accounts in inventory.
+    # Slower, but highest historical coverage.
+    [switch]$DeepHistory
 )
 
 # =========================
@@ -50,14 +51,20 @@ Import-Module psPAS -Force
 # Output paths
 # =========================
 $OutDir = "E:\Installation Media\Script\OnboardScript\data"
-if (-not (Test-Path $OutDir)) { New-Item -ItemType Directory -Path $OutDir -Force | Out-Null }
+if (-not (Test-Path $OutDir)) {
+    New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
+}
 
-$LogFile = Join-Path $OutDir "Disabled_Account.log"
-$CsvFile = Join-Path $OutDir "Disabled_Account.csv"
+$LogFile = Join-Path $OutDir "WinRc1384_Accounts.log"
+$CsvFile = Join-Path $OutDir "WinRc1384_Accounts.csv"
 New-Item -ItemType File -Force -Path $LogFile | Out-Null
 
 function Write-Log {
-    param([string]$Message, [ConsoleColor]$Color = 'White')
+    param(
+        [string]$Message,
+        [ConsoleColor]$Color = 'White'
+    )
+
     $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     $line = "$ts - $Message"
     Write-Host $line -ForegroundColor $Color
@@ -65,7 +72,7 @@ function Write-Log {
 }
 
 # =========================
-# CCP / Identity config (your values)
+# CCP / Identity config
 # =========================
 $CCPAddress    = "https://vskau1p1231.cna.com"
 $location      = "AIMWebService"
@@ -78,12 +85,12 @@ $IdentityTenantURL = "aat4012.id.cyberark.cloud"
 $PCloudSubdomain   = "cna-prod"
 
 # =========================
-# Match logic (regex catches variations)
+# Match logic
 # =========================
-$NeedleRegex = "(?i)winRc\s*=\s*1331|account\s+is\s+currently\s+disabled|error_account_disabled"
+$NeedleRegex = '(?i)winRc\s*=\s*1384|security\s+context\s+accumulated\s+too\s+many\s+security\s+ids|too\s+many\s+security\s+ids'
 
 # =========================
-# Login helper: CCP -> Identity header -> psPAS
+# Login helper
 # =========================
 function Start-PASSessionFromCCP {
     param(
@@ -98,6 +105,7 @@ function Start-PASSessionFromCCP {
     if (-not $resp -or -not $resp.Content -or -not $resp.Username) {
         throw "CCP response missing Content/Username."
     }
+
     Write-Log "CCP returned username for service principal." 'Green'
 
     $secPass = ConvertTo-SecureString -String $resp.Content -AsPlainText -Force
@@ -107,14 +115,20 @@ function Start-PASSessionFromCCP {
     $hdr = Get-IdentityHeader -IdentityTenantURL $IdentityTenantURL -psPASFormat -PCloudSubdomain $PCloudSubdomain -UPCreds $upCred
 
     Use-PASSession $hdr
-    if (-not (Get-PASSession)) { throw "psPAS session not established." }
+    if (-not (Get-PASSession)) {
+        throw "psPAS session not established."
+    }
 
     $resp.Content = $null
-    Write-Log "PAS session established (no prompts)." 'Green'
+    Write-Log "PAS session established." 'Green'
 }
 
 function Cmd-HasParam {
-    param([string]$CommandName, [string]$ParamName)
+    param(
+        [string]$CommandName,
+        [string]$ParamName
+    )
+
     $c = Get-Command $CommandName -ErrorAction Stop
     return $c.Parameters.ContainsKey($ParamName)
 }
@@ -138,23 +152,24 @@ function Get-AccountsPaged {
         if ($hasLimit)  { $params["limit"]  = $Limit }
         if ($hasOffset) { $params["offset"] = $offset }
 
-        # If module lacks -offset, we can only call once
         if (-not $hasOffset -and $offset -gt 0) { break }
 
         $page = @()
         try {
             $page = @(Get-PASAccount @params -ErrorAction Stop)
-        } catch {
+        }
+        catch {
             if ($SavedFilter -and -not $hasSavedFilter) {
                 $page = @(Get-PASAccount -ErrorAction Stop)
-            } else {
+            }
+            else {
                 throw
             }
         }
 
         if ($page.Count -eq 0) { break }
 
-        foreach ($a in $page) { $all.Add($a) }
+        foreach ($a in $page) { $all.Add($a) | Out-Null }
 
         if (-not $hasOffset) { break }
         if ($page.Count -lt $Limit) { break }
@@ -163,7 +178,11 @@ function Get-AccountsPaged {
         $offset += $Limit
     }
 
-    return @($all | Group-Object id | ForEach-Object { $_.Group | Select-Object -First 1 })
+    return @(
+        $all |
+        Group-Object id |
+        ForEach-Object { $_.Group | Select-Object -First 1 }
+    )
 }
 
 function Get-ActivitiesSafe {
@@ -171,68 +190,120 @@ function Get-ActivitiesSafe {
 
     try {
         return @(Get-PASAccountActivity -AccountID $AccountId -ErrorAction Stop)
-    } catch {
+    }
+    catch {
         return @(Get-PASAccountActivity -AccountID $AccountId -useGen1API -ErrorAction Stop)
     }
 }
 
-# -------- FAST-PATH: check account object fields without activity call --------
+function Join-Text {
+    param([object[]]$Values)
+
+    return (
+        $Values |
+        Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_) } |
+        ForEach-Object { [string]$_ } |
+        Select-Object -Unique
+    ) -join ' | '
+}
+
+function Get-AccountDiagnosticText {
+    param([object]$Acct)
+
+    $vals = @()
+
+    try { $vals += $Acct.secretManagement.status } catch {}
+    try { $vals += $Acct.secretManagement.automaticManagementEnabled } catch {}
+    try { $vals += $Acct.secretManagement.lastTask.status } catch {}
+    try { $vals += $Acct.secretManagement.lastTask.reason } catch {}
+    try { $vals += $Acct.secretManagement.lastTask.details } catch {}
+    try { $vals += $Acct.secretManagement.lastTask.error } catch {}
+    try { $vals += $Acct.secretManagement.lastTask.moreInfo } catch {}
+    try { $vals += $Acct.secretManagement.lastTask.message } catch {}
+
+    try { $vals += $Acct.secretManagement.lastFailedTask.status } catch {}
+    try { $vals += $Acct.secretManagement.lastFailedTask.reason } catch {}
+    try { $vals += $Acct.secretManagement.lastFailedTask.details } catch {}
+    try { $vals += $Acct.secretManagement.lastFailedTask.error } catch {}
+    try { $vals += $Acct.secretManagement.lastFailedTask.moreInfo } catch {}
+    try { $vals += $Acct.secretManagement.lastFailedTask.message } catch {}
+
+    return (Join-Text -Values $vals)
+}
+
+function Get-ActivityDiagnosticText {
+    param([object]$Activity)
+
+    $vals = @()
+
+    foreach ($n in @('Reason','MoreInfo','Message','Details','Action','Error','Status','Description')) {
+        try { $vals += $Activity.$n } catch {}
+    }
+
+    return (Join-Text -Values $vals)
+}
+
 function AccountMatchesFast {
     param([object]$Acct)
 
-    # Pull only likely fields (cheap). Different tenants may shape these differently.
-    $parts = New-Object System.Collections.Generic.List[string]
+    $txt = Get-AccountDiagnosticText -Acct $Acct
+    if (-not $txt) { return $false }
 
-    try { if ($Acct.secretManagement) { $parts.Add(($Acct.secretManagement | Out-String)) } } catch {}
-    try { if ($Acct.secretManagement.lastTask) { $parts.Add(($Acct.secretManagement.lastTask | Out-String)) } } catch {}
-    try { if ($Acct.secretManagement.lastFailedTask) { $parts.Add(($Acct.secretManagement.lastFailedTask | Out-String)) } } catch {}
-    try { if ($Acct.secretManagement.status) { $parts.Add([string]$Acct.secretManagement.status) } } catch {}
-    try { if ($Acct.secretManagement.lastTask.status) { $parts.Add([string]$Acct.secretManagement.lastTask.status) } } catch {}
-    try { if ($Acct.secretManagement.lastTask.reason) { $parts.Add([string]$Acct.secretManagement.lastTask.reason) } } catch {}
-    try { if ($Acct.secretManagement.lastTask.details) { $parts.Add([string]$Acct.secretManagement.lastTask.details) } } catch {}
-    try { if ($Acct.secretManagement.lastTask.error) { $parts.Add([string]$Acct.secretManagement.lastTask.error) } } catch {}
-    try { if ($Acct.secretManagement.lastTask.moreInfo) { $parts.Add([string]$Acct.secretManagement.lastTask.moreInfo) } } catch {}
-
-    if ($parts.Count -eq 0) { return $false }
-
-    $hay = ($parts -join " | ")
-    return ($hay -match $NeedleRegex)
+    return ($txt -match $NeedleRegex)
 }
 
-# -------- Narrow which accounts deserve slow-path activity calls --------
-function ShouldScanActivities {
+function ShouldQueueActivityScan {
     param([object]$Acct)
 
-    # If the account doesn't show any hint of failure in secretManagement, skip activity scan.
-    # (This is the biggest performance lever.)
     try {
-        if ($Acct.secretManagement -and $Acct.secretManagement.status) {
-            return ([string]$Acct.secretManagement.status -match '(?i)fail|error')
+        if ($Acct.secretManagement.status -and ([string]$Acct.secretManagement.status -match '(?i)fail|error')) {
+            return $true
         }
-        if ($Acct.secretManagement -and $Acct.secretManagement.lastTask -and $Acct.secretManagement.lastTask.status) {
-            return ([string]$Acct.secretManagement.lastTask.status -match '(?i)fail|error')
+    } catch {}
+
+    try {
+        if ($Acct.secretManagement.lastTask.status -and ([string]$Acct.secretManagement.lastTask.status -match '(?i)fail|error')) {
+            return $true
         }
-    } catch { }
+    } catch {}
+
+    try {
+        if ($Acct.secretManagement.lastFailedTask) {
+            return $true
+        }
+    } catch {}
+
+    try {
+        $txt = Get-AccountDiagnosticText -Acct $Acct
+        if ($txt -and ($txt -match $NeedleRegex)) {
+            return $true
+        }
+    } catch {}
 
     return $false
 }
 
-# -------- Faster activity match (no ConvertTo-Json) --------
-function ActivityMatchesFast {
-    param($Activity)
+function Add-ResultRow {
+    param(
+        [Parameter(Mandatory)] [object]$Acct,
+        [Parameter(Mandatory)] [System.Collections.Generic.List[object]]$Bucket,
+        [Parameter(Mandatory)] [System.Collections.Generic.HashSet[string]]$SeenIds
+    )
 
-    $fields = @()
-    foreach ($n in @("Reason","MoreInfo","Message","Details","Action","Error","Status","Description")) {
-        try {
-            $v = $Activity.$n
-            if ($v) { $fields += [string]$v }
-        } catch {}
+    $id = [string]$Acct.id
+    if ([string]::IsNullOrWhiteSpace($id)) { return $false }
+    if (-not $SeenIds.Add($id)) { return $false }
+
+    $row = [PSCustomObject]@{
+        AccountID = [string]$Acct.id
+        Username  = [string]$Acct.userName
+        Address   = [string]$Acct.address
+        Safe      = [string]$Acct.safeName
+        Platform  = [string]$Acct.platformId
     }
 
-    if ($fields.Count -eq 0) { return $false }
-
-    $hay = ($fields -join " | ")
-    return ($hay -match $NeedleRegex)
+    $Bucket.Add($row) | Out-Null
+    return $true
 }
 
 # =========================
@@ -241,132 +312,163 @@ function ActivityMatchesFast {
 try {
     Start-PASSessionFromCCP -ObjectName "cna.com-CA_PAMDiscovery_SVC" -UPUser "CA_PAMDiscovery_SVC"
 
-    Write-Log "Searching for ALL accounts with disabled-login error (winRc=1331)..." 'Yellow'
+    Write-Log "Searching for accounts that experienced winRc=1384..." 'Yellow'
     Write-Log "NeedleRegex: $NeedleRegex" 'DarkYellow'
+    Write-Log "Mode: $([string]($(if($DeepHistory){'DeepHistory'}else{'FastOptimized'})))" 'DarkCyan'
 
-    # 1) Pull candidates from saved filters (fast)
+    # -------------------------------------------------
+    # 1) Pull full inventory once (cheap pass only)
+    # -------------------------------------------------
+    Write-Log "Pulling account inventory..." 'Cyan'
+    $inventory = @(Get-AccountsPaged -SavedFilter $null -Limit $PageSize)
+    Write-Log "Inventory returned $($inventory.Count) account(s)." 'Green'
+
+    # -------------------------------------------------
+    # 2) Pull likely-failure candidates from saved filters
+    # -------------------------------------------------
     $filtersToTry = @("FailedVerify","FailedChange","FailedReconcile")
+    $candidateIds = New-Object 'System.Collections.Generic.HashSet[string]'
 
-    $candidatesList = New-Object System.Collections.Generic.List[object]
     foreach ($sf in $filtersToTry) {
-        Write-Log "Pulling candidates via savedFilter='$sf' (PageSize=$PageSize)..." 'Cyan'
-        $page = Get-AccountsPaged -SavedFilter $sf -Limit $PageSize
+        Write-Log "Pulling candidates via savedFilter='$sf'..." 'Cyan'
+        $page = @(Get-AccountsPaged -SavedFilter $sf -Limit $PageSize)
         Write-Log "savedFilter '$sf' returned $($page.Count) account(s)." 'Green'
-        foreach ($a in $page) { $candidatesList.Add($a) }
+
+        foreach ($a in $page) {
+            if ($a.id) { [void]$candidateIds.Add([string]$a.id) }
+        }
     }
 
-    $candidates = @($candidatesList | Group-Object id | ForEach-Object { $_.Group | Select-Object -First 1 })
-
-    # 2) Optional inventory fallback (slow for huge tenants)
-    if ($candidates.Count -eq 0 -and -not $SkipInventoryFallback) {
-        Write-Log "SavedFilters returned 0. Falling back to inventory paging..." 'Yellow'
-        $candidates = @(Get-AccountsPaged -SavedFilter $null -Limit $PageSize)
-        Write-Log "Inventory paging returned $($candidates.Count) account(s) (cap=$MaxAccountsToInspect)." 'Green'
-    } elseif ($candidates.Count -eq 0) {
-        Write-Log "SavedFilters returned 0 and -SkipInventoryFallback set. Exiting." 'Yellow'
-        exit 0
-    } else {
-        Write-Log "Total unique candidates from saved filters: $($candidates.Count)" 'Yellow'
-    }
+    Write-Log "Unique failed-filter candidate count: $($candidateIds.Count)" 'Yellow'
 
     $results = New-Object System.Collections.Generic.List[object]
-    $toActivityScan = New-Object System.Collections.Generic.List[object]
+    $seenIds = New-Object 'System.Collections.Generic.HashSet[string]'
+    $queuedIds = New-Object 'System.Collections.Generic.HashSet[string]'
+    $activityQueue = New-Object System.Collections.Generic.List[object]
 
-    $inspected = 0
-    $fastHits  = 0
-    $queuedForActivity = 0
+    $inspectedInventory = 0
+    $fastHits = 0
+    $queueCount = 0
 
-    # 3) First pass: FAST PATH (no activity calls)
-    foreach ($acct in $candidates) {
-        $inspected++
-        if ($inspected -gt $MaxAccountsToInspect) {
-            Write-Log "Safety stop: inspected $MaxAccountsToInspect accounts." 'Yellow'
+    # -------------------------------------------------
+    # 3) Fast pass across inventory
+    # -------------------------------------------------
+    foreach ($acct in $inventory) {
+        $inspectedInventory++
+
+        if ($inspectedInventory -gt $MaxAccountsToInspect) {
+            Write-Log "Safety stop reached at $MaxAccountsToInspect accounts." 'Yellow'
             break
         }
 
-        if ($inspected % 500 -eq 0) {
-            Write-Log "Progress (pass1): inspected $inspected / $($candidates.Count). FastHits=$fastHits, QueuedForActivity=$queuedForActivity" 'DarkGray'
+        if ($inspectedInventory % 500 -eq 0) {
+            Write-Log "Progress (inventory pass): inspected $inspectedInventory / $($inventory.Count). FastHits=$fastHits Queue=$queueCount" 'DarkGray'
         }
 
+        $acctId = [string]$acct.id
+        if ([string]::IsNullOrWhiteSpace($acctId)) { continue }
+
+        # Fast account-level match
         if (AccountMatchesFast -Acct $acct) {
-            $fastHits++
-
-            $row = [PSCustomObject]@{
-                AccountID  = $acct.id
-                SafeName   = $acct.safeName
-                Name       = $acct.name
-                UserName   = $acct.userName
-                Address    = $acct.address
-                PlatformId = $acct.platformId
+            if (Add-ResultRow -Acct $acct -Bucket $results -SeenIds $seenIds) {
+                $fastHits++
+                Write-Log ("FAST MATCH: AccountID={0} User={1} Address={2} Safe={3} Platform={4}" -f `
+                    [string]$acct.id, [string]$acct.userName, [string]$acct.address, [string]$acct.safeName, [string]$acct.platformId) 'Green'
             }
-
-            $results.Add($row) | Out-Null
-            Write-Log ("✅ FAST MATCH: AccountID={0} Safe={1} User={2} Address={3} Platform={4}" -f `
-                $row.AccountID, $row.SafeName, $row.UserName, $row.Address, $row.PlatformId) 'Green'
             continue
         }
 
-        if (ShouldScanActivities -Acct $acct) {
-            $queuedForActivity++
-            $toActivityScan.Add($acct) | Out-Null
+        # Queue rules for slower activity scan
+        $queueThis = $false
+
+        if ($DeepHistory) {
+            $queueThis = $true
+        }
+        elseif ($candidateIds.Contains($acctId)) {
+            $queueThis = $true
+        }
+        elseif (ShouldQueueActivityScan -Acct $acct) {
+            $queueThis = $true
+        }
+
+        if ($queueThis -and $queuedIds.Add($acctId)) {
+            $activityQueue.Add($acct) | Out-Null
+            $queueCount++
         }
     }
 
-    Write-Log "Pass1 complete. FastHits=$fastHits. ActivityScanQueue=$($toActivityScan.Count)." 'Yellow'
+    Write-Log "Inventory pass complete. FastHits=$fastHits. ActivityQueue=$($activityQueue.Count)." 'Yellow'
 
-    # 4) Second pass: SLOW PATH (activity calls ONLY for failure-like accounts)
-    $scanned = 0
-    foreach ($acct in $toActivityScan) {
-        $scanned++
+    # -------------------------------------------------
+    # 4) Activity scan only for queued accounts
+    # -------------------------------------------------
+    $activityHits = 0
+    $activityReadFailures = 0
+    $scannedActivities = 0
 
-        if ($scanned % 250 -eq 0) {
-            Write-Log "Progress (pass2): scanned $scanned / $($toActivityScan.Count) activity-eligible accounts. TotalMatches=$($results.Count)" 'DarkGray'
+    foreach ($acct in $activityQueue) {
+        $scannedActivities++
+
+        if ($scannedActivities % 250 -eq 0) {
+            Write-Log "Progress (activity pass): scanned $scannedActivities / $($activityQueue.Count). TotalMatches=$($results.Count)" 'DarkGray'
         }
 
-        # Avoid re-checking accounts already in results (in case of duplicates)
-        if ($results.Where({ $_.AccountID -eq $acct.id }).Count -gt 0) { continue }
+        if ($seenIds.Contains([string]$acct.id)) { continue }
 
         $acts = @()
-        try { $acts = Get-ActivitiesSafe -AccountId $acct.id }
+        try {
+            $acts = @(Get-ActivitiesSafe -AccountId $acct.id)
+        }
         catch {
-            Write-Log ("⚠️ Could not read activities for AccountID={0}: {1}" -f $acct.id, $_.Exception.Message) 'DarkYellow'
+            $activityReadFailures++
+            Write-Log ("Could not read activities for AccountID={0}: {1}" -f [string]$acct.id, $_.Exception.Message) 'DarkYellow'
             continue
         }
 
         $matched = $false
         foreach ($act in ($acts | Select-Object -First $MaxActivitiesToInspect)) {
-            if (ActivityMatchesFast -Activity $act) { $matched = $true; break }
+            $txt = Get-ActivityDiagnosticText -Activity $act
+            if ($txt -and ($txt -match $NeedleRegex)) {
+                $matched = $true
+                break
+            }
         }
 
         if (-not $matched) { continue }
 
-        $row = [PSCustomObject]@{
-            AccountID  = $acct.id
-            SafeName   = $acct.safeName
-            Name       = $acct.name
-            UserName   = $acct.userName
-            Address    = $acct.address
-            PlatformId = $acct.platformId
+        if (Add-ResultRow -Acct $acct -Bucket $results -SeenIds $seenIds) {
+            $activityHits++
+            Write-Log ("ACTIVITY MATCH: AccountID={0} User={1} Address={2} Safe={3} Platform={4}" -f `
+                [string]$acct.id, [string]$acct.userName, [string]$acct.address, [string]$acct.safeName, [string]$acct.platformId) 'Green'
         }
-
-        $results.Add($row) | Out-Null
-        Write-Log ("✅ ACTIVITY MATCH: AccountID={0} Safe={1} User={2} Address={3} Platform={4}" -f `
-            $row.AccountID, $row.SafeName, $row.UserName, $row.Address, $row.PlatformId) 'Green'
     }
 
+    # -------------------------------------------------
     # 5) Export
+    # -------------------------------------------------
     if ($results.Count -gt 0) {
         $results |
-            Sort-Object SafeName, Address, UserName |
+            Sort-Object Safe, Address, Username |
             Export-Csv -Path $CsvFile -NoTypeInformation -Encoding UTF8
-        Write-Log "✅ Exported $($results.Count) matching account(s) to: $CsvFile" 'Green'
-    } else {
+
+        Write-Log "Exported $($results.Count) matching account(s) to: $CsvFile" 'Green'
+    }
+    else {
         Write-Log "No matching accounts found." 'Yellow'
-        @([PSCustomObject]@{AccountID="";SafeName="";Name="";UserName="";Address="";PlatformId=""}) |
-            Export-Csv -Path $CsvFile -NoTypeInformation -Encoding UTF8
+        @(
+            [PSCustomObject]@{
+                AccountID = ""
+                Username  = ""
+                Address   = ""
+                Safe      = ""
+                Platform  = ""
+            }
+        ) | Export-Csv -Path $CsvFile -NoTypeInformation -Encoding UTF8
     }
 
-} finally {
+    Write-Log "Summary: FastHits=$fastHits, ActivityHits=$activityHits, ActivityReadFailures=$activityReadFailures, Total=$($results.Count)" 'Cyan'
+}
+finally {
     try { Close-PASSession | Out-Null } catch {}
     Write-Log "Done." 'Green'
 }
