@@ -1,312 +1,372 @@
-<#
-UpdateSafes_NumberOfDaysRetention_AllSafes_CCP.ps1
+I amm looking to modulate the script below to generate report of list of account experience the error below
 
-AUTH (Automation)
-- CCP -> Service User credential
-- Auth to Privilege Cloud via Identity Shared Services
-  1) Primary: New-PASSession -IdentityTenantURL -PrivilegeCloudURL -Credential -ServiceUser
-  2) Fallback: Get-IdentityHeader -psPASFormat -PCloudSubdomain + Use-PASSession
+Reason: During a logon attempt, the user's security context accumulated too many security IDs. (winRc=1384). 
 
-ACTION
-- Sets NumberOfDaysRetention = 60 for ALL safes in the environment
-- No CSV required
-- Only outputs safes that FAILED to update (also logged)
+Review error logs and activity report even if this has happened in previous activity and now result
 
-LOG
-- I:\Script\IDENTITY Script New\logs\UpdateRetention_AllSafes.txt
-#>
+Export account details in csv in a list, Account ID, Username, Address, Safe and Platform only.
 
-[CmdletBinding(SupportsShouldProcess = $true)]
+
+
+<# =====================================================================
+DisabledAccountDetectAllWinRc1331_FAST.ps1
+
+- CCP -> Identity Header -> psPAS (same login approach)
+- Find ALL accounts that match winRc=1331 / account disabled
+- Faster approach:
+    1) FAST-PATH: match on account-level secretManagement/lastTask fields (no activity call)
+    2) SLOW-PATH: only for likely failures, pull limited activities and match Reason/MoreInfo/Message/Details (no ConvertTo-Json)
+
+Outputs:
+  E:\Installation Media\Script\OnboardScript\data\Disabled_Account.csv
+  E:\Installation Media\Script\OnboardScript\data\Disabled_Account.log
+===================================================================== #>
+
+[CmdletBinding()]
 param(
-    # ===== Identity / Privilege Cloud =====
-    [string]$IdentityTenantURL  = "https://aak4521.my.idaptive.app",
-    [string]$PrivilegeCloudURL  = "https://alliantcredit.privilegecloud.cyberark.cloud",
+    [ValidateRange(1,1000)]
+    [int]$PageSize = 500,
 
-    # ===== CCP settings (Service User stored in Vault) =====
-    [string]$CCPAddress         = "https://aam.alliantcreditunion.com",
-    [string]$CCPLocation        = "AIMWebService",
-    [string]$CCPAppID           = "ACURestAPI",
-    [string]$CCPSafe            = "ACU-VAULT-API",
-    [string]$CCPObject          = "Application-CyberArkVaultRestAPI-alliantcredit.cyberark.cloud",
-    [bool]  $CCPWindowsAuth     = $false,
+    [ValidateRange(1,200000)]
+    [int]$MaxAccountsToInspect = 50000,
 
-    # ===== Target retention for ALL safes =====
-    [ValidateRange(1,3650)]
-    [int]$TargetRetentionDays   = 60,
+    [ValidateRange(1,500)]
+    [int]$MaxActivitiesToInspect = 60,
 
-    # ===== Logging =====
-    [string]$LogFilePath        = "I:\Script\IDENTITY Script New\logs\UpdateRetention_AllSafes.txt",
-
-    # ===== Paging fallback (API) =====
-    [ValidateRange(50,2000)]
-    [int]$PageSize              = 500
+    # If you want speed over coverage, set this to skip full inventory fallback
+    [switch]$SkipInventoryFallback
 )
 
-# --- Modules & TLS ---
-Import-Module psPAS -ErrorAction Stop
+# =========================
+# Baseline
+# =========================
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'
 
-# --- Minimal console output: only failures (and one header line) ---
-function Write-Err($m){ Write-Host "❌ $m" -ForegroundColor Red }
+Import-Module psPAS -Force
 
-function Ensure-Directory {
-    param([Parameter(Mandatory)][string]$Path)
-    if (-not (Test-Path $Path)) { New-Item -ItemType Directory -Path $Path -Force | Out-Null }
+# =========================
+# Output paths
+# =========================
+$OutDir = "E:\Installation Media\Script\OnboardScript\data"
+if (-not (Test-Path $OutDir)) { New-Item -ItemType Directory -Path $OutDir -Force | Out-Null }
+
+$LogFile = Join-Path $OutDir "Disabled_Account.log"
+$CsvFile = Join-Path $OutDir "Disabled_Account.csv"
+New-Item -ItemType File -Force -Path $LogFile | Out-Null
+
+function Write-Log {
+    param([string]$Message, [ConsoleColor]$Color = 'White')
+    $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $line = "$ts - $Message"
+    Write-Host $line -ForegroundColor $Color
+    Add-Content -Path $LogFile -Value $line
 }
 
-function Write-LogLine {
+# =========================
+# CCP / Identity config (your values)
+# =========================
+$CCPAddress    = "https://vskau1p1231.cna.com"
+$location      = "AIMWebService"
+$application   = "PAMDiscovery"
+$safeCCP       = "CA_PCloud_Admins"
+$windowsAuth   = $false
+$headers       = @{ 'Content-Type' = 'application/json' }
+
+$IdentityTenantURL = "aat4012.id.cyberark.cloud"
+$PCloudSubdomain   = "cna-prod"
+
+# =========================
+# Match logic (regex catches variations)
+# =========================
+$NeedleRegex = "(?i)winRc\s*=\s*1331|account\s+is\s+currently\s+disabled|error_account_disabled"
+
+# =========================
+# Login helper: CCP -> Identity header -> psPAS
+# =========================
+function Start-PASSessionFromCCP {
     param(
-        [Parameter(Mandatory)][string]$Message,
-        [ValidateSet('INFO','SUCCESS','WARN','ERROR')][string]$Level = 'INFO'
-    )
-    $line = "{0} [{1}] {2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level, $Message
-    Add-Content -Path $LogFilePath -Value $line
-}
-
-function Get-HostFromUrl {
-    param([Parameter(Mandatory)][string]$Url)
-    try { return ([uri]$Url).Host } catch {
-        return ($Url -replace '^https?://','' -replace '/.*$','').Trim()
-    }
-}
-
-function Get-PCloudSubdomainFromUrl {
-    param([Parameter(Mandatory)][string]$PrivilegeCloudURL)
-
-    # ✅ Do NOT use $host (conflicts with built-in $Host)
-    $pcloudHost = Get-HostFromUrl $PrivilegeCloudURL
-    return ($pcloudHost.Split('.')[0]).Trim()
-}
-
-function Get-PropValueCI {
-    param(
-        [Parameter(Mandatory)]$Object,
-        [Parameter(Mandatory)][string]$PropName
-    )
-    if ($null -eq $Object) { return $null }
-    $p = $Object.PSObject.Properties | Where-Object { $_.Name -ieq $PropName } | Select-Object -First 1
-    if ($p) { return $p.Value }
-    return $null
-}
-
-# --- CCP -> PSCredential ---
-function Get-ServiceUserCredentialFromCCP {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)][string]$CCPAddress,
-        [Parameter(Mandatory)][string]$Location,
-        [Parameter(Mandatory)][string]$AppID,
-        [Parameter(Mandatory)][string]$Safe,
-        [Parameter(Mandatory)][string]$Object,
-        [bool]$WindowsAuth = $false
+        [Parameter(Mandatory)] [string]$ObjectName,
+        [Parameter(Mandatory)] [string]$UPUser
     )
 
-    $base = $CCPAddress.TrimEnd('/')
-    $loc  = $Location.Trim('/')
+    $ccpUrl = "$CCPAddress/$location/api/Accounts?AppID=$application&Safe=$safeCCP&Object=$ObjectName"
+    Write-Log "Retrieving CCP credential for '$UPUser' via Object..." 'Cyan'
 
-    $url  = "{0}/{1}/api/Accounts?AppID={2}&Safe={3}&Object={4}" -f $base, $loc, $AppID, $Safe, $Object
-
-    Write-LogLine "Retrieving Service User credential from CCP: $url" "INFO"
-
-    $headers = @{ "Content-Type" = "application/json" }
-    $resp = Invoke-RestMethod -Uri $url -Method GET -Headers $headers -UseDefaultCredentials:$WindowsAuth -ErrorAction Stop
-
-    if (-not $resp.UserName -or -not $resp.Content) {
-        throw "CCP response missing UserName/Content."
+    $resp = Invoke-RestMethod -Uri $ccpUrl -Method GET -Headers $headers -UseDefaultCredentials:$windowsAuth
+    if (-not $resp -or -not $resp.Content -or -not $resp.Username) {
+        throw "CCP response missing Content/Username."
     }
+    Write-Log "CCP returned username for service principal." 'Green'
 
-    Write-LogLine "CCP returned service user: $($resp.UserName)" "SUCCESS"
-    $sec = ConvertTo-SecureString $resp.Content -AsPlainText -Force
-    return [PSCredential]::new($resp.UserName, $sec)
+    $secPass = ConvertTo-SecureString -String $resp.Content -AsPlainText -Force
+    $upCred  = [PSCredential]::new($UPUser, $secPass)
+
+    Write-Log "Requesting Identity header for '$IdentityTenantURL' (subdomain '$PCloudSubdomain')." 'Cyan'
+    $hdr = Get-IdentityHeader -IdentityTenantURL $IdentityTenantURL -psPASFormat -PCloudSubdomain $PCloudSubdomain -UPCreds $upCred
+
+    Use-PASSession $hdr
+    if (-not (Get-PASSession)) { throw "psPAS session not established." }
+
+    $resp.Content = $null
+    Write-Log "PAS session established (no prompts)." 'Green'
 }
 
-# --- Auth helper: Primary (New-PASSession), Fallback (Get-IdentityHeader/Use-PASSession) ---
-function Connect-PCloudWithServiceUser {
-    [CmdletBinding()]
+function Cmd-HasParam {
+    param([string]$CommandName, [string]$ParamName)
+    $c = Get-Command $CommandName -ErrorAction Stop
+    return $c.Parameters.ContainsKey($ParamName)
+}
+
+function Get-AccountsPaged {
     param(
-        [Parameter(Mandatory)][string]$IdentityTenantURL,
-        [Parameter(Mandatory)][string]$PrivilegeCloudURL,
-        [Parameter(Mandatory)][pscredential]$ServiceCred
+        [string]$SavedFilter,
+        [int]$Limit = 200
     )
 
-    $tenantHost = Get-HostFromUrl $IdentityTenantURL
-    $subdomain  = Get-PCloudSubdomainFromUrl $PrivilegeCloudURL
-
-    Write-LogLine "Attempting login (Primary): New-PASSession (ServiceUser)..." "INFO"
-    try {
-        New-PASSession `
-            -IdentityTenantURL $IdentityTenantURL `
-            -PrivilegeCloudURL $PrivilegeCloudURL `
-            -Credential        $ServiceCred `
-            -ServiceUser `
-            -ErrorAction Stop | Out-Null
-
-        $sess = Get-PASSession
-        if (-not $sess) { throw "Get-PASSession returned null after New-PASSession." }
-
-        Write-LogLine "Authenticated (Primary) to $PrivilegeCloudURL as $($ServiceCred.UserName)" "SUCCESS"
-        return
-    }
-    catch {
-        Write-LogLine "Primary login failed: $($_.Exception.Message)" "WARN"
-        Write-LogLine "Attempting login (Fallback): Get-IdentityHeader + Use-PASSession..." "INFO"
-
-        $cmd = Get-Command Get-IdentityHeader -ErrorAction SilentlyContinue
-        if (-not $cmd) {
-            throw "Fallback login not available (Get-IdentityHeader not found). Primary login failed."
-        }
-
-        $header = Get-IdentityHeader `
-            -IdentityTenantURL $tenantHost `
-            -psPASFormat `
-            -PCloudSubdomain $subdomain `
-            -UPCreds $ServiceCred
-
-        Use-PASSession $header
-
-        $sess2 = Get-PASSession
-        if (-not $sess2) { throw "Get-PASSession returned null after Use-PASSession." }
-
-        Write-LogLine "Authenticated (Fallback) to $PrivilegeCloudURL as $($ServiceCred.UserName)" "SUCCESS"
-        return
-    }
-}
-
-# --- API fallback: list safes if Get-PASSafe fails ---
-function Get-AllSafesViaAPI {
-    [CmdletBinding()]
-    param([int]$Limit = 500)
-
-    $offset = 0
     $all = New-Object System.Collections.Generic.List[object]
+    $offset = 0
+
+    $hasSavedFilter = Cmd-HasParam -CommandName "Get-PASAccount" -ParamName "savedFilter"
+    $hasOffset      = Cmd-HasParam -CommandName "Get-PASAccount" -ParamName "offset"
+    $hasLimit       = Cmd-HasParam -CommandName "Get-PASAccount" -ParamName "limit"
 
     while ($true) {
-        $uri  = "api/Safes?limit=$Limit&offset=$offset"
-        $resp = Invoke-PASRestMethod -Method GET -URI $uri -ErrorAction Stop
+        $params = @{}
+        if ($SavedFilter -and $hasSavedFilter) { $params["savedFilter"] = $SavedFilter }
+        if ($hasLimit)  { $params["limit"]  = $Limit }
+        if ($hasOffset) { $params["offset"] = $offset }
 
-        $items = Get-PropValueCI -Object $resp -PropName "value"
-        $count = Get-PropValueCI -Object $resp -PropName "count"
+        # If module lacks -offset, we can only call once
+        if (-not $hasOffset -and $offset -gt 0) { break }
 
-        if ($null -eq $items) {
-            if ($resp -is [System.Collections.IEnumerable]) { $items = $resp } else { $items = @() }
+        $page = @()
+        try {
+            $page = @(Get-PASAccount @params -ErrorAction Stop)
+        } catch {
+            if ($SavedFilter -and -not $hasSavedFilter) {
+                $page = @(Get-PASAccount -ErrorAction Stop)
+            } else {
+                throw
+            }
         }
 
-        foreach ($i in $items) { $all.Add($i) | Out-Null }
+        if ($page.Count -eq 0) { break }
 
-        if ($null -ne $count) {
-            $offset += $Limit
-            if ($offset -ge [int]$count) { break }
-        }
-        else {
-            if (($items | Measure-Object).Count -lt $Limit) { break }
-            $offset += $Limit
-        }
+        foreach ($a in $page) { $all.Add($a) }
+
+        if (-not $hasOffset) { break }
+        if ($page.Count -lt $Limit) { break }
+        if ($all.Count -ge $MaxAccountsToInspect) { break }
+
+        $offset += $Limit
     }
 
-    return ,$all.ToArray()
+    return @($all | Group-Object id | ForEach-Object { $_.Group | Select-Object -First 1 })
 }
 
-# ============================
-# MAIN
-# ============================
-$sessionCreated = $false
-$failed = New-Object System.Collections.Generic.List[object]
+function Get-ActivitiesSafe {
+    param([string]$AccountId)
 
-try {
-    Ensure-Directory -Path (Split-Path $LogFilePath -Parent)
-    New-Item -ItemType File -Path $LogFilePath -Force | Out-Null
-
-    Write-LogLine "Starting retention update run (ALL safes). Target NumberOfDaysRetention=$TargetRetentionDays" "INFO"
-
-    # 1) Get service user from CCP
-    $serviceCred = Get-ServiceUserCredentialFromCCP `
-        -CCPAddress $CCPAddress `
-        -Location   $CCPLocation `
-        -AppID      $CCPAppID `
-        -Safe       $CCPSafe `
-        -Object     $CCPObject `
-        -WindowsAuth:$CCPWindowsAuth
-
-    # 2) Login using service user automation
-    Connect-PCloudWithServiceUser -IdentityTenantURL $IdentityTenantURL -PrivilegeCloudURL $PrivilegeCloudURL -ServiceCred $serviceCred
-    $sessionCreated = $true
-    Write-LogLine "Authenticated successfully." "SUCCESS"
-
-    # 3) Get all safes
-    $safes = @()
     try {
-        $safes = @(Get-PASSafe -ErrorAction Stop)
-        Write-LogLine "Safes retrieved via Get-PASSafe: $($safes.Count)" "INFO"
+        return @(Get-PASAccountActivity -AccountID $AccountId -ErrorAction Stop)
+    } catch {
+        return @(Get-PASAccountActivity -AccountID $AccountId -useGen1API -ErrorAction Stop)
     }
-    catch {
-        Write-LogLine "Get-PASSafe failed: $($_.Exception.Message)" "WARN"
-        Write-LogLine "Falling back to API paging (api/Safes)..." "INFO"
-        $safes = @(Get-AllSafesViaAPI -Limit $PageSize)
-        Write-LogLine "Safes retrieved via API: $($safes.Count)" "INFO"
-    }
+}
 
-    if (-not $safes -or $safes.Count -eq 0) {
-        throw "No safes returned. Check permissions/service user membership."
-    }
+# -------- FAST-PATH: check account object fields without activity call --------
+function AccountMatchesFast {
+    param([object]$Acct)
 
-    Write-Host ("Updating NumberOfDaysRetention={0} for {1} safe(s)... (only failures will be shown)" -f $TargetRetentionDays, $safes.Count) -ForegroundColor Cyan
+    # Pull only likely fields (cheap). Different tenants may shape these differently.
+    $parts = New-Object System.Collections.Generic.List[string]
 
-    # 4) Update ALL safes
-    foreach ($s in $safes) {
-        $safeName = $null
+    try { if ($Acct.secretManagement) { $parts.Add(($Acct.secretManagement | Out-String)) } } catch {}
+    try { if ($Acct.secretManagement.lastTask) { $parts.Add(($Acct.secretManagement.lastTask | Out-String)) } } catch {}
+    try { if ($Acct.secretManagement.lastFailedTask) { $parts.Add(($Acct.secretManagement.lastFailedTask | Out-String)) } } catch {}
+    try { if ($Acct.secretManagement.status) { $parts.Add([string]$Acct.secretManagement.status) } } catch {}
+    try { if ($Acct.secretManagement.lastTask.status) { $parts.Add([string]$Acct.secretManagement.lastTask.status) } } catch {}
+    try { if ($Acct.secretManagement.lastTask.reason) { $parts.Add([string]$Acct.secretManagement.lastTask.reason) } } catch {}
+    try { if ($Acct.secretManagement.lastTask.details) { $parts.Add([string]$Acct.secretManagement.lastTask.details) } } catch {}
+    try { if ($Acct.secretManagement.lastTask.error) { $parts.Add([string]$Acct.secretManagement.lastTask.error) } } catch {}
+    try { if ($Acct.secretManagement.lastTask.moreInfo) { $parts.Add([string]$Acct.secretManagement.lastTask.moreInfo) } } catch {}
+
+    if ($parts.Count -eq 0) { return $false }
+
+    $hay = ($parts -join " | ")
+    return ($hay -match $NeedleRegex)
+}
+
+# -------- Narrow which accounts deserve slow-path activity calls --------
+function ShouldScanActivities {
+    param([object]$Acct)
+
+    # If the account doesn't show any hint of failure in secretManagement, skip activity scan.
+    # (This is the biggest performance lever.)
+    try {
+        if ($Acct.secretManagement -and $Acct.secretManagement.status) {
+            return ([string]$Acct.secretManagement.status -match '(?i)fail|error')
+        }
+        if ($Acct.secretManagement -and $Acct.secretManagement.lastTask -and $Acct.secretManagement.lastTask.status) {
+            return ([string]$Acct.secretManagement.lastTask.status -match '(?i)fail|error')
+        }
+    } catch { }
+
+    return $false
+}
+
+# -------- Faster activity match (no ConvertTo-Json) --------
+function ActivityMatchesFast {
+    param($Activity)
+
+    $fields = @()
+    foreach ($n in @("Reason","MoreInfo","Message","Details","Action","Error","Status","Description")) {
         try {
-            $safeName = (Get-PropValueCI -Object $s -PropName "safeName")
-            if ([string]::IsNullOrWhiteSpace($safeName)) { $safeName = (Get-PropValueCI -Object $s -PropName "SafeName") }
-            if ([string]::IsNullOrWhiteSpace($safeName)) { throw "Unable to determine safeName from safe object." }
-            $safeName = $safeName.Trim()
+            $v = $Activity.$n
+            if ($v) { $fields += [string]$v }
+        } catch {}
+    }
 
-            if ($PSCmdlet.ShouldProcess($safeName, "Set-PASSafe NumberOfDaysRetention=$TargetRetentionDays")) {
-                Set-PASSafe -SafeName $safeName -NumberOfDaysRetention $TargetRetentionDays -ErrorAction Stop | Out-Null
+    if ($fields.Count -eq 0) { return $false }
+
+    $hay = ($fields -join " | ")
+    return ($hay -match $NeedleRegex)
+}
+
+# =========================
+# MAIN
+# =========================
+try {
+    Start-PASSessionFromCCP -ObjectName "cna.com-CA_PAMDiscovery_SVC" -UPUser "CA_PAMDiscovery_SVC"
+
+    Write-Log "Searching for ALL accounts with disabled-login error (winRc=1331)..." 'Yellow'
+    Write-Log "NeedleRegex: $NeedleRegex" 'DarkYellow'
+
+    # 1) Pull candidates from saved filters (fast)
+    $filtersToTry = @("FailedVerify","FailedChange","FailedReconcile")
+
+    $candidatesList = New-Object System.Collections.Generic.List[object]
+    foreach ($sf in $filtersToTry) {
+        Write-Log "Pulling candidates via savedFilter='$sf' (PageSize=$PageSize)..." 'Cyan'
+        $page = Get-AccountsPaged -SavedFilter $sf -Limit $PageSize
+        Write-Log "savedFilter '$sf' returned $($page.Count) account(s)." 'Green'
+        foreach ($a in $page) { $candidatesList.Add($a) }
+    }
+
+    $candidates = @($candidatesList | Group-Object id | ForEach-Object { $_.Group | Select-Object -First 1 })
+
+    # 2) Optional inventory fallback (slow for huge tenants)
+    if ($candidates.Count -eq 0 -and -not $SkipInventoryFallback) {
+        Write-Log "SavedFilters returned 0. Falling back to inventory paging..." 'Yellow'
+        $candidates = @(Get-AccountsPaged -SavedFilter $null -Limit $PageSize)
+        Write-Log "Inventory paging returned $($candidates.Count) account(s) (cap=$MaxAccountsToInspect)." 'Green'
+    } elseif ($candidates.Count -eq 0) {
+        Write-Log "SavedFilters returned 0 and -SkipInventoryFallback set. Exiting." 'Yellow'
+        exit 0
+    } else {
+        Write-Log "Total unique candidates from saved filters: $($candidates.Count)" 'Yellow'
+    }
+
+    $results = New-Object System.Collections.Generic.List[object]
+    $toActivityScan = New-Object System.Collections.Generic.List[object]
+
+    $inspected = 0
+    $fastHits  = 0
+    $queuedForActivity = 0
+
+    # 3) First pass: FAST PATH (no activity calls)
+    foreach ($acct in $candidates) {
+        $inspected++
+        if ($inspected -gt $MaxAccountsToInspect) {
+            Write-Log "Safety stop: inspected $MaxAccountsToInspect accounts." 'Yellow'
+            break
+        }
+
+        if ($inspected % 500 -eq 0) {
+            Write-Log "Progress (pass1): inspected $inspected / $($candidates.Count). FastHits=$fastHits, QueuedForActivity=$queuedForActivity" 'DarkGray'
+        }
+
+        if (AccountMatchesFast -Acct $acct) {
+            $fastHits++
+
+            $row = [PSCustomObject]@{
+                AccountID  = $acct.id
+                SafeName   = $acct.safeName
+                Name       = $acct.name
+                UserName   = $acct.userName
+                Address    = $acct.address
+                PlatformId = $acct.platformId
             }
 
-            Write-LogLine "Safe '$safeName' updated. NumberOfDaysRetention=$TargetRetentionDays" "SUCCESS"
-        }
-        catch {
-            $err = $_.Exception.Message
-            $failed.Add([PSCustomObject]@{
-                SafeName = $safeName
-                Error    = $err
-            }) | Out-Null
-
-            Write-LogLine "Failed to update safe '$safeName'. Error: $err" "ERROR"
-            Write-Err "Failed to update safe '$safeName' -> $err"
+            $results.Add($row) | Out-Null
+            Write-Log ("✅ FAST MATCH: AccountID={0} Safe={1} User={2} Address={3} Platform={4}" -f `
+                $row.AccountID, $row.SafeName, $row.UserName, $row.Address, $row.PlatformId) 'Green'
             continue
         }
-    }
 
-    if ($failed.Count -gt 0) {
-        Write-Host ""
-        Write-Host ("FAILED safes: {0}" -f $failed.Count) -ForegroundColor Yellow
-        $failed | Sort-Object SafeName | Format-Table -AutoSize
-    }
-    else {
-        Write-Host ""
-        Write-Host "All safes updated successfully (no failures)." -ForegroundColor Green
-    }
-
-    Write-LogLine "Completed processing all safes. Failures=$($failed.Count)" "SUCCESS"
-}
-catch {
-    Write-LogLine "Fatal error: $($_.Exception.Message)" "ERROR"
-    Write-Err $_.Exception.Message
-}
-finally {
-    if ($sessionCreated) {
-        try {
-            Close-PASSession | Out-Null
-            Write-LogLine "Logged off." "INFO"
-        } catch {
-            Write-LogLine "Logoff warning: $($_.Exception.Message)" "WARN"
+        if (ShouldScanActivities -Acct $acct) {
+            $queuedForActivity++
+            $toActivityScan.Add($acct) | Out-Null
         }
     }
-}
 
-# Return failures as objects (pipeline-friendly)
-$failed
+    Write-Log "Pass1 complete. FastHits=$fastHits. ActivityScanQueue=$($toActivityScan.Count)." 'Yellow'
+
+    # 4) Second pass: SLOW PATH (activity calls ONLY for failure-like accounts)
+    $scanned = 0
+    foreach ($acct in $toActivityScan) {
+        $scanned++
+
+        if ($scanned % 250 -eq 0) {
+            Write-Log "Progress (pass2): scanned $scanned / $($toActivityScan.Count) activity-eligible accounts. TotalMatches=$($results.Count)" 'DarkGray'
+        }
+
+        # Avoid re-checking accounts already in results (in case of duplicates)
+        if ($results.Where({ $_.AccountID -eq $acct.id }).Count -gt 0) { continue }
+
+        $acts = @()
+        try { $acts = Get-ActivitiesSafe -AccountId $acct.id }
+        catch {
+            Write-Log ("⚠️ Could not read activities for AccountID={0}: {1}" -f $acct.id, $_.Exception.Message) 'DarkYellow'
+            continue
+        }
+
+        $matched = $false
+        foreach ($act in ($acts | Select-Object -First $MaxActivitiesToInspect)) {
+            if (ActivityMatchesFast -Activity $act) { $matched = $true; break }
+        }
+
+        if (-not $matched) { continue }
+
+        $row = [PSCustomObject]@{
+            AccountID  = $acct.id
+            SafeName   = $acct.safeName
+            Name       = $acct.name
+            UserName   = $acct.userName
+            Address    = $acct.address
+            PlatformId = $acct.platformId
+        }
+
+        $results.Add($row) | Out-Null
+        Write-Log ("✅ ACTIVITY MATCH: AccountID={0} Safe={1} User={2} Address={3} Platform={4}" -f `
+            $row.AccountID, $row.SafeName, $row.UserName, $row.Address, $row.PlatformId) 'Green'
+    }
+
+    # 5) Export
+    if ($results.Count -gt 0) {
+        $results |
+            Sort-Object SafeName, Address, UserName |
+            Export-Csv -Path $CsvFile -NoTypeInformation -Encoding UTF8
+        Write-Log "✅ Exported $($results.Count) matching account(s) to: $CsvFile" 'Green'
+    } else {
+        Write-Log "No matching accounts found." 'Yellow'
+        @([PSCustomObject]@{AccountID="";SafeName="";Name="";UserName="";Address="";PlatformId=""}) |
+            Export-Csv -Path $CsvFile -NoTypeInformation -Encoding UTF8
+    }
+
+} finally {
+    try { Close-PASSession | Out-Null } catch {}
+    Write-Log "Done." 'Green'
+}
