@@ -1,195 +1,102 @@
 <#
-CCP → Identity Service User → Privilege Cloud → Safe + Domain Group Membership
+CNA_Safes_Missing_CA_PCloud_Admins.ps1
 
-Fixes:
-  - Handles "Member <group> has not been defined" by:
-      * Searching Privilege Cloud Groups (Directory) first
-      * Using -SearchIn with the correct LDAP directory name (if applicable)
-      * Retrying with UPN (group@domain) when only sAM was supplied
-      * Optional: LDAP lookup in on-prem AD to confirm the group exists there
+- CNA Login (like your pattern):
+  CCP -> Get-IdentityHeader (-psPASFormat) -> Use-PASSession
+- Export ALL safes that do NOT have member:
+    CA_PCloud_Admins@cna.com
 
-Notes:
-  - Parser error fixed by removing nested quotes inside a double-quoted string
-  - PreferredLDAPDirectoryName should be the PVWA LDAP directory "name/id" (not the domain)
-    Example values are often like: "alliantcreditunion" / "ACU" / "corp.local" depending on LDAP Integration config
+Outputs:
+  E:\Installation Media\Script\OnboardScript\data\CNA_Safes_Missing_CA_PCloud_Admins.csv
+  E:\Installation Media\Script\OnboardScript\data\CNA_Safes_Missing_CA_PCloud_Admins.log
+
+Key Fixes vs your failing run:
+- URL-encodes CCP query values (AppID/Safe/Object) to avoid 400 due to '@' in Object
+- Reads & logs WebException response body for CCP failures (helps you confirm wrong AppID/Safe/Object quickly)
 #>
 
-[CmdletBinding(SupportsShouldProcess=$true)]
+[CmdletBinding()]
 param(
-    # ===== Identity / Privilege Cloud (Shared Services) =====
-    [string]$IdentityTenantURL  = "https://aak4521.my.idaptive.app",
-    [string]$PrivilegeCloudURL  = "https://alliantcredit.privilegecloud.cyberark.cloud",
+    [ValidateRange(1,5000)]
+    [int]$SafePageSize = 200,
 
-    # ===== CPM / Safe settings =====
-    [string]$ManagingCPM        = "HQVECYBARK101",
-    [string]$Location           = "\",
+    [ValidateRange(1,200000)]
+    [int]$MaxSafesToInspect = 50000,
 
-    # ===== CCP settings (for API Service User stored in Vault) =====
-    [string]$CCPAddress         = "https://aam.alliantcreditunion.com",
-    [string]$CCPLocation        = "AIMWebService",
-    [string]$CCPAppID           = "ACURestAPI",
-    [string]$CCPSafe            = "ACU-VAULT-API",
-    [string]$CCPObject          = "Application-CyberArkVaultRestAPI-alliantcredit.cyberark.cloud",
-    [bool]  $CCPWindowsAuth     = $false,
+    [ValidateSet('All','Fast','Strict')]
+    [string]$MatchMode = 'All',
 
-    # ===== Directory behavior =====
-    [string]$DefaultUPNSuffix   = "alliantcreditunion.com",
+    # Output folder
+    [string]$OutDir = "E:\Installation Media\Script\OnboardScript\data",
 
-    # OPTIONAL: If your PVWA LDAP Integration directory name/id is known, set it here.
-    # If blank, the script will TRY to discover via Get-PASDirectory (requires Vault Admin rights).
-    [string]$PreferredLDAPDirectoryName = "alliantcreditunion.com"
+    # ===== CNA Identity / Privilege Cloud =====
+    [string]$IdentityTenantURL  = "https://aat4012.id.cyberark.cloud",
+    [string]$PCloudSubdomain    = "cna-prod",
+    [string]$PrivilegeCloudURL  = "https://cna-prod.privilegecloud.cyberark.cloud",
+
+    # ===== CCP settings (CNA) =====
+    [string]$CCPAddress      = "https://www.ccp.cna.com",
+    [string]$CCPLocation     = "AIMWebService",
+    [string]$CCPAppID        = "PAMDiscovery",
+    [string]$CCPSafe         = "CA_PCloud_Admins",
+    [string]$CCPObject       = "cna-prod.cyberark.cloud-cnarestbot@cyberark.cloud.6679",
+    [bool]  $CCPWindowsAuth  = $false,
+
+    # ===== Target member to check =====
+    [string]$RequiredMember  = "CA_PCloud_Admins@cna.com"
 )
 
-# --- Modules & TLS ---
-Import-Module psPAS -ErrorAction Stop
+# =========================
+# Baseline
+# =========================
+Import-Module psPAS -Force -ErrorAction Stop
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$ErrorActionPreference = 'Stop'
+$ProgressPreference    = 'SilentlyContinue'
 
-# --- Pretty log helpers ---
-function Write-Info($m){ Write-Host "🛠  $m" -ForegroundColor Cyan }
-function Write-Ok($m){   Write-Host "✅ $m" -ForegroundColor Green }
-function Write-Warn($m){ Write-Host "⚠️  $m" -ForegroundColor Yellow }
-function Write-Err($m){  Write-Host "❌ $m" -ForegroundColor Red }
+# =========================
+# Output paths
+# =========================
+if (-not (Test-Path $OutDir)) { New-Item -ItemType Directory -Path $OutDir -Force | Out-Null }
 
-# --- GUI input helpers (fallback to Read-Host) ---
-Add-Type -AssemblyName System.Windows.Forms | Out-Null
-Add-Type -AssemblyName System.Drawing       | Out-Null
+$LogFile = Join-Path $OutDir "CNA_Safes_Missing_CA_PCloud_Admins.log"
+$CsvFile = Join-Path $OutDir "CNA_Safes_Missing_CA_PCloud_Admins.csv"
+New-Item -ItemType File -Force -Path $LogFile | Out-Null
 
-function Show-InputDialog {
-    param(
-        [Parameter(Mandatory)][string]$Title,
-        [Parameter(Mandatory)][string]$Prompt,
-        [Parameter()][string]$Default = '',
-        [Parameter()][scriptblock]$ValidateScript = {$true},
-        [Parameter()][string]$ValidationHint = ''
-    )
+function Write-Log {
+    param([string]$Message, [ConsoleColor]$Color = 'White')
+    $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $line = "$ts - $Message"
+    Write-Host $line -ForegroundColor $Color
+    Add-Content -Path $LogFile -Value $line
+}
+
+function Get-WebExceptionBody {
+    param([Parameter(Mandatory)][System.Exception]$Exception)
+
     try {
-        $form                 = New-Object System.Windows.Forms.Form
-        $form.Text            = $Title
-        $form.StartPosition   = 'CenterScreen'
-        $form.TopMost         = $true
-        $form.Size            = New-Object System.Drawing.Size(520,200)
-        $form.FormBorderStyle = 'FixedDialog'
-        $form.MaximizeBox     = $false
-
-        $lbl                  = New-Object System.Windows.Forms.Label
-        $lbl.Text             = $Prompt
-        $lbl.AutoSize         = $true
-        $lbl.Location         = '12,15'
-        $lbl.Font             = New-Object System.Drawing.Font('Segoe UI',10)
-        $form.Controls.Add($lbl)
-
-        $tb                   = New-Object System.Windows.Forms.TextBox
-        $tb.Location          = '16,48'
-        $tb.Width             = 470
-        $tb.Text              = $Default
-        $tb.Font              = New-Object System.Drawing.Font('Consolas',11)
-        $form.Controls.Add($tb)
-
-        $hint                 = New-Object System.Windows.Forms.Label
-        $hint.AutoSize        = $true
-        $hint.ForeColor       = [System.Drawing.Color]::DarkGray
-        $hint.Text            = $ValidationHint
-        $hint.Location        = '16,80'
-        $form.Controls.Add($hint)
-
-        $ok                   = New-Object System.Windows.Forms.Button
-        $ok.Text              = 'Continue'
-        $ok.Location          = '312,120'
-        $ok.Width             = 80
-        $ok.DialogResult      = [System.Windows.Forms.DialogResult]::OK
-        $form.AcceptButton    = $ok
-        $form.Controls.Add($ok)
-
-        $cancel               = New-Object System.Windows.Forms.Button
-        $cancel.Text          = 'Cancel'
-        $cancel.Location      = '406,120'
-        $cancel.Width         = 80
-        $cancel.DialogResult  = [System.Windows.Forms.DialogResult]::Cancel
-        $form.CancelButton    = $cancel
-        $form.Controls.Add($cancel)
-
-        $tb.add_TextChanged({
-            try {
-                if (& $ValidateScript $tb.Text) { $tb.BackColor = [System.Drawing.Color]::White }
-                else                            { $tb.BackColor = [System.Drawing.Color]::MistyRose }
-            } catch {
-                $tb.BackColor = [System.Drawing.Color]::MistyRose
-            }
-        })
-
-        $dialog = $form.ShowDialog()
-        if ($dialog -ne [System.Windows.Forms.DialogResult]::OK) { return $null }
-
-        $val = $tb.Text.Trim()
-        if (-not (& $ValidateScript $val)) {
-            [System.Windows.Forms.MessageBox]::Show(
-                "Value is invalid. Please try again.",
-                "Validation",
-                [System.Windows.Forms.MessageBoxButtons]::OK,
-                [System.Windows.Forms.MessageBoxIcon]::Warning
-            ) | Out-Null
-            return Show-InputDialog @PSBoundParameters
+        $we = $Exception
+        if ($Exception -isnot [System.Net.WebException]) {
+            $we = $Exception.InnerException
         }
-        return $val
+        if (-not $we -or $we -isnot [System.Net.WebException]) { return $null }
+        if (-not $we.Response) { return $null }
+
+        $stream = $we.Response.GetResponseStream()
+        if (-not $stream) { return $null }
+
+        $reader = New-Object System.IO.StreamReader($stream)
+        $text = $reader.ReadToEnd()
+        $reader.Close()
+        return $text
     } catch {
-        $val = Read-Host "$Title - $Prompt"
-        if (-not (& $ValidateScript $val)) { throw "Input failed validation." }
-        return $val
+        return $null
     }
 }
 
-# --- Permissions helpers ---
-function Get-AdminPerms {
-    @{
-        UseAccounts                             = $true
-        RetrieveAccounts                        = $true
-        ListAccounts                            = $true
-        AddAccounts                             = $true
-        UpdateAccountContent                    = $true
-        UpdateAccountProperties                 = $true
-        InitiateCPMAccountManagementOperations  = $true
-        SpecifyNextAccountContent               = $true
-        RenameAccounts                          = $true
-        DeleteAccounts                          = $true
-        UnlockAccounts                          = $true
-        ManageSafe                              = $true
-        ManageSafeMembers                       = $true
-        BackupSafe                              = $true
-        ViewAuditLog                            = $true
-        ViewSafeMembers                         = $true
-        AccessWithoutConfirmation               = $true
-        CreateFolders                           = $true
-        DeleteFolders                           = $true
-        MoveAccountsAndFolders                  = $true
-    }
-}
-
-function Get-CarkPerms {
-    @{
-        UseAccounts                             = $true
-        RetrieveAccounts                        = $true
-        ListAccounts                            = $true
-        AddAccounts                             = $false
-        UpdateAccountContent                    = $true
-        UpdateAccountProperties                 = $false
-        InitiateCPMAccountManagementOperations  = $true
-        SpecifyNextAccountContent               = $true
-        RenameAccounts                          = $false
-        DeleteAccounts                          = $false
-        UnlockAccounts                          = $false
-        ManageSafe                              = $false
-        ManageSafeMembers                       = $false
-        BackupSafe                              = $false
-        ViewAuditLog                            = $true
-        ViewSafeMembers                         = $true
-        AccessWithoutConfirmation               = $true
-        CreateFolders                           = $false
-        DeleteFolders                           = $false
-        MoveAccountsAndFolders                  = $false
-    }
-}
-
-# --- CCP → PSCredential (API Service User) ---
+# =========================
+# Helper: CCP fetch (URL-ENCODED)
+# =========================
 function Get-ServiceUserCredentialFromCCP {
     [CmdletBinding()]
     param(
@@ -204,320 +111,296 @@ function Get-ServiceUserCredentialFromCCP {
     $base = $CCPAddress.TrimEnd('/')
     $loc  = $Location.Trim('/')
 
-    $url  = "{0}/{1}/api/Accounts?AppID={2}&Safe={3}&Object={4}" -f $base, $loc, $AppID, $Safe, $Object
+    # URL-encode query values (THIS FIXES MANY CCP 400s, especially with '@' in Object)
+    $encApp  = [uri]::EscapeDataString($AppID)
+    $encSafe = [uri]::EscapeDataString($Safe)
+    $encObj  = [uri]::EscapeDataString($Object)
 
-    Write-Info "Retrieving **Service User** credential from CCP:"
-    Write-Info "  $url"
+    $url  = "{0}/{1}/api/Accounts?AppID={2}&Safe={3}&Object={4}" -f $base, $loc, $encApp, $encSafe, $encObj
 
-    $headers = @{ "Content-Type" = "application/json" }
+    Write-Log "Retrieving CCP credential via Object..." 'Cyan'
+    Write-Log ("CCP URL (encoded): {0}" -f $url) 'DarkGray'
 
-    $resp = Invoke-RestMethod -Uri $url -Method GET -Headers $headers -UseDefaultCredentials:$WindowsAuth -ErrorAction Stop
-
-    if (-not $resp.UserName -or -not $resp.Content) {
-        throw "CCP response missing UserName/Content. Raw: $($resp | ConvertTo-Json -Depth 5)"
-    }
-
-    Write-Ok "CCP returned service user: $($resp.UserName)"
-
-    $sec = ConvertTo-SecureString $resp.Content -AsPlainText -Force
-    return [PSCredential]::new($resp.UserName, $sec)
-}
-
-# --- Discover LDAP directory name (for -SearchIn) ---
-function Get-EffectiveLDAPDirectoryName {
-    param([string]$Preferred)
-
-    if ($Preferred -and $Preferred.Trim()) {
-        Write-Info "Using configured LDAP directory name for -SearchIn: '$Preferred'"
-        return $Preferred.Trim()
-    }
+    $headers = @{ 'Content-Type' = 'application/json' }
 
     try {
-        $dirs = Get-PASDirectory -ErrorAction Stop
-        if ($dirs) {
-            $match = $dirs | Where-Object {
-                ($_.DomainName -and $_.DomainName -like "*$DefaultUPNSuffix*") -or
-                ($_.id -and $_.id -like "*$DefaultUPNSuffix*") -or
-                ($_.DomainName -and $_.DomainName -like "*alliant*")
-            } | Select-Object -First 1
-
-            if (-not $match) { $match = $dirs | Select-Object -First 1 }
-
-            if ($match) {
-                $name = $match.id
-                Write-Info "Auto-discovered LDAP directory name for -SearchIn: '$name'"
-                return $name
-            }
-        }
+        $resp = Invoke-RestMethod -Uri $url -Method GET -Headers $headers -UseDefaultCredentials:$WindowsAuth -ErrorAction Stop
     } catch {
-        Write-Warn "Could not auto-discover LDAP directory name (Get-PASDirectory may require Vault Admin). We'll still try without -SearchIn."
-    }
-
-    return $null
-}
-
-# --- Search Privilege Cloud for a directory group (API-backed via Get-PASGroup) ---
-function Find-DirectoryGroupInVault {
-    param([Parameter(Mandatory)][string]$GroupNameNoDomain)
-
-    try {
-        $hits = Get-PASGroup -groupType Directory -search $GroupNameNoDomain -ErrorAction Stop
-        if ($hits) {
-            $exact = $hits | Where-Object { $_.groupName -eq $GroupNameNoDomain } | Select-Object -First 1
-            if ($exact) { return $exact }
-            return ($hits | Select-Object -First 1)
+        $body = Get-WebExceptionBody -Exception $_.Exception
+        if ($body) {
+            Write-Log ("CCP Error Body: {0}" -f $body) 'Yellow'
         }
-    } catch { }
-    return $null
+        throw
+    }
+
+    if (-not $resp -or -not $resp.Content) { throw "Empty CCP response or missing Content." }
+    if (-not $resp.UserName -and -not $resp.Username) { throw "CCP response missing UserName/Username." }
+
+    $uname = if ($resp.UserName) { $resp.UserName } else { $resp.Username }
+    Write-Log ("CCP returned username: {0}" -f $uname) 'Green'
+
+    $sec = ConvertTo-SecureString -String $resp.Content -AsPlainText -Force
+    return [PSCredential]::new($uname, $sec)
 }
 
-# --- Optional: LDAP query to check group exists in on-prem AD (no RSAT needed) ---
-function Test-GroupExistsInADViaLDAP {
-    param([Parameter(Mandatory)][string]$GroupSam)
+# =========================
+# Helper: CNA login (Identity header method)
+# =========================
+function Start-PASSessionFromCCP {
+    [CmdletBinding()]
+    param()
 
-    try {
-        Add-Type -AssemblyName System.DirectoryServices -ErrorAction Stop
-        $root = New-Object System.DirectoryServices.DirectoryEntry("LDAP://RootDSE")
-        $baseDN = $root.Properties["defaultNamingContext"][0]
-        if (-not $baseDN) { return $false }
+    $upCred = Get-ServiceUserCredentialFromCCP `
+        -CCPAddress  $CCPAddress `
+        -Location    $CCPLocation `
+        -AppID       $CCPAppID `
+        -Safe        $CCPSafe `
+        -Object      $CCPObject `
+        -WindowsAuth $CCPWindowsAuth
 
-        $searchRoot = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$baseDN")
-        $ds = New-Object System.DirectoryServices.DirectorySearcher($searchRoot)
-        $ds.Filter = "(&(objectCategory=group)(sAMAccountName=$GroupSam))"
-        $ds.PageSize = 200
-        $res = $ds.FindOne()
-        return [bool]$res
-    } catch {
-        return $false
+    Write-Log ("Requesting Identity header for tenant '{0}' (subdomain '{1}')..." -f $IdentityTenantURL, $PCloudSubdomain) 'Cyan'
+
+    $hdr = Get-IdentityHeader `
+        -IdentityTenantURL $IdentityTenantURL `
+        -psPASFormat `
+        -PCloudSubdomain $PCloudSubdomain `
+        -UPCreds $upCred
+
+    Use-PASSession $hdr
+    if (-not (Get-PASSession)) { throw "psPAS session not established." }
+
+    Write-Log ("PAS session established via Identity header as {0}" -f $upCred.UserName) 'Green'
+}
+
+# =========================
+# Helper: Discover Base PVWA URL from session (fallback to PrivilegeCloudURL)
+# =========================
+function Get-PVWABase {
+    $sess = Get-PASSession
+    if (-not $sess) { throw "No PAS session found." }
+
+    $base = $null
+    foreach ($p in @('BaseURI','BaseUrl','PVWAURL','Url','URI')) {
+        if ($sess.PSObject.Properties[$p]) {
+            $base = [string]$sess.$p
+            if (-not [string]::IsNullOrWhiteSpace($base)) { break }
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($base)) {
+        $base = ($PrivilegeCloudURL.TrimEnd('/') + "/PasswordVault")
+    }
+
+    if ($base -notmatch '(?i)/PasswordVault(/|$)') {
+        $base = $base.TrimEnd('/') + "/PasswordVault"
+    }
+
+    return $base.TrimEnd('/')
+}
+
+# =========================
+# Helper: Get headers/websession from psPAS session
+# =========================
+function Get-SessionTransport {
+    $sess = Get-PASSession
+    if (-not $sess) { throw "No PAS session found." }
+
+    $headers = @{ 'Content-Type' = 'application/json' }
+    if ($sess.PSObject.Properties['Headers'] -and $sess.Headers) {
+        foreach ($k in $sess.Headers.Keys) { $headers[$k] = $sess.Headers[$k] }
+    }
+
+    $token = $null
+    foreach ($p in @('Token','token','Authorization','AuthToken')) {
+        if ($sess.PSObject.Properties[$p]) {
+            $token = [string]$sess.$p
+            if (-not [string]::IsNullOrWhiteSpace($token)) { break }
+        }
+    }
+    if ($token -and -not $headers.ContainsKey('Authorization')) {
+        $headers['Authorization'] = $token
+    }
+
+    $webSession = $null
+    foreach ($p in @('WebSession','webSession')) {
+        if ($sess.PSObject.Properties[$p]) {
+            $webSession = $sess.$p
+            if ($webSession) { break }
+        }
+    }
+
+    return [PSCustomObject]@{
+        Headers    = $headers
+        WebSession = $webSession
     }
 }
 
-# --- Safe member ensure helper (supports -SearchIn + retry logic) ---
-function Ensure-SafeMember {
+function Invoke-PVWAGet {
+    param([Parameter(Mandatory)][string]$FullUri)
+
+    $t = Get-SessionTransport
+    if ($t.WebSession) {
+        return Invoke-RestMethod -Uri $FullUri -Method GET -Headers $t.Headers -WebSession $t.WebSession -ErrorAction Stop
+    }
+    return Invoke-RestMethod -Uri $FullUri -Method GET -Headers $t.Headers -ErrorAction Stop
+}
+
+# =========================
+# Safe listing (paged): /api/Safes?limit=&offset=
+# =========================
+function Get-AllSafesPaged {
+    [CmdletBinding()]
+    param(
+        [int]$Limit = 200,
+        [int]$Max   = 50000
+    )
+
+    $base = Get-PVWABase
+    $offset = 0
+    $all = New-Object System.Collections.Generic.List[object]
+
+    while ($true) {
+        $uri = "{0}/api/Safes?limit={1}&offset={2}" -f $base, $Limit, $offset
+        $resp = Invoke-PVWAGet -FullUri $uri
+
+        $items = @()
+        if ($resp.value) { $items = @($resp.value) }
+        elseif ($resp.safes) { $items = @($resp.safes) }
+        elseif ($resp -is [array]) { $items = @($resp) }
+
+        if ($items.Count -eq 0) { break }
+
+        foreach ($s in $items) { $all.Add($s) | Out-Null }
+
+        if ($all.Count -ge $Max) { break }
+        if ($items.Count -lt $Limit) { break }
+
+        $offset += $Limit
+    }
+
+    return @($all)
+}
+
+# =========================
+# Members check: /api/Safes/{safeName}/Members
+# =========================
+function Safe-HasMember {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$SafeName,
-        [Parameter(Mandatory)][string]$MemberName,   # sAM or UPN
-        [Parameter(Mandatory)][ValidateSet('User','Group','Role')][string]$MemberType,
-        [Parameter(Mandatory)][hashtable]$PermFlags,
-        [Parameter()][string]$SearchIn
+        [Parameter(Mandatory)][string]$MemberToFind
     )
 
-    $cmdAdd = Get-Command Add-PASSafeMember -ErrorAction Stop
-    $cmdSet = Get-Command Set-PASSafeMember -ErrorAction Stop
-    $supportsMemberType = $cmdAdd.Parameters.ContainsKey('MemberType')
-    $supportsSearchIn   = $cmdAdd.Parameters.ContainsKey('SearchIn')
+    $base = Get-PVWABase
+    $safeEsc = [uri]::EscapeDataString($SafeName)
+    $uri = "{0}/api/Safes/{1}/Members" -f $base, $safeEsc
 
-    # ✅ FIX: avoid nested quotes inside a double-quoted string (prevents parser error)
-    $searchMsg = if ($SearchIn) { "; SearchIn=$SearchIn" } else { "" }
-    Write-Info ("Processing member '{0}' on '{1}' (Type={2}){3}..." -f $MemberName, $SafeName, $MemberType, $searchMsg)
+    $resp = Invoke-PVWAGet -FullUri $uri
 
-    $existing = $null
-    try {
-        $existing = Get-PASSafeMember -SafeName $SafeName -Search $MemberName -ErrorAction SilentlyContinue |
-                    Where-Object { $_.MemberName -eq $MemberName }
-    } catch { }
+    $members = @()
+    if ($resp.value) { $members = @($resp.value) }
+    elseif ($resp.members) { $members = @($resp.members) }
+    elseif ($resp -is [array]) { $members = @($resp) }
 
-    $permParams = @{}
-    foreach ($k in $PermFlags.Keys) { $permParams[$k] = $PermFlags[$k] }
+    if ($members.Count -eq 0) { return $false }
 
-    $splat = @{
-        SafeName   = $SafeName
-        MemberName = $MemberName
+    $needle = $MemberToFind.Trim()
+
+    foreach ($m in $members) {
+        $cands = @()
+
+        foreach ($p in @('memberName','MemberName','userName','UserName','name','Name')) {
+            if ($m.PSObject.Properties[$p] -and $m.$p) { $cands += [string]$m.$p }
+        }
+        if ($m.PSObject.Properties['member'] -and $m.member) {
+            foreach ($p in @('memberName','MemberName','userName','UserName','name','Name')) {
+                if ($m.member.PSObject.Properties[$p] -and $m.member.$p) { $cands += [string]$m.member.$p }
+            }
+        }
+
+        foreach ($c in $cands) {
+            if ([string]::IsNullOrWhiteSpace($c)) { continue }
+            $c1 = $c.Trim()
+
+            if ($MatchMode -eq 'Strict') {
+                if ($c1 -ieq $needle) { return $true }
+            }
+            elseif ($MatchMode -eq 'Fast') {
+                if ($c1 -ieq $needle) { return $true }
+                if ($c1.Split('@')[0] -ieq $needle.Split('@')[0]) { return $true }
+            }
+            else {
+                if ($c1 -ieq $needle) { return $true }
+                if ($c1 -like "*$needle*") { return $true }
+                if ($c1.Split('@')[0] -ieq $needle.Split('@')[0]) { return $true }
+            }
+        }
     }
-    if ($supportsMemberType) { $splat.MemberType = $MemberType }
-    if ($supportsSearchIn -and $SearchIn) { $splat.SearchIn = $SearchIn }
-    $splat += $permParams
 
-    if ($existing) {
-        Write-Info "Member exists; updating permissions via Set-PASSafeMember..."
-        $setSplat = @{} + $splat
-        if (-not $cmdSet.Parameters.ContainsKey('MemberType')) { $setSplat.Remove('MemberType') | Out-Null }
-        if (-not $cmdSet.Parameters.ContainsKey('SearchIn'))   { $setSplat.Remove('SearchIn')   | Out-Null }
-
-        Set-PASSafeMember @setSplat -ErrorAction Stop | Out-Null
-        Write-Ok  "Updated '$MemberName' on '$SafeName'."
-    }
-    else {
-        Write-Info "Member not found; adding via Add-PASSafeMember..."
-        Add-PASSafeMember @splat -ErrorAction Stop | Out-Null
-        Write-Ok  "Added '$MemberName' to '$SafeName'."
-    }
+    return $false
 }
 
-# --- MAIN ---
+# =========================
+# MAIN
+# =========================
 $sessionCreated = $false
 
 try {
-    $serviceCred = Get-ServiceUserCredentialFromCCP `
-        -CCPAddress $CCPAddress `
-        -Location   $CCPLocation `
-        -AppID      $CCPAppID `
-        -Safe       $CCPSafe `
-        -Object     $CCPObject `
-        -WindowsAuth:$CCPWindowsAuth
-
-    Write-Info "Authenticating to Privilege Cloud via Identity (Service User)..."
-
-    New-PASSession `
-        -IdentityTenantURL $IdentityTenantURL `
-        -PrivilegeCloudURL $PrivilegeCloudURL `
-        -Credential        $serviceCred `
-        -ServiceUser `
-        -ErrorAction Stop | Out-Null
-
-    $session = Get-PASSession
-    if (-not $session) { throw "psPAS session not established via ServiceUser." }
-
+    Start-PASSessionFromCCP
     $sessionCreated = $true
-    Write-Ok "Authenticated to $PrivilegeCloudURL as service user: $($serviceCred.UserName)"
 
-    $ldapDirName = Get-EffectiveLDAPDirectoryName -Preferred $PreferredLDAPDirectoryName
+    Write-Log ("Scanning all safes for missing member: {0}" -f $RequiredMember) 'Yellow'
+    Write-Log ("SafePageSize={0} MaxSafesToInspect={1} MatchMode={2}" -f $SafePageSize, $MaxSafesToInspect, $MatchMode) 'DarkYellow'
 
-    $safeName = Show-InputDialog -Title "New Safe" `
-        -Prompt "Enter the Safe name (must start with APP_ or AAM_):" `
-        -Default "APP_" `
-        -ValidationHint "Examples: APP_MyApp_Prod, AAM_MySvc_NonProd" `
-        -ValidateScript {
-            param($x)
-            $t = $x.Trim()
-            if ([string]::IsNullOrWhiteSpace($t)) { return $false }
-            return ($t.StartsWith('APP_') -or $t.StartsWith('AAM_'))
+    $safes = @(Get-AllSafesPaged -Limit $SafePageSize -Max $MaxSafesToInspect)
+    Write-Log ("Total safes retrieved: {0}" -f $safes.Count) 'Green'
+
+    $missing = New-Object System.Collections.Generic.List[object]
+    $checked = 0
+    $failedMemberCalls = 0
+
+    foreach ($s in $safes) {
+        $checked++
+        if ($checked % 200 -eq 0) {
+            Write-Log ("Progress: checked {0}/{1}. Missing={2} MemberQueryFailures={3}" -f $checked, $safes.Count, $missing.Count, $failedMemberCalls) 'DarkGray'
         }
 
-    if (-not $safeName) { Write-Warn "Safe name entry cancelled."; return }
-
-    Write-Info "Provisioning Safe: $safeName"
-
-    $exists = $null
-    try { $exists = Get-PASSafe -SafeName $safeName -ErrorAction SilentlyContinue } catch {}
-
-    if (-not $exists) {
-        $splat = @{
-            SafeName              = $safeName
-            Description           = ""
-            ManagingCPM           = $ManagingCPM
-            NumberOfDaysRetention = 120
-            location              = $Location
+        $safeName = $null
+        foreach ($p in @('safeName','SafeName','name','Name')) {
+            if ($s.PSObject.Properties[$p] -and $s.$p) { $safeName = [string]$s.$p; break }
         }
-        if ($PSCmdlet.ShouldProcess($safeName, "Add-PASSafe")) {
-            Add-PASSafe @splat -ErrorAction Stop | Out-Null
-            Write-Ok "Safe created: '$safeName' (Retention: 120 days)."
-        }
-    }
-    else {
-        Write-Warn "Safe '$safeName' already exists; enforcing retention=120."
+        if ([string]::IsNullOrWhiteSpace($safeName)) { continue }
+
         try {
-            Set-PASSafe -SafeName $safeName -NumberOfDaysRetention 120 -ErrorAction Stop | Out-Null
-            Write-Ok "Retention updated on existing Safe."
-        } catch {
-            Write-Warn "Could not update existing Safe retention: $($_.Exception.Message)"
-        }
-    }
-
-    $permAdmin = Get-AdminPerms
-    $permCark  = Get-CarkPerms
-
-    $iamUpn = "IAM_ACU_CA_Admins@$DefaultUPNSuffix"
-    $iamSam = "IAM_ACU_CA_Admins"
-
-    Write-Info "Adding/updating IAM_ACU_CA_Admins on '$safeName'..."
-    $iamDone = $false
-
-    foreach ($try in @(
-        @{ Name=$iamUpn; SearchIn=$ldapDirName },
-        @{ Name=$iamUpn; SearchIn=$null      },
-        @{ Name=$iamSam; SearchIn=$ldapDirName },
-        @{ Name=$iamSam; SearchIn=$null      }
-    )) {
-        if ($iamDone) { break }
-        try {
-            Ensure-SafeMember -SafeName $safeName -MemberName $try.Name -MemberType Group -PermFlags $permAdmin -SearchIn $try.SearchIn
-            $iamDone = $true
-        } catch {
-            $si = if ($try.SearchIn) { " (SearchIn=$($try.SearchIn))" } else { "" }
-            Write-Warn ("IAM add attempt failed for '{0}'{1}: {2}" -f $try.Name, $si, $_.Exception.Message)
-        }
-    }
-
-    if (-not $iamDone) { throw "Failed to add IAM_ACU_CA_Admins by all methods." }
-    Write-Ok "IAM_ACU_CA_Admins membership ensured on '$safeName' (full classic rights)."
-
-    $ownerGroup = Show-InputDialog -Title "Safe Owner (CARK_ Group)" `
-        -Prompt "Enter the AD group that will own the Safe (sAM or UPN, must start with CARK_):" `
-        -Default "CARK_" `
-        -ValidationHint "Examples: CARK_AppTeam_Prod or CARK_AppTeam_Prod@alliantcreditunion.com" `
-        -ValidateScript {
-            param($x)
-            $t = $x.Trim()
-            if ([string]::IsNullOrWhiteSpace($t)) { return $false }
-            return $t.StartsWith('CARK_')
-        }
-
-    if (-not $ownerGroup) {
-        Write-Warn "Owner group entry cancelled; skipping owner assignment and description."
-    }
-    else {
-        $ownerNoDomain = $ownerGroup.Split('@')[0]
-        $ownerUpn = if ($ownerGroup -match '@') { $ownerGroup } else { "$ownerGroup@$DefaultUPNSuffix" }
-
-        Write-Info "Adding/updating owner group '$ownerGroup' with CARK permissions…"
-
-        $vaultHit = Find-DirectoryGroupInVault -GroupNameNoDomain $ownerNoDomain
-        if ($vaultHit) {
-            Write-Info ("Privilege Cloud directory search found a matching group: '{0}' (Directory={1})" -f $vaultHit.groupName, $vaultHit.directory)
-        } else {
-            Write-Warn "Privilege Cloud directory search did NOT find '$ownerNoDomain' as a directory group."
-            $adExists = Test-GroupExistsInADViaLDAP -GroupSam $ownerNoDomain
-            if ($adExists) {
-                Write-Warn "AD LDAP lookup: group EXISTS in AD, but is NOT visible in Privilege Cloud. This usually means LDAP Integration / mapping / sync is missing for that group."
-            } else {
-                Write-Warn "AD LDAP lookup: group NOT found (or LDAP lookup not available on this host). Double-check the group name."
+            $has = Safe-HasMember -SafeName $safeName -MemberToFind $RequiredMember
+            if (-not $has) {
+                $missing.Add([pscustomobject]@{ SafeName = $safeName }) | Out-Null
             }
-        }
-
-        $ownerDone = $false
-        foreach ($try in @(
-            @{ Name=$ownerGroup; SearchIn=$ldapDirName },
-            @{ Name=$ownerUpn;   SearchIn=$ldapDirName },
-            @{ Name=$ownerGroup; SearchIn=$null      },
-            @{ Name=$ownerUpn;   SearchIn=$null      }
-        )) {
-            if ($ownerDone) { break }
-            try {
-                Ensure-SafeMember -SafeName $safeName -MemberName $try.Name -MemberType Group -PermFlags $permCark -SearchIn $try.SearchIn
-                $ownerDone = $true
-            } catch {
-                $si = if ($try.SearchIn) { " (SearchIn=$($try.SearchIn))" } else { "" }
-                Write-Warn ("Owner add attempt failed for '{0}'{1}: {2}" -f $try.Name, $si, $_.Exception.Message)
-            }
-        }
-
-        if (-not $ownerDone) {
-            throw "Owner group could not be added. Most likely it is not synced/defined in Privilege Cloud (LDAP Integration / directory mapping)."
-        }
-
-        try {
-            $desc = "Safe Managed By $ownerNoDomain"
-            Set-PASSafe -SafeName $safeName -Description $desc -ErrorAction Stop | Out-Null
-            Write-Ok "Description set: '$desc'"
         } catch {
-            Write-Warn "Could not set description: $($_.Exception.Message)"
+            $failedMemberCalls++
+            Write-Log ("Member check failed for Safe='{0}': {1}" -f $safeName, $_.Exception.Message) 'Yellow'
+            continue
         }
     }
 
-    Write-Ok "Provisioning complete for '$safeName'."
-}
-catch {
-    Write-Err $_.Exception.Message
-}
-finally {
+    if ($missing.Count -gt 0) {
+        $missing | Sort-Object SafeName | Export-Csv -Path $CsvFile -NoTypeInformation -Encoding UTF8
+        Write-Log ("Exported {0} safe(s) missing '{1}' to: {2}" -f $missing.Count, $RequiredMember, $CsvFile) 'Green'
+    } else {
+        @([pscustomobject]@{ SafeName = "" }) | Export-Csv -Path $CsvFile -NoTypeInformation -Encoding UTF8
+        Write-Log ("No safes missing '{0}' were found. Exported empty CSV: {1}" -f $RequiredMember, $CsvFile) 'Green'
+    }
+
+} catch {
+    $body = Get-WebExceptionBody -Exception $_.Exception
+    if ($body) {
+        Write-Log ("HTTP Error Body: {0}" -f $body) 'Yellow'
+    }
+    Write-Log ("ERROR: {0}" -f $_.Exception.Message) 'Red'
+} finally {
     if ($sessionCreated) {
-        try {
-            Close-PASSession | Out-Null
-            Write-Ok "Logged off."
-        } catch {
-            Write-Warn "Logoff warning: $($_.Exception.Message)"
-        }
+        try { Close-PASSession | Out-Null } catch {}
+        Write-Log "Logged off." 'Green'
     }
+    Write-Log "Done." 'Green'
 }
