@@ -1,13 +1,24 @@
 # Cisco_M300V_AsyncOS_Process.ini
-# Updated: 20/02/2026
+# Updated: 12/03/2026
 # Supports: verifypass, logon, changepass
-# Fixes:
+# Enhancements:
+# - Adds linked logon account support using extrapass1 for logon/changepass
+# - Keeps verifypass on the target account so verify still validates the target secret
+# - Uses userconfig-based target password change when logged in with a linked logon account
+# - Retains direct self-change flow when no linked logon account is attached
 # - Handles system-generated passphrase prompt
 # - Handles multi-line policy rejection blocks with []> menus
 # - Cleanly fails with 8004 on policy rejection so CPM retries later
 
 [states]
-Init=(script)set verifyLogon 1; set tgtUser "<username>"; set tgtPass "<pmpass>"
+Init=(script)set verifyLogon 1; set tgtUser "<username>"; set tgtPass "<pmpass>"; set logonUser "<extrapass1\username>"; set logonPass "<pmextrapass1>"
+
+# Action routing before login selection
+CheckAction=
+RouteLogonLogin=
+RouteChangeLogin=
+SetTargetLogin=(script)set loginUser $tgtUser; set loginPass $tgtPass
+SetLogonAccountLogin=(script)set loginUser $logonUser; set loginPass $logonPass
 
 # Protocol routing (SSH default)
 CheckProtocol=
@@ -17,26 +28,44 @@ StartTelnet=(spawn)telnet <address> <port>
 StoreKeyInCache=y
 
 # Login
-LoginUser=$tgtUser
-SendPassword=$tgtPass
+LoginUser=$loginUser
+SendPassword=$loginPass
+PostLoginRoute=
 
-CheckAction=
+# Change routing
+RouteChangeMethod=
 
 # ---- Change (self) ----
 # Some builds use passphrase, others accept passwd/password - try all
 ChangeCmd1=passphrase
 ChangeCmd2=passwd
 ChangeCmd3=password
-
 SendOld=$tgtPass
-
-# Answer system-generated question with ENTER (default [N])
 SendSysGenDefault=\r
 
+# ---- Change (with linked logon account) ----
+# Login with extrapass1, then change the target user via userconfig
+UserConfigCmd=userconfig
+UserConfigPassMenu1=PASSWORD
+UserConfigPassMenu2=PASSPHRASE
+SendConfigAuth1=$loginPass
+SendConfigAuth2=$loginPass
+SendConfigAuth3=$loginPass
+UserConfigAssign=ASSIGN
+SendTargetUser=$tgtUser
+
+# ---- Shared new password entry ----
 SendNew1=<pmnewpass>
 SendNew2=<pmnewpass>
-
 WaitAfterNew1=
+
+# ---- Commit after linked-logon change ----
+RoutePostChange=
+ExitUserConfig=\r
+CommitCmd=commit
+CommitComment=CPM password update
+CommitRollback=Y
+
 FinalStep=
 END=
 
@@ -45,18 +74,35 @@ FAILNotSupportedRec=FAIL(Reconcile action is not supported, 8003)
 FAILUnableToConnect=FAIL(Unable to connect to target, 8000)
 FAILInvalidLogin=FAIL(Invalid username or bad password, 2114)
 FAILAccountDisabled=FAIL(User account is disabled/locked, 8010)
-FAILNotAllowedLogin=FAIL(User is not allowed to log in, 8012)
+FAILNotAllowedLogin=FAIL(User is not allowed to log in or lacks sufficient privilege, 8012)
 FAILInvalidNewPassword=FAIL(Invalid new password rejected by device policy, 8004)
 FAILPassMismatch=FAIL(New password entries did not match, 8005)
+FAILTargetUserNotFound=FAIL(Target user was not found on the device, 2114)
 
 [transitions]
-Init,TRUE,CheckProtocol
+Init,TRUE,CheckAction
+
+# Action selection
+CheckAction,ActionIsVerify,SetTargetLogin
+CheckAction,ActionIsLogon,RouteLogonLogin
+CheckAction,ActionIsChange,RouteChangeLogin
+CheckAction,ActionIsRecOrPreRec,FAILNotSupportedRec
+
+RouteLogonLogin,HasLogonAccount,SetLogonAccountLogin
+RouteLogonLogin,NoLogonAccount,SetTargetLogin
+
+RouteChangeLogin,HasLogonAccount,SetLogonAccountLogin
+RouteChangeLogin,NoLogonAccount,SetTargetLogin
+
+SetTargetLogin,TRUE,CheckProtocol
+SetLogonAccountLogin,TRUE,CheckProtocol
+
+# Connect + login
 CheckProtocol,ProtocolIsTelnet,StartTelnet
 CheckProtocol,ProtocolIsSSH,StartSSH_WithPort
 CheckProtocol,ProtocolIsEmpty,StartSSH_WithPort
 StartSSH_WithPort,PortNotSet,StartSSH_NoPort
 
-# Connect + login
 StartSSH_WithPort,UnableToConnect,FAILUnableToConnect
 StartSSH_WithPort,PlinkStoreKey,StoreKeyInCache
 StartSSH_WithPort,Login,LoginUser
@@ -74,15 +120,18 @@ LoginUser,PasswordPrompt,SendPassword
 SendPassword,InvalidLogin,FAILInvalidLogin
 SendPassword,AccountDisabled,FAILAccountDisabled
 SendPassword,NotAllowedLogin,FAILNotAllowedLogin
-SendPassword,DevicePrompt,CheckAction
+SendPassword,DevicePrompt,PostLoginRoute
 
-# Action routing
-CheckAction,ActionIsVerify,END
-CheckAction,ActionIsLogon,END
-CheckAction,ActionIsRecOrPreRec,FAILNotSupportedRec
-CheckAction,ActionIsChange,ChangeCmd1
+# Action routing after successful login
+PostLoginRoute,ActionIsVerify,END
+PostLoginRoute,ActionIsLogon,END
+PostLoginRoute,ActionIsChange,RouteChangeMethod
 
-# Command selection (passphrase vs passwd vs password)
+# Change method selection
+RouteChangeMethod,HasLogonAccount,UserConfigCmd
+RouteChangeMethod,NoLogonAccount,ChangeCmd1
+
+# ---- Direct self-change flow ----
 ChangeCmd1,UnknownCommand,ChangeCmd2
 ChangeCmd1,OldPassPrompt,SendOld
 
@@ -91,29 +140,63 @@ ChangeCmd2,OldPassPrompt,SendOld
 
 ChangeCmd3,OldPassPrompt,SendOld
 
-# After sending old passphrase:
 SendOld,SystemGenPrompt,SendSysGenDefault
 SendOld,NewPassPrompt,SendNew1
 SendOld,CriteriaNotMet,FAILInvalidNewPassword
 SendOld,PolicyFail,FAILInvalidNewPassword
 
-# After answering system-generated prompt (default [N]):
 SendSysGenDefault,NewPassPrompt,SendNew1
 SendSysGenDefault,CriteriaNotMet,FAILInvalidNewPassword
 SendSysGenDefault,PolicyFail,FAILInvalidNewPassword
-# If device echoes menu prompt while printing, keep waiting
 SendSysGenDefault,MenuPrompt,SendSysGenDefault
 
-# After sending first New Passphrase:
+# ---- Linked-logon change flow ----
+UserConfigCmd,UserConfigMainMenu,UserConfigPassMenu1
+UserConfigCmd,ConfigAuthPrompt,SendConfigAuth1
+UserConfigCmd,NotAllowedLogin,FAILNotAllowedLogin
+
+SendConfigAuth1,UserConfigMainMenu,UserConfigPassMenu1
+SendConfigAuth1,UserConfigPassMenu,UserConfigAssign
+SendConfigAuth1,SelectUserPrompt,SendTargetUser
+SendConfigAuth1,InvalidLogin,FAILInvalidLogin
+
+UserConfigPassMenu1,ConfigAuthPrompt,SendConfigAuth2
+UserConfigPassMenu1,UserConfigPassMenu,UserConfigAssign
+UserConfigPassMenu1,SelectUserPrompt,SendTargetUser
+UserConfigPassMenu1,InvalidMenuChoice,UserConfigPassMenu2
+UserConfigPassMenu1,UnknownCommand,UserConfigPassMenu2
+
+SendConfigAuth2,UserConfigPassMenu,UserConfigAssign
+SendConfigAuth2,SelectUserPrompt,SendTargetUser
+SendConfigAuth2,InvalidLogin,FAILInvalidLogin
+
+UserConfigPassMenu2,ConfigAuthPrompt,SendConfigAuth2
+UserConfigPassMenu2,UserConfigPassMenu,UserConfigAssign
+UserConfigPassMenu2,SelectUserPrompt,SendTargetUser
+UserConfigPassMenu2,InvalidMenuChoice,FAILNotAllowedLogin
+UserConfigPassMenu2,UnknownCommand,FAILNotAllowedLogin
+
+UserConfigAssign,ConfigAuthPrompt,SendConfigAuth3
+UserConfigAssign,SelectUserPrompt,SendTargetUser
+UserConfigAssign,InvalidMenuChoice,FAILNotAllowedLogin
+UserConfigAssign,UnknownCommand,FAILNotAllowedLogin
+
+SendConfigAuth3,SelectUserPrompt,SendTargetUser
+SendConfigAuth3,InvalidLogin,FAILInvalidLogin
+
+SendTargetUser,TargetUserNotFound,FAILTargetUserNotFound
+SendTargetUser,NewPassPrompt,SendNew1
+SendTargetUser,RetypePrompt,SendNew2
+SendTargetUser,CriteriaNotMet,FAILInvalidNewPassword
+SendTargetUser,PolicyFail,FAILInvalidNewPassword
+
+# ---- Shared new password handling ----
 SendNew1,RetypePrompt,SendNew2
 SendNew1,CriteriaNotMet,FAILInvalidNewPassword
 SendNew1,PolicyFail,FAILInvalidNewPassword
-# Some builds print menu prompt then criteria lines then re-prompt new passphrase
 SendNew1,MenuPrompt,WaitAfterNew1
-# If it immediately re-prompts for New Passphrase again, treat as rejection (can't change value in same run)
 SendNew1,NewPassPrompt,FAILInvalidNewPassword
 
-# Wait state while device prints criteria block after menu prompt
 WaitAfterNew1,CriteriaNotMet,FAILInvalidNewPassword
 WaitAfterNew1,PolicyFail,FAILInvalidNewPassword
 WaitAfterNew1,NewPassPrompt,FAILInvalidNewPassword
@@ -121,12 +204,28 @@ WaitAfterNew1,RetypePrompt,SendNew2
 WaitAfterNew1,MenuPrompt,WaitAfterNew1
 WaitAfterNew1,DevicePrompt,WaitAfterNew1
 
-# Retype:
 SendNew2,PassMismatch,FAILPassMismatch
 SendNew2,CriteriaNotMet,FAILInvalidNewPassword
 SendNew2,PolicyFail,FAILInvalidNewPassword
-SendNew2,PassChangeSuccess,FinalStep
-SendNew2,DevicePrompt,FinalStep
+SendNew2,PassChangeSuccess,RoutePostChange
+SendNew2,DevicePrompt,RoutePostChange
+SendNew2,MenuPrompt,RoutePostChange
+
+RoutePostChange,HasLogonAccount,ExitUserConfig
+RoutePostChange,NoLogonAccount,FinalStep
+
+ExitUserConfig,MenuPrompt,ExitUserConfig
+ExitUserConfig,DevicePrompt,CommitCmd
+
+CommitCmd,CommitCommentPrompt,CommitComment
+CommitCmd,RollbackPrompt,CommitRollback
+CommitCmd,CommitSuccess,END
+
+CommitComment,RollbackPrompt,CommitRollback
+CommitComment,CommitSuccess,END
+
+CommitRollback,CommitSuccess,END
+CommitRollback,DevicePrompt,END
 
 FinalStep,TRUE,END
 
@@ -135,6 +234,7 @@ username, source=FILE, Mandatory=yes
 address,  source=FILE, Mandatory=yes
 protocol, source=FILE, Mandatory=no
 port, source=FILE, Mandatory=no
+extrapass1\username, source=FILE, Mandatory=![string equal -nocase "<pmextrapass1>" ""]
 
 [Parameters]
 PromptTimeout=90
@@ -148,15 +248,17 @@ DebugLogFullExecutionInfo=no
 DebugLogDetailBuiltInActions=no
 
 
-:::::::::::::::::::::::::::::::::::::::::
+:::::::::::::::::::::::::::::::::::::::
 
 
 # Cisco_M300V_AsyncOS_Prompts.ini
-# Updated: 20/02/2026
+# Updated: 12/03/2026
 # Fixes:
-# - New Passphrase prompt appears in multi-line buffer + menu prompt []>
-# - Criteria block for complexity/dictionary/history is multi-line
-# - Avoids treating []> as shell prompt
+# - Adds linked logon account routing conditions
+# - Adds userconfig/menu prompts for target-user password change
+# - Matches commit comment and rollback prompts
+# - Handles multi-line criteria/policy blocks
+# - Avoids treating []>, [N]>, and [Y]> as device prompts
 
 [Conditions]
 TRUE=(expression)true
@@ -170,14 +272,14 @@ Login=login as:|login:|Username:
 PasswordPrompt=Password:|Passphrase:
 
 InvalidLogin=Permission denied \(password\)|Permission denied|Authentication failed|Access denied|Login incorrect|Invalid passphrase|Login invalid
-NotAllowedLogin=not allowed to login|not allowed to log in|Wrong time period
+NotAllowedLogin=not allowed to login|not allowed to log in|Wrong time period|permission denied to perform this operation|insufficient privileges
 AccountDisabled=account is disabled|account has been locked|locked|disabled
 
-# Menu prompt inside passphrase/userconfig flows (DO NOT treat as shell prompt)
+# Menu prompt inside userconfig/passphrase flows
 MenuPrompt=(?m)^\[\d*\]>\s*$
 
-# Device prompt (hostname> or #, but not menu prompts)
-DevicePrompt=(?m)^(?!\[\d*\]>).*[>#]\s*$
+# Device prompt (hostname> or #, but not bracketed prompts like []>, [N]>, [Y]>)
+DevicePrompt=(?m)^(?!\[[^\r\n]*\]>\s*$).*[>#]\s*$
 
 # Action checks
 ActionIsVerify=(expression)[string equal -nocase "<action>" "verifypass"]
@@ -185,29 +287,43 @@ ActionIsLogon=(expression)[string equal -nocase "<action>" "logon"]
 ActionIsChange=(expression)[string equal -nocase "<action>" "changepass"]
 ActionIsRecOrPreRec=(expression)[string equal -nocase "<action>" "reconcilepass"]||[string equal -nocase "<action>" "prereconcilepass"]
 
+# Linked logon account checks
+HasLogonAccount=(expression)![string equal -nocase "<pmextrapass1>" ""]
+NoLogonAccount=(expression)[string equal -nocase "<pmextrapass1>" ""]
+
 # Protocol checks
 ProtocolIsSSH=(expression)[string equal -nocase "<protocol>" "ssh"]
 ProtocolIsTelnet=(expression)[string equal -nocase "<protocol>" "telnet"]
 ProtocolIsEmpty=(expression)[string equal -nocase "<protocol>" ""]
 PortNotSet=(expression)[string equal -nocase "<port>" ""]
 
-# passphrase/passwd interactive prompts
+# Direct passphrase/passwd interactive prompts
 OldPassPrompt=(?im)^Old\s+passphrase\s*:\s*$|^Old\s+password\s*:\s*$|^Current\s+passphrase\s*:\s*$|^Current\s+password\s*:\s*$
+SystemGenPrompt=(?im)^Would\s+you\s+like\s+to\s+get\s+a\s+system\s+generated\s+passphrase\?\s*\[N\]>\s*$
 
-SystemGenPrompt=(?im)^Would you like to get a system generated passphrase\?\s*\[N\]>\s*$
+# userconfig-based target password change
+UserConfigMainMenu=(?is)Choose\s+the\s+operation\s+you\s+want\s+to\s+perform:.*-\s*(PASSWORD|PASSPHRASE)\s*-
+UserConfigPassMenu=(?is)Choose\s+the\s+operation\s+you\s+want\s+to\s+perform:.*-\s*ASSIGN\s*-
+ConfigAuthPrompt=(?im)^Enter\s+your\s+Passphrase\s+to\s+make\s+changes:\s*$|^Enter\s+your\s+Password\s+to\s+make\s+changes:\s*$
+InvalidMenuChoice=(?i)That value is not valid\.?|Invalid choice|Please enter a valid choice|Unknown option|not a valid selection
+SelectUserPrompt=(?im)^Enter\s+the\s+(?:name|number|name\s+or\s+number)\s+of\s+the\s+user(?:\s+account)?(?:\s+you\s+wish\s+to\s+(?:edit|change|modify))?\s*:\s*$|^Choose\s+the\s+user(?:\s+account)?(?:\s+.*)?\s*:\s*$|^Enter\s+the\s+username\s*:\s*$|^Which\s+user.*:\s*$
+TargetUserNotFound=(?i)no such user|unknown user|user .* does not exist|That value is not valid
 
-# Match prompt line, not end-of-buffer
-NewPassPrompt=(?im)^New\s+Passphrase\s*:\s*$|^New\s+password\s*:\s*$
-
-RetypePrompt=(?im)^Please enter the new passphrase again:\s*$|^Retype\s+new\s+passphrase\s*:\s*$|^Retype\s+new\s+password\s*:\s*$|^Confirm\s+new\s+passphrase\s*:\s*$|^Confirm\s+new\s+password\s*:\s*$
+# New password / confirm prompts
+NewPassPrompt=(?im)^New\s+Passphrase\s*:\s*$|^New\s+password\s*:\s*$|^Enter\s+the\s+new\s+passphrase\.?\s*$|^Enter\s+the\s+new\s+password\.?\s*$
+RetypePrompt=(?im)^Please\s+enter\s+the\s+new\s+passphrase\s+again:\s*$|^Please\s+enter\s+the\s+new\s+password\s+again:\s*$|^Retype\s+new\s+passphrase\s*:\s*$|^Retype\s+new\s+password\s*:\s*$|^Confirm\s+new\s+passphrase\s*:\s*$|^Confirm\s+new\s+password\s*:\s*$
 
 PassChangeSuccess=(?i)Your passphrase has been changed\.|passphrase\s+changed|password\s+changed|updated\s+successfully
-
 PassMismatch=(?i)do\s+not\s*match|mismatch
 UnknownCommand=(?i)unknown\s+command|invalid\s+command|not\s+found
+
+# Commit prompts after userconfig change
+CommitCommentPrompt=(?is)Please\s+enter\s+some\s+comments\s+describing\s+your\s+changes:\s*(?:\r?\n\s*)?(?:\[\]>\s*)?$
+RollbackPrompt=(?is)Do\s+you\s+want\s+to\s+save\s+the\s+current\s+configuration\s+for\s+rollback\?\s*(?:\r?\n\s*)?\[Y\]>\s*$
+CommitSuccess=(?i)Changes committed:
 
 # Multi-line criteria block (covers history + complexity + dictionary)
 CriteriaNotMet=(?is)Following\s+criteria\s+for\s+passphrase\s+are\s+not\s+met:.*$
 
-# General policy failures (explicitly includes your bullet lines)
+# General policy failures
 PolicyFail=(?i)criteria\s+for\s+passphrase\s+are\s+not\s+met|at\s+least\s+\d+\s+characters|upper\s+\(A-Z\)|lower\s+\(a-z\)|number\s+\(0-9\)|special\s+character|not\s+a\s+commonly\s+used\s+one|previous\s+passphrases?|recent\s+passphrases?|too\s+short|too\s+long|must\s+contain|must\s+include|invalid|not\s+allowed|cannot\s+reuse|repetitive|sequential|forbidden|unchanged
