@@ -1,662 +1,180 @@
-<#
-CNA_Safe_Member_Lookup_FromCsv.ps1
-
-Purpose
-- Read safes from a user-provided CSV
-- Deduplicate safes from the CSV
-- Log in to CyberArk Privilege Cloud using:
-    CCP -> Get-IdentityHeader (-psPASFormat) -> Use-PASSession
-- Check each safe for these members:
-    1) cna_pas_admin@cyberark.cloud.6679
-    2) identity-privilege-integration-user$@cyberark.cloud.6679
-
-Exports
-1) Safes containing cna_pas_admin@cyberark.cloud.6679
-2) Safes not containing cna_pas_admin@cyberark.cloud.6679
-3) Safes containing identity-privilege-integration-user$@cyberark.cloud.6679
-   WITHOUT cna_pas_admin@cyberark.cloud.6679
-
-Notes
-- CSV header for safes is auto-detected if not specified
-- Duplicate safes in the CSV are consolidated
-- InputOccurrences shows how many times the safe appeared in the source CSV
-- Lookup failures are included in the "without cna_pas_admin" export with LookupStatus=LookupFailed
-#>
-
-[CmdletBinding()]
-param(
-    # ===== Input CSV =====
-    [Parameter(Mandatory = $true)]
-    [string]$CsvPath,
-
-    # Optional: explicitly name the CSV column that contains the safe name
-    [string]$SafeColumn = '',
-
-    # ===== Matching =====
-    [ValidateSet('All','Fast','Strict')]
-    [string]$MatchMode = 'Strict',
-
-    # ===== Throttle / retry =====
-    [ValidateRange(0,5000)]
-    [int]$DelayMsBetweenCalls = 150,
-
-    [ValidateRange(1,20)]
-    [int]$MaxRetries = 6,
-
-    [ValidateRange(1,60)]
-    [int]$RetryBaseDelaySec = 3,
-
-    # ===== Output =====
-    [string]$OutDir = 'E:\Installation Media\Script\OnboardScript\data',
-
-    # ===== CNA Identity / Privilege Cloud =====
-    [string]$IdentityTenantURL = 'https://aat4012.id.cyberark.cloud',
-    [string]$PCloudSubdomain   = 'cna-prod',
-    [string]$PrivilegeCloudURL = 'https://cna-prod.privilegecloud.cyberark.cloud',
-
-    # ===== CCP settings (CNA) =====
-    [string]$CCPAddress     = 'https://vskau1p1231.cna.com',
-    [string]$CCPLocation    = 'AIMWebService',
-    [string]$CCPAppID       = 'PAMDiscovery',
-    [string]$CCPSafe        = 'CA_PCloud_Admins',
-    [string]$CCPObject      = 'cna-prod.cyberark.cloud-cnarestbot',
-    [bool]$CCPWindowsAuth   = $false,
-
-    # ===== Members to evaluate =====
-    [string]$AdminMember    = 'cna_pas_admin@cyberark.cloud.6679',
-    [string]$IdentityMember = 'identity-privilege-integration-user$@cyberark.cloud.6679'
-)
-
-# =========================
-# Baseline
-# =========================
-Import-Module psPAS -Force -ErrorAction Stop
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-$ErrorActionPreference = 'Stop'
-$ProgressPreference    = 'SilentlyContinue'
-
-# =========================
-# Output paths
-# =========================
-if (-not (Test-Path -LiteralPath $OutDir)) {
-    New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
-}
-
-$Stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-
-$LogFile                = Join-Path $OutDir "CNA_Safe_Member_Lookup_$Stamp.log"
-$CsvWithAdmin           = Join-Path $OutDir "Safes_With_cna_pas_admin_$Stamp.csv"
-$CsvWithoutAdmin        = Join-Path $OutDir "Safes_Without_cna_pas_admin_$Stamp.csv"
-$CsvIdentityWithoutAdmin= Join-Path $OutDir "Safes_With_identity_without_cna_pas_admin_$Stamp.csv"
-
-New-Item -ItemType File -Force -Path $LogFile | Out-Null
-
-function Write-Log {
-    param(
-        [string]$Message,
-        [ConsoleColor]$Color = 'White'
-    )
-    $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    $line = "$ts - $Message"
-    Write-Host $line -ForegroundColor $Color
-    Add-Content -Path $LogFile -Value $line
-}
-
-function Get-WebExceptionStatusCode {
-    param([System.Exception]$Exception)
-    try {
-        $we = $Exception
-        if ($we -isnot [System.Net.WebException]) { $we = $Exception.InnerException }
-        if ($we -and $we.Response -and $we.Response.StatusCode) {
-            return [int]$we.Response.StatusCode
-        }
-    } catch {}
-    return $null
-}
-
-function Get-WebExceptionBody {
-    param([System.Exception]$Exception)
-    try {
-        $we = $Exception
-        if ($we -isnot [System.Net.WebException]) { $we = $Exception.InnerException }
-        if (-not $we -or -not $we.Response) { return $null }
-
-        $stream = $we.Response.GetResponseStream()
-        if (-not $stream) { return $null }
-
-        $reader = New-Object System.IO.StreamReader($stream)
-        $text = $reader.ReadToEnd()
-        $reader.Close()
-        return $text
-    } catch {
-        return $null
-    }
-}
-
-# =========================
-# CCP -> PSCredential
-# =========================
-function Get-ServiceUserCredentialFromCCP {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)][string]$CCPAddress,
-        [Parameter(Mandatory)][string]$Location,
-        [Parameter(Mandatory)][string]$AppID,
-        [Parameter(Mandatory)][string]$Safe,
-        [Parameter(Mandatory)][string]$Object,
-        [bool]$WindowsAuth = $false
-    )
-
-    $base = $CCPAddress.TrimEnd('/')
-    $loc  = $Location.Trim('/')
-
-    $encApp  = [uri]::EscapeDataString($AppID)
-    $encSafe = [uri]::EscapeDataString($Safe)
-    $encObj  = [uri]::EscapeDataString($Object)
-
-    $url = '{0}/{1}/api/Accounts?AppID={2}&Safe={3}&Object={4}' -f $base, $loc, $encApp, $encSafe, $encObj
-
-    Write-Log 'Retrieving CCP credential via Object...' 'Cyan'
-    Write-Log ("CCP URL (encoded): {0}" -f $url) 'DarkGray'
-
-    $headers = @{ 'Content-Type' = 'application/json' }
-
-    try {
-        $resp = Invoke-RestMethod -Uri $url -Method GET -Headers $headers -UseDefaultCredentials:$WindowsAuth -ErrorAction Stop
-    } catch {
-        $body = Get-WebExceptionBody -Exception $_.Exception
-        if ($body) {
-            $trimmed = $body
-            if ($trimmed.Length -gt 400) { $trimmed = $trimmed.Substring(0,400) + '...' }
-            Write-Log ("CCP Error Body (trimmed): {0}" -f $trimmed) 'Yellow'
-        }
-        throw
-    }
-
-    if (-not $resp -or -not $resp.Content) {
-        throw 'Empty CCP response or missing Content.'
-    }
-
-    if (-not $resp.UserName -and -not $resp.Username) {
-        throw 'CCP response missing UserName/Username.'
-    }
-
-    $userName = if ($resp.UserName) { $resp.UserName } else { $resp.Username }
-    Write-Log ("CCP returned username: {0}" -f $userName) 'Green'
-
-    $securePassword = ConvertTo-SecureString -String $resp.Content -AsPlainText -Force
-    return [PSCredential]::new($userName, $securePassword)
-}
-
-# =========================
-# Start PAS session
-# =========================
-function Start-PASSessionFromCCP {
-    $upCred = Get-ServiceUserCredentialFromCCP `
-        -CCPAddress  $CCPAddress `
-        -Location    $CCPLocation `
-        -AppID       $CCPAppID `
-        -Safe        $CCPSafe `
-        -Object      $CCPObject `
-        -WindowsAuth $CCPWindowsAuth
-
-    Write-Log ("Requesting Identity header for tenant '{0}' (subdomain '{1}')..." -f $IdentityTenantURL, $PCloudSubdomain) 'Cyan'
-
-    $hdr = Get-IdentityHeader `
-        -IdentityTenantURL $IdentityTenantURL `
-        -psPASFormat `
-        -PCloudSubdomain $PCloudSubdomain `
-        -UPCreds $upCred
-
-    Use-PASSession $hdr
-
-    if (-not (Get-PASSession)) {
-        throw 'psPAS session not established.'
-    }
-
-    Write-Log ("PAS session established via Identity header as {0}" -f $upCred.UserName) 'Green'
-}
-
-# =========================
-# Session transport helpers
-# =========================
-function Get-PVWABase {
-    $sess = Get-PASSession
-    if (-not $sess) { throw 'No PAS session found.' }
-
-    $base = $null
-    foreach ($p in @('BaseURI','BaseUrl','PVWAURL','Url','URI')) {
-        if ($sess.PSObject.Properties[$p]) {
-            $base = [string]$sess.$p
-            if (-not [string]::IsNullOrWhiteSpace($base)) { break }
-        }
-    }
-
-    if ([string]::IsNullOrWhiteSpace($base)) {
-        $base = ($PrivilegeCloudURL.TrimEnd('/') + '/PasswordVault')
-    }
-
-    if ($base -notmatch '(?i)/PasswordVault(/|$)') {
-        $base = $base.TrimEnd('/') + '/PasswordVault'
-    }
-
-    return $base.TrimEnd('/')
-}
-
-function Get-SessionTransport {
-    $sess = Get-PASSession
-    if (-not $sess) { throw 'No PAS session found.' }
-
-    $headers = @{ 'Content-Type' = 'application/json' }
-
-    if ($sess.PSObject.Properties['Headers'] -and $sess.Headers) {
-        foreach ($k in $sess.Headers.Keys) {
-            $headers[$k] = $sess.Headers[$k]
-        }
-    }
-
-    $token = $null
-    foreach ($p in @('Token','token','Authorization','AuthToken')) {
-        if ($sess.PSObject.Properties[$p]) {
-            $token = [string]$sess.$p
-            if (-not [string]::IsNullOrWhiteSpace($token)) { break }
-        }
-    }
-
-    if ($token -and -not $headers.ContainsKey('Authorization')) {
-        $headers['Authorization'] = $token
-    }
-
-    $webSession = $null
-    foreach ($p in @('WebSession','webSession')) {
-        if ($sess.PSObject.Properties[$p]) {
-            $webSession = $sess.$p
-            if ($webSession) { break }
-        }
-    }
-
-    return [pscustomobject]@{
-        Headers    = $headers
-        WebSession = $webSession
-    }
-}
-
-function Invoke-PVWAGet {
-    param([Parameter(Mandatory)][string]$FullUri)
-
-    $transport = Get-SessionTransport
-
-    if ($transport.WebSession) {
-        return Invoke-RestMethod -Uri $FullUri -Method GET -Headers $transport.Headers -WebSession $transport.WebSession -ErrorAction Stop
-    }
-
-    return Invoke-RestMethod -Uri $FullUri -Method GET -Headers $transport.Headers -ErrorAction Stop
-}
-
-function Invoke-PVWAGetWithRetry {
-    param(
-        [Parameter(Mandatory)][string]$FullUri,
-        [Parameter(Mandatory)][string]$Purpose
-    )
-
-    $lastErr = $null
-
-    for ($attempt = 1; $attempt -le [int]$MaxRetries; $attempt++) {
-        try {
-            $resp = Invoke-PVWAGet -FullUri $FullUri
-            if ([int]$DelayMsBetweenCalls -gt 0) {
-                Start-Sleep -Milliseconds ([int]$DelayMsBetweenCalls)
-            }
-            return $resp
-        } catch {
-            $lastErr = $_.Exception
-            $code    = Get-WebExceptionStatusCode -Exception $lastErr
-            $body    = Get-WebExceptionBody -Exception $lastErr
-
-            $msg = if ($code) { "HTTP $code" } else { 'HTTP <unknown>' }
-            Write-Log ("{0} failed (attempt {1}/{2}) - {3} - {4}" -f $Purpose, $attempt, $MaxRetries, $msg, $lastErr.Message) 'Yellow'
-
-            if ($body) {
-                $trimmed = $body
-                if ($trimmed.Length -gt 250) { $trimmed = $trimmed.Substring(0,250) + '...' }
-                Write-Log ("{0} error body (trimmed): {1}" -f $Purpose, $trimmed) 'DarkYellow'
-            }
-
-            if ($code -in 429,500,502,503,504 -or -not $code) {
-                $sleep = [Math]::Min(60, ([int]$RetryBaseDelaySec * $attempt))
-                Start-Sleep -Seconds $sleep
-                continue
-            }
-
-            break
-        }
-    }
-
-    throw ("{0} failed after {1} attempts. Last error: {2}" -f $Purpose, $MaxRetries, $lastErr.Message)
-}
-
-# =========================
-# CSV helpers
-# =========================
-function Resolve-SafeColumnName {
-    param(
-        [Parameter(Mandatory)][object[]]$Rows,
-        [string]$RequestedColumn
-    )
-
-    if (-not $Rows -or $Rows.Count -eq 0) {
-        throw 'CSV has no rows.'
-    }
-
-    $headers = @($Rows[0].PSObject.Properties.Name)
-
-    if (-not [string]::IsNullOrWhiteSpace($RequestedColumn)) {
-        if ($headers -contains $RequestedColumn) {
-            return $RequestedColumn
-        }
-        throw ("Requested SafeColumn '{0}' was not found in CSV headers: {1}" -f $RequestedColumn, ($headers -join ', '))
-    }
-
-    foreach ($candidate in @('Safe','safe','SafeName','safeName','Safename','VaultSafe','Safe Name')) {
-        if ($headers -contains $candidate) {
-            return $candidate
-        }
-    }
-
-    foreach ($h in $headers) {
-        if ($h -match '(?i)safe') {
-            return $h
-        }
-    }
-
-    throw ("Unable to auto-detect the safe column. CSV headers found: {0}" -f ($headers -join ', '))
-}
-
-function Get-UniqueSafesFromCsv {
-    param(
-        [Parameter(Mandatory)][string]$Path,
-        [string]$SafeColumnName
-    )
-
-    if (-not (Test-Path -LiteralPath $Path)) {
-        throw ("CSV file not found: {0}" -f $Path)
-    }
-
-    $rows = Import-Csv -LiteralPath $Path
-    if (-not $rows -or $rows.Count -eq 0) {
-        throw ("CSV file is empty: {0}" -f $Path)
-    }
-
-    $resolvedSafeColumn = Resolve-SafeColumnName -Rows $rows -RequestedColumn $SafeColumnName
-    Write-Log ("Resolved CSV safe column: {0}" -f $resolvedSafeColumn) 'Green'
-
-    $occurrenceMap = @{}
-
-    foreach ($row in $rows) {
-        $safeName = [string]$row.$resolvedSafeColumn
-        if ([string]::IsNullOrWhiteSpace($safeName)) { continue }
-
-        $safeName = $safeName.Trim()
-        if ([string]::IsNullOrWhiteSpace($safeName)) { continue }
-
-        if ($occurrenceMap.ContainsKey($safeName)) {
-            $occurrenceMap[$safeName]++
-        } else {
-            $occurrenceMap[$safeName] = 1
-        }
-    }
-
-    if ($occurrenceMap.Count -eq 0) {
-        throw ("No non-blank safe values found in column '{0}'." -f $resolvedSafeColumn)
-    }
-
-    $uniqueSafes = @($occurrenceMap.Keys | Sort-Object)
-
-    return [pscustomobject]@{
-        SafeColumn      = $resolvedSafeColumn
-        OccurrenceMap   = $occurrenceMap
-        UniqueSafes     = $uniqueSafes
-        TotalRows       = $rows.Count
-        UniqueSafeCount = $uniqueSafes.Count
-    }
-}
-
-# =========================
-# Member helpers
-# =========================
-function Get-SafeMembers {
-    param(
-        [Parameter(Mandatory)][string]$SafeName
-    )
-
-    $base    = Get-PVWABase
-    $safeEsc = [uri]::EscapeDataString($SafeName)
-    $uri     = '{0}/api/Safes/{1}/Members' -f $base, $safeEsc
-
-    $resp = Invoke-PVWAGetWithRetry -FullUri $uri -Purpose ("Members safe='{0}'" -f $SafeName)
-
-    if ($resp.PSObject.Properties['value'] -and $resp.value)   { return @($resp.value) }
-    if ($resp.PSObject.Properties['members'] -and $resp.members) { return @($resp.members) }
-    if ($resp -is [array]) { return @($resp) }
-
-    return @()
-}
-
-function Get-MemberCandidateNames {
-    param(
-        [Parameter(Mandatory)][object[]]$Members
-    )
-
-    $names = New-Object System.Collections.Generic.List[string]
-
-    foreach ($m in $Members) {
-        foreach ($p in @('memberName','MemberName','userName','UserName','name','Name')) {
-            if ($m.PSObject.Properties[$p] -and $m.$p) {
-                [void]$names.Add([string]$m.$p)
-            }
-        }
-
-        if ($m.PSObject.Properties['member'] -and $m.member) {
-            foreach ($p in @('memberName','MemberName','userName','UserName','name','Name')) {
-                if ($m.member.PSObject.Properties[$p] -and $m.member.$p) {
-                    [void]$names.Add([string]$m.member.$p)
-                }
-            }
-        }
-    }
-
-    return @($names | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Trim() } | Select-Object -Unique)
-}
-
-function Test-MemberMatch {
-    param(
-        [Parameter(Mandatory)][object[]]$Members,
-        [Parameter(Mandatory)][string]$MemberToFind,
-        [ValidateSet('All','Fast','Strict')]
-        [string]$Mode = 'Strict'
-    )
-
-    $needle = $MemberToFind.Trim()
-    if ([string]::IsNullOrWhiteSpace($needle)) { return $false }
-
-    $candidates = Get-MemberCandidateNames -Members $Members
-
-    foreach ($candidate in $candidates) {
-        $c = $candidate.Trim()
-
-        switch ($Mode) {
-            'Strict' {
-                if ($c -ieq $needle) { return $true }
-            }
-            'Fast' {
-                if ($c -ieq $needle) { return $true }
-                if (($c.Split('@')[0]) -ieq ($needle.Split('@')[0])) { return $true }
-            }
-            'All' {
-                if ($c -ieq $needle) { return $true }
-                if ($c -like "*$needle*") { return $true }
-                if (($c.Split('@')[0]) -ieq ($needle.Split('@')[0])) { return $true }
-            }
-        }
-    }
-
-    return $false
-}
-
-function Export-ResultsCsv {
-    param(
-        [Parameter(Mandatory)][object[]]$Rows,
-        [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][string[]]$Columns
-    )
-
-    if ($Rows -and $Rows.Count -gt 0) {
-        $Rows | Select-Object $Columns | Export-Csv -Path $Path -NoTypeInformation -Encoding UTF8
-        return
-    }
-
-    Set-Content -Path $Path -Value ($Columns -join ',') -Encoding UTF8
-}
-
-# =========================
-# MAIN
-# =========================
-$sessionCreated = $false
-
-$withAdmin            = New-Object System.Collections.Generic.List[object]
-$withoutAdmin         = New-Object System.Collections.Generic.List[object]
-$identityWithoutAdmin = New-Object System.Collections.Generic.List[object]
-
-$exportColumns = @(
-    'SafeName',
-    'InputOccurrences',
-    'HasCnaPasAdmin',
-    'HasIdentityPrivilegeIntegrationUser',
-    'MemberCount',
-    'LookupStatus',
-    'Classification',
-    'Error'
-)
-
-try {
-    Write-Log ("Input CSV: {0}" -f $CsvPath) 'Cyan'
-
-    $csvInfo = Get-UniqueSafesFromCsv -Path $CsvPath -SafeColumnName $SafeColumn
-    Write-Log ("CSV Rows={0} UniqueSafes={1}" -f $csvInfo.TotalRows, $csvInfo.UniqueSafeCount) 'Green'
-
-    Start-PASSessionFromCCP
-    $sessionCreated = $true
-
-    $base = Get-PVWABase
-    Write-Log ("PVWA Base: {0}" -f $base) 'DarkGray'
-    Write-Log ("MatchMode={0}" -f $MatchMode) 'DarkYellow'
-    Write-Log ("AdminMember={0}" -f $AdminMember) 'DarkYellow'
-    Write-Log ("IdentityMember={0}" -f $IdentityMember) 'DarkYellow'
-
-    $processed = 0
-
-    foreach ($safeName in $csvInfo.UniqueSafes) {
-        $processed++
-        if ($processed % 100 -eq 0) {
-            Write-Log ("Progress: processed {0}/{1}" -f $processed, $csvInfo.UniqueSafeCount) 'DarkGray'
-        }
-
-        try {
-            $members      = @(Get-SafeMembers -SafeName $safeName)
-            $memberCount  = [int]$members.Count
-            $hasAdmin     = Test-MemberMatch -Members $members -MemberToFind $AdminMember -Mode $MatchMode
-            $hasIdentity  = Test-MemberMatch -Members $members -MemberToFind $IdentityMember -Mode $MatchMode
-
-            $baseRow = [pscustomobject]@{
-                SafeName                            = $safeName
-                InputOccurrences                    = [int]$csvInfo.OccurrenceMap[$safeName]
-                HasCnaPasAdmin                      = [bool]$hasAdmin
-                HasIdentityPrivilegeIntegrationUser = [bool]$hasIdentity
-                MemberCount                         = $memberCount
-                LookupStatus                        = 'OK'
-                Classification                      = ''
-                Error                               = ''
-            }
-
-            if ($hasAdmin) {
-                $row = [pscustomobject]@{
-                    SafeName                            = $baseRow.SafeName
-                    InputOccurrences                    = $baseRow.InputOccurrences
-                    HasCnaPasAdmin                      = $baseRow.HasCnaPasAdmin
-                    HasIdentityPrivilegeIntegrationUser = $baseRow.HasIdentityPrivilegeIntegrationUser
-                    MemberCount                         = $baseRow.MemberCount
-                    LookupStatus                        = $baseRow.LookupStatus
-                    Classification                      = 'ContainsCnaPasAdmin'
-                    Error                               = ''
-                }
-                [void]$withAdmin.Add($row)
-            }
-            else {
-                $row = [pscustomobject]@{
-                    SafeName                            = $baseRow.SafeName
-                    InputOccurrences                    = $baseRow.InputOccurrences
-                    HasCnaPasAdmin                      = $baseRow.HasCnaPasAdmin
-                    HasIdentityPrivilegeIntegrationUser = $baseRow.HasIdentityPrivilegeIntegrationUser
-                    MemberCount                         = $baseRow.MemberCount
-                    LookupStatus                        = $baseRow.LookupStatus
-                    Classification                      = 'MissingCnaPasAdmin'
-                    Error                               = ''
-                }
-                [void]$withoutAdmin.Add($row)
-
-                if ($hasIdentity) {
-                    $row3 = [pscustomobject]@{
-                        SafeName                            = $baseRow.SafeName
-                        InputOccurrences                    = $baseRow.InputOccurrences
-                        HasCnaPasAdmin                      = $baseRow.HasCnaPasAdmin
-                        HasIdentityPrivilegeIntegrationUser = $baseRow.HasIdentityPrivilegeIntegrationUser
-                        MemberCount                         = $baseRow.MemberCount
-                        LookupStatus                        = $baseRow.LookupStatus
-                        Classification                      = 'IdentityWithoutCnaPasAdmin'
-                        Error                               = ''
-                    }
-                    [void]$identityWithoutAdmin.Add($row3)
-                }
-            }
-        }
-        catch {
-            $err = $_.Exception.Message
-            Write-Log ("Lookup failed for Safe='{0}': {1}" -f $safeName, $err) 'Yellow'
-
-            $failedRow = [pscustomobject]@{
-                SafeName                            = $safeName
-                InputOccurrences                    = [int]$csvInfo.OccurrenceMap[$safeName]
-                HasCnaPasAdmin                      = $false
-                HasIdentityPrivilegeIntegrationUser = $false
-                MemberCount                         = 0
-                LookupStatus                        = 'LookupFailed'
-                Classification                      = 'LookupFailedMissingCnaPasAdmin'
-                Error                               = $err
-            }
-
-            [void]$withoutAdmin.Add($failedRow)
-        }
-    }
-
-    Export-ResultsCsv -Rows @($withAdmin.ToArray())            -Path $CsvWithAdmin            -Columns $exportColumns
-    Export-ResultsCsv -Rows @($withoutAdmin.ToArray())         -Path $CsvWithoutAdmin         -Columns $exportColumns
-    Export-ResultsCsv -Rows @($identityWithoutAdmin.ToArray()) -Path $CsvIdentityWithoutAdmin -Columns $exportColumns
-
-    Write-Log ("Exported WITH admin member: {0} -> {1}" -f $withAdmin.Count, $CsvWithAdmin) 'Green'
-    Write-Log ("Exported WITHOUT admin member: {0} -> {1}" -f $withoutAdmin.Count, $CsvWithoutAdmin) 'Green'
-    Write-Log ("Exported identity-without-admin: {0} -> {1}" -f $identityWithoutAdmin.Count, $CsvIdentityWithoutAdmin) 'Green'
-}
-catch {
-    Write-Log ("ERROR: {0}" -f $_.Exception.Message) 'Red'
-    if ($_.InvocationInfo) {
-        Write-Log ("Where: Line {0} : {1}" -f $_.InvocationInfo.ScriptLineNumber, $_.InvocationInfo.Line.Trim()) 'Red'
-    }
-}
-finally {
-    if ($sessionCreated) {
-        try { Close-PASSession | Out-Null } catch {}
-        Write-Log 'Logged off.' 'Green'
-    }
-
-    Write-Log 'Done.' 'Green'
-}
+#This plugin has been automatically generated by PGU. Version 1.0.0.0
+[states]
+Init=(script)set verifyLogon 0; set username "<username>"; set curr_pass "<pmpass>";
+RunCommand=(spawn)plink.exe <address> -<protocol> -P <port>
+StoreKeyInCache=n
+CheckInitAction=
+CheckExtraPass=
+LoginUser=$username
+SendPassword=$curr_pass
+CheckAction=
+LoginExtraUser=<extrapass1\username>
+SendExtraPassword=<pmextrapass1>
+FinalStep=
+END=
+FAILNotSupported=FAIL(Change action is not supported, 8001)
+FAILNotSupported3=FAIL(Reconcile action is not supported, 8003)
+FAILUnableToConnect=FAIL(First login - Unable to connect to machine. Check machine address and port, 8000)
+FAILNotAllowedLogin1=FAIL(User is not allowed to log in, 8012)
+FAILTARGETInvalidUsernameOrPassword=FAIL(Invalid username or bad password, 2114)
+FAILAccountDisabled1=FAIL(First login - User account is disabled, 8010)
+FAILNotSupported2=FAIL(Logon account use is not supported, 8002)
+FAILInvalidExtraPassword=FAIL(First login - Current assigned logon account password is invalid, 8006)
+FAILAccountDisabled2=FAIL(First login - Current assigned logon account user is disabled, 8011)
+FAILNotAllowedLogin2=FAIL(First login - Current assigned logon account is not allowed to log in, 8013)
+ChangeStep1=modify auth user <username> prompt-for-password
+ChangeStep2=<pmnewpass>
+ChangeStep3=<pmnewpass>
+ChangeStep4=save sys config
+ChangeStep5=quit
+IsReconcileAccountExist=
+FAILNoReconcileAccount=FAIL(Reconcile Account is not assinged, 8016)
+PRCheckExtraPass=
+PRLoginUser=<extrapass3\username>
+PRLoginPass=<pmextrapass3>
+PRLoginExtraUser=<extrapass3\extrapass1\username>
+PRLoginExtraPass=<pmextrapass3\pmextrapass1>
+PRCheckAction=
+FAILRECInvalidUsernameOrPassword=FAIL(Reconcile Account - Invalid username or bad password, 8015)
+FAILRECAccountDisabled1=FAIL(Reconcile Account - User account is disabled, 8020)
+FAILRECNotAllowedLogin1=FAIL(Reconcile Account - User is not allowed to log in, 8022)
+FAILNotSupported4=FAIL(Reconcile Account - logon account use is not supported, 8004)
+FAILRECInvalidExtraPassword=FAIL(Reconcile Account - Current assigned logon account password is invalid, 8016)
+FAILRECAccountDisabled2=FAIL(Reconcile Account - Current assigned logon account user is disabled, 8021)
+FAILRECNotAllowedLogin2=FAIL(Reconcile Account - Current assigned logon account user is not allowed to log in, 8023)
+ReconcileStep1=tmsh modify auth user <username> prompt-for-password
+ReconcileStep2=<pmnewpass>
+ReconcileStep3=<pmnewpass>
+ReconcileStep4=tmsh save sys config
+ReconcileStep5=exit
+[transitions]
+Init,TRUE,RunCommand
+
+RunCommand,UnableToConnect,FAILUnableToConnect
+RunCommand,PlinkStoreKey,StoreKeyInCache
+RunCommand,Login,CheckInitAction
+
+StoreKeyInCache,Login,CheckInitAction
+
+CheckInitAction,ActionIsRecOrPreRec,IsReconcileAccountExist
+CheckInitAction,ActionIsNotRecOrPreRec,CheckExtraPass
+
+CheckExtraPass,ExtraPassExists,LoginExtraUser
+CheckExtraPass,ExtraPassNotExists,LoginUser
+
+LoginUser,InvalidLogin,FAILNotAllowedLogin1
+LoginUser,Password,SendPassword
+
+SendPassword,InvalidLogin,FAILTARGETInvalidUsernameOrPassword
+SendPassword,NotAllowedLogin,FAILNotAllowedLogin1
+SendPassword,AccountDisabled,FAILAccountDisabled1
+SendPassword,Password,FailTARGETInvalidUsernameOrPassword
+SendPassword,StandardPrompt,CheckAction
+
+CheckAction,ActionIsVerify,END
+CheckAction,ActionIsLogon,END
+CheckAction,ActionIsChange,ChangeStep1
+
+LoginExtraUser,Password,SendExtraPassword
+
+SendExtraPassword,InvalidLogin,FAILInvalidExtraPassword
+SendExtraPassword,Password,FAILInvalidExtraPassword
+SendExtraPassword,AccountDisabled,FAILAccountDisabled2
+SendExtraPassword,NotAllowedLogin,FAILNotAllowedLogin2
+SendExtraPassword,StandardPrompt,FAILNotSupported2
+
+FinalStep,TRUE,END
+
+ChangeStep1,Changeprompt2,ChangeStep2
+
+ChangeStep2,Changeprompt3,ChangeStep3
+
+ChangeStep3,Changeprompt4,ChangeStep4
+
+ChangeStep4,Changeprompt5,ChangeStep5
+
+ChangeStep5,TRUE,FinalStep
+
+IsReconcileAccountExist,PRPassNotExists,FAILNoReconcileAccount
+IsReconcileAccountExist,PRPassExists,PRCheckExtraPass
+
+PRCheckExtraPass,RecExtraPassNotExists,PRLoginUser
+PRCheckExtraPass,RecExtraPassExists,PRLoginExtraUser
+
+PRLoginUser,Password,PRLoginPass
+
+PRLoginPass,InvalidLogin,FailRECInvalidUsernameOrPassword
+PRLoginPass,Password,FailRECInvalidUsernameOrPassword
+PRLoginPass,AccountDisabled,FailRECAccountDisabled1
+PRLoginPass,NotAllowedLogin,FailRECNotAllowedLogin1
+PRLoginPass,StandardPrompt,PRCheckAction
+
+PRLoginExtraUser,Password,PRLoginExtraPass
+
+PRLoginExtraPass,InvalidLogin,FAILRECInvalidExtraPassword
+PRLoginExtraPass,Password,FAILRECInvalidExtraPassword
+PRLoginExtraPass,AccountDisabled,FailRECAccountDisabled2
+PRLoginExtraPass,NotAllowedLogin,FailRECNotAllowedLogin2
+PRLoginExtraPass,StandardPrompt,FAILNotSupported4
+
+PRCheckAction,ActionIsPreRec,END
+PRCheckAction,ActionIsReconcile,ReconcileStep1
+
+ReconcileStep1,Reconcileprompt2,ReconcileStep2
+
+ReconcileStep2,Reconcileprompt3,ReconcileStep3
+
+ReconcileStep3,Reconcileprompt4,ReconcileStep4
+
+ReconcileStep4,Reconcileprompt5,ReconcileStep5
+
+ReconcileStep5,Reconcileprompt6,FinalStep
+
+[CPM Parameters Validation]
+address, source=FILE, Mandatory=yes
+[Parameters]
+PromptTimeout=30
+SendHuman=.1 .3 1 .05 2
+[Debug Information]
+DebugLogFullParsingInfo=no
+DebugLogFullExecutionInfo=no
+DebugLogDetailBuiltInActions=no
+ExpectLog=yes
+ConsoleOutput=no
+
+::::::::::::::::::::::::::::::::::::::::::::::::::
+
+
+#This plugin has been automatically generated by PGU. Version 1.0.0.0
+[Conditions]
+TRUE=(expression)true
+UnableToConnect=FATAL ERROR:|Unable to open connection:|Could not open connection to the host
+PlinkStoreKey=Store key in cache
+Login=login as:|login:
+ActionIsRecOrPreRec=(expression)[string equal -nocase "<action>" "reconcilepass"]||[string equal -nocase "<action>" "prereconcilepass"]
+ActionIsNotRecOrPreRec=(expression)!([string equal -nocase "<action>" "reconcilepass"]&&[string equal -nocase "<action>" "prereconcilepass"])
+ExtraPassExists=(expression)![string equal -nocase "<pmextrapass1>" ""]
+ExtraPassNotExists=(expression)[string equal -nocase "<pmextrapass1>" ""]
+InvalidLogin=Access denied|Login incorrect|You entered an invalid login name or passwd
+Password=Password:
+NotAllowedLogin=Wrong time period .*|You are not allowed to login at this time.|Remote logins are not allowed for this account.
+AccountDisabled=Account is disabled .*|account has been locked
+StandardPrompt=.*\$ ?$|.*\# ?$|.*\> ?$|.*\% ?$|.*\] ?$|.*\$\u001b\[.*m ?$|.*\> ?\u001b\[.*m ?$
+ActionIsVerify=(expression)[string equal -nocase "<action>" verifypass]
+ActionIsLogon=(expression)[string equal -nocase "<action>" logon]
+ActionIsChange=(expression)[string equal -nocase "<action>" changepass]
+Changeprompt2=New password:
+Changeprompt3=Confirm password:
+Changeprompt4=.*\#
+Changeprompt5=.*\#
+PRPassNotExists=(expression)[string equal -nocase "<pmextrapass3>" ""]
+PRPassExists=(expression)![string equal -nocase "<pmextrapass3>" ""]
+RecExtraPassNotExists=(expression)[string equal -nocase "<pmextrapass3\pmextrapass1>" ""]
+RecExtraPassExists=(expression)![string equal -nocase "<pmextrapass3\pmextrapass1>" ""]
+ActionIsPreRec=(expression)[string equal -nocase "<action>" prereconcilepass]
+ActionIsReconcile=(expression)[string equal -nocase "<action>" reconcilepass]
+Reconcileprompt2=New password:
+Reconcileprompt3=Confirm password:
+Reconcileprompt4=.*\#
+Reconcileprompt5=.*\#
+Reconcileprompt6=logout
