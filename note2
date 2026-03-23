@@ -1,10 +1,37 @@
+<#
+Run-VerifyFromCsv_Alliant.ps1
 
-Now use this login pattern to create a script, now instead of reconcile, this should just do a verify but carry patterns on how you did the reconcile
+PURPOSE
+- Log in to Alliant Privilege Cloud using CCP + psPAS Shared Services service-user auth
+- Read accounts from CSV
+- Find each account in CyberArk by Username + Address
+- Optionally narrow by Safe / PlatformID if those columns exist in the CSV
+- Submit immediate verify via psPAS
+- Export a detailed status CSV
 
+SUPPORTED CSV HEADERS (flexible)
+Required:
+- Username
+- Address
 
+Also accepted:
+- UserName
+- userName
+- Target system user name
 
+- Target system address
+- Hostname
+- Machine
+- AccountAddress
 
+Optional:
+- Safe
+- SafeName
+- PlatformID
+- platformId
+#>
 
+[CmdletBinding()]
 param(
     # ===== Identity / Privilege Cloud =====
     [string]$IdentityTenantURL   = "https://aak4521.my.idaptive.app",
@@ -22,18 +49,644 @@ param(
     [string]$CsvPath             = "I:\Script\IDENTITY Script New\csv\accounttobeverified.csv",
 
     # ===== Status export =====
-    [string]$StatusCsvPath       = "I:\Script\IDENTITY Script New\logs\safeupdatestatus.csv",
-
-    # ===== Default retention if CSV row does not provide one =====
-    [ValidateRange(1,3650)]
-    [int]$TargetRetentionDays    = 60,
-
-    # ===== Safe member enforcement =====
-    [string]$ServiceIdentityUser = "acurestapi_local@alliantcreditunion.admin",
-    [string]$SafeMemberSearchIn  = "Vault",
-    [ValidateSet("User","Group","Role")]
-    [string]$SafeMemberType      = "User",
+    [string]$StatusCsvPath       = "I:\Script\IDENTITY Script New\logs\accountverifystatus.csv",
 
     # ===== Logging =====
-    [string]$LogFilePath         = "I:\Script\IDENTITY Script New\logs\UpdateRetention_SelectedSafes.txt"
+    [string]$LogFilePath         = "I:\Script\IDENTITY Script New\logs\RunVerify_SelectedAccounts.txt",
+
+    # ===== Matching / execution options =====
+    [ValidateRange(1,1000)]
+    [int]$SearchLimit            = 500,
+    [switch]$AllowShortHostMatch,
+    [switch]$UseGen1APIVerify
 )
+
+# -----------------------------
+# Initial setup
+# -----------------------------
+try { Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force -ErrorAction Stop } catch {}
+
+$psPASDirs = @(
+    "$env:ProgramFiles\WindowsPowerShell\Modules\psPAS\6.4.85",
+    "$HOME\Documents\WindowsPowerShell\Modules\psPAS\6.4.85"
+) | Where-Object { Test-Path $_ }
+
+foreach ($dir in $psPASDirs) {
+    try { Get-ChildItem -Path $dir -Recurse -File | Unblock-File -ErrorAction SilentlyContinue } catch {}
+}
+
+foreach ($path in @($LogFilePath, $StatusCsvPath)) {
+    try {
+        $parent = Split-Path -Path $path -Parent
+        if ($parent -and -not (Test-Path $parent)) {
+            New-Item -Path $parent -ItemType Directory -Force | Out-Null
+        }
+    } catch {}
+}
+
+# -----------------------------
+# Logging
+# -----------------------------
+function Write-Log {
+    param(
+        [string]$Message,
+        [string]$Color = "White"
+    )
+
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $entry = "$timestamp - $Message"
+
+    try { Write-Host $entry -ForegroundColor $Color } catch { Write-Host $entry }
+    try { Add-Content -Path $LogFilePath -Value $entry } catch {}
+}
+
+# -----------------------------
+# Helpers
+# -----------------------------
+function Normalize-Text {
+    param([AllowNull()][string]$Value)
+
+    if ($null -eq $Value) { return "" }
+    return $Value.Trim().ToLowerInvariant()
+}
+
+function Normalize-Address {
+    param([AllowNull()][string]$Value)
+
+    if ($null -eq $Value) { return "" }
+
+    $v = $Value.Trim().ToLowerInvariant()
+    $v = $v.TrimEnd('\')
+    $v = $v.TrimEnd('/')
+
+    return $v
+}
+
+function Get-ShortHost {
+    param([AllowNull()][string]$Value)
+
+    $v = Normalize-Address $Value
+    if ([string]::IsNullOrWhiteSpace($v)) { return "" }
+
+    if ($v.Contains('.')) {
+        return $v.Split('.')[0]
+    }
+
+    return $v
+}
+
+function Get-ObjectPropertyValue {
+    param(
+        [Parameter(Mandatory)][object]$Object,
+        [Parameter(Mandatory)][string[]]$Names
+    )
+
+    foreach ($name in $Names) {
+        $prop = $Object.PSObject.Properties[$name]
+        if ($prop -and $null -ne $prop.Value -and "$($prop.Value)".Trim() -ne "") {
+            return [string]$prop.Value
+        }
+    }
+
+    return $null
+}
+
+function Get-HashtableLikeValue {
+    param(
+        [Parameter(Mandatory)][object]$Object,
+        [Parameter(Mandatory)][string[]]$Names
+    )
+
+    if ($null -eq $Object) { return $null }
+
+    if ($Object -is [System.Collections.IDictionary]) {
+        foreach ($name in $Names) {
+            if ($Object.Contains($name) -and $null -ne $Object[$name] -and "$($Object[$name])".Trim() -ne "") {
+                return [string]$Object[$name]
+            }
+        }
+    }
+
+    foreach ($name in $Names) {
+        $prop = $Object.PSObject.Properties[$name]
+        if ($prop -and $null -ne $prop.Value -and "$($prop.Value)".Trim() -ne "") {
+            return [string]$prop.Value
+        }
+    }
+
+    return $null
+}
+
+function Get-AccountID {
+    param([Parameter(Mandatory)][object]$Account)
+    return (Get-ObjectPropertyValue -Object $Account -Names @("id","ID","AccountID","accountID"))
+}
+
+function Get-AccountUserName {
+    param([Parameter(Mandatory)][object]$Account)
+
+    $direct = Get-ObjectPropertyValue -Object $Account -Names @("userName","UserName","username","Username")
+    if (-not [string]::IsNullOrWhiteSpace($direct)) { return $direct }
+
+    $pp = $Account.PSObject.Properties["platformAccountProperties"]
+    if ($pp -and $null -ne $pp.Value) {
+        $indirect = Get-HashtableLikeValue -Object $pp.Value -Names @("UserName","Username","userName","username")
+        if (-not [string]::IsNullOrWhiteSpace($indirect)) { return $indirect }
+    }
+
+    return $null
+}
+
+function Get-AccountAddress {
+    param([Parameter(Mandatory)][object]$Account)
+
+    $direct = Get-ObjectPropertyValue -Object $Account -Names @("address","Address")
+    if (-not [string]::IsNullOrWhiteSpace($direct)) { return $direct }
+
+    $pp = $Account.PSObject.Properties["platformAccountProperties"]
+    if ($pp -and $null -ne $pp.Value) {
+        $indirect = Get-HashtableLikeValue -Object $pp.Value -Names @("Address","address","Machine","HostName","Hostname")
+        if (-not [string]::IsNullOrWhiteSpace($indirect)) { return $indirect }
+    }
+
+    return $null
+}
+
+function Get-AccountSafeName {
+    param([Parameter(Mandatory)][object]$Account)
+    return (Get-ObjectPropertyValue -Object $Account -Names @("safeName","SafeName","safe","Safe"))
+}
+
+function Get-AccountPlatformID {
+    param([Parameter(Mandatory)][object]$Account)
+    return (Get-ObjectPropertyValue -Object $Account -Names @("platformId","platformID","PlatformID"))
+}
+
+function Get-RowValue {
+    param(
+        [Parameter(Mandatory)][object]$Row,
+        [Parameter(Mandatory)][string[]]$Aliases
+    )
+
+    foreach ($alias in $Aliases) {
+        $prop = $Row.PSObject.Properties[$alias]
+        if ($prop -and $null -ne $prop.Value -and "$($prop.Value)".Trim() -ne "") {
+            return [string]$prop.Value
+        }
+    }
+
+    return $null
+}
+
+function Start-PASSessionFromCCP {
+    param(
+        [Parameter(Mandatory)][string]$ObjectName
+    )
+
+    $headers = @{ "Content-Type" = "application/json" }
+    $ccpUrl  = "$CCPAddress/$CCPLocation/api/Accounts?AppID=$CCPAppID&Safe=$CCPSafe&Object=$ObjectName"
+
+    Write-Log ("Retrieving CyberArk API credentials from CCP using Object='{0}'..." -f $ObjectName)
+    Write-Log ("CCP URL: {0}" -f $ccpUrl) "Gray"
+
+    try {
+        $resp = Invoke-RestMethod -Uri $ccpUrl -Method GET -Headers $headers -UseDefaultCredentials:$CCPWindowsAuth -ErrorAction Stop
+        if (-not $resp -or -not $resp.Content) {
+            throw "Empty CCP response"
+        }
+    } catch {
+        Write-Log ("❌ ERROR: CCP credential fetch failed - {0}" -f $_.Exception.Message) "Red"
+        throw
+    }
+
+    $resolvedUser = $null
+    if ($resp.PSObject.Properties.Name -contains "Username") {
+        $resolvedUser = [string]$resp.Username
+    } elseif ($resp.PSObject.Properties.Name -contains "UserName") {
+        $resolvedUser = [string]$resp.UserName
+    }
+
+    if ([string]::IsNullOrWhiteSpace($resolvedUser)) {
+        throw "CCP returned password but no Username/UserName field."
+    }
+
+    Write-Log ("✅ Successfully retrieved credentials for user: {0}" -f $resolvedUser) "Green"
+
+    try {
+        $securePass = ConvertTo-SecureString $resp.Content -AsPlainText -Force
+        $credential = [PSCredential]::new($resolvedUser, $securePass)
+
+        Write-Log ("Requesting CyberArk PAS authentication via New-PASSession as {0}..." -f $resolvedUser)
+
+        New-PASSession `
+            -IdentityTenantURL $IdentityTenantURL `
+            -PrivilegeCloudURL $PrivilegeCloudURL `
+            -Credential $credential `
+            -ServiceUser `
+            -ErrorAction Stop | Out-Null
+
+        if (-not (Get-PASSession)) {
+            throw "psPAS session not established"
+        }
+
+        Write-Log ("✅ Authentication successful, PAS session established ({0})." -f $resolvedUser) "Green"
+    } catch {
+        Write-Log ("❌ Failed to authenticate via New-PASSession: {0}" -f $_.Exception.Message) "Red"
+        throw
+    }
+
+    return $resp
+}
+
+function Resolve-CyberArkAccount {
+    param(
+        [Parameter(Mandatory)][string]$UserName,
+        [Parameter(Mandatory)][string]$Address,
+        [string]$SafeName,
+        [string]$PlatformID
+    )
+
+    $normUser     = Normalize-Text $UserName
+    $normAddr     = Normalize-Address $Address
+    $normSafe     = Normalize-Text $SafeName
+    $normPlatform = Normalize-Text $PlatformID
+
+    $searchResults = @()
+
+    try {
+        if (-not [string]::IsNullOrWhiteSpace($SafeName)) {
+            $searchResults = @(Get-PASAccount -safeName $SafeName -search $UserName -limit $SearchLimit -ErrorAction Stop)
+        } else {
+            $searchResults = @(Get-PASAccount -search $UserName -limit $SearchLimit -ErrorAction Stop)
+        }
+    } catch {
+        return [pscustomobject]@{
+            Status     = "LookupError"
+            MatchType  = ""
+            Detail     = $_.Exception.Message
+            Candidates = @()
+            Account    = $null
+        }
+    }
+
+    if (($null -eq $searchResults -or $searchResults.Count -eq 0) -and -not [string]::IsNullOrWhiteSpace($Address)) {
+        try {
+            $compositeSearch = "$UserName $Address"
+            if (-not [string]::IsNullOrWhiteSpace($SafeName)) {
+                $searchResults = @(Get-PASAccount -safeName $SafeName -search $compositeSearch -limit $SearchLimit -ErrorAction Stop)
+            } else {
+                $searchResults = @(Get-PASAccount -search $compositeSearch -limit $SearchLimit -ErrorAction Stop)
+            }
+        } catch {}
+    }
+
+    $exact = @(
+        $searchResults | Where-Object {
+            $candUser     = Normalize-Text (Get-AccountUserName $_)
+            $candAddr     = Normalize-Address (Get-AccountAddress $_)
+            $candSafe     = Normalize-Text (Get-AccountSafeName $_)
+            $candPlatform = Normalize-Text (Get-AccountPlatformID $_)
+
+            $userOk     = ($candUser -eq $normUser)
+            $addrOk     = ($candAddr -eq $normAddr)
+            $safeOk     = ([string]::IsNullOrWhiteSpace($SafeName)  -or ($candSafe -eq $normSafe))
+            $platformOk = ([string]::IsNullOrWhiteSpace($PlatformID) -or ($candPlatform -eq $normPlatform))
+
+            $userOk -and $addrOk -and $safeOk -and $platformOk
+        }
+    )
+
+    if ($exact.Count -eq 1) {
+        return [pscustomobject]@{
+            Status     = "Matched"
+            MatchType  = "Exact"
+            Detail     = "Single exact Username + Address match found."
+            Candidates = $exact
+            Account    = $exact[0]
+        }
+    }
+
+    if ($exact.Count -gt 1) {
+        return [pscustomobject]@{
+            Status     = "MultipleMatches"
+            MatchType  = "Exact"
+            Detail     = "Multiple exact matches found ($($exact.Count))."
+            Candidates = $exact
+            Account    = $null
+        }
+    }
+
+    if ($AllowShortHostMatch -and -not [string]::IsNullOrWhiteSpace($Address)) {
+        $targetShort = Get-ShortHost $Address
+
+        $shortMatches = @(
+            $searchResults | Where-Object {
+                $candUser      = Normalize-Text (Get-AccountUserName $_)
+                $candShortAddr = Get-ShortHost (Get-AccountAddress $_)
+                $candSafe      = Normalize-Text (Get-AccountSafeName $_)
+                $candPlatform  = Normalize-Text (Get-AccountPlatformID $_)
+
+                $userOk     = ($candUser -eq $normUser)
+                $addrOk     = ($candShortAddr -eq $targetShort)
+                $safeOk     = ([string]::IsNullOrWhiteSpace($SafeName)  -or ($candSafe -eq $normSafe))
+                $platformOk = ([string]::IsNullOrWhiteSpace($PlatformID) -or ($candPlatform -eq $normPlatform))
+
+                $userOk -and $addrOk -and $safeOk -and $platformOk
+            }
+        )
+
+        if ($shortMatches.Count -eq 1) {
+            return [pscustomobject]@{
+                Status     = "Matched"
+                MatchType  = "ShortHost"
+                Detail     = "Single Username + short-host match found."
+                Candidates = $shortMatches
+                Account    = $shortMatches[0]
+            }
+        }
+
+        if ($shortMatches.Count -gt 1) {
+            return [pscustomobject]@{
+                Status     = "MultipleMatches"
+                MatchType  = "ShortHost"
+                Detail     = "Multiple short-host matches found ($($shortMatches.Count))."
+                Candidates = $shortMatches
+                Account    = $null
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        Status     = "NotFound"
+        MatchType  = ""
+        Detail     = "No exact CyberArk account match found for Username='$UserName' Address='$Address'."
+        Candidates = $searchResults
+        Account    = $null
+    }
+}
+
+# -----------------------------
+# Load modules
+# -----------------------------
+try {
+    Import-Module psPAS -Force -ErrorAction Stop
+    $mod = Get-Module psPAS
+    Write-Log ("psPAS loaded ({0})." -f $mod.Version) "Green"
+} catch {
+    Write-Log ("❌ psPAS module not found/loaded: {0}" -f $_.Exception.Message) "Red"
+    exit 1
+}
+
+try {
+    Import-Module IdentityCommand -ErrorAction Stop
+    Write-Log "IdentityCommand module loaded." "Green"
+} catch {
+    Write-Log "ℹ️ IdentityCommand module not explicitly loaded. Continuing; authentication will rely on installed dependencies." "Yellow"
+}
+
+# -----------------------------
+# Validate CSV
+# -----------------------------
+if (-not (Test-Path $CsvPath)) {
+    Write-Log ("❌ CSV file not found: {0}" -f $CsvPath) "Red"
+    exit 1
+}
+
+try {
+    $rows = Import-Csv -Path $CsvPath -ErrorAction Stop
+} catch {
+    Write-Log ("❌ Failed to read CSV '{0}': {1}" -f $CsvPath, $_.Exception.Message) "Red"
+    exit 1
+}
+
+if (-not $rows -or $rows.Count -eq 0) {
+    Write-Log ("❌ CSV is empty: {0}" -f $CsvPath) "Red"
+    exit 1
+}
+
+Write-Log ("Loaded {0} row(s) from CSV: {1}" -f $rows.Count, $CsvPath) "Green"
+
+# -----------------------------
+# Login
+# -----------------------------
+try {
+    [void](Start-PASSessionFromCCP -ObjectName $CCPObject)
+} catch {
+    exit 1
+}
+
+# -----------------------------
+# Process rows
+# -----------------------------
+$results = New-Object System.Collections.Generic.List[object]
+$processedAccountIds = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+
+$rowNumber = 0
+
+try {
+    foreach ($row in $rows) {
+        $rowNumber++
+
+        $csvUser = Get-RowValue -Row $row -Aliases @("Username","UserName","userName","Target system user name")
+        $csvAddr = Get-RowValue -Row $row -Aliases @("Address","address","Target system address","Hostname","Machine","AccountAddress")
+        $csvSafe = Get-RowValue -Row $row -Aliases @("Safe","safe","SafeName","safeName")
+        $csvPlat = Get-RowValue -Row $row -Aliases @("PlatformID","platformId","platformID")
+
+        if ([string]::IsNullOrWhiteSpace($csvUser) -or [string]::IsNullOrWhiteSpace($csvAddr)) {
+            $msg = "Missing required Username and/or Address column value."
+            Write-Log ("Row {0}: ❌ {1}" -f $rowNumber, $msg) "Red"
+
+            $results.Add([pscustomobject]@{
+                RowNumber        = $rowNumber
+                CsvUserName      = $csvUser
+                CsvAddress       = $csvAddr
+                CsvSafe          = $csvSafe
+                CsvPlatformID    = $csvPlat
+                MatchType        = ""
+                AccountID        = ""
+                VaultUserName    = ""
+                VaultAddress     = ""
+                VaultSafe        = ""
+                VaultPlatformID  = ""
+                ActionStatus     = "InvalidRow"
+                Detail           = $msg
+                ProcessedAt      = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+            }) | Out-Null
+
+            continue
+        }
+
+        Write-Log ("Row {0}: Looking up account Username='{1}' Address='{2}'..." -f $rowNumber, $csvUser, $csvAddr) "Cyan"
+
+        $resolved = Resolve-CyberArkAccount -UserName $csvUser -Address $csvAddr -SafeName $csvSafe -PlatformID $csvPlat
+
+        if ($resolved.Status -ne "Matched") {
+            $msgColor = if ($resolved.Status -eq "MultipleMatches") { "Yellow" } else { "Red" }
+            Write-Log ("Row {0}: {1} - {2}" -f $rowNumber, $resolved.Status, $resolved.Detail) $msgColor
+
+            $results.Add([pscustomobject]@{
+                RowNumber        = $rowNumber
+                CsvUserName      = $csvUser
+                CsvAddress       = $csvAddr
+                CsvSafe          = $csvSafe
+                CsvPlatformID    = $csvPlat
+                MatchType        = $resolved.MatchType
+                AccountID        = ""
+                VaultUserName    = ""
+                VaultAddress     = ""
+                VaultSafe        = ""
+                VaultPlatformID  = ""
+                ActionStatus     = $resolved.Status
+                Detail           = $resolved.Detail
+                ProcessedAt      = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+            }) | Out-Null
+
+            continue
+        }
+
+        $account         = $resolved.Account
+        $accountId       = Get-AccountID $account
+        $vaultUser       = Get-AccountUserName $account
+        $vaultAddr       = Get-AccountAddress $account
+        $vaultSafe       = Get-AccountSafeName $account
+        $vaultPlatformId = Get-AccountPlatformID $account
+
+        if ([string]::IsNullOrWhiteSpace($accountId)) {
+            $msg = "Matched account, but AccountID was empty."
+            Write-Log ("Row {0}: ❌ {1}" -f $rowNumber, $msg) "Red"
+
+            $results.Add([pscustomobject]@{
+                RowNumber        = $rowNumber
+                CsvUserName      = $csvUser
+                CsvAddress       = $csvAddr
+                CsvSafe          = $csvSafe
+                CsvPlatformID    = $csvPlat
+                MatchType        = $resolved.MatchType
+                AccountID        = ""
+                VaultUserName    = $vaultUser
+                VaultAddress     = $vaultAddr
+                VaultSafe        = $vaultSafe
+                VaultPlatformID  = $vaultPlatformId
+                ActionStatus     = "MatchWithoutID"
+                Detail           = $msg
+                ProcessedAt      = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+            }) | Out-Null
+
+            continue
+        }
+
+        if ($processedAccountIds.Contains($accountId)) {
+            $msg = "AccountID '$accountId' already processed earlier in this run."
+            Write-Log ("Row {0}: ⚠️ {1}" -f $rowNumber, $msg) "Yellow"
+
+            $results.Add([pscustomobject]@{
+                RowNumber        = $rowNumber
+                CsvUserName      = $csvUser
+                CsvAddress       = $csvAddr
+                CsvSafe          = $csvSafe
+                CsvPlatformID    = $csvPlat
+                MatchType        = $resolved.MatchType
+                AccountID        = $accountId
+                VaultUserName    = $vaultUser
+                VaultAddress     = $vaultAddr
+                VaultSafe        = $vaultSafe
+                VaultPlatformID  = $vaultPlatformId
+                ActionStatus     = "SkippedDuplicateInRun"
+                Detail           = $msg
+                ProcessedAt      = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+            }) | Out-Null
+
+            continue
+        }
+
+        try {
+            Write-Log ("Row {0}: Submitting verify for AccountID='{1}' UserName='{2}' Address='{3}'..." -f $rowNumber, $accountId, $vaultUser, $vaultAddr) "Cyan"
+
+            if ($UseGen1APIVerify) {
+                Invoke-PASCPMOperation -AccountID $accountId -VerifyTask -UseGen1API -Confirm:$false -ErrorAction Stop | Out-Null
+            } else {
+                Invoke-PASCPMOperation -AccountID $accountId -VerifyTask -Confirm:$false -ErrorAction Stop | Out-Null
+            }
+
+            [void]$processedAccountIds.Add($accountId)
+
+            $msg = "Verify submitted successfully."
+            Write-Log ("Row {0}: ✅ {1}" -f $rowNumber, $msg) "Green"
+
+            $results.Add([pscustomobject]@{
+                RowNumber        = $rowNumber
+                CsvUserName      = $csvUser
+                CsvAddress       = $csvAddr
+                CsvSafe          = $csvSafe
+                CsvPlatformID    = $csvPlat
+                MatchType        = $resolved.MatchType
+                AccountID        = $accountId
+                VaultUserName    = $vaultUser
+                VaultAddress     = $vaultAddr
+                VaultSafe        = $vaultSafe
+                VaultPlatformID  = $vaultPlatformId
+                ActionStatus     = "VerifySubmitted"
+                Detail           = $msg
+                ProcessedAt      = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+            }) | Out-Null
+        } catch {
+            $msg = $_.Exception.Message
+            Write-Log ("Row {0}: ❌ Verify failed for AccountID='{1}' - {2}" -f $rowNumber, $accountId, $msg) "Red"
+
+            $results.Add([pscustomobject]@{
+                RowNumber        = $rowNumber
+                CsvUserName      = $csvUser
+                CsvAddress       = $csvAddr
+                CsvSafe          = $csvSafe
+                CsvPlatformID    = $csvPlat
+                MatchType        = $resolved.MatchType
+                AccountID        = $accountId
+                VaultUserName    = $vaultUser
+                VaultAddress     = $vaultAddr
+                VaultSafe        = $vaultSafe
+                VaultPlatformID  = $vaultPlatformId
+                ActionStatus     = "VerifyFailed"
+                Detail           = $msg
+                ProcessedAt      = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+            }) | Out-Null
+        }
+    }
+}
+finally {
+    try {
+        Close-PASSession | Out-Null
+        Write-Log "✅ PAS session closed." "Green"
+    } catch {}
+}
+
+# -----------------------------
+# Export status CSV
+# -----------------------------
+try {
+    $results | Export-Csv -Path $StatusCsvPath -NoTypeInformation -Encoding UTF8
+    Write-Log ("✅ Status exported to: {0}" -f $StatusCsvPath) "Green"
+} catch {
+    Write-Log ("❌ Failed to export status CSV: {0}" -f $_.Exception.Message) "Red"
+}
+
+# -----------------------------
+# Summary
+# -----------------------------
+$submitted = @($results | Where-Object { $_.ActionStatus -eq "VerifySubmitted" }).Count
+$failed    = @($results | Where-Object { $_.ActionStatus -eq "VerifyFailed" }).Count
+$notFound  = @($results | Where-Object { $_.ActionStatus -eq "NotFound" }).Count
+$multi     = @($results | Where-Object { $_.ActionStatus -eq "MultipleMatches" }).Count
+$invalid   = @($results | Where-Object { $_.ActionStatus -eq "InvalidRow" }).Count
+$skipped   = @($results | Where-Object { $_.ActionStatus -eq "SkippedDuplicateInRun" }).Count
+
+Write-Log ("Summary => Submitted: {0} | Failed: {1} | NotFound: {2} | MultipleMatches: {3} | InvalidRow: {4} | SkippedDuplicateInRun: {5}" -f $submitted, $failed, $notFound, $multi, $invalid, $skipped) "Cyan"
+
+
+
+
+
+Username,Address,Safe,PlatformID
+svc_app01,server01.alliantcreditunion.com,APP_MySafe,WinDomain
+svc_app02,server02.alliantcreditunion.com,APP_OtherSafe,UnixSSH
+
+
