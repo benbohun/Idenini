@@ -1,37 +1,15 @@
 <#
-Run-ReconcileFromCsv_CNA.ps1
+Export-AllSafes_CreationDate_CNA.ps1
 
 PURPOSE
 - Log in to CNA Privilege Cloud using the same CCP + Identity header pattern
-- Read accounts from CSV
-- Find each account in CyberArk by Username + Address
-- Optionally narrow by Safe / PlatformID if those columns exist in the CSV
-- Submit immediate reconcile via psPAS
-- Export a detailed results CSV
+- Retrieve all safes visible to the service user
+- Export Safe Name + Creation Date report to CSV
 
-SUPPORTED CSV HEADERS (flexible)
-Required:
-- Username
-- Address
-
-Also accepted:
-- UserName
-- userName
-- Target system user name
-
-- Target system address
-- Hostname
-- Machine
-- AccountAddress
-
-Optional:
-- Safe
-- SafeName
-- PlatformID
-- platformId
-
-DEFAULT CSV PATH
-E:\Installation Media\Script\OnboardScript\csv\Accounts_To_Reconcile.csv
+NOTES
+- Gen2 safe listing returns all visible safes and includes creationTime
+- creationTime is returned as Unix time; this script converts it to local datetime
+- Optional -UseGen1API switch is included as a fallback path
 #>
 
 [CmdletBinding()]
@@ -49,14 +27,12 @@ param(
     [string]$CCPObject         = 'cna-prod.cyberark.cloud-cnarestbot',
     [bool]$CCPWindowsAuth      = $false,
 
-    # ===== Input / output =====
-    [string]$CsvPath           = 'E:\Installation Media\Script\OnboardScript\csv\Accounts_To_Reconcile.csv',
-    [string]$LogPath           = 'E:\Installation Media\Script\OnboardScript\logs\Run-ReconcileFromCsv_CNA.log',
-    [string]$ReportPath        = '',
+    # ===== Output =====
+    [string]$ReportPath        = 'E:\Installation Media\Script\OnboardScript\logs\CNA_AllSafes_CreationDate.csv',
+    [string]$LogPath           = 'E:\Installation Media\Script\OnboardScript\logs\CNA_AllSafes_CreationDate.log',
 
-    # ===== Matching options =====
-    [int]$SearchLimit          = 500,
-    [switch]$AllowShortHostMatch
+    # ===== Retrieval options =====
+    [switch]$UseGen1API
 )
 
 # -----------------------------
@@ -73,13 +49,7 @@ foreach ($dir in $psPASDirs) {
     try { Get-ChildItem -Path $dir -Recurse -File | Unblock-File -ErrorAction SilentlyContinue } catch {}
 }
 
-if ([string]::IsNullOrWhiteSpace($ReportPath)) {
-    $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-    $ReportPath = "E:\Installation Media\Script\OnboardScript\logs\Run-ReconcileFromCsv_CNA_$stamp.csv"
-}
-
-# Ensure folders exist
-foreach ($path in @($LogPath, $ReportPath)) {
+foreach ($path in @($ReportPath, $LogPath)) {
     try {
         $parent = Split-Path -Path $path -Parent
         if ($parent -and -not (Test-Path $parent)) {
@@ -117,38 +87,6 @@ function Get-NormalizedIdentityTenant {
     return $value
 }
 
-function Normalize-Text {
-    param([AllowNull()][string]$Value)
-
-    if ($null -eq $Value) { return '' }
-    return $Value.Trim().ToLowerInvariant()
-}
-
-function Normalize-Address {
-    param([AllowNull()][string]$Value)
-
-    if ($null -eq $Value) { return '' }
-
-    $v = $Value.Trim().ToLowerInvariant()
-    $v = $v.TrimEnd('\')
-    $v = $v.TrimEnd('/')
-
-    return $v
-}
-
-function Get-ShortHost {
-    param([AllowNull()][string]$Value)
-
-    $v = Normalize-Address $Value
-    if ([string]::IsNullOrWhiteSpace($v)) { return '' }
-
-    if ($v.Contains('.')) {
-        return $v.Split('.')[0]
-    }
-
-    return $v
-}
-
 function Get-ObjectPropertyValue {
     param(
         [Parameter(Mandatory)][object]$Object,
@@ -158,101 +96,60 @@ function Get-ObjectPropertyValue {
     foreach ($name in $Names) {
         $prop = $Object.PSObject.Properties[$name]
         if ($prop -and $null -ne $prop.Value -and "$($prop.Value)".Trim() -ne '') {
-            return [string]$prop.Value
+            return $prop.Value
         }
     }
 
     return $null
 }
 
-function Get-HashtableLikeValue {
+function Convert-FromUnixLikeTime {
     param(
-        [Parameter(Mandatory)][object]$Object,
-        [Parameter(Mandatory)][string[]]$Names
+        [Parameter(ValueFromPipeline = $true)]
+        [AllowNull()]
+        $Value
     )
 
-    if ($null -eq $Object) { return $null }
+    process {
+        if ($null -eq $Value -or "$Value".Trim() -eq '') {
+            return $null
+        }
 
-    # IDictionary
-    if ($Object -is [System.Collections.IDictionary]) {
-        foreach ($name in $Names) {
-            if ($Object.Contains($name) -and $null -ne $Object[$name] -and "$($Object[$name])".Trim() -ne '') {
-                return [string]$Object[$name]
+        $text = "$Value".Trim()
+
+        if ($text -notmatch '^\d+$') {
+            # Already looks like a formatted date string
+            try { return [datetime]$text } catch { return $null }
+        }
+
+        try {
+            $num = [int64]$text
+
+            # Common formats:
+            # 10 digits  = Unix seconds
+            # 13 digits  = Unix milliseconds
+            # 16 digits  = Unix microseconds
+            # 19 digits  = Unix nanoseconds (rare in this context)
+            switch ($text.Length) {
+                10 { return [DateTimeOffset]::FromUnixTimeSeconds($num).LocalDateTime }
+                13 { return [DateTimeOffset]::FromUnixTimeMilliseconds($num).LocalDateTime }
+                16 { return [DateTimeOffset]::FromUnixTimeMilliseconds([int64]($num / 1000)).LocalDateTime }
+                19 { return [DateTimeOffset]::FromUnixTimeMilliseconds([int64]($num / 1000000)).LocalDateTime }
+                default {
+                    # Best effort fallback:
+                    if ($num -lt 32503680000) {
+                        return [DateTimeOffset]::FromUnixTimeSeconds($num).LocalDateTime
+                    } elseif ($num -lt 32503680000000) {
+                        return [DateTimeOffset]::FromUnixTimeMilliseconds($num).LocalDateTime
+                    } else {
+                        return [DateTimeOffset]::FromUnixTimeMilliseconds([int64]($num / 1000)).LocalDateTime
+                    }
+                }
             }
+        } catch {
+            return $null
         }
     }
-
-    # PSCustomObject / object with properties
-    foreach ($name in $Names) {
-        $prop = $Object.PSObject.Properties[$name]
-        if ($prop -and $null -ne $prop.Value -and "$($prop.Value)".Trim() -ne '') {
-            return [string]$prop.Value
-        }
-    }
-
-    return $null
-}
-
-function Get-AccountID {
-    param([Parameter(Mandatory)][object]$Account)
-    return (Get-ObjectPropertyValue -Object $Account -Names @('id','ID','AccountID','accountID'))
-}
-
-function Get-AccountUserName {
-    param([Parameter(Mandatory)][object]$Account)
-
-    $direct = Get-ObjectPropertyValue -Object $Account -Names @('userName','UserName','username','Username')
-    if (-not [string]::IsNullOrWhiteSpace($direct)) { return $direct }
-
-    $platformProps = Get-ObjectPropertyValue -Object $Account -Names @('platformAccountProperties')
-    if ($platformProps) {
-        $pp = $Account.platformAccountProperties
-        $indirect = Get-HashtableLikeValue -Object $pp -Names @('UserName','Username','userName','username')
-        if (-not [string]::IsNullOrWhiteSpace($indirect)) { return $indirect }
-    }
-
-    return $null
-}
-
-function Get-AccountAddress {
-    param([Parameter(Mandatory)][object]$Account)
-
-    $direct = Get-ObjectPropertyValue -Object $Account -Names @('address','Address')
-    if (-not [string]::IsNullOrWhiteSpace($direct)) { return $direct }
-
-    $pp = $Account.PSObject.Properties['platformAccountProperties']
-    if ($pp -and $null -ne $pp.Value) {
-        $indirect = Get-HashtableLikeValue -Object $pp.Value -Names @('Address','address','Machine','HostName','Hostname')
-        if (-not [string]::IsNullOrWhiteSpace($indirect)) { return $indirect }
-    }
-
-    return $null
-}
-
-function Get-AccountSafeName {
-    param([Parameter(Mandatory)][object]$Account)
-    return (Get-ObjectPropertyValue -Object $Account -Names @('safeName','SafeName','safe','Safe'))
-}
-
-function Get-AccountPlatformID {
-    param([Parameter(Mandatory)][object]$Account)
-    return (Get-ObjectPropertyValue -Object $Account -Names @('platformId','platformID','PlatformID'))
-}
-
-function Get-RowValue {
-    param(
-        [Parameter(Mandatory)][object]$Row,
-        [Parameter(Mandatory)][string[]]$Aliases
-    )
-
-    foreach ($alias in $Aliases) {
-        $prop = $Row.PSObject.Properties[$alias]
-        if ($prop -and $null -ne $prop.Value -and "$($prop.Value)".Trim() -ne '') {
-            return [string]$prop.Value
-        }
-    }
-
-    return $null
 }
 
 function Start-PASSessionFromCCP {
@@ -318,138 +215,8 @@ function Start-PASSessionFromCCP {
     return $resp
 }
 
-function Resolve-CyberArkAccount {
-    param(
-        [Parameter(Mandatory)][string]$UserName,
-        [Parameter(Mandatory)][string]$Address,
-        [string]$SafeName,
-        [string]$PlatformID
-    )
-
-    $normUser     = Normalize-Text $UserName
-    $normAddr     = Normalize-Address $Address
-    $normSafe     = Normalize-Text $SafeName
-    $normPlatform = Normalize-Text $PlatformID
-
-    $searchResults = @()
-
-    try {
-        if (-not [string]::IsNullOrWhiteSpace($SafeName)) {
-            $searchResults = @(Get-PASAccount -safeName $SafeName -search $UserName -limit $SearchLimit -ErrorAction Stop)
-        } else {
-            $searchResults = @(Get-PASAccount -search $UserName -limit $SearchLimit -ErrorAction Stop)
-        }
-    } catch {
-        return [pscustomobject]@{
-            Status     = 'LookupError'
-            MatchType  = ''
-            Detail     = $_.Exception.Message
-            Candidates = @()
-            Account    = $null
-        }
-    }
-
-    # Fallback search using both username and address keywords if username-only search came back empty
-    if (($null -eq $searchResults -or $searchResults.Count -eq 0) -and -not [string]::IsNullOrWhiteSpace($Address)) {
-        try {
-            $compositeSearch = "$UserName $Address"
-            if (-not [string]::IsNullOrWhiteSpace($SafeName)) {
-                $searchResults = @(Get-PASAccount -safeName $SafeName -search $compositeSearch -limit $SearchLimit -ErrorAction Stop)
-            } else {
-                $searchResults = @(Get-PASAccount -search $compositeSearch -limit $SearchLimit -ErrorAction Stop)
-            }
-        } catch {
-            # keep prior outcome
-        }
-    }
-
-    $exact = @(
-        $searchResults | Where-Object {
-            $candUser     = Normalize-Text (Get-AccountUserName $_)
-            $candAddr     = Normalize-Address (Get-AccountAddress $_)
-            $candSafe     = Normalize-Text (Get-AccountSafeName $_)
-            $candPlatform = Normalize-Text (Get-AccountPlatformID $_)
-
-            $userOk     = ($candUser -eq $normUser)
-            $addrOk     = ($candAddr -eq $normAddr)
-            $safeOk     = ([string]::IsNullOrWhiteSpace($SafeName)  -or ($candSafe -eq $normSafe))
-            $platformOk = ([string]::IsNullOrWhiteSpace($PlatformID) -or ($candPlatform -eq $normPlatform))
-
-            $userOk -and $addrOk -and $safeOk -and $platformOk
-        }
-    )
-
-    if ($exact.Count -eq 1) {
-        return [pscustomobject]@{
-            Status     = 'Matched'
-            MatchType  = 'Exact'
-            Detail     = 'Single exact Username + Address match found.'
-            Candidates = $exact
-            Account    = $exact[0]
-        }
-    }
-
-    if ($exact.Count -gt 1) {
-        return [pscustomobject]@{
-            Status     = 'MultipleMatches'
-            MatchType  = 'Exact'
-            Detail     = "Multiple exact matches found ($($exact.Count))."
-            Candidates = $exact
-            Account    = $null
-        }
-    }
-
-    if ($AllowShortHostMatch -and -not [string]::IsNullOrWhiteSpace($Address)) {
-        $targetShort = Get-ShortHost $Address
-
-        $shortMatches = @(
-            $searchResults | Where-Object {
-                $candUser      = Normalize-Text (Get-AccountUserName $_)
-                $candShortAddr = Get-ShortHost (Get-AccountAddress $_)
-                $candSafe      = Normalize-Text (Get-AccountSafeName $_)
-                $candPlatform  = Normalize-Text (Get-AccountPlatformID $_)
-
-                $userOk     = ($candUser -eq $normUser)
-                $addrOk     = ($candShortAddr -eq $targetShort)
-                $safeOk     = ([string]::IsNullOrWhiteSpace($SafeName)  -or ($candSafe -eq $normSafe))
-                $platformOk = ([string]::IsNullOrWhiteSpace($PlatformID) -or ($candPlatform -eq $normPlatform))
-
-                $userOk -and $addrOk -and $safeOk -and $platformOk
-            }
-        )
-
-        if ($shortMatches.Count -eq 1) {
-            return [pscustomobject]@{
-                Status     = 'Matched'
-                MatchType  = 'ShortHost'
-                Detail     = 'Single Username + short-host match found.'
-                Candidates = $shortMatches
-                Account    = $shortMatches[0]
-            }
-        }
-
-        if ($shortMatches.Count -gt 1) {
-            return [pscustomobject]@{
-                Status     = 'MultipleMatches'
-                MatchType  = 'ShortHost'
-                Detail     = "Multiple short-host matches found ($($shortMatches.Count))."
-                Candidates = $shortMatches
-                Account    = $null
-            }
-        }
-    }
-
-    return [pscustomobject]@{
-        Status     = 'NotFound'
-        MatchType  = ''
-        Detail     = "No exact CyberArk account match found for Username='$UserName' Address='$Address'."
-        Candidates = $searchResults
-        Account    = $null
-    }
-}
-
 # -----------------------------
-# Load psPAS
+# Load modules
 # -----------------------------
 try {
     Import-Module psPAS -Force -ErrorAction Stop
@@ -461,28 +228,6 @@ try {
 }
 
 # -----------------------------
-# Validate CSV
-# -----------------------------
-if (-not (Test-Path $CsvPath)) {
-    Write-Log ("❌ CSV file not found: {0}" -f $CsvPath) 'Red'
-    exit 1
-}
-
-try {
-    $rows = Import-Csv -Path $CsvPath -ErrorAction Stop
-} catch {
-    Write-Log ("❌ Failed to read CSV '{0}': {1}" -f $CsvPath, $_.Exception.Message) 'Red'
-    exit 1
-}
-
-if (-not $rows -or $rows.Count -eq 0) {
-    Write-Log ("❌ CSV is empty: {0}" -f $CsvPath) 'Red'
-    exit 1
-}
-
-Write-Log ("Loaded {0} row(s) from CSV: {1}" -f $rows.Count, $CsvPath) 'Green'
-
-# -----------------------------
 # Login
 # -----------------------------
 try {
@@ -492,176 +237,58 @@ try {
 }
 
 # -----------------------------
-# Process rows
+# Get safes
 # -----------------------------
-$results = New-Object System.Collections.Generic.List[object]
-$processedAccountIds = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-
-$rowNumber = 0
+$report = @()
 
 try {
-    foreach ($row in $rows) {
-        $rowNumber++
+    Write-Log "Retrieving safes from CyberArk..." 'Cyan'
 
-        $csvUser = Get-RowValue -Row $row -Aliases @('Username','UserName','userName','Target system user name')
-        $csvAddr = Get-RowValue -Row $row -Aliases @('Address','address','Target system address','Hostname','Machine','AccountAddress')
-        $csvSafe = Get-RowValue -Row $row -Aliases @('Safe','safe','SafeName','safeName')
-        $csvPlat = Get-RowValue -Row $row -Aliases @('PlatformID','platformId','platformID')
+    if ($UseGen1API) {
+        $safes = @(Get-PASSafe -FindAll -UseGen1API -ErrorAction Stop)
+    } else {
+        $safes = @(Get-PASSafe -ErrorAction Stop)
+    }
 
-        if ([string]::IsNullOrWhiteSpace($csvUser) -or [string]::IsNullOrWhiteSpace($csvAddr)) {
-            $msg = 'Missing required Username and/or Address column value.'
-            Write-Log ("Row {0}: ❌ {1}" -f $rowNumber, $msg) 'Red'
+    Write-Log ("Retrieved {0} safe(s)." -f $safes.Count) 'Green'
 
-            $results.Add([pscustomobject]@{
-                RowNumber        = $rowNumber
-                CsvUserName      = $csvUser
-                CsvAddress       = $csvAddr
-                CsvSafe          = $csvSafe
-                CsvPlatformID    = $csvPlat
-                MatchType        = ''
-                AccountID        = ''
-                VaultUserName    = ''
-                VaultAddress     = ''
-                VaultSafe        = ''
-                VaultPlatformID  = ''
-                ActionStatus     = 'InvalidRow'
-                Detail           = $msg
-                ProcessedAt      = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
-            }) | Out-Null
+    foreach ($safe in $safes) {
+        $safeName      = Get-ObjectPropertyValue -Object $safe -Names @('safeName','SafeName','Safe')
+        $safeUrlId     = Get-ObjectPropertyValue -Object $safe -Names @('safeUrlId','SafeUrlId')
+        $safeNumber    = Get-ObjectPropertyValue -Object $safe -Names @('safeNumber','SafeNumber')
+        $description   = Get-ObjectPropertyValue -Object $safe -Names @('description','Description')
+        $location      = Get-ObjectPropertyValue -Object $safe -Names @('location','Location')
+        $managingCPM   = Get-ObjectPropertyValue -Object $safe -Names @('managingCPM','ManagingCPM')
+        $creationRaw   = Get-ObjectPropertyValue -Object $safe -Names @('creationTime','CreationTime')
+        $modifiedRaw   = Get-ObjectPropertyValue -Object $safe -Names @('lastModificationTime','LastModificationTime')
+        $createdDate   = Convert-FromUnixLikeTime $creationRaw
+        $modifiedDate  = Convert-FromUnixLikeTime $modifiedRaw
 
-            continue
+        $creatorName = $null
+        $creatorProp = $safe.PSObject.Properties['creator']
+        if ($creatorProp -and $null -ne $creatorProp.Value) {
+            $creatorName = Get-ObjectPropertyValue -Object $creatorProp.Value -Names @('name','Name')
         }
 
-        Write-Log ("Row {0}: Looking up account Username='{1}' Address='{2}'..." -f $rowNumber, $csvUser, $csvAddr) 'Cyan'
-
-        $resolved = Resolve-CyberArkAccount -UserName $csvUser -Address $csvAddr -SafeName $csvSafe -PlatformID $csvPlat
-
-        if ($resolved.Status -ne 'Matched') {
-            $msgColor = if ($resolved.Status -eq 'MultipleMatches') { 'Yellow' } else { 'Red' }
-            Write-Log ("Row {0}: {1} - {2}" -f $rowNumber, $resolved.Status, $resolved.Detail) $msgColor
-
-            $results.Add([pscustomobject]@{
-                RowNumber        = $rowNumber
-                CsvUserName      = $csvUser
-                CsvAddress       = $csvAddr
-                CsvSafe          = $csvSafe
-                CsvPlatformID    = $csvPlat
-                MatchType        = $resolved.MatchType
-                AccountID        = ''
-                VaultUserName    = ''
-                VaultAddress     = ''
-                VaultSafe        = ''
-                VaultPlatformID  = ''
-                ActionStatus     = $resolved.Status
-                Detail           = $resolved.Detail
-                ProcessedAt      = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
-            }) | Out-Null
-
-            continue
-        }
-
-        $account         = $resolved.Account
-        $accountId       = Get-AccountID $account
-        $vaultUser       = Get-AccountUserName $account
-        $vaultAddr       = Get-AccountAddress $account
-        $vaultSafe       = Get-AccountSafeName $account
-        $vaultPlatformId = Get-AccountPlatformID $account
-
-        if ([string]::IsNullOrWhiteSpace($accountId)) {
-            $msg = 'Matched account, but AccountID was empty.'
-            Write-Log ("Row {0}: ❌ {1}" -f $rowNumber, $msg) 'Red'
-
-            $results.Add([pscustomobject]@{
-                RowNumber        = $rowNumber
-                CsvUserName      = $csvUser
-                CsvAddress       = $csvAddr
-                CsvSafe          = $csvSafe
-                CsvPlatformID    = $csvPlat
-                MatchType        = $resolved.MatchType
-                AccountID        = ''
-                VaultUserName    = $vaultUser
-                VaultAddress     = $vaultAddr
-                VaultSafe        = $vaultSafe
-                VaultPlatformID  = $vaultPlatformId
-                ActionStatus     = 'MatchWithoutID'
-                Detail           = $msg
-                ProcessedAt      = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
-            }) | Out-Null
-
-            continue
-        }
-
-        if ($processedAccountIds.Contains($accountId)) {
-            $msg = "AccountID '$accountId' already processed earlier in this run."
-            Write-Log ("Row {0}: ⚠️ {1}" -f $rowNumber, $msg) 'Yellow'
-
-            $results.Add([pscustomobject]@{
-                RowNumber        = $rowNumber
-                CsvUserName      = $csvUser
-                CsvAddress       = $csvAddr
-                CsvSafe          = $csvSafe
-                CsvPlatformID    = $csvPlat
-                MatchType        = $resolved.MatchType
-                AccountID        = $accountId
-                VaultUserName    = $vaultUser
-                VaultAddress     = $vaultAddr
-                VaultSafe        = $vaultSafe
-                VaultPlatformID  = $vaultPlatformId
-                ActionStatus     = 'SkippedDuplicateInRun'
-                Detail           = $msg
-                ProcessedAt      = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
-            }) | Out-Null
-
-            continue
-        }
-
-        try {
-            Write-Log ("Row {0}: Submitting reconcile for AccountID='{1}' UserName='{2}' Address='{3}'..." -f $rowNumber, $accountId, $vaultUser, $vaultAddr) 'Cyan'
-
-            Invoke-PASCPMOperation -AccountID $accountId -ReconcileTask -Confirm:$false -ErrorAction Stop | Out-Null
-            [void]$processedAccountIds.Add($accountId)
-
-            $msg = 'Reconcile submitted successfully.'
-            Write-Log ("Row {0}: ✅ {1}" -f $rowNumber, $msg) 'Green'
-
-            $results.Add([pscustomobject]@{
-                RowNumber        = $rowNumber
-                CsvUserName      = $csvUser
-                CsvAddress       = $csvAddr
-                CsvSafe          = $csvSafe
-                CsvPlatformID    = $csvPlat
-                MatchType        = $resolved.MatchType
-                AccountID        = $accountId
-                VaultUserName    = $vaultUser
-                VaultAddress     = $vaultAddr
-                VaultSafe        = $vaultSafe
-                VaultPlatformID  = $vaultPlatformId
-                ActionStatus     = 'ReconcileSubmitted'
-                Detail           = $msg
-                ProcessedAt      = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
-            }) | Out-Null
-        } catch {
-            $msg = $_.Exception.Message
-            Write-Log ("Row {0}: ❌ Reconcile failed for AccountID='{1}' - {2}" -f $rowNumber, $accountId, $msg) 'Red'
-
-            $results.Add([pscustomobject]@{
-                RowNumber        = $rowNumber
-                CsvUserName      = $csvUser
-                CsvAddress       = $csvAddr
-                CsvSafe          = $csvSafe
-                CsvPlatformID    = $csvPlat
-                MatchType        = $resolved.MatchType
-                AccountID        = $accountId
-                VaultUserName    = $vaultUser
-                VaultAddress     = $vaultAddr
-                VaultSafe        = $vaultSafe
-                VaultPlatformID  = $vaultPlatformId
-                ActionStatus     = 'ReconcileFailed'
-                Detail           = $msg
-                ProcessedAt      = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
-            }) | Out-Null
+        $report += [pscustomobject]@{
+            SafeName                  = $safeName
+            SafeUrlId                 = $safeUrlId
+            SafeNumber                = $safeNumber
+            CreationTimeRaw           = $creationRaw
+            CreationDateLocal         = if ($createdDate) { $createdDate.ToString('yyyy-MM-dd HH:mm:ss') } else { '' }
+            LastModificationTimeRaw   = $modifiedRaw
+            LastModificationDateLocal = if ($modifiedDate) { $modifiedDate.ToString('yyyy-MM-dd HH:mm:ss') } else { '' }
+            CreatorName               = $creatorName
+            ManagingCPM               = $managingCPM
+            Location                  = $location
+            Description               = $description
         }
     }
+}
+catch {
+    Write-Log ("❌ Failed to retrieve safes: {0}" -f $_.Exception.Message) 'Red'
+    try { Close-PASSession | Out-Null } catch {}
+    exit 1
 }
 finally {
     try {
@@ -674,26 +301,15 @@ finally {
 # Export report
 # -----------------------------
 try {
-    $results | Export-Csv -Path $ReportPath -NoTypeInformation -Encoding UTF8
-    Write-Log ("✅ Results exported to: {0}" -f $ReportPath) 'Green'
-} catch {
+    $report |
+        Sort-Object @{ Expression = { if ($_.CreationDateLocal) { [datetime]$_.CreationDateLocal } else { [datetime]'1900-01-01' } } }, SafeName |
+        Export-Csv -Path $ReportPath -NoTypeInformation -Encoding UTF8
+
+    Write-Log ("✅ Report exported to: {0}" -f $ReportPath) 'Green'
+}
+catch {
     Write-Log ("❌ Failed to export report: {0}" -f $_.Exception.Message) 'Red'
+    exit 1
 }
 
-# -----------------------------
-# Summary
-# -----------------------------
-$submitted = @($results | Where-Object { $_.ActionStatus -eq 'ReconcileSubmitted' }).Count
-$failed    = @($results | Where-Object { $_.ActionStatus -eq 'ReconcileFailed' }).Count
-$notFound  = @($results | Where-Object { $_.ActionStatus -eq 'NotFound' }).Count
-$multi     = @($results | Where-Object { $_.ActionStatus -eq 'MultipleMatches' }).Count
-$invalid   = @($results | Where-Object { $_.ActionStatus -eq 'InvalidRow' }).Count
-$skipped   = @($results | Where-Object { $_.ActionStatus -eq 'SkippedDuplicateInRun' }).Count
-
-Write-Log ("Summary => Submitted: {0} | Failed: {1} | NotFound: {2} | MultipleMatches: {3} | InvalidRow: {4} | SkippedDuplicateInRun: {5}" -f $submitted, $failed, $notFound, $multi, $invalid, $skipped) 'Cyan'
-
-
-
-Username,Address,Safe,PlatformID
-svc_app01,server01.cna.com,APP_MySafe,WinDomain
-svc_app02,server02.cna.com,APP_OtherSafe,UnixSSH
+Write-Log ("✅ Completed. Total safes in report: {0}" -f $report.Count) 'Cyan'
