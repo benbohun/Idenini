@@ -1,57 +1,45 @@
 <#
-Add-AcuRestApiLocal-To-IND-Safes.ps1
+Add_AcuRestApiLocal_To_All_Ind_Safes.ps1
 
 PURPOSE
-- Prompt for an interactive human user credential
-- Authenticate to Alliant Privilege Cloud
-- Review all safes whose names begin with IND_
-- Ensure acurestapi_local@alliantcreditunion.admin exists as a Safe member
-  with full permissions on each matching safe
-- If the member exists, update permissions
-- If the member does not exist, add it
-
-AUTH MODES
-- IdentityUser (default, recommended for Privilege Cloud Shared Services)
-- LDAP
-- CyberArk
+- Prompt for an interactive non-service-user login
+- Authenticate to Alliant Privilege Cloud using IdentityUser auth
+- Find all safes whose names begin with IND_
+- Add acurestapi_local@alliantcreditunion.admin with full permissions only if missing
+- Ignore safes where the user already exists as a member
+- Export a status CSV
 
 NOTES
-- RequestsAuthorizationLevel1 / RequestsAuthorizationLevel2 were intentionally
-  omitted because current Gen2 safe-member operations do not use those fields.
-- Use -WhatIf first if you want a safe preview.
+- This script is designed for psPAS 6.4.85 + IdentityCommand 0.3.61
+- IdentityUser login may trigger MFA/browser interaction depending on tenant policy
+- Existing memberships are NOT modified; they are skipped
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
     # ===== Module versions =====
-    [string]$RequiredPsPASVersion            = "6.4.85",
-    [string]$RequiredIdentityCommandVersion  = "0.3.61",
+    [string]$RequiredPsPASVersion           = "6.4.85",
+    [string]$RequiredIdentityCommandVersion = "0.3.61",
 
-    # ===== Auth =====
-    [ValidateSet("IdentityUser","LDAP","CyberArk")]
-    [string]$AuthMode                        = "IdentityUser",
-
-    # IdentityUser mode
-    [string]$IdentityTenantURL               = "https://aak4521.my.idaptive.app",
-    [string]$PrivilegeCloudURL               = "https://alliantcredit.privilegecloud.cyberark.cloud",
-
-    # LDAP / CyberArk mode
-    [string]$BaseURI                         = "https://alliantcredit.privilegecloud.cyberark.cloud",
+    # ===== Authentication =====
+    [string]$TenantSubdomain                = "alliantcredit",
 
     # ===== Safe targeting =====
-    [string]$SafePrefix                      = "IND_",
+    [string]$SafePrefix                     = "IND_",
 
-    # ===== Member enforcement =====
-    [string]$TargetMemberName                = "acurestapi_local@alliantcreditunion.admin",
-    [string]$TargetMemberSearchIn            = "Vault",
+    # ===== Member to add =====
+    [string]$TargetMemberName               = "acurestapi_local@alliantcreditunion.admin",
+    [string]$TargetMemberSearchIn           = "Vault",
+    [ValidateSet("User","Group","Role")]
+    [string]$TargetMemberType               = "User",
 
     # ===== Output =====
-    [string]$StatusCsvPath                   = "I:\Script\IDENTITY Script New\csv\IND_Safes_AcuRestApiLocal_Status.csv",
-    [string]$LogFilePath                     = "I:\Script\IDENTITY Script New\logs\IND_Safes_AcuRestApiLocal.log"
+    [string]$StatusCsvPath                  = "I:\Script\IDENTITY Script New\csv\IND_Safes_Add_AcuRestApiLocal_Status.csv",
+    [string]$LogFilePath                    = "I:\Script\IDENTITY Script New\logs\IND_Safes_Add_AcuRestApiLocal.log"
 )
 
 # -------------------------------------------------------------------
-# Full permission set normalized for current Add/Set-PASSafeMember use
+# Full permission set requested
 # -------------------------------------------------------------------
 $FullPermPAS = [PSCustomObject]@{
     UseAccounts                            = $true
@@ -74,17 +62,19 @@ $FullPermPAS = [PSCustomObject]@{
     CreateFolders                          = $true
     DeleteFolders                          = $true
     MoveAccountsAndFolders                 = $true
+    requestsAuthorizationLevel1            = $true
+    requestsAuthorizationLevel2            = $false
 }
 
 # -------------------------------------------------------------------
-# Runtime preferences
+# Runtime
 # -------------------------------------------------------------------
 $ErrorActionPreference = "Stop"
 $ProgressPreference    = "SilentlyContinue"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # -------------------------------------------------------------------
-# Helper functions
+# Helpers
 # -------------------------------------------------------------------
 function Write-Info {
     param([string]$Message)
@@ -153,23 +143,22 @@ function Import-RequiredModules {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$PsPASVersion,
-        [Parameter(Mandatory)][string]$AuthMode,
-        [string]$IdentityCommandVersion
+        [Parameter(Mandatory)][string]$IdentityCommandVersion
     )
 
     Remove-Module psPAS, IdentityCommand -ErrorAction SilentlyContinue
 
     Import-Module psPAS -RequiredVersion $PsPASVersion -Force -ErrorAction Stop
-    $pspasLoaded = Get-Module psPAS | Sort-Object Version -Descending | Select-Object -First 1
-    Write-Info ("psPAS loaded. Version: {0}" -f $pspasLoaded.Version)
-    Write-LogLine ("psPAS loaded from: {0}" -f $pspasLoaded.Path) "SUCCESS"
+    Import-Module IdentityCommand -RequiredVersion $IdentityCommandVersion -Force -ErrorAction Stop
 
-    if ($AuthMode -eq "IdentityUser") {
-        Import-Module IdentityCommand -RequiredVersion $IdentityCommandVersion -Force -ErrorAction Stop
-        $idLoaded = Get-Module IdentityCommand | Sort-Object Version -Descending | Select-Object -First 1
-        Write-Info ("IdentityCommand loaded. Version: {0}" -f $idLoaded.Version)
-        Write-LogLine ("IdentityCommand loaded from: {0}" -f $idLoaded.Path) "SUCCESS"
-    }
+    $pspasLoaded = Get-Module psPAS | Sort-Object Version -Descending | Select-Object -First 1
+    $idLoaded    = Get-Module IdentityCommand | Sort-Object Version -Descending | Select-Object -First 1
+
+    Write-Info ("psPAS loaded. Version: {0}" -f $pspasLoaded.Version)
+    Write-Info ("IdentityCommand loaded. Version: {0}" -f $idLoaded.Version)
+
+    Write-LogLine ("psPAS loaded from: {0}" -f $pspasLoaded.Path) "SUCCESS"
+    Write-LogLine ("IdentityCommand loaded from: {0}" -f $idLoaded.Path) "SUCCESS"
 }
 
 function New-InteractiveCredential {
@@ -184,45 +173,21 @@ function New-InteractiveCredential {
     return Get-Credential -UserName $loginUser -Message "Enter the password for the login user"
 }
 
-function Connect-PASInteractive {
+function Connect-PASInteractiveIdentityUser {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][ValidateSet("IdentityUser","LDAP","CyberArk")][string]$AuthMode,
-        [Parameter(Mandatory)][pscredential]$Credential,
-        [string]$IdentityTenantURL,
-        [string]$PrivilegeCloudURL,
-        [string]$BaseURI
+        [Parameter(Mandatory)][string]$TenantSubdomain,
+        [Parameter(Mandatory)][pscredential]$Credential
     )
 
-    switch ($AuthMode) {
-        "IdentityUser" {
-            Write-Info "Authenticating with interactive IdentityUser login..."
-            New-PASSession `
-                -IdentityTenantURL $IdentityTenantURL `
-                -PrivilegeCloudURL $PrivilegeCloudURL `
-                -Credential        $Credential `
-                -IdentityUser `
-                -ErrorAction Stop | Out-Null
-        }
+    Write-Info "Authenticating with interactive IdentityUser login..."
+    Write-Info "Complete MFA in the browser or challenge prompt if prompted."
 
-        "LDAP" {
-            Write-Info "Authenticating with interactive LDAP login..."
-            New-PASSession `
-                -BaseURI    $BaseURI `
-                -Credential $Credential `
-                -type       LDAP `
-                -ErrorAction Stop | Out-Null
-        }
-
-        "CyberArk" {
-            Write-Info "Authenticating with interactive CyberArk local login..."
-            New-PASSession `
-                -BaseURI    $BaseURI `
-                -Credential $Credential `
-                -type       CyberArk `
-                -ErrorAction Stop | Out-Null
-        }
-    }
+    New-PASSession `
+        -TenantSubdomain $TenantSubdomain `
+        -Credential      $Credential `
+        -IdentityUser `
+        -ErrorAction Stop | Out-Null
 
     $session = Get-PASSession
     if (-not $session) {
@@ -230,7 +195,7 @@ function Connect-PASInteractive {
     }
 
     Write-Ok "Authentication stage completed successfully."
-    Write-LogLine ("Authenticated successfully using auth mode: {0}" -f $AuthMode) "SUCCESS"
+    Write-LogLine ("Authenticated successfully to tenant subdomain '{0}' using IdentityUser." -f $TenantSubdomain) "SUCCESS"
 }
 
 function Get-TargetSafeNames {
@@ -242,7 +207,7 @@ function Get-TargetSafeNames {
     Write-Info ("Searching for safes with prefix '{0}'..." -f $Prefix)
     Write-LogLine ("Searching for safes with prefix '{0}'" -f $Prefix) "INFO"
 
-    $rawSafes = @(Get-PASSafe -search $Prefix -extendedDetails $false -ErrorAction Stop)
+    $rawSafes = @(Get-PASSafe -Search $Prefix -ErrorAction Stop)
 
     $safeNames = $rawSafes |
         ForEach-Object {
@@ -288,49 +253,50 @@ function Get-ExistingSafeMember {
     return $null
 }
 
-function Ensure-SafeMemberFullPermission {
+function Add-SafeMemberIfMissing {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$SafeName,
         [Parameter(Mandatory)][string]$MemberName,
         [Parameter(Mandatory)][string]$SearchIn,
+        [Parameter(Mandatory)][string]$MemberType,
         [Parameter(Mandatory)]$PermissionObject
     )
 
-    $permHash = Convert-ObjectToHashtable -InputObject $PermissionObject
     $existing = Get-ExistingSafeMember -SafeName $SafeName -MemberName $MemberName
-
     if ($null -ne $existing) {
-        $setParams = @{
-            SafeName    = $SafeName
-            MemberName  = $MemberName
-            ErrorAction = "Stop"
-        }
-
-        foreach ($k in $permHash.Keys) {
-            $setParams[$k] = $permHash[$k]
-        }
-
-        Set-PASSafeMember @setParams | Out-Null
-        Write-LogLine ("Updated existing member '{0}' on safe '{1}'" -f $MemberName, $SafeName) "SUCCESS"
-        return "UPDATED"
+        Write-LogLine ("Safe '{0}': member '{1}' already exists. Skipping." -f $SafeName, $MemberName) "INFO"
+        return "SKIPPED_ALREADY_EXISTS"
     }
-    else {
-        $addParams = @{
-            SafeName    = $SafeName
-            MemberName  = $MemberName
-            SearchIn    = $SearchIn
-            ErrorAction = "Stop"
-        }
 
-        foreach ($k in $permHash.Keys) {
-            $addParams[$k] = $permHash[$k]
-        }
+    $permHash = Convert-ObjectToHashtable -InputObject $PermissionObject
+    $addCmd = Get-Command Add-PASSafeMember -ErrorAction Stop
 
-        Add-PASSafeMember @addParams | Out-Null
-        Write-LogLine ("Added member '{0}' to safe '{1}'" -f $MemberName, $SafeName) "SUCCESS"
-        return "ADDED"
+    $addParams = @{
+        SafeName    = $SafeName
+        MemberName  = $MemberName
+        ErrorAction = "Stop"
     }
+
+    foreach ($k in $permHash.Keys) {
+        $addParams[$k] = $permHash[$k]
+    }
+
+    if ($addCmd.Parameters.ContainsKey("SearchIn") -and -not [string]::IsNullOrWhiteSpace($SearchIn)) {
+        $addParams["SearchIn"] = $SearchIn
+    }
+
+    if ($addCmd.Parameters.ContainsKey("memberType")) {
+        $addParams["memberType"] = $MemberType
+    }
+    elseif ($addCmd.Parameters.ContainsKey("MemberType")) {
+        $addParams["MemberType"] = $MemberType
+    }
+
+    Add-PASSafeMember @addParams | Out-Null
+
+    Write-LogLine ("Safe '{0}': member '{1}' added successfully." -f $SafeName, $MemberName) "SUCCESS"
+    return "ADDED"
 }
 
 # -------------------------------------------------------------------
@@ -345,23 +311,19 @@ try {
     Ensure-Directory -Path (Split-Path $StatusCsvPath -Parent)
     New-Item -ItemType File -Path $LogFilePath -Force | Out-Null
 
-    Write-LogLine "Starting IND_ safe membership enforcement run." "INFO"
-    Write-LogLine ("AuthMode={0}; IdentityTenantURL={1}; PrivilegeCloudURL={2}; BaseURI={3}" -f $AuthMode, $IdentityTenantURL, $PrivilegeCloudURL, $BaseURI) "INFO"
-    Write-LogLine ("TargetMemberName={0}; SearchIn={1}; SafePrefix={2}" -f $TargetMemberName, $TargetMemberSearchIn, $SafePrefix) "INFO"
+    Write-LogLine "Starting IND_ safe membership add-only run." "INFO"
+    Write-LogLine ("TenantSubdomain={0}; SafePrefix={1}; TargetMemberName={2}; SearchIn={3}; MemberType={4}" -f `
+        $TenantSubdomain, $SafePrefix, $TargetMemberName, $TargetMemberSearchIn, $TargetMemberType) "INFO"
 
     Import-RequiredModules `
         -PsPASVersion $RequiredPsPASVersion `
-        -AuthMode $AuthMode `
         -IdentityCommandVersion $RequiredIdentityCommandVersion
 
     $cred = New-InteractiveCredential
 
-    Connect-PASInteractive `
-        -AuthMode $AuthMode `
-        -Credential $cred `
-        -IdentityTenantURL $IdentityTenantURL `
-        -PrivilegeCloudURL $PrivilegeCloudURL `
-        -BaseURI $BaseURI
+    Connect-PASInteractiveIdentityUser `
+        -TenantSubdomain $TenantSubdomain `
+        -Credential $cred
 
     $sessionCreated = $true
 
@@ -383,15 +345,16 @@ try {
         Write-Progress -Activity "Ensuring Safe membership" -Status $safeName -PercentComplete (($counter / $targetSafes.Count) * 100)
 
         try {
-            if ($PSCmdlet.ShouldProcess($safeName, "Ensure member '$TargetMemberName' has full permissions")) {
-                $status = Ensure-SafeMemberFullPermission `
+            if ($PSCmdlet.ShouldProcess($safeName, "Add member '$TargetMemberName' only if missing")) {
+                $status = Add-SafeMemberIfMissing `
                     -SafeName $safeName `
                     -MemberName $TargetMemberName `
                     -SearchIn $TargetMemberSearchIn `
+                    -MemberType $TargetMemberType `
                     -PermissionObject $FullPermPAS
             }
             else {
-                $status = "SKIPPED"
+                $status = "WHATIF"
             }
         }
         catch {
@@ -406,6 +369,7 @@ try {
             SafeName       = $safeName
             TargetMember   = $TargetMemberName
             SearchIn       = $TargetMemberSearchIn
+            MemberType     = $TargetMemberType
             Status         = $status
             Error          = $errorText
         }
@@ -421,19 +385,27 @@ try {
         Sort-Object SafeName |
         Export-Csv -LiteralPath $StatusCsvPath -NoTypeInformation -Encoding UTF8
 
-    Write-Ok ("Status CSV exported: {0}" -f $StatusCsvPath)
-    Write-LogLine ("Status CSV exported: {0}" -f $StatusCsvPath) "SUCCESS"
+    $addedCount   = @($statusRows | Where-Object { $_.Status -eq "ADDED" }).Count
+    $skipCount    = @($statusRows | Where-Object { $_.Status -eq "SKIPPED_ALREADY_EXISTS" }).Count
+    $failedCount  = @($statusRows | Where-Object { $_.Status -eq "FAILED" }).Count
+    $whatIfCount  = @($statusRows | Where-Object { $_.Status -eq "WHATIF" }).Count
 
     Write-Host ""
-    Write-Host ("Completed. Total safes processed: {0}" -f $statusRows.Count) -ForegroundColor Green
-    Write-Host ("Failures: {0}" -f $failedRows.Count) -ForegroundColor Yellow
+    Write-Ok ("Status CSV exported: {0}" -f $StatusCsvPath)
+    Write-Host ("Added:   {0}" -f $addedCount) -ForegroundColor Green
+    Write-Host ("Skipped: {0}" -f $skipCount) -ForegroundColor Yellow
+    Write-Host ("Failed:  {0}" -f $failedCount) -ForegroundColor Red
+    if ($whatIfCount -gt 0) {
+        Write-Host ("WhatIf:  {0}" -f $whatIfCount) -ForegroundColor Cyan
+    }
 
     if ($failedRows.Count -gt 0) {
         Write-Host ""
         $failedRows | Sort-Object SafeName | Format-Table -AutoSize
     }
 
-    Write-LogLine ("Completed run. SafesProcessed={0}; Failures={1}" -f $statusRows.Count, $failedRows.Count) "SUCCESS"
+    Write-LogLine ("Completed run. SafesProcessed={0}; Added={1}; Skipped={2}; Failed={3}; WhatIf={4}" -f `
+        $statusRows.Count, $addedCount, $skipCount, $failedCount, $whatIfCount) "SUCCESS"
 }
 catch {
     Write-LogLine ("Fatal error: {0}" -f $_.Exception.Message) "ERROR"
