@@ -1,9 +1,10 @@
 <#
-Ensure_IND_Safes_ServiceIdentity_Member.ps1
+Ensure_IND_Safes_ServiceIdentity_Member_Interactive.ps1
 
 PURPOSE
 - Prompt for a non-service CyberArk Identity user credential
-- Log in to Alliant Privilege Cloud
+- Validate the Identity login interactively first
+- Log in to Alliant Privilege Cloud as an Identity User
 - Find all safes whose names begin with IND_
 - Ensure the identity user acurestapi_local@alliantcreditunion.admin
   exists on each IND_ safe with full permissions
@@ -18,7 +19,7 @@ OUTPUTS
 NOTES
 - This script uses interactive Identity User authentication (not Service User / CCP)
 - Requires psPAS
-- Requires IdentityCommand for -IdentityUser login flow
+- Requires IdentityCommand
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true)]
@@ -147,7 +148,7 @@ function Import-RequiredModules {
         Write-LogLine "IdentityCommand loaded successfully. Version=$($idmod.Version)" "SUCCESS"
     }
     catch {
-        throw "IdentityCommand module is required for -IdentityUser authentication but could not be loaded. Error: $($_.Exception.Message)"
+        throw "IdentityCommand module is required for interactive Identity login but could not be loaded. Error: $($_.Exception.Message)"
     }
 }
 
@@ -165,22 +166,51 @@ function Connect-PCloudInteractive {
         throw "Credential prompt cancelled or no username provided."
     }
 
-    Write-LogLine "Attempting interactive Privilege Cloud login for user '$($cred.UserName)'" "INFO"
+    # Step 1: validate Identity login directly so MFA/challenge errors show up clearly
+    Write-Info "Validating CyberArk Identity login..."
+    Write-LogLine "Attempting Identity login validation for user '$($cred.UserName)'" "INFO"
+
+    try {
+        New-IDSession -tenant_url $IdentityTenantURL -Credential $cred -ErrorAction Stop | Out-Null
+        $idSession = Get-IDSession -ErrorAction Stop
+        if (-not $idSession) {
+            throw "Get-IDSession returned null after New-IDSession."
+        }
+
+        Write-LogLine "Identity login validation succeeded for user '$($cred.UserName)'" "SUCCESS"
+        Write-Ok "CyberArk Identity login validated successfully as: $($cred.UserName)"
+    }
+    catch {
+        throw "Identity login validation failed for user '$($cred.UserName)'. Error: $($_.Exception.Message)"
+    }
+    finally {
+        try {
+            Close-IDSession | Out-Null
+            Write-LogLine "Closed temporary Identity session after validation." "INFO"
+        }
+        catch {
+            Write-LogLine "Identity session close warning after validation: $($_.Exception.Message)" "WARN"
+        }
+    }
+
+    # Step 2: establish psPAS Privilege Cloud session
     Write-Info "Attempting Privilege Cloud login as Identity User..."
+    Write-LogLine "Attempting Privilege Cloud login for user '$($cred.UserName)'" "INFO"
 
     New-PASSession `
         -IdentityTenantURL $IdentityTenantURL `
         -PrivilegeCloudURL $PrivilegeCloudURL `
         -Credential        $cred `
         -IdentityUser `
+        -SkipVersionCheck `
         -ErrorAction Stop | Out-Null
 
     $sess = Get-PASSession
     if (-not $sess) {
-        throw "Get-PASSession returned null after interactive login."
+        throw "Get-PASSession returned null after New-PASSession."
     }
 
-    Write-LogLine "Interactive login successful for user '$($cred.UserName)'" "SUCCESS"
+    Write-LogLine "Privilege Cloud login successful for user '$($cred.UserName)'" "SUCCESS"
     Write-Ok "Privilege Cloud login successful as: $($cred.UserName)"
 
     return $cred.UserName
@@ -266,7 +296,6 @@ function Test-SafeMemberExists {
         if ($null -ne $member) { return $true }
     }
     catch {
-        # Fall back to listing all members if targeted lookup is not available or returns a non-fatal lookup issue
         try {
             $members = @(Get-PASSafeMember -SafeName $SafeName -ErrorAction Stop)
             foreach ($m in $members) {
@@ -294,6 +323,52 @@ function Test-SafeMemberExists {
     return $false
 }
 
+function Add-SafeMemberRobust {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$SafeName,
+        [Parameter(Mandatory)][string]$MemberName,
+        [Parameter(Mandatory)][string]$SearchIn,
+        [Parameter(Mandatory)][string]$MemberType,
+        [Parameter(Mandatory)][hashtable]$PermissionHash
+    )
+
+    try {
+        Add-PASSafeMember `
+            -SafeName   $SafeName `
+            -MemberName $MemberName `
+            -SearchIn   $SearchIn `
+            -memberType $MemberType `
+            @PermissionHash `
+            -ErrorAction Stop | Out-Null
+        return
+    }
+    catch {
+        $firstError = $_.Exception.Message
+        Write-LogLine "Add-PASSafeMember primary attempt failed on '$SafeName': $firstError" "WARN"
+    }
+
+    try {
+        Add-PASSafeMember `
+            -SafeName   $SafeName `
+            -MemberName $MemberName `
+            -SearchIn   $SearchIn `
+            @PermissionHash `
+            -ErrorAction Stop | Out-Null
+        return
+    }
+    catch {
+        $secondError = $_.Exception.Message
+        Write-LogLine "Add-PASSafeMember retry without memberType failed on '$SafeName': $secondError" "WARN"
+    }
+
+    Add-PASSafeMember `
+        -SafeName   $SafeName `
+        -MemberName $MemberName `
+        @PermissionHash `
+        -ErrorAction Stop | Out-Null
+}
+
 function Ensure-SafeMemberWithFullPermissions {
     [CmdletBinding()]
     param(
@@ -319,13 +394,12 @@ function Ensure-SafeMemberWithFullPermissions {
         return "UPDATED"
     }
     else {
-        Add-PASSafeMember `
-            -SafeName   $SafeName `
-            -MemberName $MemberName `
-            -SearchIn   $SearchIn `
-            -memberType $MemberType `
-            @permHash `
-            -ErrorAction Stop | Out-Null
+        Add-SafeMemberRobust `
+            -SafeName       $SafeName `
+            -MemberName     $MemberName `
+            -SearchIn       $SearchIn `
+            -MemberType     $MemberType `
+            -PermissionHash $permHash
 
         Write-LogLine "Added member '$MemberName' to safe '$SafeName' with full permissions." "SUCCESS"
         return "ADDED"
@@ -394,15 +468,15 @@ try {
         }
 
         $row = [PSCustomObject]@{
-            SafeName           = $safeName
-            MemberName         = $IdentityUserToAdd
-            SearchIn           = $SafeMemberSearchIn
-            MemberType         = $SafeMemberType
-            Action             = $memberAction
-            OverallStatus      = $overallStatus
-            ExecutedBy         = $loggedInUser
-            Timestamp          = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-            Error              = $rowError
+            SafeName      = $safeName
+            MemberName    = $IdentityUserToAdd
+            SearchIn      = $SafeMemberSearchIn
+            MemberType    = $SafeMemberType
+            Action        = $memberAction
+            OverallStatus = $overallStatus
+            ExecutedBy    = $loggedInUser
+            Timestamp     = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+            Error         = $rowError
         }
 
         $statusRows.Add($row) | Out-Null
