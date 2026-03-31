@@ -1,46 +1,47 @@
 <#
-Add_AcuRestApiLocal_To_All_Ind_Safes.ps1
+Add_AcuRestApiLocal_To_All_Ind_Safes_SAML_Interactive.ps1
 
-PURPOSE
-- Prompt for an interactive non-service-user login
-- Authenticate to Alliant Privilege Cloud using IdentityUser auth
-- Find all safes whose names begin with IND_
-- Add acurestapi_local@alliantcreditunion.admin with full permissions only if missing
-- Ignore safes where the user already exists as a member
-- Export a status CSV
+REQUIRES
+- psPAS 6.4.85 (or newer compatible version)
+- PS-SAML-Interactive module file
+- Privilege Cloud SAML already configured
+- IdP-initiated SSO enabled for API SAML logon
 
-NOTES
-- This script is designed for psPAS 6.4.85 + IdentityCommand 0.3.61
-- IdentityUser login may trigger MFA/browser interaction depending on tenant policy
-- Existing memberships are NOT modified; they are skipped
+WHAT IT DOES
+- Opens interactive SAML login window
+- Gets SAMLResponse
+- Authenticates to Privilege Cloud with SAML
+- Finds all safes beginning with IND_
+- Adds acurestapi_local@alliantcreditunion.admin only if missing
+- Skips safes where member already exists
+- Exports status CSV
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
-    # ===== Module versions =====
-    [string]$RequiredPsPASVersion           = "6.4.85",
-    [string]$RequiredIdentityCommandVersion = "0.3.61",
+    # ===== Modules =====
+    [string]$RequiredPsPASVersion = "6.4.85",
+    [string]$SamlModulePath       = "C:\Tools\PS-SAML-Interactive.psm1",
 
-    # ===== Authentication =====
-    [string]$TenantSubdomain                = "alliantcredit",
+    # ===== SAML / Privilege Cloud =====
+    [string]$LoginIDP             = "https://REPLACE-WITH-YOUR-IDP-APP-LAUNCH-URL",
+    [string]$BaseURI              = "https://alliantcredit.privilegecloud.cyberark.cloud",
 
     # ===== Safe targeting =====
-    [string]$SafePrefix                     = "IND_",
+    [string]$SafePrefix           = "IND_",
 
     # ===== Member to add =====
-    [string]$TargetMemberName               = "acurestapi_local@alliantcreditunion.admin",
-    [string]$TargetMemberSearchIn           = "Vault",
+    [string]$TargetMemberName     = "acurestapi_local@alliantcreditunion.admin",
+    [string]$TargetMemberSearchIn = "Vault",
     [ValidateSet("User","Group","Role")]
-    [string]$TargetMemberType               = "User",
+    [string]$TargetMemberType     = "User",
 
     # ===== Output =====
-    [string]$StatusCsvPath                  = "I:\Script\IDENTITY Script New\csv\IND_Safes_Add_AcuRestApiLocal_Status.csv",
-    [string]$LogFilePath                    = "I:\Script\IDENTITY Script New\logs\IND_Safes_Add_AcuRestApiLocal.log"
+    [string]$StatusCsvPath        = "I:\Script\IDENTITY Script New\csv\IND_Safes_Add_AcuRestApiLocal_SAML_Status.csv",
+    [string]$LogFilePath          = "I:\Script\IDENTITY Script New\logs\IND_Safes_Add_AcuRestApiLocal_SAML.log"
 )
 
-# -------------------------------------------------------------------
-# Full permission set requested
-# -------------------------------------------------------------------
+# Requested permission set
 $FullPermPAS = [PSCustomObject]@{
     UseAccounts                            = $true
     RetrieveAccounts                       = $true
@@ -66,16 +67,10 @@ $FullPermPAS = [PSCustomObject]@{
     requestsAuthorizationLevel2            = $false
 }
 
-# -------------------------------------------------------------------
-# Runtime
-# -------------------------------------------------------------------
 $ErrorActionPreference = "Stop"
 $ProgressPreference    = "SilentlyContinue"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-# -------------------------------------------------------------------
-# Helpers
-# -------------------------------------------------------------------
 function Write-Info {
     param([string]$Message)
     Write-Host "[INFO] $Message" -ForegroundColor Cyan
@@ -98,7 +93,6 @@ function Write-Err {
 
 function Ensure-Directory {
     param([Parameter(Mandatory)][string]$Path)
-
     if (-not [string]::IsNullOrWhiteSpace($Path) -and -not (Test-Path -LiteralPath $Path)) {
         New-Item -ItemType Directory -Path $Path -Force | Out-Null
     }
@@ -110,7 +104,6 @@ function Write-LogLine {
         [ValidateSet("INFO","SUCCESS","WARN","ERROR")]
         [string]$Level = "INFO"
     )
-
     $line = "{0} [{1}] {2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level, $Message
     Add-Content -Path $LogFilePath -Value $line
 }
@@ -140,66 +133,65 @@ function Get-PropValueCI {
 }
 
 function Import-RequiredModules {
-    [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$PsPASVersion,
-        [Parameter(Mandatory)][string]$IdentityCommandVersion
+        [Parameter(Mandatory)][string]$PSSamlModulePath
     )
 
-    Remove-Module psPAS, IdentityCommand -ErrorAction SilentlyContinue
+    Remove-Module psPAS -ErrorAction SilentlyContinue
 
     Import-Module psPAS -RequiredVersion $PsPASVersion -Force -ErrorAction Stop
-    Import-Module IdentityCommand -RequiredVersion $IdentityCommandVersion -Force -ErrorAction Stop
-
     $pspasLoaded = Get-Module psPAS | Sort-Object Version -Descending | Select-Object -First 1
-    $idLoaded    = Get-Module IdentityCommand | Sort-Object Version -Descending | Select-Object -First 1
 
-    Write-Info ("psPAS loaded. Version: {0}" -f $pspasLoaded.Version)
-    Write-Info ("IdentityCommand loaded. Version: {0}" -f $idLoaded.Version)
-
-    Write-LogLine ("psPAS loaded from: {0}" -f $pspasLoaded.Path) "SUCCESS"
-    Write-LogLine ("IdentityCommand loaded from: {0}" -f $idLoaded.Path) "SUCCESS"
-}
-
-function New-InteractiveCredential {
-    [CmdletBinding()]
-    param()
-
-    $loginUser = Read-Host "Enter the login username"
-    if ([string]::IsNullOrWhiteSpace($loginUser)) {
-        throw "Username entry was blank."
+    if (-not (Test-Path -LiteralPath $PSSamlModulePath)) {
+        throw "PS-SAML-Interactive module not found at: $PSSamlModulePath"
     }
 
-    return Get-Credential -UserName $loginUser -Message "Enter the password for the login user"
+    Import-Module $PSSamlModulePath -Force -ErrorAction Stop
+
+    if (-not (Get-Command New-SAMLInteractive -ErrorAction SilentlyContinue)) {
+        throw "New-SAMLInteractive command is not available after importing: $PSSamlModulePath"
+    }
+
+    Write-Info ("psPAS loaded. Version: {0}" -f $pspasLoaded.Version)
+    Write-LogLine ("psPAS loaded from: {0}" -f $pspasLoaded.Path) "SUCCESS"
+    Write-LogLine ("PS-SAML-Interactive loaded from: {0}" -f $PSSamlModulePath) "SUCCESS"
 }
 
-function Connect-PASInteractiveIdentityUser {
-    [CmdletBinding()]
+function Connect-PASSamlInteractive {
     param(
-        [Parameter(Mandatory)][string]$TenantSubdomain,
-        [Parameter(Mandatory)][pscredential]$Credential
+        [Parameter(Mandatory)][string]$LoginIDP,
+        [Parameter(Mandatory)][string]$BaseURI
     )
 
-    Write-Info "Authenticating with interactive IdentityUser login..."
-    Write-Info "Complete MFA in the browser or challenge prompt if prompted."
+    Write-Info "Opening interactive SAML sign-in window..."
+    Write-Info "Complete your SSO and MFA inside the popup window. Do not copy the link to another browser."
+    Write-LogLine ("Starting interactive SAML login. LoginIDP={0}" -f $LoginIDP) "INFO"
 
+    $loginResponse = New-SAMLInteractive -LoginIDP $LoginIDP
+
+    if ([string]::IsNullOrWhiteSpace($loginResponse)) {
+        throw "Interactive SAML login completed without returning a SAMLResponse."
+    }
+
+    Write-Info "SAMLResponse received. Starting Privilege Cloud session..."
     New-PASSession `
-        -TenantSubdomain $TenantSubdomain `
-        -Credential      $Credential `
-        -IdentityUser `
+        -SAMLAuth `
+        -ConcurrentSession $true `
+        -BaseURI $BaseURI `
+        -SAMLResponse $loginResponse `
         -ErrorAction Stop | Out-Null
 
     $session = Get-PASSession
     if (-not $session) {
-        throw "Authentication appeared to complete, but Get-PASSession returned null."
+        throw "SAML authentication appeared to complete, but Get-PASSession returned null."
     }
 
-    Write-Ok "Authentication stage completed successfully."
-    Write-LogLine ("Authenticated successfully to tenant subdomain '{0}' using IdentityUser." -f $TenantSubdomain) "SUCCESS"
+    Write-Ok "Privilege Cloud SAML session established successfully."
+    Write-LogLine ("Authenticated successfully with SAML to BaseURI={0}" -f $BaseURI) "SUCCESS"
 }
 
 function Get-TargetSafeNames {
-    [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$Prefix
     )
@@ -225,7 +217,6 @@ function Get-TargetSafeNames {
 }
 
 function Get-ExistingSafeMember {
-    [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$SafeName,
         [Parameter(Mandatory)][string]$MemberName
@@ -254,7 +245,6 @@ function Get-ExistingSafeMember {
 }
 
 function Add-SafeMemberIfMissing {
-    [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$SafeName,
         [Parameter(Mandatory)][string]$MemberName,
@@ -278,8 +268,11 @@ function Add-SafeMemberIfMissing {
         ErrorAction = "Stop"
     }
 
+    # Only pass permission/member arguments actually supported by the loaded cmdlet
     foreach ($k in $permHash.Keys) {
-        $addParams[$k] = $permHash[$k]
+        if ($addCmd.Parameters.ContainsKey($k)) {
+            $addParams[$k] = $permHash[$k]
+        }
     }
 
     if ($addCmd.Parameters.ContainsKey("SearchIn") -and -not [string]::IsNullOrWhiteSpace($SearchIn)) {
@@ -299,9 +292,6 @@ function Add-SafeMemberIfMissing {
     return "ADDED"
 }
 
-# -------------------------------------------------------------------
-# Main
-# -------------------------------------------------------------------
 $sessionCreated = $false
 $statusRows     = New-Object System.Collections.Generic.List[object]
 $failedRows     = New-Object System.Collections.Generic.List[object]
@@ -311,19 +301,16 @@ try {
     Ensure-Directory -Path (Split-Path $StatusCsvPath -Parent)
     New-Item -ItemType File -Path $LogFilePath -Force | Out-Null
 
-    Write-LogLine "Starting IND_ safe membership add-only run." "INFO"
-    Write-LogLine ("TenantSubdomain={0}; SafePrefix={1}; TargetMemberName={2}; SearchIn={3}; MemberType={4}" -f `
-        $TenantSubdomain, $SafePrefix, $TargetMemberName, $TargetMemberSearchIn, $TargetMemberType) "INFO"
+    Write-LogLine "Starting IND_ safe membership add-only run via SAML interactive." "INFO"
+    Write-LogLine ("LoginIDP={0}; BaseURI={1}; SafePrefix={2}; TargetMemberName={3}" -f $LoginIDP, $BaseURI, $SafePrefix, $TargetMemberName) "INFO"
 
     Import-RequiredModules `
         -PsPASVersion $RequiredPsPASVersion `
-        -IdentityCommandVersion $RequiredIdentityCommandVersion
+        -PSSamlModulePath $SamlModulePath
 
-    $cred = New-InteractiveCredential
-
-    Connect-PASInteractiveIdentityUser `
-        -TenantSubdomain $TenantSubdomain `
-        -Credential $cred
+    Connect-PASSamlInteractive `
+        -LoginIDP $LoginIDP `
+        -BaseURI $BaseURI
 
     $sessionCreated = $true
 
@@ -342,7 +329,7 @@ try {
         $status = "PENDING"
         $errorText = ""
 
-        Write-Progress -Activity "Ensuring Safe membership" -Status $safeName -PercentComplete (($counter / $targetSafes.Count) * 100)
+        Write-Progress -Activity "Adding safe member where missing" -Status $safeName -PercentComplete (($counter / $targetSafes.Count) * 100)
 
         try {
             if ($PSCmdlet.ShouldProcess($safeName, "Add member '$TargetMemberName' only if missing")) {
@@ -366,12 +353,12 @@ try {
         }
 
         $row = [PSCustomObject]@{
-            SafeName       = $safeName
-            TargetMember   = $TargetMemberName
-            SearchIn       = $TargetMemberSearchIn
-            MemberType     = $TargetMemberType
-            Status         = $status
-            Error          = $errorText
+            SafeName     = $safeName
+            TargetMember = $TargetMemberName
+            SearchIn     = $TargetMemberSearchIn
+            MemberType   = $TargetMemberType
+            Status       = $status
+            Error        = $errorText
         }
 
         $statusRows.Add($row) | Out-Null
@@ -385,10 +372,10 @@ try {
         Sort-Object SafeName |
         Export-Csv -LiteralPath $StatusCsvPath -NoTypeInformation -Encoding UTF8
 
-    $addedCount   = @($statusRows | Where-Object { $_.Status -eq "ADDED" }).Count
-    $skipCount    = @($statusRows | Where-Object { $_.Status -eq "SKIPPED_ALREADY_EXISTS" }).Count
-    $failedCount  = @($statusRows | Where-Object { $_.Status -eq "FAILED" }).Count
-    $whatIfCount  = @($statusRows | Where-Object { $_.Status -eq "WHATIF" }).Count
+    $addedCount  = @($statusRows | Where-Object { $_.Status -eq "ADDED" }).Count
+    $skipCount   = @($statusRows | Where-Object { $_.Status -eq "SKIPPED_ALREADY_EXISTS" }).Count
+    $failedCount = @($statusRows | Where-Object { $_.Status -eq "FAILED" }).Count
+    $whatIfCount = @($statusRows | Where-Object { $_.Status -eq "WHATIF" }).Count
 
     Write-Host ""
     Write-Ok ("Status CSV exported: {0}" -f $StatusCsvPath)
@@ -436,5 +423,4 @@ finally {
     }
 }
 
-# Pipeline-friendly failed rows
 $failedRows
