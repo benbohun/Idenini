@@ -1,31 +1,36 @@
 <#
-Add_AcuRestApiLocal_To_All_Ind_Safes_SAML_Interactive.ps1
+Add_AcuRestApiLocal_To_All_Ind_Safes_ServiceUser.ps1
 
-REQUIRES
-- psPAS 6.4.85 (or newer compatible version)
-- PS-SAML-Interactive module file
-- Privilege Cloud SAML already configured
-- IdP-initiated SSO enabled for API SAML logon
+PURPOSE
+- Retrieve service-user credential from CCP
+- Authenticate to Alliant Privilege Cloud using ServiceUser auth
+- Find all safes beginning with IND_
+- Add acurestapi_local@alliantcreditunion.admin only if missing
+- Skip safes where the member already exists
+- Export status CSV
 
-WHAT IT DOES
-- Opens interactive SAML login window
-- Gets SAMLResponse
-- Authenticates to Privilege Cloud with SAML
-- Finds all safes beginning with IND_
-- Adds acurestapi_local@alliantcreditunion.admin only if missing
-- Skips safes where member already exists
-- Exports status CSV
+REQUIREMENTS
+- psPAS 6.4.85 (or compatible newer version that supports -ServiceUser)
+- Service user must have access plus "Manage Safe Members" on target safes
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
-    # ===== Modules =====
+    # ===== Module version =====
     [string]$RequiredPsPASVersion = "6.4.85",
-    [string]$SamlModulePath       = "C:\Tools\PS-SAML-Interactive.psm1",
 
-    # ===== SAML / Privilege Cloud =====
-    [string]$LoginIDP             = "https://REPLACE-WITH-YOUR-IDP-APP-LAUNCH-URL",
-    [string]$BaseURI              = "https://alliantcredit.privilegecloud.cyberark.cloud",
+    # ===== Privilege Cloud / Shared Services =====
+    [string]$TenantSubdomain      = "alliantcredit",
+    [string]$IdentityTenantURL    = "https://aak4521.id.cyberark.cloud",
+    [string]$PrivilegeCloudURL    = "https://alliantcredit.privilegecloud.cyberark.cloud",
+
+    # ===== CCP settings =====
+    [string]$CCPAddress           = "https://aam.alliantcreditunion.com",
+    [string]$CCPLocation          = "AIMWebService",
+    [string]$CCPAppID             = "ACURestAPI",
+    [string]$CCPSafe              = "ACU-VAULT-API",
+    [string]$CCPObject            = "Application-CyberArkVaultRestAPI-alliantcredit.cyberark.cloud",
+    [bool]$CCPWindowsAuth         = $false,
 
     # ===== Safe targeting =====
     [string]$SafePrefix           = "IND_",
@@ -37,8 +42,8 @@ param(
     [string]$TargetMemberType     = "User",
 
     # ===== Output =====
-    [string]$StatusCsvPath        = "I:\Script\IDENTITY Script New\csv\IND_Safes_Add_AcuRestApiLocal_SAML_Status.csv",
-    [string]$LogFilePath          = "I:\Script\IDENTITY Script New\logs\IND_Safes_Add_AcuRestApiLocal_SAML.log"
+    [string]$StatusCsvPath        = "I:\Script\IDENTITY Script New\csv\IND_Safes_Add_AcuRestApiLocal_ServiceUser_Status.csv",
+    [string]$LogFilePath          = "I:\Script\IDENTITY Script New\logs\IND_Safes_Add_AcuRestApiLocal_ServiceUser.log"
 )
 
 # Requested permission set
@@ -110,7 +115,6 @@ function Write-LogLine {
 
 function Convert-ObjectToHashtable {
     param([Parameter(Mandatory)]$InputObject)
-
     $hash = @{}
     foreach ($prop in $InputObject.PSObject.Properties) {
         $hash[$prop.Name] = $prop.Value
@@ -123,78 +127,120 @@ function Get-PropValueCI {
         [Parameter(Mandatory)]$Object,
         [Parameter(Mandatory)][string]$PropName
     )
-
     if ($null -eq $Object) { return $null }
-
     $prop = $Object.PSObject.Properties | Where-Object { $_.Name -ieq $PropName } | Select-Object -First 1
     if ($prop) { return $prop.Value }
-
     return $null
 }
 
 function Import-RequiredModules {
-    param(
-        [Parameter(Mandatory)][string]$PsPASVersion,
-        [Parameter(Mandatory)][string]$PSSamlModulePath
-    )
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$PsPASVersion)
 
     Remove-Module psPAS -ErrorAction SilentlyContinue
-
     Import-Module psPAS -RequiredVersion $PsPASVersion -Force -ErrorAction Stop
+
     $pspasLoaded = Get-Module psPAS | Sort-Object Version -Descending | Select-Object -First 1
-
-    if (-not (Test-Path -LiteralPath $PSSamlModulePath)) {
-        throw "PS-SAML-Interactive module not found at: $PSSamlModulePath"
-    }
-
-    Import-Module $PSSamlModulePath -Force -ErrorAction Stop
-
-    if (-not (Get-Command New-SAMLInteractive -ErrorAction SilentlyContinue)) {
-        throw "New-SAMLInteractive command is not available after importing: $PSSamlModulePath"
-    }
-
     Write-Info ("psPAS loaded. Version: {0}" -f $pspasLoaded.Version)
     Write-LogLine ("psPAS loaded from: {0}" -f $pspasLoaded.Path) "SUCCESS"
-    Write-LogLine ("PS-SAML-Interactive loaded from: {0}" -f $PSSamlModulePath) "SUCCESS"
 }
 
-function Connect-PASSamlInteractive {
+function Get-ServiceUserCredentialFromCCP {
+    [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][string]$LoginIDP,
-        [Parameter(Mandatory)][string]$BaseURI
+        [Parameter(Mandatory)][string]$CCPAddress,
+        [Parameter(Mandatory)][string]$Location,
+        [Parameter(Mandatory)][string]$AppID,
+        [Parameter(Mandatory)][string]$Safe,
+        [Parameter(Mandatory)][string]$Object,
+        [bool]$WindowsAuth = $false
     )
 
-    Write-Info "Opening interactive SAML sign-in window..."
-    Write-Info "Complete your SSO and MFA inside the popup window. Do not copy the link to another browser."
-    Write-LogLine ("Starting interactive SAML login. LoginIDP={0}" -f $LoginIDP) "INFO"
+    $base = $CCPAddress.TrimEnd("/")
+    $loc  = $Location.Trim("/")
 
-    $loginResponse = New-SAMLInteractive -LoginIDP $LoginIDP
+    $url  = "{0}/{1}/api/Accounts?AppID={2}&Safe={3}&Object={4}" -f `
+        $base, `
+        $loc, `
+        [uri]::EscapeDataString($AppID), `
+        [uri]::EscapeDataString($Safe), `
+        [uri]::EscapeDataString($Object)
 
-    if ([string]::IsNullOrWhiteSpace($loginResponse)) {
-        throw "Interactive SAML login completed without returning a SAMLResponse."
+    Write-Info "Retrieving service credential from CCP..."
+    Write-LogLine ("Retrieving service credential from CCP: {0}" -f $url) "INFO"
+
+    $headers = @{ "Content-Type" = "application/json" }
+    $resp = Invoke-RestMethod -Uri $url -Method GET -Headers $headers -UseDefaultCredentials:$WindowsAuth -ErrorAction Stop
+
+    if (-not $resp.UserName -or -not $resp.Content) {
+        throw "CCP response missing UserName and/or Content."
     }
 
-    Write-Info "SAMLResponse received. Starting Privilege Cloud session..."
-    New-PASSession `
-        -SAMLAuth `
-        -ConcurrentSession $true `
-        -BaseURI $BaseURI `
-        -SAMLResponse $loginResponse `
-        -ErrorAction Stop | Out-Null
+    Write-Ok ("CCP credential retrieved successfully for: {0}" -f $resp.UserName)
+    Write-LogLine ("CCP returned service user: {0}" -f $resp.UserName) "SUCCESS"
 
-    $session = Get-PASSession
-    if (-not $session) {
-        throw "SAML authentication appeared to complete, but Get-PASSession returned null."
+    $sec = ConvertTo-SecureString $resp.Content -AsPlainText -Force
+    return [PSCredential]::new($resp.UserName, $sec)
+}
+
+function Connect-PASServiceUser {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][pscredential]$Credential,
+        [Parameter(Mandatory)][string]$TenantSubdomain,
+        [string]$IdentityTenantURL,
+        [string]$PrivilegeCloudURL
+    )
+
+    $errors = New-Object System.Collections.Generic.List[string]
+
+    try {
+        Write-Info "Authenticating using ServiceUser with TenantSubdomain..."
+        New-PASSession `
+            -TenantSubdomain $TenantSubdomain `
+            -Credential      $Credential `
+            -ServiceUser `
+            -ErrorAction Stop | Out-Null
+
+        if (-not (Get-PASSession)) {
+            throw "Get-PASSession returned null after TenantSubdomain service-user authentication."
+        }
+
+        Write-Ok "Privilege Cloud login successful using ServiceUser."
+        Write-LogLine ("Authenticated successfully using ServiceUser + TenantSubdomain '{0}'." -f $TenantSubdomain) "SUCCESS"
+        return
+    }
+    catch {
+        $errors.Add("TenantSubdomain auth failed: $($_.Exception.Message)") | Out-Null
+        Write-Warn "TenantSubdomain auth failed. Attempting explicit URL-based ServiceUser authentication..."
+        Write-LogLine ("TenantSubdomain service-user auth failed: {0}" -f $_.Exception.Message) "WARN"
     }
 
-    Write-Ok "Privilege Cloud SAML session established successfully."
-    Write-LogLine ("Authenticated successfully with SAML to BaseURI={0}" -f $BaseURI) "SUCCESS"
+    try {
+        New-PASSession `
+            -IdentityTenantURL $IdentityTenantURL `
+            -PrivilegeCloudURL $PrivilegeCloudURL `
+            -Credential        $Credential `
+            -ServiceUser `
+            -ErrorAction Stop | Out-Null
+
+        if (-not (Get-PASSession)) {
+            throw "Get-PASSession returned null after explicit URL-based service-user authentication."
+        }
+
+        Write-Ok "Privilege Cloud login successful using explicit ServiceUser URLs."
+        Write-LogLine ("Authenticated successfully using explicit ServiceUser URLs." ) "SUCCESS"
+        return
+    }
+    catch {
+        $errors.Add("Explicit URL auth failed: $($_.Exception.Message)") | Out-Null
+        throw ("All ServiceUser authentication methods failed. " + ($errors -join " | "))
+    }
 }
 
 function Get-TargetSafeNames {
-    param(
-        [Parameter(Mandatory)][string]$Prefix
-    )
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Prefix)
 
     Write-Info ("Searching for safes with prefix '{0}'..." -f $Prefix)
     Write-LogLine ("Searching for safes with prefix '{0}'" -f $Prefix) "INFO"
@@ -217,6 +263,7 @@ function Get-TargetSafeNames {
 }
 
 function Get-ExistingSafeMember {
+    [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$SafeName,
         [Parameter(Mandatory)][string]$MemberName
@@ -245,6 +292,7 @@ function Get-ExistingSafeMember {
 }
 
 function Add-SafeMemberIfMissing {
+    [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$SafeName,
         [Parameter(Mandatory)][string]$MemberName,
@@ -268,7 +316,6 @@ function Add-SafeMemberIfMissing {
         ErrorAction = "Stop"
     }
 
-    # Only pass permission/member arguments actually supported by the loaded cmdlet
     foreach ($k in $permHash.Keys) {
         if ($addCmd.Parameters.ContainsKey($k)) {
             $addParams[$k] = $permHash[$k]
@@ -287,7 +334,6 @@ function Add-SafeMemberIfMissing {
     }
 
     Add-PASSafeMember @addParams | Out-Null
-
     Write-LogLine ("Safe '{0}': member '{1}' added successfully." -f $SafeName, $MemberName) "SUCCESS"
     return "ADDED"
 }
@@ -301,16 +347,25 @@ try {
     Ensure-Directory -Path (Split-Path $StatusCsvPath -Parent)
     New-Item -ItemType File -Path $LogFilePath -Force | Out-Null
 
-    Write-LogLine "Starting IND_ safe membership add-only run via SAML interactive." "INFO"
-    Write-LogLine ("LoginIDP={0}; BaseURI={1}; SafePrefix={2}; TargetMemberName={3}" -f $LoginIDP, $BaseURI, $SafePrefix, $TargetMemberName) "INFO"
+    Write-LogLine "Starting IND_ safe membership add-only run via ServiceUser." "INFO"
+    Write-LogLine ("TenantSubdomain={0}; IdentityTenantURL={1}; PrivilegeCloudURL={2}; SafePrefix={3}; TargetMemberName={4}" -f `
+        $TenantSubdomain, $IdentityTenantURL, $PrivilegeCloudURL, $SafePrefix, $TargetMemberName) "INFO"
 
-    Import-RequiredModules `
-        -PsPASVersion $RequiredPsPASVersion `
-        -PSSamlModulePath $SamlModulePath
+    Import-RequiredModules -PsPASVersion $RequiredPsPASVersion
 
-    Connect-PASSamlInteractive `
-        -LoginIDP $LoginIDP `
-        -BaseURI $BaseURI
+    $serviceCred = Get-ServiceUserCredentialFromCCP `
+        -CCPAddress $CCPAddress `
+        -Location   $CCPLocation `
+        -AppID      $CCPAppID `
+        -Safe       $CCPSafe `
+        -Object     $CCPObject `
+        -WindowsAuth:$CCPWindowsAuth
+
+    Connect-PASServiceUser `
+        -Credential $serviceCred `
+        -TenantSubdomain $TenantSubdomain `
+        -IdentityTenantURL $IdentityTenantURL `
+        -PrivilegeCloudURL $PrivilegeCloudURL
 
     $sessionCreated = $true
 
@@ -347,7 +402,6 @@ try {
         catch {
             $status = "FAILED"
             $errorText = $_.Exception.Message
-
             Write-LogLine ("Failed on safe '{0}': {1}" -f $safeName, $errorText) "ERROR"
             Write-Err ("Failed on safe '{0}' -> {1}" -f $safeName, $errorText)
         }
@@ -362,7 +416,6 @@ try {
         }
 
         $statusRows.Add($row) | Out-Null
-
         if ($status -eq "FAILED") {
             $failedRows.Add($row) | Out-Null
         }
