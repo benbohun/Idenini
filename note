@@ -7,11 +7,13 @@ PURPOSE
 - Find all safes beginning with IND_
 - Add acurestapi_local@alliantcreditunion.admin only if missing
 - Skip safes where the member already exists
-- Export status CSV
+- Export full status CSV
+- Export separate CSV of safes that were unauthorized to review/update
 
 REQUIREMENTS
-- psPAS 6.4.85 (or compatible newer version that supports -ServiceUser)
-- Service user must have access plus "Manage Safe Members" on target safes
+- psPAS 6.4.85 or compatible newer version that supports -ServiceUser
+- Service user must have enough rights to search safes
+- Service user must have Manage Safe Members on safes it is expected to update
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true)]
@@ -43,6 +45,7 @@ param(
 
     # ===== Output =====
     [string]$StatusCsvPath        = "I:\Script\IDENTITY Script New\csv\IND_Safes_Add_AcuRestApiLocal_ServiceUser_Status.csv",
+    [string]$UnauthorizedCsvPath  = "I:\Script\IDENTITY Script New\csv\IND_Safes_Add_AcuRestApiLocal_ServiceUser_Unauthorized.csv",
     [string]$LogFilePath          = "I:\Script\IDENTITY Script New\logs\IND_Safes_Add_AcuRestApiLocal_ServiceUser.log"
 )
 
@@ -98,6 +101,7 @@ function Write-Err {
 
 function Ensure-Directory {
     param([Parameter(Mandatory)][string]$Path)
+
     if (-not [string]::IsNullOrWhiteSpace($Path) -and -not (Test-Path -LiteralPath $Path)) {
         New-Item -ItemType Directory -Path $Path -Force | Out-Null
     }
@@ -109,12 +113,14 @@ function Write-LogLine {
         [ValidateSet("INFO","SUCCESS","WARN","ERROR")]
         [string]$Level = "INFO"
     )
+
     $line = "{0} [{1}] {2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level, $Message
     Add-Content -Path $LogFilePath -Value $line
 }
 
 function Convert-ObjectToHashtable {
     param([Parameter(Mandatory)]$InputObject)
+
     $hash = @{}
     foreach ($prop in $InputObject.PSObject.Properties) {
         $hash[$prop.Name] = $prop.Value
@@ -127,9 +133,12 @@ function Get-PropValueCI {
         [Parameter(Mandatory)]$Object,
         [Parameter(Mandatory)][string]$PropName
     )
+
     if ($null -eq $Object) { return $null }
+
     $prop = $Object.PSObject.Properties | Where-Object { $_.Name -ieq $PropName } | Select-Object -First 1
     if ($prop) { return $prop.Value }
+
     return $null
 }
 
@@ -143,6 +152,52 @@ function Import-RequiredModules {
     $pspasLoaded = Get-Module psPAS | Sort-Object Version -Descending | Select-Object -First 1
     Write-Info ("psPAS loaded. Version: {0}" -f $pspasLoaded.Version)
     Write-LogLine ("psPAS loaded from: {0}" -f $pspasLoaded.Path) "SUCCESS"
+}
+
+function Export-CsvEvenIfEmpty {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Rows,
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string[]]$Headers
+    )
+
+    Ensure-Directory -Path (Split-Path $Path -Parent)
+
+    if ($Rows -and $Rows.Count -gt 0) {
+        $Rows | Export-Csv -LiteralPath $Path -NoTypeInformation -Encoding UTF8
+    }
+    else {
+        [System.IO.File]::WriteAllText($Path, (($Headers -join ",") + [Environment]::NewLine))
+    }
+}
+
+function Test-IsUnauthorizedError {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Message)
+
+    if ([string]::IsNullOrWhiteSpace($Message)) { return $false }
+
+    $patterns = @(
+        "unauthori[sz]ed",
+        "not authorized",
+        "forbidden",
+        "access denied",
+        "permission denied",
+        "insufficient\s+(permission|privilege|privileges)",
+        "does not have.*permission",
+        "does not have.*authorization",
+        "not allowed",
+        "\b403\b"
+    )
+
+    foreach ($pattern in $patterns) {
+        if ($Message -match $pattern) {
+            return $true
+        }
+    }
+
+    return $false
 }
 
 function Get-ServiceUserCredentialFromCCP {
@@ -229,7 +284,7 @@ function Connect-PASServiceUser {
         }
 
         Write-Ok "Privilege Cloud login successful using explicit ServiceUser URLs."
-        Write-LogLine ("Authenticated successfully using explicit ServiceUser URLs." ) "SUCCESS"
+        Write-LogLine "Authenticated successfully using explicit ServiceUser URLs." "SUCCESS"
         return
     }
     catch {
@@ -338,13 +393,15 @@ function Add-SafeMemberIfMissing {
     return "ADDED"
 }
 
-$sessionCreated = $false
-$statusRows     = New-Object System.Collections.Generic.List[object]
-$failedRows     = New-Object System.Collections.Generic.List[object]
+$sessionCreated   = $false
+$statusRows       = New-Object System.Collections.Generic.List[object]
+$failedRows       = New-Object System.Collections.Generic.List[object]
+$unauthorizedRows = New-Object System.Collections.Generic.List[object]
 
 try {
     Ensure-Directory -Path (Split-Path $LogFilePath -Parent)
     Ensure-Directory -Path (Split-Path $StatusCsvPath -Parent)
+    Ensure-Directory -Path (Split-Path $UnauthorizedCsvPath -Parent)
     New-Item -ItemType File -Path $LogFilePath -Force | Out-Null
 
     Write-LogLine "Starting IND_ safe membership add-only run via ServiceUser." "INFO"
@@ -400,10 +457,29 @@ try {
             }
         }
         catch {
-            $status = "FAILED"
             $errorText = $_.Exception.Message
-            Write-LogLine ("Failed on safe '{0}': {1}" -f $safeName, $errorText) "ERROR"
-            Write-Err ("Failed on safe '{0}' -> {1}" -f $safeName, $errorText)
+
+            if (Test-IsUnauthorizedError -Message $errorText) {
+                $status = "FAILED_UNAUTHORIZED"
+
+                $unauthRow = [PSCustomObject]@{
+                    SafeName       = $safeName
+                    TargetMember   = $TargetMemberName
+                    SearchIn       = $TargetMemberSearchIn
+                    MemberType     = $TargetMemberType
+                    FailureStage   = "ReviewOrAddMember"
+                    Error          = $errorText
+                }
+
+                $unauthorizedRows.Add($unauthRow) | Out-Null
+                Write-LogLine ("Unauthorized on safe '{0}': {1}" -f $safeName, $errorText) "WARN"
+                Write-Warn ("Unauthorized on safe '{0}' -> {1}" -f $safeName, $errorText)
+            }
+            else {
+                $status = "FAILED"
+                Write-LogLine ("Failed on safe '{0}': {1}" -f $safeName, $errorText) "ERROR"
+                Write-Err ("Failed on safe '{0}' -> {1}" -f $safeName, $errorText)
+            }
         }
 
         $row = [PSCustomObject]@{
@@ -416,27 +492,37 @@ try {
         }
 
         $statusRows.Add($row) | Out-Null
-        if ($status -eq "FAILED") {
+
+        if ($status -like "FAILED*") {
             $failedRows.Add($row) | Out-Null
         }
     }
 
-    $statusRows |
-        Sort-Object SafeName |
-        Export-Csv -LiteralPath $StatusCsvPath -NoTypeInformation -Encoding UTF8
+    Export-CsvEvenIfEmpty `
+        -Rows $statusRows `
+        -Path $StatusCsvPath `
+        -Headers @("SafeName","TargetMember","SearchIn","MemberType","Status","Error")
 
-    $addedCount  = @($statusRows | Where-Object { $_.Status -eq "ADDED" }).Count
-    $skipCount   = @($statusRows | Where-Object { $_.Status -eq "SKIPPED_ALREADY_EXISTS" }).Count
-    $failedCount = @($statusRows | Where-Object { $_.Status -eq "FAILED" }).Count
-    $whatIfCount = @($statusRows | Where-Object { $_.Status -eq "WHATIF" }).Count
+    Export-CsvEvenIfEmpty `
+        -Rows $unauthorizedRows `
+        -Path $UnauthorizedCsvPath `
+        -Headers @("SafeName","TargetMember","SearchIn","MemberType","FailureStage","Error")
+
+    $addedCount         = @($statusRows | Where-Object { $_.Status -eq "ADDED" }).Count
+    $skipCount          = @($statusRows | Where-Object { $_.Status -eq "SKIPPED_ALREADY_EXISTS" }).Count
+    $failedCount        = @($statusRows | Where-Object { $_.Status -eq "FAILED" }).Count
+    $unauthorizedCount  = @($statusRows | Where-Object { $_.Status -eq "FAILED_UNAUTHORIZED" }).Count
+    $whatIfCount        = @($statusRows | Where-Object { $_.Status -eq "WHATIF" }).Count
 
     Write-Host ""
     Write-Ok ("Status CSV exported: {0}" -f $StatusCsvPath)
-    Write-Host ("Added:   {0}" -f $addedCount) -ForegroundColor Green
-    Write-Host ("Skipped: {0}" -f $skipCount) -ForegroundColor Yellow
-    Write-Host ("Failed:  {0}" -f $failedCount) -ForegroundColor Red
+    Write-Ok ("Unauthorized CSV exported: {0}" -f $UnauthorizedCsvPath)
+    Write-Host ("Added:        {0}" -f $addedCount) -ForegroundColor Green
+    Write-Host ("Skipped:      {0}" -f $skipCount) -ForegroundColor Yellow
+    Write-Host ("Unauthorized: {0}" -f $unauthorizedCount) -ForegroundColor Yellow
+    Write-Host ("Failed:       {0}" -f $failedCount) -ForegroundColor Red
     if ($whatIfCount -gt 0) {
-        Write-Host ("WhatIf:  {0}" -f $whatIfCount) -ForegroundColor Cyan
+        Write-Host ("WhatIf:       {0}" -f $whatIfCount) -ForegroundColor Cyan
     }
 
     if ($failedRows.Count -gt 0) {
@@ -444,23 +530,28 @@ try {
         $failedRows | Sort-Object SafeName | Format-Table -AutoSize
     }
 
-    Write-LogLine ("Completed run. SafesProcessed={0}; Added={1}; Skipped={2}; Failed={3}; WhatIf={4}" -f `
-        $statusRows.Count, $addedCount, $skipCount, $failedCount, $whatIfCount) "SUCCESS"
+    Write-LogLine ("Completed run. SafesProcessed={0}; Added={1}; Skipped={2}; Unauthorized={3}; Failed={4}; WhatIf={5}" -f `
+        $statusRows.Count, $addedCount, $skipCount, $unauthorizedCount, $failedCount, $whatIfCount) "SUCCESS"
 }
 catch {
     Write-LogLine ("Fatal error: {0}" -f $_.Exception.Message) "ERROR"
     Write-Err $_.Exception.Message
 
-    if ($statusRows.Count -gt 0) {
-        try {
-            $statusRows |
-                Sort-Object SafeName |
-                Export-Csv -LiteralPath $StatusCsvPath -NoTypeInformation -Encoding UTF8
-            Write-LogLine ("Partial status CSV exported after fatal error: {0}" -f $StatusCsvPath) "WARN"
-        }
-        catch {
-            Write-LogLine ("Failed to export partial CSV after fatal error: {0}" -f $_.Exception.Message) "WARN"
-        }
+    try {
+        Export-CsvEvenIfEmpty `
+            -Rows $statusRows `
+            -Path $StatusCsvPath `
+            -Headers @("SafeName","TargetMember","SearchIn","MemberType","Status","Error")
+
+        Export-CsvEvenIfEmpty `
+            -Rows $unauthorizedRows `
+            -Path $UnauthorizedCsvPath `
+            -Headers @("SafeName","TargetMember","SearchIn","MemberType","FailureStage","Error")
+
+        Write-LogLine "Partial CSV export completed after fatal error." "WARN"
+    }
+    catch {
+        Write-LogLine ("Failed to export partial CSV after fatal error: {0}" -f $_.Exception.Message) "WARN"
     }
 }
 finally {
