@@ -1,6 +1,629 @@
-✅ Required modules loaded successfully.
-ℹ️  Prompting for interactive CyberArk Identity credential...
-ℹ️  Validating CyberArk Identity login...
-✅ CyberArk Identity login validated successfully as: bakinbohun@alliantcreditunion.com
-ℹ️  Attempting Privilege Cloud login as Identity User...
-❌ Cannot index into a null array.
+<#
+Ensure_IND_Safes_ServiceIdentity_Member_DirectREST.ps1
+
+PURPOSE
+- Prompt for a non-service CyberArk Identity user credential
+- Authenticate with IdentityCommand only
+- Use the Identity bearer token / web session directly against Privilege Cloud REST APIs
+- Find all safes whose names begin with IND_
+- Ensure the identity user acurestapi_local@alliantcreditunion.admin
+  exists on each IND_ safe with full permissions
+- If already present, update permissions to the desired full permission set
+
+WHY THIS VERSION
+- Avoids psPAS New-PASSession -IdentityUser handoff issues
+- Uses documented Privilege Cloud Shared Services REST endpoints directly
+
+OUTPUTS
+- Status CSV:
+  I:\Script\IDENTITY Script New\csv\IND_Safes_ServiceIdentity_Status.csv
+- Log file:
+  I:\Script\IDENTITY Script New\logs\Ensure_IND_Safes_ServiceIdentity.log
+#>
+
+[CmdletBinding(SupportsShouldProcess = $true)]
+param(
+    # ===== Identity / Privilege Cloud =====
+    [string]$IdentityTenantURL   = "https://aak4521.my.idaptive.app",
+    [string]$PrivilegeCloudURL   = "https://alliantcredit.privilegecloud.cyberark.cloud",
+
+    # ===== Safe selection =====
+    [string]$SafePrefix          = "IND_",
+
+    # ===== Member to enforce =====
+    [string]$IdentityUserToAdd   = "acurestapi_local@alliantcreditunion.admin",
+    [string]$SafeMemberSearchIn  = "Vault",
+    [ValidateSet("User","Group","Role")]
+    [string]$SafeMemberType      = "User",
+
+    # ===== Output =====
+    [string]$StatusCsvPath       = "I:\Script\IDENTITY Script New\csv\IND_Safes_ServiceIdentity_Status.csv",
+    [string]$LogFilePath         = "I:\Script\IDENTITY Script New\logs\Ensure_IND_Safes_ServiceIdentity.log",
+
+    # ===== Paging =====
+    [ValidateRange(25,2000)]
+    [int]$PageSize               = 500
+)
+
+# ===== Desired full permissions =====
+$FullPermPAS = [PSCustomObject]@{
+    UseAccounts                            = $true
+    RetrieveAccounts                       = $true
+    ListAccounts                           = $true
+    AddAccounts                            = $true
+    UpdateAccountContent                   = $true
+    UpdateAccountProperties                = $true
+    InitiateCPMAccountManagementOperations = $true
+    SpecifyNextAccountContent              = $true
+    RenameAccounts                         = $true
+    DeleteAccounts                         = $true
+    UnlockAccounts                         = $true
+    ManageSafe                             = $true
+    ManageSafeMembers                      = $true
+    BackupSafe                             = $true
+    ViewAuditLog                           = $true
+    ViewSafeMembers                        = $true
+    AccessWithoutConfirmation              = $true
+    CreateFolders                          = $true
+    DeleteFolders                          = $true
+    MoveAccountsAndFolders                 = $true
+    RequestsAuthorizationLevel1            = $true
+    RequestsAuthorizationLevel2            = $false
+}
+
+# ===== Runtime =====
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$ErrorActionPreference = 'Stop'
+$ProgressPreference    = 'SilentlyContinue'
+
+function Write-Err {
+    param([string]$Message)
+    Write-Host "❌ $Message" -ForegroundColor Red
+}
+
+function Write-Info {
+    param([string]$Message)
+    Write-Host "ℹ️  $Message" -ForegroundColor Cyan
+}
+
+function Write-Ok {
+    param([string]$Message)
+    Write-Host "✅ $Message" -ForegroundColor Green
+}
+
+function Ensure-Directory {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not [string]::IsNullOrWhiteSpace($Path) -and -not (Test-Path -LiteralPath $Path)) {
+        New-Item -ItemType Directory -Path $Path -Force | Out-Null
+    }
+}
+
+function Write-LogLine {
+    param(
+        [Parameter(Mandatory)][string]$Message,
+        [ValidateSet('INFO','SUCCESS','WARN','ERROR')][string]$Level = 'INFO'
+    )
+    $line = "{0} [{1}] {2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level, $Message
+    Add-Content -Path $LogFilePath -Value $line
+}
+
+function Convert-ObjectToHashtable {
+    param([Parameter(Mandatory)]$InputObject)
+
+    $hash = @{}
+    foreach ($prop in $InputObject.PSObject.Properties) {
+        $hash[$prop.Name] = $prop.Value
+    }
+    return $hash
+}
+
+function Get-PropValueCI {
+    param(
+        [Parameter(Mandatory)]$Object,
+        [Parameter(Mandatory)][string]$PropName
+    )
+    if ($null -eq $Object) { return $null }
+    $p = $Object.PSObject.Properties | Where-Object { $_.Name -ieq $PropName } | Select-Object -First 1
+    if ($p) { return $p.Value }
+    return $null
+}
+
+function Get-CollectionItems {
+    param([Parameter(Mandatory)]$Response)
+
+    foreach ($name in @('value','Value','Members','members')) {
+        $v = Get-PropValueCI -Object $Response -PropName $name
+        if ($null -ne $v) {
+            return @($v)
+        }
+    }
+
+    if ($Response -is [System.Collections.IEnumerable] -and $Response -isnot [string]) {
+        return @($Response)
+    }
+
+    return @()
+}
+
+function Import-RequiredModules {
+    [CmdletBinding()]
+    param()
+
+    try {
+        Import-Module IdentityCommand -ErrorAction Stop
+        $idmod = Get-Module IdentityCommand | Select-Object -First 1
+        Write-LogLine "IdentityCommand loaded successfully. Version=$($idmod.Version)" "SUCCESS"
+        Write-Ok "IdentityCommand loaded successfully. Version $($idmod.Version)"
+    }
+    catch {
+        throw "IdentityCommand module is required but could not be loaded. Error: $($_.Exception.Message)"
+    }
+}
+
+function Get-AuthorizationValueFromSession {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$IDSession
+    )
+
+    # 1) Try GetToken()
+    try {
+        if ($IDSession.PSObject.Methods.Name -contains 'GetToken') {
+            $tok = $IDSession.GetToken()
+
+            if ($tok -is [System.Collections.IDictionary] -and $tok.Contains('Authorization')) {
+                return [string]$tok['Authorization']
+            }
+
+            $prop = $tok.PSObject.Properties | Where-Object { $_.Name -ieq 'Authorization' } | Select-Object -First 1
+            if ($prop -and -not [string]::IsNullOrWhiteSpace([string]$prop.Value)) {
+                return [string]$prop.Value
+            }
+
+            if ($tok -is [string] -and -not [string]::IsNullOrWhiteSpace($tok)) {
+                if ($tok -match '^Bearer ') { return $tok }
+                return "Bearer $tok"
+            }
+        }
+    }
+    catch {}
+
+    # 2) Try direct Token property
+    $tokenProp = $IDSession.PSObject.Properties | Where-Object { $_.Name -ieq 'Token' } | Select-Object -First 1
+    if ($tokenProp -and -not [string]::IsNullOrWhiteSpace([string]$tokenProp.Value)) {
+        return "Bearer $($tokenProp.Value)"
+    }
+
+    # 3) Try Get-IDSession module scope object
+    try {
+        $sess = Get-IDSession -ErrorAction Stop
+        $web = Get-PropValueCI -Object $sess -PropName 'WebSession'
+        if ($web -and $web.Headers -and $web.Headers['Authorization']) {
+            return [string]$web.Headers['Authorization']
+        }
+
+        $tok2 = Get-PropValueCI -Object $sess -PropName 'Token'
+        if (-not [string]::IsNullOrWhiteSpace([string]$tok2)) {
+            return "Bearer $tok2"
+        }
+    }
+    catch {}
+
+    throw "Unable to determine Authorization token from Identity session."
+}
+
+function Get-WebSessionFromSession {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$IDSession
+    )
+
+    # 1) Try GetWebSession()
+    try {
+        if ($IDSession.PSObject.Methods.Name -contains 'GetWebSession') {
+            $ws = $IDSession.GetWebSession()
+            if ($null -ne $ws) { return $ws }
+        }
+    }
+    catch {}
+
+    # 2) Try Get-IDSession module scope object
+    try {
+        $sess = Get-IDSession -ErrorAction Stop
+        $ws2 = Get-PropValueCI -Object $sess -PropName 'WebSession'
+        if ($null -ne $ws2) { return $ws2 }
+    }
+    catch {}
+
+    throw "Unable to determine WebSession from Identity session."
+}
+
+function Connect-IdentityDirect {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$IdentityTenantURL
+    )
+
+    Write-Info "Prompting for interactive CyberArk Identity credential..."
+    $cred = Get-Credential -Message "Enter your Alliant CyberArk Identity username and password"
+
+    if ($null -eq $cred -or [string]::IsNullOrWhiteSpace($cred.UserName)) {
+        throw "Credential prompt cancelled or no username provided."
+    }
+
+    Write-Info "Authenticating to CyberArk Identity..."
+    Write-LogLine "Attempting Identity login for user '$($cred.UserName)'" "INFO"
+
+    $idSession = New-IDSession -tenant_url $IdentityTenantURL -Credential $cred -ErrorAction Stop
+
+    if ($null -eq $idSession) {
+        throw "New-IDSession returned null."
+    }
+
+    $authValue = Get-AuthorizationValueFromSession -IDSession $idSession
+    $webSession = Get-WebSessionFromSession -IDSession $idSession
+
+    if ($null -eq $webSession) {
+        throw "Identity session did not yield a reusable WebSession."
+    }
+
+    if ($null -eq $webSession.Headers) {
+        throw "Identity WebSession does not contain headers."
+    }
+
+    if (-not $webSession.Headers['Authorization']) {
+        $webSession.Headers['Authorization'] = $authValue
+    }
+
+    Write-LogLine "Identity login successful for user '$($cred.UserName)'" "SUCCESS"
+    Write-Ok "CyberArk Identity login successful as: $($cred.UserName)"
+
+    return [PSCustomObject]@{
+        UserName      = $cred.UserName
+        Credential    = $cred
+        IDSession     = $idSession
+        WebSession    = $webSession
+        Authorization = $authValue
+    }
+}
+
+function Invoke-PCloudRest {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidateSet('GET','POST','PUT','DELETE')][string]$Method,
+        [Parameter(Mandatory)][string]$Uri,
+        [Parameter(Mandatory)]$AuthContext,
+        $Body = $null
+    )
+
+    $headers = @{
+        Authorization = $AuthContext.Authorization
+        Accept        = 'application/json'
+    }
+
+    $params = @{
+        Method      = $Method
+        Uri         = $Uri
+        Headers     = $headers
+        WebSession  = $AuthContext.WebSession
+        ErrorAction = 'Stop'
+    }
+
+    if ($Method -in @('POST','PUT')) {
+        $params['ContentType'] = 'application/json'
+        if ($null -ne $Body) {
+            $params['Body'] = ($Body | ConvertTo-Json -Depth 10)
+        }
+    }
+
+    return Invoke-RestMethod @params
+}
+
+function Get-AllPCloudSafes {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$PrivilegeCloudURL,
+        [Parameter(Mandatory)]$AuthContext,
+        [Parameter(Mandatory)][int]$Limit
+    )
+
+    $offset = 0
+    $all = New-Object System.Collections.Generic.List[object]
+
+    while ($true) {
+        $uri = "{0}/PasswordVault/API/Safes/?limit={1}&offset={2}" -f $PrivilegeCloudURL.TrimEnd('/'), $Limit, $offset
+        $resp = Invoke-PCloudRest -Method GET -Uri $uri -AuthContext $AuthContext
+
+        $items = @(Get-CollectionItems -Response $resp)
+        foreach ($i in $items) {
+            $all.Add($i) | Out-Null
+        }
+
+        $count = Get-PropValueCI -Object $resp -PropName 'count'
+        $nextLink = Get-PropValueCI -Object $resp -PropName 'nextLink'
+
+        if ($null -ne $count) {
+            $offset += $Limit
+            if ($offset -ge [int]$count) { break }
+        }
+        elseif (-not [string]::IsNullOrWhiteSpace([string]$nextLink)) {
+            $offset += $Limit
+        }
+        else {
+            if ($items.Count -lt $Limit) { break }
+            $offset += $Limit
+        }
+    }
+
+    return $all.ToArray()
+}
+
+function Get-SafeMembers {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$PrivilegeCloudURL,
+        [Parameter(Mandatory)][string]$SafeUrlId,
+        [Parameter(Mandatory)]$AuthContext
+    )
+
+    $uri = "{0}/PasswordVault/API/Safes/{1}/Members/?limit=1000&offset=0" -f `
+        $PrivilegeCloudURL.TrimEnd('/'), `
+        [uri]::EscapeDataString($SafeUrlId)
+
+    $resp = Invoke-PCloudRest -Method GET -Uri $uri -AuthContext $AuthContext
+    return @(Get-CollectionItems -Response $resp)
+}
+
+function New-SafeMemberBody {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$MemberName,
+        [Parameter(Mandatory)][string]$SearchIn,
+        [Parameter(Mandatory)][string]$MemberType,
+        [Parameter(Mandatory)]$Permissions
+    )
+
+    $perm = Convert-ObjectToHashtable -InputObject $Permissions
+
+    return @{
+        memberName  = $MemberName
+        searchIn    = $SearchIn
+        permissions = $perm
+        memberType  = $MemberType
+    }
+}
+
+function New-UpdateSafeMemberBody {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$ExistingMember,
+        [Parameter(Mandatory)]$Permissions
+    )
+
+    $perm = Convert-ObjectToHashtable -InputObject $Permissions
+
+    return @{
+        safeUrlId                  = Get-PropValueCI -Object $ExistingMember -PropName 'safeUrlId'
+        safeName                   = Get-PropValueCI -Object $ExistingMember -PropName 'safeName'
+        safeNumber                 = Get-PropValueCI -Object $ExistingMember -PropName 'safeNumber'
+        memberId                   = Get-PropValueCI -Object $ExistingMember -PropName 'memberId'
+        memberName                 = Get-PropValueCI -Object $ExistingMember -PropName 'memberName'
+        memberType                 = Get-PropValueCI -Object $ExistingMember -PropName 'memberType'
+        membershipExpirationDate   = Get-PropValueCI -Object $ExistingMember -PropName 'membershipExpirationDate'
+        isExpiredMembershipEnable  = [bool](Get-PropValueCI -Object $ExistingMember -PropName 'isExpiredMembershipEnable')
+        isPredefinedUser           = [bool](Get-PropValueCI -Object $ExistingMember -PropName 'isPredefinedUser')
+        isReadOnly                 = [bool](Get-PropValueCI -Object $ExistingMember -PropName 'isReadOnly')
+        permissions                = $perm
+    }
+}
+
+function Ensure-SafeMemberFullPermission {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$PrivilegeCloudURL,
+        [Parameter(Mandatory)]$AuthContext,
+        [Parameter(Mandatory)]$SafeObject,
+        [Parameter(Mandatory)][string]$MemberName,
+        [Parameter(Mandatory)][string]$SearchIn,
+        [Parameter(Mandatory)][string]$MemberType,
+        [Parameter(Mandatory)]$Permissions
+    )
+
+    $safeUrlId = [string](Get-PropValueCI -Object $SafeObject -PropName 'safeUrlId')
+    $safeName  = [string](Get-PropValueCI -Object $SafeObject -PropName 'safeName')
+
+    if ([string]::IsNullOrWhiteSpace($safeUrlId)) {
+        throw "Safe '$safeName' does not have a safeUrlId."
+    }
+
+    $members = @(Get-SafeMembers -PrivilegeCloudURL $PrivilegeCloudURL -SafeUrlId $safeUrlId -AuthContext $AuthContext)
+
+    $existing = $null
+    foreach ($m in $members) {
+        $candidate = [string](Get-PropValueCI -Object $m -PropName 'memberName')
+        if (-not [string]::IsNullOrWhiteSpace($candidate) -and $candidate.Trim() -ieq $MemberName) {
+            $existing = $m
+            break
+        }
+    }
+
+    if ($null -eq $existing) {
+        $body = New-SafeMemberBody `
+            -MemberName $MemberName `
+            -SearchIn $SearchIn `
+            -MemberType $MemberType `
+            -Permissions $Permissions
+
+        $uri = "{0}/PasswordVault/API/Safes/{1}/Members/" -f `
+            $PrivilegeCloudURL.TrimEnd('/'), `
+            [uri]::EscapeDataString($safeUrlId)
+
+        Invoke-PCloudRest -Method POST -Uri $uri -AuthContext $AuthContext -Body $body | Out-Null
+        Write-LogLine "Added member '$MemberName' to safe '$safeName' with full permissions." "SUCCESS"
+        return "ADDED"
+    }
+    else {
+        $body = New-UpdateSafeMemberBody -ExistingMember $existing -Permissions $Permissions
+
+        $memberUrlName = [string](Get-PropValueCI -Object $existing -PropName 'memberName')
+        $uri = "{0}/PasswordVault/API/Safes/{1}/Members/{2}/" -f `
+            $PrivilegeCloudURL.TrimEnd('/'), `
+            [uri]::EscapeDataString($safeUrlId), `
+            [uri]::EscapeDataString($memberUrlName)
+
+        Invoke-PCloudRest -Method PUT -Uri $uri -AuthContext $AuthContext -Body $body | Out-Null
+        Write-LogLine "Updated existing member '$MemberName' on safe '$safeName' with full permissions." "SUCCESS"
+        return "UPDATED"
+    }
+}
+
+# ============================
+# MAIN
+# ============================
+$identityConnected = $false
+$authContext = $null
+$statusRows = New-Object System.Collections.Generic.List[object]
+$failedRows = New-Object System.Collections.Generic.List[object]
+
+try {
+    Ensure-Directory -Path (Split-Path $LogFilePath -Parent)
+    Ensure-Directory -Path (Split-Path $StatusCsvPath -Parent)
+    New-Item -ItemType File -Path $LogFilePath -Force | Out-Null
+
+    Write-LogLine "Script started. SafePrefix='$SafePrefix', Member='$IdentityUserToAdd', SearchIn='$SafeMemberSearchIn', MemberType='$SafeMemberType'" "INFO"
+
+    Import-RequiredModules
+
+    $authContext = Connect-IdentityDirect -IdentityTenantURL $IdentityTenantURL
+    $identityConnected = $true
+    Write-Ok "Authentication stage completed successfully."
+
+    Write-Info "Retrieving safes from Privilege Cloud..."
+    $allSafes = @(Get-AllPCloudSafes -PrivilegeCloudURL $PrivilegeCloudURL -AuthContext $authContext -Limit $PageSize)
+
+    if (-not $allSafes -or $allSafes.Count -eq 0) {
+        throw "No safes were returned from Privilege Cloud."
+    }
+
+    $targetSafes = @(
+        $allSafes | Where-Object {
+            $name = [string](Get-PropValueCI -Object $_ -PropName 'safeName')
+            -not [string]::IsNullOrWhiteSpace($name) -and $name.StartsWith($SafePrefix, [System.StringComparison]::OrdinalIgnoreCase)
+        } | Sort-Object { [string](Get-PropValueCI -Object $_ -PropName 'safeName') } -Unique
+    )
+
+    if (-not $targetSafes -or $targetSafes.Count -eq 0) {
+        throw "No safes found with prefix '$SafePrefix'."
+    }
+
+    Write-Ok "IND safes discovered: $($targetSafes.Count)"
+    Write-LogLine "Target safes discovered with prefix '$SafePrefix': $($targetSafes.Count)" "SUCCESS"
+
+    foreach ($safe in $targetSafes) {
+        $safeName  = [string](Get-PropValueCI -Object $safe -PropName 'safeName')
+        $safeUrlId = [string](Get-PropValueCI -Object $safe -PropName 'safeUrlId')
+        $action = "PENDING"
+        $overallStatus = "SUCCESS"
+        $rowError = ""
+
+        try {
+            if ($PSCmdlet.ShouldProcess($safeName, "Ensure Safe member '$IdentityUserToAdd' with full permissions")) {
+                $action = Ensure-SafeMemberFullPermission `
+                    -PrivilegeCloudURL $PrivilegeCloudURL `
+                    -AuthContext $authContext `
+                    -SafeObject $safe `
+                    -MemberName $IdentityUserToAdd `
+                    -SearchIn $SafeMemberSearchIn `
+                    -MemberType $SafeMemberType `
+                    -Permissions $FullPermPAS
+            }
+            else {
+                $action = "SKIPPED"
+            }
+        }
+        catch {
+            $action = "FAILED"
+            $overallStatus = "FAILED"
+            $rowError = $_.Exception.Message
+
+            Write-LogLine "Failed on safe '$safeName'. Error: $rowError" "ERROR"
+            Write-Err "Failed on safe '$safeName' -> $rowError"
+        }
+
+        $row = [PSCustomObject]@{
+            SafeName      = $safeName
+            SafeUrlId     = $safeUrlId
+            MemberName    = $IdentityUserToAdd
+            SearchIn      = $SafeMemberSearchIn
+            MemberType    = $SafeMemberType
+            Action        = $action
+            OverallStatus = $overallStatus
+            ExecutedBy    = $authContext.UserName
+            Timestamp     = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+            Error         = $rowError
+        }
+
+        $statusRows.Add($row) | Out-Null
+
+        if ($overallStatus -eq "FAILED") {
+            $failedRows.Add($row) | Out-Null
+        }
+    }
+
+    $statusRows |
+        Sort-Object SafeName |
+        Export-Csv -LiteralPath $StatusCsvPath -NoTypeInformation -Encoding UTF8
+
+    Write-LogLine "Status CSV exported: $StatusCsvPath. Rows=$($statusRows.Count)" "SUCCESS"
+    Write-Ok "Status CSV exported successfully: $StatusCsvPath"
+
+    Write-Host ""
+    Write-Host "Summary" -ForegroundColor Yellow
+    Write-Host "-------" -ForegroundColor Yellow
+    Write-Host ("IND safes reviewed : {0}" -f $targetSafes.Count) -ForegroundColor White
+    Write-Host ("Rows exported      : {0}" -f $statusRows.Count) -ForegroundColor White
+    Write-Host ("Failures           : {0}" -f $failedRows.Count) -ForegroundColor White
+
+    if ($failedRows.Count -eq 0) {
+        Write-Host ""
+        Write-Host "All IND_ safes processed successfully." -ForegroundColor Green
+    }
+    else {
+        Write-Host ""
+        Write-Host "Failed rows:" -ForegroundColor Yellow
+        $failedRows | Sort-Object SafeName | Format-Table -AutoSize
+    }
+
+    Write-LogLine "Script completed. Failures=$($failedRows.Count)" "SUCCESS"
+}
+catch {
+    Write-LogLine "Fatal error: $($_.Exception.Message)" "ERROR"
+    Write-Err $_.Exception.Message
+
+    try {
+        if ($statusRows.Count -gt 0) {
+            $statusRows |
+                Sort-Object SafeName |
+                Export-Csv -LiteralPath $StatusCsvPath -NoTypeInformation -Encoding UTF8
+            Write-LogLine "Partial status CSV exported after fatal error: $StatusCsvPath. Rows=$($statusRows.Count)" "WARN"
+        }
+    }
+    catch {
+        Write-LogLine "Failed to export partial status CSV after fatal error: $($_.Exception.Message)" "WARN"
+    }
+}
+finally {
+    if ($identityConnected) {
+        try {
+            Close-IDSession | Out-Null
+            Write-LogLine "Closed Identity session." "INFO"
+            Write-Info "Closed Identity session."
+        }
+        catch {
+            Write-LogLine "Identity session close warning: $($_.Exception.Message)" "WARN"
+        }
+    }
+}
+
+# Pipeline-friendly failed rows
+$failedRows
