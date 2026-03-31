@@ -1,20 +1,12 @@
-PS I:\Script\IDENTITY Script New> .\UpdateSafes_NumberOfDaysRetention_FromCSV_CCP.ps1
-ℹ️  CSV parsed successfully. Safes to process: 100
-ℹ️  Retrieving service credential from CCP...
-✅ CCP credential retrieved successfully for: acurestapi_local@alliantcreditunion.admin
-ℹ️  Attempting Privilege Cloud login using primary authentication method...
-ℹ️  Primary login failed. Attempting fallback authentication...
-❌ Fallback login not available (Get-IdentityHeader not found). Primary login failed.
-
-
 <#
 UpdateSafes_NumberOfDaysRetention_FromCSV_CCP.ps1
 
 AUTH (Automation)
 - CCP -> Service User credential
-- Auth to Privilege Cloud via Identity Shared Services
-  1) Primary: New-PASSession -IdentityTenantURL -PrivilegeCloudURL -Credential -ServiceUser
-  2) Fallback: Get-IdentityHeader (-psPASFormat) + Use-PASSession
+- Auth to Privilege Cloud via Shared Services
+  1) Preferred: New-PASSession -TenantSubdomain <subdomain> -Credential <cred> -ServiceUser
+  2) Secondary: New-PASSession -IdentityTenantURL <url> -PrivilegeCloudURL <url> -Credential <cred> -ServiceUser
+  3) Fallback: Get-IdentityHeader (-psPASFormat) + Use-PASSession (only if IdentityCommand is available)
 
 ACTION
 - Reads safes from CSV
@@ -46,8 +38,11 @@ LOG
 
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
-    # ===== Identity / Privilege Cloud =====
-    [string]$IdentityTenantURL   = "https://aak4521.my.idaptive.app",
+    # ===== Preferred Shared Services auth =====
+    [string]$TenantSubdomain     = "alliantcredit",
+
+    # ===== Optional explicit URLs (used by secondary / fallback auth) =====
+    [string]$IdentityTenantURL   = "",
     [string]$PrivilegeCloudURL   = "https://alliantcredit.privilegecloud.cyberark.cloud",
 
     # ===== CCP settings (Service User stored in Vault) =====
@@ -55,9 +50,7 @@ param(
     [string]$CCPLocation         = "AIMWebService",
     [string]$CCPAppID            = "ACURestAPI",
     [string]$CCPSafe             = "ACU-VAULT-API",
-    #[string]$CCPObject           = "application-cyb_p_builtinadmin-alliantcredit.cyberark.cloud",
-    [string]$CCPObject          = "Application-CyberArkVaultRestAPI-alliantcredit.cyberark.cloud",
-
+    [string]$CCPObject           = "Application-CyberArkVaultRestAPI-alliantcredit.cyberark.cloud",
     [bool]  $CCPWindowsAuth      = $false,
 
     # ===== CSV input =====
@@ -106,25 +99,31 @@ $FullPermPAS = [PSCustomObject]@{
     requestsAuthorizationLevel2            = $false
 }
 
-# --- Modules & TLS ---
-Import-Module psPAS -ErrorAction Stop
+# --- Modules / runtime ---
+$ErrorActionPreference = "Stop"
+$ProgressPreference    = "SilentlyContinue"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-$ErrorActionPreference = 'Stop'
-$ProgressPreference    = 'SilentlyContinue'
+
+try {
+    Import-Module psPAS -ErrorAction Stop
+}
+catch {
+    throw "psPAS module could not be loaded. $($_.Exception.Message)"
+}
 
 function Write-Err {
     param([string]$Message)
-    Write-Host "❌ $Message" -ForegroundColor Red
+    Write-Host "[ERR]  $Message" -ForegroundColor Red
 }
 
 function Write-Info {
     param([string]$Message)
-    Write-Host "ℹ️  $Message" -ForegroundColor Cyan
+    Write-Host "[INFO] $Message" -ForegroundColor Cyan
 }
 
 function Write-Ok {
     param([string]$Message)
-    Write-Host "✅ $Message" -ForegroundColor Green
+    Write-Host "[OK]   $Message" -ForegroundColor Green
 }
 
 function Ensure-Directory {
@@ -137,7 +136,7 @@ function Ensure-Directory {
 function Write-LogLine {
     param(
         [Parameter(Mandatory)][string]$Message,
-        [ValidateSet('INFO','SUCCESS','WARN','ERROR')][string]$Level = 'INFO'
+        [ValidateSet("INFO","SUCCESS","WARN","ERROR")][string]$Level = "INFO"
     )
     $line = "{0} [{1}] {2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level, $Message
     Add-Content -Path $LogFilePath -Value $line
@@ -149,14 +148,15 @@ function Get-HostFromUrl {
         return ([uri]$Url).Host
     }
     catch {
-        return ($Url -replace '^https?://','' -replace '/.*$','').Trim()
+        return ($Url -replace "^https?://","" -replace "/.*$","").Trim()
     }
 }
 
 function Get-PCloudSubdomainFromUrl {
     param([Parameter(Mandatory)][string]$PrivilegeCloudURL)
     $pcloudHost = Get-HostFromUrl $PrivilegeCloudURL
-    return ($pcloudHost.Split('.')[0]).Trim()
+    if ([string]::IsNullOrWhiteSpace($pcloudHost)) { return $null }
+    return ($pcloudHost.Split(".")[0]).Trim()
 }
 
 function Get-PropValueCI {
@@ -175,24 +175,58 @@ function Get-RowValueCI {
         [Parameter(Mandatory)]$Row,
         [Parameter(Mandatory)][string[]]$CandidateNames
     )
-
     foreach ($name in $CandidateNames) {
         $prop = $Row.PSObject.Properties | Where-Object { $_.Name -ieq $name } | Select-Object -First 1
-        if ($prop) {
-            return $prop.Value
-        }
+        if ($prop) { return $prop.Value }
     }
     return $null
 }
 
 function Convert-ObjectToHashtable {
     param([Parameter(Mandatory)]$InputObject)
-
     $hash = @{}
     foreach ($prop in $InputObject.PSObject.Properties) {
         $hash[$prop.Name] = $prop.Value
     }
     return $hash
+}
+
+function Import-OptionalIdentityCommand {
+    [CmdletBinding()]
+    param()
+
+    try {
+        if (Get-Module IdentityCommand -ErrorAction SilentlyContinue) {
+            Write-LogLine "IdentityCommand already loaded." "INFO"
+            return $true
+        }
+
+        $available = Get-Module IdentityCommand -ListAvailable | Sort-Object Version -Descending | Select-Object -First 1
+        if ($available) {
+            Import-Module $available.Path -Force -ErrorAction Stop
+            Write-LogLine ("IdentityCommand loaded from: {0}" -f $available.Path) "SUCCESS"
+            return $true
+        }
+
+        Write-LogLine "IdentityCommand module not found on this host." "WARN"
+        return $false
+    }
+    catch {
+        Write-LogLine ("Unable to load IdentityCommand: {0}" -f $_.Exception.Message) "WARN"
+        return $false
+    }
+}
+
+function Test-PASSessionReady {
+    [CmdletBinding()]
+    param()
+    try {
+        $sess = Get-PASSession
+        return ($null -ne $sess)
+    }
+    catch {
+        return $false
+    }
 }
 
 function Get-ServiceUserCredentialFromCCP {
@@ -206,10 +240,15 @@ function Get-ServiceUserCredentialFromCCP {
         [bool]$WindowsAuth = $false
     )
 
-    $base = $CCPAddress.TrimEnd('/')
-    $loc  = $Location.Trim('/')
+    $base = $CCPAddress.TrimEnd("/")
+    $loc  = $Location.Trim("/")
 
-    $url  = "{0}/{1}/api/Accounts?AppID={2}&Safe={3}&Object={4}" -f $base, $loc, $AppID, $Safe, $Object
+    $url  = "{0}/{1}/api/Accounts?AppID={2}&Safe={3}&Object={4}" -f `
+        $base, `
+        $loc, `
+        [uri]::EscapeDataString($AppID), `
+        [uri]::EscapeDataString($Safe), `
+        [uri]::EscapeDataString($Object)
 
     Write-LogLine "Retrieving Service User credential from CCP: $url" "INFO"
     Write-Info "Retrieving service credential from CCP..."
@@ -231,56 +270,139 @@ function Get-ServiceUserCredentialFromCCP {
 function Connect-PCloudWithServiceUser {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][string]$IdentityTenantURL,
-        [Parameter(Mandatory)][string]$PrivilegeCloudURL,
-        [Parameter(Mandatory)][pscredential]$ServiceCred
+        [Parameter(Mandatory)][pscredential]$ServiceCred,
+        [string]$TenantSubdomain,
+        [string]$IdentityTenantURL,
+        [string]$PrivilegeCloudURL
     )
 
-    $tenantHost = Get-HostFromUrl $IdentityTenantURL
-    $subdomain  = Get-PCloudSubdomainFromUrl $PrivilegeCloudURL
+    $resolvedSubdomain = $TenantSubdomain
+    if ([string]::IsNullOrWhiteSpace($resolvedSubdomain) -and -not [string]::IsNullOrWhiteSpace($PrivilegeCloudURL)) {
+        $resolvedSubdomain = Get-PCloudSubdomainFromUrl -PrivilegeCloudURL $PrivilegeCloudURL
+    }
+    if ([string]::IsNullOrWhiteSpace($resolvedSubdomain)) {
+        throw "Unable to resolve TenantSubdomain. Provide -TenantSubdomain explicitly."
+    }
 
-    Write-LogLine "Attempting login (Primary): New-PASSession (ServiceUser)..." "INFO"
-    Write-Info "Attempting Privilege Cloud login using primary authentication method..."
+    $resolvedIdentityURL = $IdentityTenantURL
+    if ([string]::IsNullOrWhiteSpace($resolvedIdentityURL)) {
+        $resolvedIdentityURL = "https://{0}.id.cyberark.cloud" -f $resolvedSubdomain
+    }
 
+    Write-LogLine ("Authentication inputs resolved. TenantSubdomain={0}; IdentityTenantURL={1}; PrivilegeCloudURL={2}" -f `
+        $resolvedSubdomain, $resolvedIdentityURL, $PrivilegeCloudURL) "INFO"
+
+    $authErrors = New-Object System.Collections.Generic.List[string]
+
+    # Attempt 1 - Preferred: TenantSubdomain + ServiceUser
     try {
+        Write-Info "Attempting Privilege Cloud login using TenantSubdomain service-user authentication..."
+        Write-LogLine "Auth attempt 1: New-PASSession -TenantSubdomain -ServiceUser" "INFO"
+
         New-PASSession `
-            -IdentityTenantURL $IdentityTenantURL `
+            -TenantSubdomain $resolvedSubdomain `
+            -Credential      $ServiceCred `
+            -ServiceUser `
+            -ErrorAction Stop | Out-Null
+
+        if (-not (Test-PASSessionReady)) {
+            throw "Get-PASSession returned null after TenantSubdomain authentication."
+        }
+
+        Write-LogLine "Authenticated successfully using TenantSubdomain service-user authentication." "SUCCESS"
+        Write-Ok "Privilege Cloud login successful using TenantSubdomain as: $($ServiceCred.UserName)"
+        return
+    }
+    catch {
+        $msg = $_.Exception.Message
+        $authErrors.Add("Attempt1-TenantSubdomain: $msg") | Out-Null
+        Write-LogLine "Attempt 1 failed: $msg" "WARN"
+        Write-Info "TenantSubdomain auth failed. Attempting explicit URL-based service-user authentication..."
+    }
+
+    # Attempt 2 - Explicit URL-based ServiceUser auth
+    try {
+        Write-LogLine "Auth attempt 2: New-PASSession -IdentityTenantURL -PrivilegeCloudURL -ServiceUser" "INFO"
+
+        New-PASSession `
+            -IdentityTenantURL $resolvedIdentityURL `
             -PrivilegeCloudURL $PrivilegeCloudURL `
             -Credential        $ServiceCred `
             -ServiceUser `
             -ErrorAction Stop | Out-Null
 
-        $sess = Get-PASSession
-        if (-not $sess) { throw "Get-PASSession returned null after New-PASSession." }
+        if (-not (Test-PASSessionReady)) {
+            throw "Get-PASSession returned null after explicit URL-based authentication."
+        }
 
-        Write-LogLine "Authenticated (Primary) to $PrivilegeCloudURL as $($ServiceCred.UserName)" "SUCCESS"
-        Write-Ok "Privilege Cloud login successful (Primary) as: $($ServiceCred.UserName)"
+        Write-LogLine "Authenticated successfully using explicit URL-based service-user authentication." "SUCCESS"
+        Write-Ok "Privilege Cloud login successful using explicit URLs as: $($ServiceCred.UserName)"
         return
     }
     catch {
-        Write-LogLine "Primary login failed: $($_.Exception.Message)" "WARN"
-        Write-Info "Primary login failed. Attempting fallback authentication..."
-
-        $cmd = Get-Command Get-IdentityHeader -ErrorAction SilentlyContinue
-        if (-not $cmd) {
-            throw "Fallback login not available (Get-IdentityHeader not found). Primary login failed."
-        }
-
-        $header = Get-IdentityHeader `
-            -IdentityTenantURL $tenantHost `
-            -psPASFormat `
-            -PCloudSubdomain $subdomain `
-            -UPCreds $ServiceCred
-
-        Use-PASSession $header
-
-        $sess2 = Get-PASSession
-        if (-not $sess2) { throw "Get-PASSession returned null after Use-PASSession." }
-
-        Write-LogLine "Authenticated (Fallback) to $PrivilegeCloudURL as $($ServiceCred.UserName)" "SUCCESS"
-        Write-Ok "Privilege Cloud login successful (Fallback) as: $($ServiceCred.UserName)"
-        return
+        $msg = $_.Exception.Message
+        $authErrors.Add("Attempt2-ExplicitUrls: $msg") | Out-Null
+        Write-LogLine "Attempt 2 failed: $msg" "WARN"
+        Write-Info "Explicit URL-based auth failed. Attempting IdentityCommand fallback if available..."
     }
+
+    # Attempt 3 - IdentityCommand fallback (only if available)
+    $identityLoaded = Import-OptionalIdentityCommand
+    $getIdentityHeaderCmd = $null
+    if ($identityLoaded) {
+        $getIdentityHeaderCmd = Get-Command Get-IdentityHeader -ErrorAction SilentlyContinue
+    }
+
+    if ($null -ne $getIdentityHeaderCmd) {
+        try {
+            Write-LogLine "Auth attempt 3: Get-IdentityHeader + Use-PASSession" "INFO"
+
+            try {
+                $header = Get-IdentityHeader `
+                    -IdentityTenantURL $resolvedIdentityURL `
+                    -psPASFormat `
+                    -PCloudSubdomain $resolvedSubdomain `
+                    -UPCreds $ServiceCred `
+                    -ErrorAction Stop
+            }
+            catch {
+                $headerUrlError = $_.Exception.Message
+                $tenantHost = Get-HostFromUrl $resolvedIdentityURL
+
+                Write-LogLine "Get-IdentityHeader with full IdentityTenantURL failed: $headerUrlError" "WARN"
+                Write-LogLine "Retrying Get-IdentityHeader using host value: $tenantHost" "INFO"
+
+                $header = Get-IdentityHeader `
+                    -IdentityTenantURL $tenantHost `
+                    -psPASFormat `
+                    -PCloudSubdomain $resolvedSubdomain `
+                    -UPCreds $ServiceCred `
+                    -ErrorAction Stop
+            }
+
+            Use-PASSession $header
+
+            if (-not (Test-PASSessionReady)) {
+                throw "Get-PASSession returned null after Use-PASSession."
+            }
+
+            Write-LogLine "Authenticated successfully using IdentityCommand fallback." "SUCCESS"
+            Write-Ok "Privilege Cloud login successful using IdentityCommand fallback as: $($ServiceCred.UserName)"
+            return
+        }
+        catch {
+            $msg = $_.Exception.Message
+            $authErrors.Add("Attempt3-IdentityCommandFallback: $msg") | Out-Null
+            Write-LogLine "Attempt 3 failed: $msg" "WARN"
+        }
+    }
+    else {
+        $msg = "Get-IdentityHeader command not found. IdentityCommand module is not available on this host."
+        $authErrors.Add("Attempt3-IdentityCommandFallbackUnavailable: $msg") | Out-Null
+        Write-LogLine $msg "WARN"
+    }
+
+    throw ("All authentication methods failed. " + ($authErrors -join " | "))
 }
 
 function Import-SafeTargetsFromCsv {
@@ -301,19 +423,19 @@ function Import-SafeTargetsFromCsv {
 
     $targets = New-Object System.Collections.Generic.List[object]
     $seen    = @{}
-    $rowNum = 1
+    $rowNum  = 1
 
     foreach ($row in $rows) {
         $rowNum++
 
-        $safeNameRaw = Get-RowValueCI -Row $row -CandidateNames @('safeName','SafeName','safe','Safe')
+        $safeNameRaw  = Get-RowValueCI -Row $row -CandidateNames @("safeName","SafeName","safe","Safe")
         $retentionRaw = Get-RowValueCI -Row $row -CandidateNames @(
-            'NumberOfDaysRetention',
-            'numberOfDaysRetention',
-            'RetentionDays',
-            'retentionDays',
-            'NumberOfDaysRetension',
-            'numberOfDaysRetension'
+            "NumberOfDaysRetention",
+            "numberOfDaysRetention",
+            "RetentionDays",
+            "retentionDays",
+            "NumberOfDaysRetension",
+            "numberOfDaysRetension"
         )
 
         if ([string]::IsNullOrWhiteSpace($safeNameRaw)) {
@@ -401,32 +523,52 @@ function Ensure-ServiceIdentitySafeMember {
     $existing = Get-ExistingSafeMember -SafeName $SafeName -MemberName $MemberName
 
     if ($null -ne $existing) {
-        Set-PASSafeMember `
-            -SafeName   $SafeName `
-            -MemberName $MemberName `
-            @permHash `
-            -ErrorAction Stop | Out-Null
+        $setParams = @{
+            SafeName   = $SafeName
+            MemberName = $MemberName
+            ErrorAction = "Stop"
+        }
 
+        foreach ($k in $permHash.Keys) {
+            $setParams[$k] = $permHash[$k]
+        }
+
+        Set-PASSafeMember @setParams | Out-Null
         Write-LogLine "Safe member '$MemberName' already existed on '$SafeName'. Permissions updated to target full permissions." "SUCCESS"
         return "UPDATED"
     }
     else {
-        Add-PASSafeMember `
-            -SafeName   $SafeName `
-            -MemberName $MemberName `
-            -SearchIn   $SearchIn `
-            -memberType $MemberType `
-            @permHash `
-            -ErrorAction Stop | Out-Null
+        $addCmd = Get-Command Add-PASSafeMember -ErrorAction Stop
+        $addParams = @{
+            SafeName    = $SafeName
+            MemberName  = $MemberName
+            ErrorAction = "Stop"
+        }
 
+        foreach ($k in $permHash.Keys) {
+            $addParams[$k] = $permHash[$k]
+        }
+
+        if ($addCmd.Parameters.ContainsKey("SearchIn") -and -not [string]::IsNullOrWhiteSpace($SearchIn)) {
+            $addParams["SearchIn"] = $SearchIn
+        }
+
+        if ($addCmd.Parameters.ContainsKey("memberType")) {
+            $addParams["memberType"] = $MemberType
+        }
+        elseif ($addCmd.Parameters.ContainsKey("MemberType")) {
+            $addParams["MemberType"] = $MemberType
+        }
+
+        Add-PASSafeMember @addParams | Out-Null
         Write-LogLine "Safe member '$MemberName' added to '$SafeName' with target full permissions." "SUCCESS"
         return "ADDED"
     }
 }
 
 $sessionCreated = $false
-$failed     = New-Object System.Collections.Generic.List[object]
-$statusRows = New-Object System.Collections.Generic.List[object]
+$failed         = New-Object System.Collections.Generic.List[object]
+$statusRows     = New-Object System.Collections.Generic.List[object]
 
 try {
     Ensure-Directory -Path (Split-Path $LogFilePath -Parent)
@@ -438,6 +580,15 @@ try {
     Write-LogLine "CSV Path: $CsvPath" "INFO"
     Write-LogLine "Status CSV Path: $StatusCsvPath" "INFO"
     Write-LogLine "Service identity member enforcement enabled for: $ServiceIdentityUser (SearchIn=$SafeMemberSearchIn, MemberType=$SafeMemberType)" "INFO"
+
+    if ($PSVersionTable.PSVersion) {
+        Write-LogLine ("PowerShell version: {0}" -f $PSVersionTable.PSVersion.ToString()) "INFO"
+    }
+
+    $psPASMod = Get-Module psPAS
+    if ($psPASMod) {
+        Write-LogLine ("psPAS loaded. Version: {0}" -f $psPASMod.Version.ToString()) "INFO"
+    }
 
     # 1) Parse CSV
     $safeTargets = @(Import-SafeTargetsFromCsv -Path $CsvPath -DefaultRetentionDays $TargetRetentionDays)
@@ -455,9 +606,10 @@ try {
 
     # 3) Login using service user automation
     Connect-PCloudWithServiceUser `
+        -ServiceCred      $serviceCred `
+        -TenantSubdomain  $TenantSubdomain `
         -IdentityTenantURL $IdentityTenantURL `
-        -PrivilegeCloudURL $PrivilegeCloudURL `
-        -ServiceCred $serviceCred
+        -PrivilegeCloudURL $PrivilegeCloudURL
 
     $sessionCreated = $true
     Write-LogLine "Authenticated successfully." "SUCCESS"
@@ -475,10 +627,10 @@ try {
             throw "Invalid NumberOfDaysRetention value resolved for safe '$safeName': '$($t.NumberOfDaysRetention)'"
         }
 
-        $retentionStatus   = "PENDING"
-        $safeMemberStatus  = "PENDING"
-        $overallStatus     = "SUCCESS"
-        $rowError          = ""
+        $retentionStatus  = "PENDING"
+        $safeMemberStatus = "PENDING"
+        $overallStatus    = "SUCCESS"
+        $rowError         = ""
 
         # Step 1: Update retention
         try {
@@ -519,10 +671,10 @@ try {
         try {
             if ($PSCmdlet.ShouldProcess($safeName, "Ensure Safe member '$ServiceIdentityUser' with full permissions")) {
                 $safeMemberStatus = Ensure-ServiceIdentitySafeMember `
-                    -SafeName       $safeName `
-                    -MemberName     $ServiceIdentityUser `
-                    -SearchIn       $SafeMemberSearchIn `
-                    -MemberType     $SafeMemberType `
+                    -SafeName         $safeName `
+                    -MemberName       $ServiceIdentityUser `
+                    -SearchIn         $SafeMemberSearchIn `
+                    -MemberType       $SafeMemberType `
                     -PermissionObject $FullPermPAS
             }
             else {
