@@ -1,23 +1,46 @@
-
-Use this login method to build a script to bulk delete account from CYberArk, i will provide Username and address in CSV
-
-
-
-
-
-
-
-
 <#
-SafeMemberReport_IdentityServiceUser.ps1
+BulkDelete_CyberArkAccounts_IdentityServiceUser.ps1
 
-- Auth: CCP → Identity Shared Services → ServiceUser (same method as your APP/IND scripts)
-- Enumerates all Safes via Get-PASSafe
-- For each Safe, enumerates members via Get-PASSafeMember
-- Exports full membership + permissions report to CSV
+AUTH
+- CCP -> Identity Shared Services -> ServiceUser
+- Same login method pattern as provided
+
+PURPOSE
+- Bulk delete CyberArk accounts from CSV
+- Exact match on Username + Address
+- Optional CSV columns SafeName / PlatformID can help narrow matching
+- By default, if more than one exact match is found for a CSV row, the script SKIPS deletion
+  and exports those rows to MultipleMatches.csv
+- Use -DeleteAllExactMatches if you intentionally want to delete all exact matches found
+  for a Username+Address pair
+
+CSV
+Required columns:
+- Username
+- Address
+
+Optional columns:
+- SafeName
+- PlatformID
+
+Accepted aliases:
+- Username / UserName / userName / Target system user name
+- Address / address / Target system address
+- SafeName / Safe / safeName
+- PlatformID / Platform ID / platformId
+
+EXAMPLE
+- Preview only:
+  .\BulkDelete_CyberArkAccounts_IdentityServiceUser.ps1 -CsvInputPath "I:\Script\IDENTITY Script New\csv\DeleteAccounts.csv" -WhatIf
+
+- Real delete:
+  .\BulkDelete_CyberArkAccounts_IdentityServiceUser.ps1 -CsvInputPath "I:\Script\IDENTITY Script New\csv\DeleteAccounts.csv" -Confirm:$false
+
+- Delete all exact matches if duplicates exist:
+  .\BulkDelete_CyberArkAccounts_IdentityServiceUser.ps1 -CsvInputPath "I:\Script\IDENTITY Script New\csv\DeleteAccounts.csv" -DeleteAllExactMatches -Confirm:$false
 #>
 
-[CmdletBinding()]
+[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
 param(
     # ===== Identity / Privilege Cloud (Shared Services) =====
     [string]$IdentityTenantURL  = "https://aak4521.my.idaptive.app",
@@ -31,34 +54,78 @@ param(
     [string]$CCPObject          = "Application-CyberArkVaultRestAPI-alliantcredit.cyberark.cloud",
     [bool]  $CCPWindowsAuth     = $false,
 
+    # ===== Input =====
+    [Parameter(Mandatory)]
+    [string]$CsvInputPath,
+
     # ===== Output =====
-    [string]$CsvFilePath        = "I:\Script\IDENTITY Script New\csv\SafeMembersReport.csv",
-    [string]$LogFile            = "SafeMemberAudit.log"
+    [string]$ReportFolder       = "I:\Script\IDENTITY Script New\csv\BulkDeleteAccounts_Report",
+    [string]$LogFile            = "I:\Script\IDENTITY Script New\csv\BulkDeleteAccounts_Report\BulkDeleteAccounts.log",
+
+    # ===== Behavior =====
+    [switch]$DeleteAllExactMatches,
+    [int]$PageSize              = 1000
 )
 
-# --- TLS & modules ---
+# ---------------- TLS / MODULES / PREFERENCES ----------------
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$ErrorActionPreference = 'Stop'
 
 Import-Module psPAS           -ErrorAction Stop
 Import-Module IdentityCommand -ErrorAction Stop
 
-$ErrorActionPreference = 'Stop'
-
-# --- Logging helper ---
+# ---------------- HELPERS ----------------
 function Write-Log {
     param(
         [Parameter(Mandatory)][string]$Message,
         [ConsoleColor]$Color = [ConsoleColor]::White
     )
+
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $entry     = "$timestamp | $Message"
+
+    $logDir = Split-Path -Path $LogFile -Parent
+    if (-not [string]::IsNullOrWhiteSpace($logDir) -and -not (Test-Path -LiteralPath $logDir)) {
+        New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+    }
+
     Add-Content -Path $LogFile -Value $entry
     Write-Host $entry -ForegroundColor $Color
 }
 
-Write-Log "🔹 Safe Member Report (Identity Service User) starting..." 'Cyan'
+function Normalize-Text {
+    param([AllowNull()][string]$Value)
+    if ($null -eq $Value) { return "" }
+    return $Value.Trim().ToLowerInvariant()
+}
 
-# --- CCP → PSCredential (API Service User) ---
+function Get-RowValue {
+    param(
+        [Parameter(Mandatory)]$Row,
+        [Parameter(Mandatory)][string[]]$Names
+    )
+
+    foreach ($name in $Names) {
+        $prop = $Row.PSObject.Properties[$name]
+        if ($null -ne $prop) {
+            $val = [string]$prop.Value
+            if (-not [string]::IsNullOrWhiteSpace($val)) {
+                return $val.Trim()
+            }
+        }
+    }
+
+    return ""
+}
+
+function Get-AccountLookupKey {
+    param(
+        [string]$Username,
+        [string]$Address
+    )
+    return ("{0}|{1}" -f (Normalize-Text $Username), (Normalize-Text $Address))
+}
+
 function Get-ServiceUserCredentialFromCCP {
     [CmdletBinding()]
     param(
@@ -75,7 +142,7 @@ function Get-ServiceUserCredentialFromCCP {
 
     $url  = "{0}/{1}/api/Accounts?AppID={2}&Safe={3}&Object={4}" -f $base, $loc, $AppID, $Safe, $Object
 
-    Write-Log "🛠  Retrieving Service User credential from CCP: $url" 'Cyan'
+    Write-Log "Retrieving service user credential from CCP: $url" 'Cyan'
 
     $headers = @{ "Content-Type" = "application/json" }
 
@@ -85,18 +152,135 @@ function Get-ServiceUserCredentialFromCCP {
         throw "CCP response missing UserName/Content. Raw: $($resp | ConvertTo-Json -Depth 5)"
     }
 
-    Write-Log ("✅ CCP returned service user: {0}" -f $resp.UserName) 'Green'
+    Write-Log ("CCP returned service user: {0}" -f $resp.UserName) 'Green'
 
     $sec = ConvertTo-SecureString $resp.Content -AsPlainText -Force
     return [PSCredential]::new($resp.UserName, $sec)
 }
 
-# --- MAIN ---
-$sessionCreated    = $false
-$SafeMembersReport = @()
+function Get-AllCyberArkAccounts {
+    [CmdletBinding()]
+    param(
+        [int]$PageSize = 1000
+    )
+
+    $allAccounts = New-Object 'System.Collections.Generic.List[object]'
+    $offset = 0
+    $pageNumber = 0
+
+    do {
+        $pageNumber++
+        $uri = "API/Accounts?limit=$PageSize&offset=$offset"
+
+        Write-Log ("Fetching account page {0} (offset={1}, limit={2})..." -f $pageNumber, $offset, $PageSize) 'Cyan'
+
+        $resp = Invoke-PASRestMethod -Uri $uri -Method GET -ErrorAction Stop
+
+        $page = @()
+        if ($null -ne $resp.value) {
+            $page = @($resp.value)
+        }
+        elseif ($null -ne $resp.accounts) {
+            $page = @($resp.accounts)
+        }
+        elseif ($null -ne $resp) {
+            $page = @($resp)
+        }
+
+        foreach ($acct in $page) {
+            $allAccounts.Add($acct) | Out-Null
+        }
+
+        Write-Log ("Fetched {0} account(s) in page {1). Total so far: {2}" -f $page.Count, $pageNumber, $allAccounts.Count) 'Green'
+        $offset += $page.Count
+
+    } while ($page.Count -ge $PageSize)
+
+    return $allAccounts
+}
+
+function Remove-AccountFromIndex {
+    param(
+        [hashtable]$Index,
+        [Parameter(Mandatory)]$Account
+    )
+
+    $key = Get-AccountLookupKey -Username ([string]$Account.userName) -Address ([string]$Account.address)
+
+    if (-not $Index.ContainsKey($key)) { return }
+
+    $remaining = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($item in @($Index[$key])) {
+        if ([string]$item.id -ne [string]$Account.id) {
+            $remaining.Add($item) | Out-Null
+        }
+    }
+
+    if ($remaining.Count -gt 0) {
+        $Index[$key] = $remaining
+    }
+    else {
+        $Index.Remove($key)
+    }
+}
+
+function New-ResultObject {
+    param(
+        [string]$InputUsername,
+        [string]$InputAddress,
+        [string]$InputSafeName,
+        [string]$InputPlatformID,
+        [string]$MatchedAccountID,
+        [string]$MatchedUsername,
+        [string]$MatchedAddress,
+        [string]$MatchedSafeName,
+        [string]$MatchedPlatformID,
+        [string]$Status,
+        [string]$Message
+    )
+
+    [PSCustomObject]@{
+        InputUsername     = $InputUsername
+        InputAddress      = $InputAddress
+        InputSafeName     = $InputSafeName
+        InputPlatformID   = $InputPlatformID
+        MatchedAccountID  = $MatchedAccountID
+        MatchedUsername   = $MatchedUsername
+        MatchedAddress    = $MatchedAddress
+        MatchedSafeName   = $MatchedSafeName
+        MatchedPlatformID = $MatchedPlatformID
+        Status            = $Status
+        Message           = $Message
+        Timestamp         = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+    }
+}
+
+# ---------------- MAIN ----------------
+$sessionCreated = $false
+
+$DeletedResults       = New-Object 'System.Collections.Generic.List[object]'
+$NotFoundResults      = New-Object 'System.Collections.Generic.List[object]'
+$MultipleMatchResults = New-Object 'System.Collections.Generic.List[object]'
+$FailedResults        = New-Object 'System.Collections.Generic.List[object]'
+$InvalidResults       = New-Object 'System.Collections.Generic.List[object]'
+$PreviewResults       = New-Object 'System.Collections.Generic.List[object]'
 
 try {
-    # 1) Get Service User creds from CCP
+    if (-not (Test-Path -LiteralPath $CsvInputPath)) {
+        throw "CSV input file not found: $CsvInputPath"
+    }
+
+    if (-not (Test-Path -LiteralPath $ReportFolder)) {
+        New-Item -ItemType Directory -Path $ReportFolder -Force | Out-Null
+    }
+
+    Write-Log "Bulk CyberArk account deletion starting..." 'Cyan'
+    Write-Log ("CSV Input Path : {0}" -f $CsvInputPath) 'Cyan'
+    Write-Log ("Report Folder  : {0}" -f $ReportFolder) 'Cyan'
+    Write-Log ("DeleteAllExactMatches = {0}" -f $DeleteAllExactMatches.IsPresent) 'Cyan'
+    Write-Log ("WhatIf = {0}" -f [bool]$WhatIfPreference) 'Cyan'
+
+    # 1) Get service credential from CCP
     $serviceCred = Get-ServiceUserCredentialFromCCP `
         -CCPAddress $CCPAddress `
         -Location   $CCPLocation `
@@ -105,8 +289,8 @@ try {
         -Object     $CCPObject `
         -WindowsAuth:$CCPWindowsAuth
 
-    # 2) Authenticate via Identity Shared Services using SERVICE USER
-    Write-Log "🛠  Authenticating to Privilege Cloud via Identity (Service User)..." 'Cyan'
+    # 2) Authenticate via Identity Shared Services using Service User
+    Write-Log "Authenticating to Privilege Cloud via Identity (Service User)..." 'Cyan'
 
     New-PASSession `
         -IdentityTenantURL $IdentityTenantURL `
@@ -115,101 +299,263 @@ try {
         -ServiceUser `
         -ErrorAction Stop | Out-Null
 
-    if (-not (Get-PASSession)) { throw "psPAS session not established via ServiceUser." }
+    if (-not (Get-PASSession)) {
+        throw "psPAS session not established via ServiceUser."
+    }
 
     $sessionCreated = $true
-    Write-Log ("✅ Authenticated to {0} as service user: {1}" -f $PrivilegeCloudURL, $serviceCred.UserName) 'Green'
+    Write-Log ("Authenticated to {0} as service user: {1}" -f $PrivilegeCloudURL, $serviceCred.UserName) 'Green'
 
-    # 3) Get all Safes
-    Write-Log "🛠  Retrieving safes via Get-PASSafe..." 'Cyan'
-    $Safes = Get-PASSafe -ErrorAction Stop
+    # 3) Import CSV
+    Write-Log "Importing CSV..." 'Cyan'
+    $rawRows = @(Import-Csv -Path $CsvInputPath -ErrorAction Stop)
 
-    if (-not $Safes -or $Safes.Count -eq 0) {
-        Write-Log "⚠️  No safes returned from Get-PASSafe." 'Yellow'
-        return
+    if (-not $rawRows -or $rawRows.Count -eq 0) {
+        throw "CSV contains no rows."
     }
 
-    Write-Log ("📦 Retrieved {0} safes." -f $Safes.Count) 'Green'
+    Write-Log ("Imported {0} raw row(s) from CSV." -f $rawRows.Count) 'Green'
 
-    # 4) For each Safe, get Safe Members and permissions
-    $i = 0
-    foreach ($Safe in $Safes) {
-        $i++
-        $SafeName = $Safe.SafeName
-        Write-Log ("🔹 [{0}/{1}] Retrieving members for Safe: {2}" -f $i, $Safes.Count, $SafeName) 'Cyan'
+    # 4) Normalize / validate / de-duplicate input rows
+    $seen = @{}
+    $inputRows = New-Object 'System.Collections.Generic.List[object]'
 
-        try {
-            $SafeMembers = Get-PASSafeMember -SafeName $SafeName -ErrorAction Stop
+    foreach ($row in $rawRows) {
+        $username   = Get-RowValue -Row $row -Names @('Username','UserName','userName','Target system user name')
+        $address    = Get-RowValue -Row $row -Names @('Address','address','Target system address')
+        $safeName   = Get-RowValue -Row $row -Names @('SafeName','Safe','safeName')
+        $platformID = Get-RowValue -Row $row -Names @('PlatformID','Platform ID','platformId')
 
-            if (-not $SafeMembers -or $SafeMembers.Count -eq 0) {
-                Write-Log ("⚠️  No members found for Safe: {0}" -f $SafeName) 'Yellow'
-                continue
+        if ([string]::IsNullOrWhiteSpace($username) -or [string]::IsNullOrWhiteSpace($address)) {
+            $InvalidResults.Add((New-ResultObject `
+                -InputUsername $username `
+                -InputAddress $address `
+                -InputSafeName $safeName `
+                -InputPlatformID $platformID `
+                -MatchedAccountID "" `
+                -MatchedUsername "" `
+                -MatchedAddress "" `
+                -MatchedSafeName "" `
+                -MatchedPlatformID "" `
+                -Status "InvalidInput" `
+                -Message "CSV row missing required Username and/or Address.")) | Out-Null
+            continue
+        }
+
+        $rowKey = "{0}|{1}|{2}|{3}" -f (Normalize-Text $username), (Normalize-Text $address), (Normalize-Text $safeName), (Normalize-Text $platformID)
+        if ($seen.ContainsKey($rowKey)) {
+            Write-Log ("Duplicate CSV row skipped: Username='{0}', Address='{1}', SafeName='{2}', PlatformID='{3}'" -f $username, $address, $safeName, $platformID) 'Yellow'
+            continue
+        }
+
+        $seen[$rowKey] = $true
+
+        $inputRows.Add([PSCustomObject]@{
+            Username   = $username
+            Address    = $address
+            SafeName   = $safeName
+            PlatformID = $platformID
+        }) | Out-Null
+    }
+
+    Write-Log ("Validated unique input rows to process: {0}" -f $inputRows.Count) 'Green'
+
+    # 5) Pull all accounts once and build an exact-match lookup index
+    Write-Log "Retrieving all CyberArk accounts for exact-match lookup..." 'Cyan'
+    $allAccounts = Get-AllCyberArkAccounts -PageSize $PageSize
+
+    if (-not $allAccounts -or $allAccounts.Count -eq 0) {
+        throw "No accounts returned from CyberArk."
+    }
+
+    Write-Log ("Total CyberArk accounts retrieved: {0}" -f $allAccounts.Count) 'Green'
+
+    $accountIndex = @{}
+    foreach ($acct in $allAccounts) {
+        $acctUser = [string]$acct.userName
+        $acctAddr = [string]$acct.address
+
+        if ([string]::IsNullOrWhiteSpace($acctUser) -or [string]::IsNullOrWhiteSpace($acctAddr)) {
+            continue
+        }
+
+        $key = Get-AccountLookupKey -Username $acctUser -Address $acctAddr
+
+        if (-not $accountIndex.ContainsKey($key)) {
+            $accountIndex[$key] = New-Object 'System.Collections.Generic.List[object]'
+        }
+
+        $accountIndex[$key].Add($acct) | Out-Null
+    }
+
+    Write-Log ("Exact-match lookup index built for {0} unique Username+Address key(s)." -f $accountIndex.Keys.Count) 'Green'
+
+    # 6) Process input rows
+    $rowNumber = 0
+    foreach ($item in $inputRows) {
+        $rowNumber++
+        Write-Log ("[{0}/{1}] Processing Username='{2}', Address='{3}'" -f $rowNumber, $inputRows.Count, $item.Username, $item.Address) 'Cyan'
+
+        $lookupKey = Get-AccountLookupKey -Username $item.Username -Address $item.Address
+        $matches = @()
+
+        if ($accountIndex.ContainsKey($lookupKey)) {
+            $matches = @($accountIndex[$lookupKey])
+        }
+
+        # Optional narrowing if CSV includes SafeName / PlatformID
+        if (-not [string]::IsNullOrWhiteSpace($item.SafeName)) {
+            $safeNorm = Normalize-Text $item.SafeName
+            $matches  = @($matches | Where-Object { (Normalize-Text ([string]$_.safeName)) -eq $safeNorm })
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($item.PlatformID)) {
+            $platNorm = Normalize-Text $item.PlatformID
+            $matches  = @($matches | Where-Object { (Normalize-Text ([string]$_.platformId)) -eq $platNorm })
+        }
+
+        if (-not $matches -or $matches.Count -eq 0) {
+            $NotFoundResults.Add((New-ResultObject `
+                -InputUsername $item.Username `
+                -InputAddress $item.Address `
+                -InputSafeName $item.SafeName `
+                -InputPlatformID $item.PlatformID `
+                -MatchedAccountID "" `
+                -MatchedUsername "" `
+                -MatchedAddress "" `
+                -MatchedSafeName "" `
+                -MatchedPlatformID "" `
+                -Status "NotFound" `
+                -Message "No exact CyberArk account match found.")) | Out-Null
+
+            Write-Log ("No exact match found for Username='{0}', Address='{1}'" -f $item.Username, $item.Address) 'Yellow'
+            continue
+        }
+
+        if ($matches.Count -gt 1 -and -not $DeleteAllExactMatches.IsPresent) {
+            foreach ($m in $matches) {
+                $MultipleMatchResults.Add((New-ResultObject `
+                    -InputUsername $item.Username `
+                    -InputAddress $item.Address `
+                    -InputSafeName $item.SafeName `
+                    -InputPlatformID $item.PlatformID `
+                    -MatchedAccountID ([string]$m.id) `
+                    -MatchedUsername ([string]$m.userName) `
+                    -MatchedAddress ([string]$m.address) `
+                    -MatchedSafeName ([string]$m.safeName) `
+                    -MatchedPlatformID ([string]$m.platformId) `
+                    -Status "MultipleMatches" `
+                    -Message "More than one exact match found. Skipped deletion by default.")) | Out-Null
             }
 
-            foreach ($Member in $SafeMembers) {
+            Write-Log ("Multiple exact matches found for Username='{0}', Address='{1}'. Skipped." -f $item.Username, $item.Address) 'Yellow'
+            continue
+        }
 
-                # Defensive null-check on Permissions so script doesn't blow up on weird entries
-                $perm = $Member.Permissions
+        foreach ($match in $matches) {
+            $target = "Username='{0}', Address='{1}', Safe='{2}', Platform='{3}', ID='{4}'" -f `
+                ([string]$match.userName), `
+                ([string]$match.address), `
+                ([string]$match.safeName), `
+                ([string]$match.platformId), `
+                ([string]$match.id)
 
-                $SafeMembersReport += [PSCustomObject]@{
-                    SafeName                               = $SafeName
-                    Member                                 = $Member.MemberName
-                    MemberType                             = $Member.MemberType
+            $action = "Delete CyberArk account"
 
-                    UseAccounts                            = $perm.useAccounts
-                    RetrieveAccounts                       = $perm.retrieveAccounts
-                    ListAccounts                           = $perm.listAccounts
-                    AddAccounts                            = $perm.addAccounts
-                    UpdateAccountContent                   = $perm.updateAccountContent
-                    UpdateAccountProperties                = $perm.updateAccountProperties
-                    InitiateCPMAccountManagementOperations = $perm.initiateCPMAccountManagementOperations
-                    SpecifyNextAccountContent              = $perm.specifyNextAccountContent
-                    RenameAccounts                         = $perm.renameAccounts
-                    DeleteAccounts                         = $perm.deleteAccounts
-                    UnlockAccounts                         = $perm.unlockAccounts
-                    ManageSafe                             = $perm.manageSafe
-                    ManageSafeMembers                      = $perm.manageSafeMembers
-                    BackupSafe                             = $perm.backupSafe
-                    ViewAuditLog                           = $perm.viewAuditLog
-                    ViewSafeMembers                        = $perm.viewSafeMembers
-                    AccessWithoutConfirmation              = $perm.accessWithoutConfirmation
-                    CreateFolders                          = $perm.createFolders
-                    DeleteFolders                          = $perm.deleteFolders
-                    MoveAccountsAndFolders                 = $perm.moveAccountsAndFolders
-                    RequestsAuthorizationLevel1            = $perm.requestsAuthorizationLevel1
-                    RequestsAuthorizationLevel2            = $perm.requestsAuthorizationLevel2
+            if ($PSCmdlet.ShouldProcess($target, $action)) {
+                try {
+                    $deleteUri = "API/Accounts/{0}" -f ([string]$match.id)
+
+                    Invoke-PASRestMethod -Uri $deleteUri -Method DELETE -ErrorAction Stop | Out-Null
+
+                    $DeletedResults.Add((New-ResultObject `
+                        -InputUsername $item.Username `
+                        -InputAddress $item.Address `
+                        -InputSafeName $item.SafeName `
+                        -InputPlatformID $item.PlatformID `
+                        -MatchedAccountID ([string]$match.id) `
+                        -MatchedUsername ([string]$match.userName) `
+                        -MatchedAddress ([string]$match.address) `
+                        -MatchedSafeName ([string]$match.safeName) `
+                        -MatchedPlatformID ([string]$match.platformId) `
+                        -Status "Deleted" `
+                        -Message "Account deleted successfully.")) | Out-Null
+
+                    Remove-AccountFromIndex -Index $accountIndex -Account $match
+
+                    Write-Log ("Deleted: {0}" -f $target) 'Green'
+                }
+                catch {
+                    $FailedResults.Add((New-ResultObject `
+                        -InputUsername $item.Username `
+                        -InputAddress $item.Address `
+                        -InputSafeName $item.SafeName `
+                        -InputPlatformID $item.PlatformID `
+                        -MatchedAccountID ([string]$match.id) `
+                        -MatchedUsername ([string]$match.userName) `
+                        -MatchedAddress ([string]$match.address) `
+                        -MatchedSafeName ([string]$match.safeName) `
+                        -MatchedPlatformID ([string]$match.platformId) `
+                        -Status "Failed" `
+                        -Message $_.Exception.Message)) | Out-Null
+
+                    Write-Log ("FAILED deleting: {0} | Error: {1}" -f $target, $_.Exception.Message) 'Red'
                 }
             }
+            else {
+                $PreviewResults.Add((New-ResultObject `
+                    -InputUsername $item.Username `
+                    -InputAddress $item.Address `
+                    -InputSafeName $item.SafeName `
+                    -InputPlatformID $item.PlatformID `
+                    -MatchedAccountID ([string]$match.id) `
+                    -MatchedUsername ([string]$match.userName) `
+                    -MatchedAddress ([string]$match.address) `
+                    -MatchedSafeName ([string]$match.safeName) `
+                    -MatchedPlatformID ([string]$match.platformId) `
+                    -Status "PreviewOrSkipped" `
+                    -Message "Deletion previewed with WhatIf or skipped by confirmation.")) | Out-Null
 
-            Write-Log ("✅ Retrieved {0} member(s) for Safe: {1}" -f $SafeMembers.Count, $SafeName) 'Green'
+                Write-Log ("Preview/Skipped: {0}" -f $target) 'Yellow'
+            }
         }
-        catch {
-            Write-Log ("❌ ERROR: Failed to retrieve members for Safe: {0} - {1}" -f $SafeName, $_.Exception.Message) 'Red'
-        }
     }
 
-    # 5) Export to CSV
-    if (-not $SafeMembersReport -or $SafeMembersReport.Count -eq 0) {
-        Write-Log "⚠️  No Safe Member data collected; skipping CSV export." 'Yellow'
-    }
-    else {
-        Write-Log ("🛠  Exporting Safe Member Report to: {0}" -f $CsvFilePath) 'Cyan'
-        $SafeMembersReport | Export-Csv -Path $CsvFilePath -NoTypeInformation -Encoding UTF8
-        Write-Log "✅ Safe Member Report successfully exported." 'Green'
-    }
+    # 7) Export reports
+    $deletedCsv   = Join-Path $ReportFolder "Deleted.csv"
+    $notFoundCsv  = Join-Path $ReportFolder "NotFound.csv"
+    $multipleCsv  = Join-Path $ReportFolder "MultipleMatches.csv"
+    $failedCsv    = Join-Path $ReportFolder "Failed.csv"
+    $invalidCsv   = Join-Path $ReportFolder "InvalidRows.csv"
+    $previewCsv   = Join-Path $ReportFolder "PreviewOrSkipped.csv"
 
-    Write-Log "🔹 Safe Member Report generation completed." 'Cyan'
+    if ($DeletedResults.Count -gt 0)       { $DeletedResults       | Export-Csv -Path $deletedCsv  -NoTypeInformation -Encoding UTF8 }
+    if ($NotFoundResults.Count -gt 0)      { $NotFoundResults      | Export-Csv -Path $notFoundCsv -NoTypeInformation -Encoding UTF8 }
+    if ($MultipleMatchResults.Count -gt 0) { $MultipleMatchResults | Export-Csv -Path $multipleCsv -NoTypeInformation -Encoding UTF8 }
+    if ($FailedResults.Count -gt 0)        { $FailedResults        | Export-Csv -Path $failedCsv   -NoTypeInformation -Encoding UTF8 }
+    if ($InvalidResults.Count -gt 0)       { $InvalidResults       | Export-Csv -Path $invalidCsv  -NoTypeInformation -Encoding UTF8 }
+    if ($PreviewResults.Count -gt 0)       { $PreviewResults       | Export-Csv -Path $previewCsv  -NoTypeInformation -Encoding UTF8 }
+
+    Write-Log "Processing completed." 'Cyan'
+    Write-Log ("Deleted          : {0}" -f $DeletedResults.Count) 'Green'
+    Write-Log ("NotFound         : {0}" -f $NotFoundResults.Count) 'Yellow'
+    Write-Log ("MultipleMatches  : {0}" -f $MultipleMatchResults.Count) 'Yellow'
+    Write-Log ("Failed           : {0}" -f $FailedResults.Count) 'Red'
+    Write-Log ("InvalidRows      : {0}" -f $InvalidResults.Count) 'Yellow'
+    Write-Log ("PreviewOrSkipped : {0}" -f $PreviewResults.Count) 'Yellow'
 }
 catch {
-    Write-Log ("❌ FATAL ERROR: {0}" -f $_.Exception.Message) 'Red'
+    Write-Log ("FATAL ERROR: {0}" -f $_.Exception.Message) 'Red'
+    throw
 }
 finally {
     if ($sessionCreated) {
         try {
             Close-PASSession | Out-Null
-            Write-Log "✅ Logged off from Privilege Cloud." 'Green'
-        } catch {
-            Write-Log ("⚠️  Logoff warning: {0}" -f $_.Exception.Message) 'Yellow'
+            Write-Log "Logged off from Privilege Cloud." 'Green'
+        }
+        catch {
+            Write-Log ("Logoff warning: {0}" -f $_.Exception.Message) 'Yellow'
         }
     }
 }
