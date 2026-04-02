@@ -1,205 +1,64 @@
+
+Use this login method to build a script to bulk delete account from CYberArk, i will provide Username and address in CSV
+
+
+
+
+
+
+
+
 <#
-Add_AcuRestApiLocal_To_All_Ind_Safes_ServiceUser.ps1
+SafeMemberReport_IdentityServiceUser.ps1
 
-PURPOSE
-- Retrieve service-user credential from CCP
-- Authenticate to Alliant Privilege Cloud using ServiceUser auth
-- Find all safes beginning with IND_
-- Add acurestapi_local@alliantcreditunion.admin only if missing
-- Skip safes where the member already exists
-- Export full status CSV
-- Export separate CSV of safes that were unauthorized to review/update
-
-REQUIREMENTS
-- psPAS 6.4.85 or compatible newer version that supports -ServiceUser
-- Service user must have enough rights to search safes
-- Service user must have Manage Safe Members on safes it is expected to update
+- Auth: CCP → Identity Shared Services → ServiceUser (same method as your APP/IND scripts)
+- Enumerates all Safes via Get-PASSafe
+- For each Safe, enumerates members via Get-PASSafeMember
+- Exports full membership + permissions report to CSV
 #>
 
-[CmdletBinding(SupportsShouldProcess = $true)]
+[CmdletBinding()]
 param(
-    # ===== Module version =====
-    [string]$RequiredPsPASVersion = "6.4.85",
+    # ===== Identity / Privilege Cloud (Shared Services) =====
+    [string]$IdentityTenantURL  = "https://aak4521.my.idaptive.app",
+    [string]$PrivilegeCloudURL  = "https://alliantcredit.privilegecloud.cyberark.cloud",
 
-    # ===== Privilege Cloud / Shared Services =====
-    [string]$TenantSubdomain      = "alliantcredit",
-    [string]$IdentityTenantURL    = "https://aak4521.id.cyberark.cloud",
-    [string]$PrivilegeCloudURL    = "https://alliantcredit.privilegecloud.cyberark.cloud",
-
-    # ===== CCP settings =====
-    [string]$CCPAddress           = "https://aam.alliantcreditunion.com",
-    [string]$CCPLocation          = "AIMWebService",
-    [string]$CCPAppID             = "ACURestAPI",
-    [string]$CCPSafe              = "ACU-VAULT-API",
-    [string]$CCPObject            = "Application-CyberArkVaultRestAPI-alliantcredit.cyberark.cloud",
-    [bool]$CCPWindowsAuth         = $false,
-
-    # ===== Safe targeting =====
-    [string]$SafePrefix           = "IND_",
-
-    # ===== Member to add =====
-    [string]$TargetMemberName     = "acurestapi_local@alliantcreditunion.admin",
-    [string]$TargetMemberSearchIn = "Vault",
-    [ValidateSet("User","Group","Role")]
-    [string]$TargetMemberType     = "User",
+    # ===== CCP settings (for API Service User stored in Vault) =====
+    [string]$CCPAddress         = "https://aam.alliantcreditunion.com",
+    [string]$CCPLocation        = "AIMWebService",
+    [string]$CCPAppID           = "ACURestAPI",
+    [string]$CCPSafe            = "ACU-VAULT-API",
+    [string]$CCPObject          = "Application-CyberArkVaultRestAPI-alliantcredit.cyberark.cloud",
+    [bool]  $CCPWindowsAuth     = $false,
 
     # ===== Output =====
-    [string]$StatusCsvPath        = "I:\Script\IDENTITY Script New\csv\IND_Safes_Add_AcuRestApiLocal_ServiceUser_Status.csv",
-    [string]$UnauthorizedCsvPath  = "I:\Script\IDENTITY Script New\csv\IND_Safes_Add_AcuRestApiLocal_ServiceUser_Unauthorized.csv",
-    [string]$LogFilePath          = "I:\Script\IDENTITY Script New\logs\IND_Safes_Add_AcuRestApiLocal_ServiceUser.log"
+    [string]$CsvFilePath        = "I:\Script\IDENTITY Script New\csv\SafeMembersReport.csv",
+    [string]$LogFile            = "SafeMemberAudit.log"
 )
 
-# Requested permission set
-$FullPermPAS = [PSCustomObject]@{
-    UseAccounts                            = $true
-    RetrieveAccounts                       = $true
-    ListAccounts                           = $true
-    AddAccounts                            = $true
-    UpdateAccountContent                   = $true
-    UpdateAccountProperties                = $true
-    InitiateCPMAccountManagementOperations = $true
-    SpecifyNextAccountContent              = $true
-    RenameAccounts                         = $true
-    DeleteAccounts                         = $true
-    UnlockAccounts                         = $true
-    ManageSafe                             = $true
-    ManageSafeMembers                      = $true
-    BackupSafe                             = $true
-    ViewAuditLog                           = $true
-    ViewSafeMembers                        = $true
-    AccessWithoutConfirmation              = $true
-    CreateFolders                          = $true
-    DeleteFolders                          = $true
-    MoveAccountsAndFolders                 = $true
-    requestsAuthorizationLevel1            = $true
-    requestsAuthorizationLevel2            = $false
-}
-
-$ErrorActionPreference = "Stop"
-$ProgressPreference    = "SilentlyContinue"
+# --- TLS & modules ---
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-function Write-Info {
-    param([string]$Message)
-    Write-Host "[INFO] $Message" -ForegroundColor Cyan
-}
+Import-Module psPAS           -ErrorAction Stop
+Import-Module IdentityCommand -ErrorAction Stop
 
-function Write-Ok {
-    param([string]$Message)
-    Write-Host "[OK]   $Message" -ForegroundColor Green
-}
+$ErrorActionPreference = 'Stop'
 
-function Write-Warn {
-    param([string]$Message)
-    Write-Host "[WARN] $Message" -ForegroundColor Yellow
-}
-
-function Write-Err {
-    param([string]$Message)
-    Write-Host "[ERR]  $Message" -ForegroundColor Red
-}
-
-function Ensure-Directory {
-    param([Parameter(Mandatory)][string]$Path)
-
-    if (-not [string]::IsNullOrWhiteSpace($Path) -and -not (Test-Path -LiteralPath $Path)) {
-        New-Item -ItemType Directory -Path $Path -Force | Out-Null
-    }
-}
-
-function Write-LogLine {
+# --- Logging helper ---
+function Write-Log {
     param(
         [Parameter(Mandatory)][string]$Message,
-        [ValidateSet("INFO","SUCCESS","WARN","ERROR")]
-        [string]$Level = "INFO"
+        [ConsoleColor]$Color = [ConsoleColor]::White
     )
-
-    $line = "{0} [{1}] {2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level, $Message
-    Add-Content -Path $LogFilePath -Value $line
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $entry     = "$timestamp | $Message"
+    Add-Content -Path $LogFile -Value $entry
+    Write-Host $entry -ForegroundColor $Color
 }
 
-function Convert-ObjectToHashtable {
-    param([Parameter(Mandatory)]$InputObject)
+Write-Log "🔹 Safe Member Report (Identity Service User) starting..." 'Cyan'
 
-    $hash = @{}
-    foreach ($prop in $InputObject.PSObject.Properties) {
-        $hash[$prop.Name] = $prop.Value
-    }
-    return $hash
-}
-
-function Get-PropValueCI {
-    param(
-        [Parameter(Mandatory)]$Object,
-        [Parameter(Mandatory)][string]$PropName
-    )
-
-    if ($null -eq $Object) { return $null }
-
-    $prop = $Object.PSObject.Properties | Where-Object { $_.Name -ieq $PropName } | Select-Object -First 1
-    if ($prop) { return $prop.Value }
-
-    return $null
-}
-
-function Import-RequiredModules {
-    [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$PsPASVersion)
-
-    Remove-Module psPAS -ErrorAction SilentlyContinue
-    Import-Module psPAS -RequiredVersion $PsPASVersion -Force -ErrorAction Stop
-
-    $pspasLoaded = Get-Module psPAS | Sort-Object Version -Descending | Select-Object -First 1
-    Write-Info ("psPAS loaded. Version: {0}" -f $pspasLoaded.Version)
-    Write-LogLine ("psPAS loaded from: {0}" -f $pspasLoaded.Path) "SUCCESS"
-}
-
-function Export-CsvEvenIfEmpty {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]$Rows,
-        [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][string[]]$Headers
-    )
-
-    Ensure-Directory -Path (Split-Path $Path -Parent)
-
-    if ($Rows -and $Rows.Count -gt 0) {
-        $Rows | Export-Csv -LiteralPath $Path -NoTypeInformation -Encoding UTF8
-    }
-    else {
-        [System.IO.File]::WriteAllText($Path, (($Headers -join ",") + [Environment]::NewLine))
-    }
-}
-
-function Test-IsUnauthorizedError {
-    [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$Message)
-
-    if ([string]::IsNullOrWhiteSpace($Message)) { return $false }
-
-    $patterns = @(
-        "unauthori[sz]ed",
-        "not authorized",
-        "forbidden",
-        "access denied",
-        "permission denied",
-        "insufficient\s+(permission|privilege|privileges)",
-        "does not have.*permission",
-        "does not have.*authorization",
-        "not allowed",
-        "\b403\b"
-    )
-
-    foreach ($pattern in $patterns) {
-        if ($Message -match $pattern) {
-            return $true
-        }
-    }
-
-    return $false
-}
-
+# --- CCP → PSCredential (API Service User) ---
 function Get-ServiceUserCredentialFromCCP {
     [CmdletBinding()]
     param(
@@ -211,205 +70,33 @@ function Get-ServiceUserCredentialFromCCP {
         [bool]$WindowsAuth = $false
     )
 
-    $base = $CCPAddress.TrimEnd("/")
-    $loc  = $Location.Trim("/")
+    $base = $CCPAddress.TrimEnd('/')
+    $loc  = $Location.Trim('/')
 
-    $url  = "{0}/{1}/api/Accounts?AppID={2}&Safe={3}&Object={4}" -f `
-        $base, `
-        $loc, `
-        [uri]::EscapeDataString($AppID), `
-        [uri]::EscapeDataString($Safe), `
-        [uri]::EscapeDataString($Object)
+    $url  = "{0}/{1}/api/Accounts?AppID={2}&Safe={3}&Object={4}" -f $base, $loc, $AppID, $Safe, $Object
 
-    Write-Info "Retrieving service credential from CCP..."
-    Write-LogLine ("Retrieving service credential from CCP: {0}" -f $url) "INFO"
+    Write-Log "🛠  Retrieving Service User credential from CCP: $url" 'Cyan'
 
     $headers = @{ "Content-Type" = "application/json" }
+
     $resp = Invoke-RestMethod -Uri $url -Method GET -Headers $headers -UseDefaultCredentials:$WindowsAuth -ErrorAction Stop
 
     if (-not $resp.UserName -or -not $resp.Content) {
-        throw "CCP response missing UserName and/or Content."
+        throw "CCP response missing UserName/Content. Raw: $($resp | ConvertTo-Json -Depth 5)"
     }
 
-    Write-Ok ("CCP credential retrieved successfully for: {0}" -f $resp.UserName)
-    Write-LogLine ("CCP returned service user: {0}" -f $resp.UserName) "SUCCESS"
+    Write-Log ("✅ CCP returned service user: {0}" -f $resp.UserName) 'Green'
 
     $sec = ConvertTo-SecureString $resp.Content -AsPlainText -Force
     return [PSCredential]::new($resp.UserName, $sec)
 }
 
-function Connect-PASServiceUser {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)][pscredential]$Credential,
-        [Parameter(Mandatory)][string]$TenantSubdomain,
-        [string]$IdentityTenantURL,
-        [string]$PrivilegeCloudURL
-    )
-
-    $errors = New-Object System.Collections.Generic.List[string]
-
-    try {
-        Write-Info "Authenticating using ServiceUser with TenantSubdomain..."
-        New-PASSession `
-            -TenantSubdomain $TenantSubdomain `
-            -Credential      $Credential `
-            -ServiceUser `
-            -ErrorAction Stop | Out-Null
-
-        if (-not (Get-PASSession)) {
-            throw "Get-PASSession returned null after TenantSubdomain service-user authentication."
-        }
-
-        Write-Ok "Privilege Cloud login successful using ServiceUser."
-        Write-LogLine ("Authenticated successfully using ServiceUser + TenantSubdomain '{0}'." -f $TenantSubdomain) "SUCCESS"
-        return
-    }
-    catch {
-        $errors.Add("TenantSubdomain auth failed: $($_.Exception.Message)") | Out-Null
-        Write-Warn "TenantSubdomain auth failed. Attempting explicit URL-based ServiceUser authentication..."
-        Write-LogLine ("TenantSubdomain service-user auth failed: {0}" -f $_.Exception.Message) "WARN"
-    }
-
-    try {
-        New-PASSession `
-            -IdentityTenantURL $IdentityTenantURL `
-            -PrivilegeCloudURL $PrivilegeCloudURL `
-            -Credential        $Credential `
-            -ServiceUser `
-            -ErrorAction Stop | Out-Null
-
-        if (-not (Get-PASSession)) {
-            throw "Get-PASSession returned null after explicit URL-based service-user authentication."
-        }
-
-        Write-Ok "Privilege Cloud login successful using explicit ServiceUser URLs."
-        Write-LogLine "Authenticated successfully using explicit ServiceUser URLs." "SUCCESS"
-        return
-    }
-    catch {
-        $errors.Add("Explicit URL auth failed: $($_.Exception.Message)") | Out-Null
-        throw ("All ServiceUser authentication methods failed. " + ($errors -join " | "))
-    }
-}
-
-function Get-TargetSafeNames {
-    [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$Prefix)
-
-    Write-Info ("Searching for safes with prefix '{0}'..." -f $Prefix)
-    Write-LogLine ("Searching for safes with prefix '{0}'" -f $Prefix) "INFO"
-
-    $rawSafes = @(Get-PASSafe -Search $Prefix -ErrorAction Stop)
-
-    $safeNames = $rawSafes |
-        ForEach-Object {
-            $name = Get-PropValueCI -Object $_ -PropName "safeName"
-            if ([string]::IsNullOrWhiteSpace($name)) {
-                $name = Get-PropValueCI -Object $_ -PropName "SafeName"
-            }
-            $name
-        } |
-        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
-        Where-Object { $_ -like "$Prefix*" } |
-        Sort-Object -Unique
-
-    return @($safeNames)
-}
-
-function Get-ExistingSafeMember {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)][string]$SafeName,
-        [Parameter(Mandatory)][string]$MemberName
-    )
-
-    $members = @(Get-PASSafeMember -SafeName $SafeName -ErrorAction Stop)
-
-    foreach ($member in $members) {
-        $candidateNames = @(
-            (Get-PropValueCI -Object $member -PropName "memberName"),
-            (Get-PropValueCI -Object $member -PropName "MemberName"),
-            (Get-PropValueCI -Object $member -PropName "userName"),
-            (Get-PropValueCI -Object $member -PropName "UserName"),
-            (Get-PropValueCI -Object $member -PropName "username"),
-            (Get-PropValueCI -Object $member -PropName "Username")
-        ) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }
-
-        foreach ($candidate in $candidateNames) {
-            if (([string]$candidate).Trim() -ieq $MemberName) {
-                return $member
-            }
-        }
-    }
-
-    return $null
-}
-
-function Add-SafeMemberIfMissing {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)][string]$SafeName,
-        [Parameter(Mandatory)][string]$MemberName,
-        [Parameter(Mandatory)][string]$SearchIn,
-        [Parameter(Mandatory)][string]$MemberType,
-        [Parameter(Mandatory)]$PermissionObject
-    )
-
-    $existing = Get-ExistingSafeMember -SafeName $SafeName -MemberName $MemberName
-    if ($null -ne $existing) {
-        Write-LogLine ("Safe '{0}': member '{1}' already exists. Skipping." -f $SafeName, $MemberName) "INFO"
-        return "SKIPPED_ALREADY_EXISTS"
-    }
-
-    $permHash = Convert-ObjectToHashtable -InputObject $PermissionObject
-    $addCmd = Get-Command Add-PASSafeMember -ErrorAction Stop
-
-    $addParams = @{
-        SafeName    = $SafeName
-        MemberName  = $MemberName
-        ErrorAction = "Stop"
-    }
-
-    foreach ($k in $permHash.Keys) {
-        if ($addCmd.Parameters.ContainsKey($k)) {
-            $addParams[$k] = $permHash[$k]
-        }
-    }
-
-    if ($addCmd.Parameters.ContainsKey("SearchIn") -and -not [string]::IsNullOrWhiteSpace($SearchIn)) {
-        $addParams["SearchIn"] = $SearchIn
-    }
-
-    if ($addCmd.Parameters.ContainsKey("memberType")) {
-        $addParams["memberType"] = $MemberType
-    }
-    elseif ($addCmd.Parameters.ContainsKey("MemberType")) {
-        $addParams["MemberType"] = $MemberType
-    }
-
-    Add-PASSafeMember @addParams | Out-Null
-    Write-LogLine ("Safe '{0}': member '{1}' added successfully." -f $SafeName, $MemberName) "SUCCESS"
-    return "ADDED"
-}
-
-$sessionCreated   = $false
-$statusRows       = New-Object System.Collections.Generic.List[object]
-$failedRows       = New-Object System.Collections.Generic.List[object]
-$unauthorizedRows = New-Object System.Collections.Generic.List[object]
+# --- MAIN ---
+$sessionCreated    = $false
+$SafeMembersReport = @()
 
 try {
-    Ensure-Directory -Path (Split-Path $LogFilePath -Parent)
-    Ensure-Directory -Path (Split-Path $StatusCsvPath -Parent)
-    Ensure-Directory -Path (Split-Path $UnauthorizedCsvPath -Parent)
-    New-Item -ItemType File -Path $LogFilePath -Force | Out-Null
-
-    Write-LogLine "Starting IND_ safe membership add-only run via ServiceUser." "INFO"
-    Write-LogLine ("TenantSubdomain={0}; IdentityTenantURL={1}; PrivilegeCloudURL={2}; SafePrefix={3}; TargetMemberName={4}" -f `
-        $TenantSubdomain, $IdentityTenantURL, $PrivilegeCloudURL, $SafePrefix, $TargetMemberName) "INFO"
-
-    Import-RequiredModules -PsPASVersion $RequiredPsPASVersion
-
+    # 1) Get Service User creds from CCP
     $serviceCred = Get-ServiceUserCredentialFromCCP `
         -CCPAddress $CCPAddress `
         -Location   $CCPLocation `
@@ -418,153 +105,111 @@ try {
         -Object     $CCPObject `
         -WindowsAuth:$CCPWindowsAuth
 
-    Connect-PASServiceUser `
-        -Credential $serviceCred `
-        -TenantSubdomain $TenantSubdomain `
+    # 2) Authenticate via Identity Shared Services using SERVICE USER
+    Write-Log "🛠  Authenticating to Privilege Cloud via Identity (Service User)..." 'Cyan'
+
+    New-PASSession `
         -IdentityTenantURL $IdentityTenantURL `
-        -PrivilegeCloudURL $PrivilegeCloudURL
+        -PrivilegeCloudURL $PrivilegeCloudURL `
+        -Credential        $serviceCred `
+        -ServiceUser `
+        -ErrorAction Stop | Out-Null
+
+    if (-not (Get-PASSession)) { throw "psPAS session not established via ServiceUser." }
 
     $sessionCreated = $true
+    Write-Log ("✅ Authenticated to {0} as service user: {1}" -f $PrivilegeCloudURL, $serviceCred.UserName) 'Green'
 
-    $targetSafes = @(Get-TargetSafeNames -Prefix $SafePrefix)
-    if (-not $targetSafes -or $targetSafes.Count -eq 0) {
-        throw "No safes found beginning with '$SafePrefix'."
+    # 3) Get all Safes
+    Write-Log "🛠  Retrieving safes via Get-PASSafe..." 'Cyan'
+    $Safes = Get-PASSafe -ErrorAction Stop
+
+    if (-not $Safes -or $Safes.Count -eq 0) {
+        Write-Log "⚠️  No safes returned from Get-PASSafe." 'Yellow'
+        return
     }
 
-    Write-Ok ("Total target safes found: {0}" -f $targetSafes.Count)
-    Write-Host ""
-    Write-Host ("Processing {0} safes that begin with '{1}'..." -f $targetSafes.Count, $SafePrefix) -ForegroundColor Cyan
+    Write-Log ("📦 Retrieved {0} safes." -f $Safes.Count) 'Green'
 
-    $counter = 0
-    foreach ($safeName in $targetSafes) {
-        $counter++
-        $status = "PENDING"
-        $errorText = ""
-
-        Write-Progress -Activity "Adding safe member where missing" -Status $safeName -PercentComplete (($counter / $targetSafes.Count) * 100)
+    # 4) For each Safe, get Safe Members and permissions
+    $i = 0
+    foreach ($Safe in $Safes) {
+        $i++
+        $SafeName = $Safe.SafeName
+        Write-Log ("🔹 [{0}/{1}] Retrieving members for Safe: {2}" -f $i, $Safes.Count, $SafeName) 'Cyan'
 
         try {
-            if ($PSCmdlet.ShouldProcess($safeName, "Add member '$TargetMemberName' only if missing")) {
-                $status = Add-SafeMemberIfMissing `
-                    -SafeName $safeName `
-                    -MemberName $TargetMemberName `
-                    -SearchIn $TargetMemberSearchIn `
-                    -MemberType $TargetMemberType `
-                    -PermissionObject $FullPermPAS
+            $SafeMembers = Get-PASSafeMember -SafeName $SafeName -ErrorAction Stop
+
+            if (-not $SafeMembers -or $SafeMembers.Count -eq 0) {
+                Write-Log ("⚠️  No members found for Safe: {0}" -f $SafeName) 'Yellow'
+                continue
             }
-            else {
-                $status = "WHATIF"
+
+            foreach ($Member in $SafeMembers) {
+
+                # Defensive null-check on Permissions so script doesn't blow up on weird entries
+                $perm = $Member.Permissions
+
+                $SafeMembersReport += [PSCustomObject]@{
+                    SafeName                               = $SafeName
+                    Member                                 = $Member.MemberName
+                    MemberType                             = $Member.MemberType
+
+                    UseAccounts                            = $perm.useAccounts
+                    RetrieveAccounts                       = $perm.retrieveAccounts
+                    ListAccounts                           = $perm.listAccounts
+                    AddAccounts                            = $perm.addAccounts
+                    UpdateAccountContent                   = $perm.updateAccountContent
+                    UpdateAccountProperties                = $perm.updateAccountProperties
+                    InitiateCPMAccountManagementOperations = $perm.initiateCPMAccountManagementOperations
+                    SpecifyNextAccountContent              = $perm.specifyNextAccountContent
+                    RenameAccounts                         = $perm.renameAccounts
+                    DeleteAccounts                         = $perm.deleteAccounts
+                    UnlockAccounts                         = $perm.unlockAccounts
+                    ManageSafe                             = $perm.manageSafe
+                    ManageSafeMembers                      = $perm.manageSafeMembers
+                    BackupSafe                             = $perm.backupSafe
+                    ViewAuditLog                           = $perm.viewAuditLog
+                    ViewSafeMembers                        = $perm.viewSafeMembers
+                    AccessWithoutConfirmation              = $perm.accessWithoutConfirmation
+                    CreateFolders                          = $perm.createFolders
+                    DeleteFolders                          = $perm.deleteFolders
+                    MoveAccountsAndFolders                 = $perm.moveAccountsAndFolders
+                    RequestsAuthorizationLevel1            = $perm.requestsAuthorizationLevel1
+                    RequestsAuthorizationLevel2            = $perm.requestsAuthorizationLevel2
+                }
             }
+
+            Write-Log ("✅ Retrieved {0} member(s) for Safe: {1}" -f $SafeMembers.Count, $SafeName) 'Green'
         }
         catch {
-            $errorText = $_.Exception.Message
-
-            if (Test-IsUnauthorizedError -Message $errorText) {
-                $status = "FAILED_UNAUTHORIZED"
-
-                $unauthRow = [PSCustomObject]@{
-                    SafeName       = $safeName
-                    TargetMember   = $TargetMemberName
-                    SearchIn       = $TargetMemberSearchIn
-                    MemberType     = $TargetMemberType
-                    FailureStage   = "ReviewOrAddMember"
-                    Error          = $errorText
-                }
-
-                $unauthorizedRows.Add($unauthRow) | Out-Null
-                Write-LogLine ("Unauthorized on safe '{0}': {1}" -f $safeName, $errorText) "WARN"
-                Write-Warn ("Unauthorized on safe '{0}' -> {1}" -f $safeName, $errorText)
-            }
-            else {
-                $status = "FAILED"
-                Write-LogLine ("Failed on safe '{0}': {1}" -f $safeName, $errorText) "ERROR"
-                Write-Err ("Failed on safe '{0}' -> {1}" -f $safeName, $errorText)
-            }
-        }
-
-        $row = [PSCustomObject]@{
-            SafeName     = $safeName
-            TargetMember = $TargetMemberName
-            SearchIn     = $TargetMemberSearchIn
-            MemberType   = $TargetMemberType
-            Status       = $status
-            Error        = $errorText
-        }
-
-        $statusRows.Add($row) | Out-Null
-
-        if ($status -like "FAILED*") {
-            $failedRows.Add($row) | Out-Null
+            Write-Log ("❌ ERROR: Failed to retrieve members for Safe: {0} - {1}" -f $SafeName, $_.Exception.Message) 'Red'
         }
     }
 
-    Export-CsvEvenIfEmpty `
-        -Rows $statusRows `
-        -Path $StatusCsvPath `
-        -Headers @("SafeName","TargetMember","SearchIn","MemberType","Status","Error")
-
-    Export-CsvEvenIfEmpty `
-        -Rows $unauthorizedRows `
-        -Path $UnauthorizedCsvPath `
-        -Headers @("SafeName","TargetMember","SearchIn","MemberType","FailureStage","Error")
-
-    $addedCount         = @($statusRows | Where-Object { $_.Status -eq "ADDED" }).Count
-    $skipCount          = @($statusRows | Where-Object { $_.Status -eq "SKIPPED_ALREADY_EXISTS" }).Count
-    $failedCount        = @($statusRows | Where-Object { $_.Status -eq "FAILED" }).Count
-    $unauthorizedCount  = @($statusRows | Where-Object { $_.Status -eq "FAILED_UNAUTHORIZED" }).Count
-    $whatIfCount        = @($statusRows | Where-Object { $_.Status -eq "WHATIF" }).Count
-
-    Write-Host ""
-    Write-Ok ("Status CSV exported: {0}" -f $StatusCsvPath)
-    Write-Ok ("Unauthorized CSV exported: {0}" -f $UnauthorizedCsvPath)
-    Write-Host ("Added:        {0}" -f $addedCount) -ForegroundColor Green
-    Write-Host ("Skipped:      {0}" -f $skipCount) -ForegroundColor Yellow
-    Write-Host ("Unauthorized: {0}" -f $unauthorizedCount) -ForegroundColor Yellow
-    Write-Host ("Failed:       {0}" -f $failedCount) -ForegroundColor Red
-    if ($whatIfCount -gt 0) {
-        Write-Host ("WhatIf:       {0}" -f $whatIfCount) -ForegroundColor Cyan
+    # 5) Export to CSV
+    if (-not $SafeMembersReport -or $SafeMembersReport.Count -eq 0) {
+        Write-Log "⚠️  No Safe Member data collected; skipping CSV export." 'Yellow'
+    }
+    else {
+        Write-Log ("🛠  Exporting Safe Member Report to: {0}" -f $CsvFilePath) 'Cyan'
+        $SafeMembersReport | Export-Csv -Path $CsvFilePath -NoTypeInformation -Encoding UTF8
+        Write-Log "✅ Safe Member Report successfully exported." 'Green'
     }
 
-    if ($failedRows.Count -gt 0) {
-        Write-Host ""
-        $failedRows | Sort-Object SafeName | Format-Table -AutoSize
-    }
-
-    Write-LogLine ("Completed run. SafesProcessed={0}; Added={1}; Skipped={2}; Unauthorized={3}; Failed={4}; WhatIf={5}" -f `
-        $statusRows.Count, $addedCount, $skipCount, $unauthorizedCount, $failedCount, $whatIfCount) "SUCCESS"
+    Write-Log "🔹 Safe Member Report generation completed." 'Cyan'
 }
 catch {
-    Write-LogLine ("Fatal error: {0}" -f $_.Exception.Message) "ERROR"
-    Write-Err $_.Exception.Message
-
-    try {
-        Export-CsvEvenIfEmpty `
-            -Rows $statusRows `
-            -Path $StatusCsvPath `
-            -Headers @("SafeName","TargetMember","SearchIn","MemberType","Status","Error")
-
-        Export-CsvEvenIfEmpty `
-            -Rows $unauthorizedRows `
-            -Path $UnauthorizedCsvPath `
-            -Headers @("SafeName","TargetMember","SearchIn","MemberType","FailureStage","Error")
-
-        Write-LogLine "Partial CSV export completed after fatal error." "WARN"
-    }
-    catch {
-        Write-LogLine ("Failed to export partial CSV after fatal error: {0}" -f $_.Exception.Message) "WARN"
-    }
+    Write-Log ("❌ FATAL ERROR: {0}" -f $_.Exception.Message) 'Red'
 }
 finally {
     if ($sessionCreated) {
         try {
             Close-PASSession | Out-Null
-            Write-Info "Logged off PAS session."
-            Write-LogLine "Logged off PAS session." "INFO"
-        }
-        catch {
-            Write-LogLine ("Logoff warning: {0}" -f $_.Exception.Message) "WARN"
+            Write-Log "✅ Logged off from Privilege Cloud." 'Green'
+        } catch {
+            Write-Log ("⚠️  Logoff warning: {0}" -f $_.Exception.Message) 'Yellow'
         }
     }
 }
-
-$failedRows
