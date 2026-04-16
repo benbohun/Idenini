@@ -19,7 +19,7 @@ $OverrideParam = [ordered]@{
     EnforceInDualControlRequest = "No"
 }
 
-# ---------------- LOAD ZIP SUPPORT ----------------
+# ---------------- ZIP SUPPORT ----------------
 try { Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop } catch {}
 
 # ---------------- LOGGING ----------------
@@ -184,9 +184,11 @@ function Invoke-EPVRest {
     $webSession = Get-PASWebSession
     $path = $RelativePath.TrimStart('/')
 
+    $lastError = $null
+
     foreach ($apiPrefix in @("API","api")) {
-        $uri = "https://{0}.privilegecloud.cyberark.cloud/PasswordVault/{1}" -f `
-            $PCloudSubdomain, ($path -replace '^API|^api', $apiPrefix)
+        $candidatePath = $path -replace '^(API|api)', $apiPrefix
+        $uri = "https://{0}.privilegecloud.cyberark.cloud/PasswordVault/{1}" -f $PCloudSubdomain, $candidatePath
 
         try {
             $params = @{
@@ -216,6 +218,27 @@ function Invoke-EPVRest {
     throw $lastError
 }
 
+function Get-PlatformByStringId {
+    param([Parameter(Mandatory)][string]$PlatformID)
+
+    $search = [uri]::EscapeDataString($PlatformID)
+    $result = Invoke-EPVRest -Method GET -RelativePath ("API/Platforms/Targets?search={0}" -f $search)
+
+    $matches = @($result.Platforms | Where-Object {
+        $_.PlatformID -eq $PlatformID
+    })
+
+    if ($matches.Count -eq 0) {
+        throw "Platform [$PlatformID] was not found."
+    }
+
+    if ($matches.Count -gt 1) {
+        throw "Multiple exact matches returned for platform [$PlatformID]."
+    }
+
+    return $matches[0]
+}
+
 function Get-PlatformDetails {
     param([Parameter(Mandatory)][string]$PlatformID)
 
@@ -223,11 +246,10 @@ function Get-PlatformDetails {
     return Invoke-EPVRest -Method GET -RelativePath ("API/Platforms/{0}/" -f $encoded)
 }
 
-function Get-PlatformSessionManagement {
-    param([Parameter(Mandatory)][string]$PlatformID)
+function Get-PlatformSessionManagementByNumericId {
+    param([Parameter(Mandatory)][int]$PlatformNumericID)
 
-    $encoded = [uri]::EscapeDataString($PlatformID)
-    return Invoke-EPVRest -Method GET -RelativePath ("API/Platforms/Targets/{0}/PrivilegedSessionManagement/" -f $encoded)
+    return Invoke-EPVRest -Method GET -RelativePath ("API/Platforms/Targets/{0}/PrivilegedSessionManagement/" -f $PlatformNumericID)
 }
 
 function Export-PlatformZip {
@@ -242,6 +264,7 @@ function Export-PlatformZip {
 
     $webSession = Get-PASWebSession
     $encoded = [uri]::EscapeDataString($PlatformID)
+    $lastError = $null
 
     foreach ($apiPrefix in @("API","api")) {
         $uri = "https://{0}.privilegecloud.cyberark.cloud/PasswordVault/{1}/Platforms/{2}/Export/" -f `
@@ -267,9 +290,7 @@ function Clear-StoredPlatformSilently {
     try {
         Invoke-EPVRest -Method DELETE -RelativePath "API/Platforms/Storage" | Out-Null
     }
-    catch {
-        # intentionally silent
-    }
+    catch {}
 }
 
 function Import-PlatformZipToStorage {
@@ -354,10 +375,10 @@ function Get-PackageSignals {
 
             if ($hasUserParameters -or $hasAllowMapping -or $hasAllowSelect) {
                 $signalHits.Add([pscustomobject]@{
-                    FilePath           = $file.FullName
-                    HasUserParameters  = $hasUserParameters
-                    HasAllowMapping    = $hasAllowMapping
-                    HasAllowSelectHTML5 = $hasAllowSelect
+                    FilePath             = $file.FullName
+                    HasUserParameters    = $hasUserParameters
+                    HasAllowMapping      = $hasAllowMapping
+                    HasAllowSelectHTML5  = $hasAllowSelect
                 })
             }
         }
@@ -484,14 +505,13 @@ function Update-PlatformPackage {
         [System.IO.Compression.ZipFile]::ExtractToDirectory($InputZip, $extractDir)
 
         $signals = @(Get-PackageSignals -ExtractDir $extractDir)
-
         if ($signals.Count -eq 0) {
-            throw "Export validated, but the package does not expose UserParameters or AllowMappingLocalDrives. No safe platform-level override edit is possible from this export."
+            throw "Connector linkage and export were validated, but the package does not expose UserParameters or AllowMappingLocalDrives. No safe package-based override edit is possible for this export."
         }
 
         $xmlFiles = @(Get-ChildItem -LiteralPath $extractDir -Recurse -File -Filter "*.xml")
         if ($xmlFiles.Count -eq 0) {
-            throw "Export validated, but no XML files were found in the package."
+            throw "Export succeeded, but no XML files were found in the package."
         }
 
         $xmlChanged = 0
@@ -523,9 +543,9 @@ function Update-PlatformPackage {
         if (($updated + $added) -lt 1) {
             $ctxText = ""
             if ($contexts.Count -gt 0) {
-                $ctxText = " Candidate contexts discovered: " + (($contexts | Select-Object -First 5) -join " || ")
+                $ctxText = " Candidate contexts: " + (($contexts | Select-Object -First 5) -join " || ")
             }
-            throw ("Connector linkage validated and export succeeded, but no editable UserParameters block was updated for this connector." + $ctxText)
+            throw ("Export exposed signal files, but no editable UserParameters block was updated for this connector." + $ctxText)
         }
 
         if (Test-Path -LiteralPath $modifiedZip) {
@@ -559,7 +579,6 @@ if (-not (Test-Path -LiteralPath $CsvPath)) {
 }
 
 $rows = @(Import-Csv -LiteralPath $CsvPath)
-
 if (@($rows).Count -eq 0) {
     throw "CSV is empty: $CsvPath"
 }
@@ -575,7 +594,6 @@ if (@($rows).Count -eq 0) {
 
 # ---------------- MAIN ----------------
 $reportItems = New-Object System.Collections.Generic.List[object]
-
 Write-Log ("Platforms to process: {0}" -f @($rows).Count) "Green"
 
 try {
@@ -590,6 +608,7 @@ try {
         $report = [ordered]@{
             Timestamp               = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
             PlatformID              = $platformID
+            PlatformNumericID       = ""
             ConnectionComponentName = $componentName
             PSMServerId             = ""
             LinkedConnectorIDs      = ""
@@ -607,9 +626,13 @@ try {
         Write-Log ("[{0}/{1}] {2}" -f $index, @($rows).Count, $platformID) "Magenta"
 
         try {
+            $platformLookup = Get-PlatformByStringId -PlatformID $platformID
+            $platformNumericID = [int]$platformLookup.ID
+            $report.PlatformNumericID = $platformNumericID
+
             $null = Get-PlatformDetails -PlatformID $platformID
 
-            $psmPolicy = Get-PlatformSessionManagement -PlatformID $platformID
+            $psmPolicy = Get-PlatformSessionManagementByNumericId -PlatformNumericID $platformNumericID
             $connectorList = @($psmPolicy.PSMConnectors)
             $report.PSMServerId = [string]$psmPolicy.PSMServerId
             $report.LinkedConnectorIDs = (($connectorList | ForEach-Object { $_.PSMConnectorID }) -join "; ")
@@ -629,11 +652,10 @@ try {
                         $componentName, $report.LinkedConnectorIDs)
                 }
 
-                $enabledState = @($targetConnector | ForEach-Object { [string]$_.Enabled }) -join "; "
-                Write-Log ("Validated connector [{0}] on platform. Enabled={1}" -f $componentName, $enabledState) "Green"
+                Write-Log ("Validated connector [{0}] on platform." -f $componentName) "Green"
             }
             else {
-                Write-Log ("Validated platform PSM linkage. Linked connectors: {0}" -f $report.LinkedConnectorIDs) "Green"
+                Write-Log ("Validated platform PSM linkage." ) "Green"
             }
 
             $exportZip = Export-PlatformZip -PlatformID $platformID -DestinationFolder $BackupRoot
