@@ -1,14 +1,14 @@
 [CmdletBinding()]
 param(
-    [string]$CsvPath    = "E:\Installation Media\Script\OnboardScript\csv\OverrideComponentPlatform.csv",
-    [string]$OutputRoot = "E:\Installation Media\Script\OnboardScript\logs\Platform_HTML5_Override",
-    [switch]$WhatIf
+    [string]$CsvPath                = "E:\Installation Media\Script\OnboardScript\csv\OverrideComponentPlatform.csv",
+    [string]$OutputRoot             = "E:\Installation Media\Script\OnboardScript\logs\Platform_HTML5_Override",
+    [switch]$WhatIf,
+    [switch]$UseSingleBlockFallback = $true
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-# ---------------- CONSTANTS / TARGET OVERRIDE PARAMETER ----------------
 $OverrideParam = [ordered]@{
     Name                        = "AllowSelectHTML5"
     DisplayName                 = "Connect Via Browser"
@@ -19,15 +19,11 @@ $OverrideParam = [ordered]@{
     EnforceInDualControlRequest = "No"
 }
 
-# ---------------- LOAD .NET ZIP SUPPORT ----------------
 try {
     Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
 }
-catch {
-    # Already available / loaded
-}
+catch {}
 
-# ---------------- LOGGING ----------------
 function Write-Log {
     param(
         [Parameter(Mandatory)][string]$Message,
@@ -39,7 +35,6 @@ function Write-Log {
     Write-Host ("{0} | {1}" -f $stamp, $Message) -ForegroundColor $Color
 }
 
-# ---------------- LOAD psPAS ----------------
 try {
     Import-Module psPAS -Force -ErrorAction Stop
     $mod = Get-Module psPAS
@@ -50,7 +45,6 @@ catch {
     exit 1
 }
 
-# ---------------- CCP + IDENTITY SETTINGS ----------------
 $CCPAddress      = "https://vskau1p1231.cna.com"
 $CCPLocation     = "AIMWebService"
 $CCPAppID        = "PAMDiscovery"
@@ -62,7 +56,6 @@ $CCPWindowsAuth  = $false
 $IdentityTenantURL = "https://aat4012.id.cyberark.cloud"
 $PCloudSubdomain   = "cna-prod"
 
-# ---------------- OUTPUT FOLDERS ----------------
 $BackupRoot  = Join-Path $OutputRoot "Backups"
 $WorkRoot    = Join-Path $OutputRoot "Work"
 $ReportRoot  = Join-Path $OutputRoot "Reports"
@@ -73,7 +66,6 @@ foreach ($folder in @($OutputRoot, $BackupRoot, $WorkRoot, $ReportRoot)) {
     }
 }
 
-# ---------------- HELPERS ----------------
 function Get-SafeFileName {
     param([Parameter(Mandatory)][string]$Name)
     return ($Name -replace '[\\/:*?"<>|]', '_')
@@ -94,6 +86,13 @@ function Get-OptionalCsvValue {
     return $value.Trim()
 }
 
+function Normalize-Token {
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return "" }
+    return (($Value.ToLowerInvariant()) -replace '[^a-z0-9]', '')
+}
+
 function Set-XmlAttribute {
     param(
         [Parameter(Mandatory)][System.Xml.XmlElement]$Element,
@@ -112,6 +111,32 @@ function Set-XmlAttribute {
     }
 }
 
+function Get-NodeContextStrings {
+    param(
+        [Parameter(Mandatory)][System.Xml.XmlNode]$Node
+    )
+
+    $list = New-Object System.Collections.Generic.List[string]
+    $current = $Node
+
+    while ($null -ne $current) {
+        if ($null -ne $current.Attributes) {
+            foreach ($attrName in @("Name","ID","Id","ComponentName","ConnectionComponent","PSMConnectorID","ConnectorID","DisplayName")) {
+                $attr = $current.Attributes[$attrName]
+                if ($null -ne $attr -and -not [string]::IsNullOrWhiteSpace($attr.Value)) {
+                    $value = $attr.Value.Trim()
+                    if (-not $list.Contains($value)) {
+                        $list.Add($value)
+                    }
+                }
+            }
+        }
+        $current = $current.ParentNode
+    }
+
+    return @($list)
+}
+
 function Test-XmlContextMatch {
     param(
         [Parameter(Mandatory)][System.Xml.XmlNode]$Node,
@@ -122,19 +147,19 @@ function Test-XmlContextMatch {
         return $true
     }
 
-    $current = $Node
-    while ($null -ne $current) {
-        if ($null -ne $current.Attributes) {
-            foreach ($attrName in @("Name","ID","Id","ComponentName","ConnectionComponent","PSMConnectorID","ConnectorID")) {
-                $attr = $current.Attributes[$attrName]
-                if ($null -ne $attr -and -not [string]::IsNullOrWhiteSpace($attr.Value)) {
-                    if ($attr.Value.IndexOf($ConnectionComponentName, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
-                        return $true
-                    }
-                }
-            }
-        }
-        $current = $current.ParentNode
+    $needle = Normalize-Token $ConnectionComponentName
+    if ([string]::IsNullOrWhiteSpace($needle)) {
+        return $true
+    }
+
+    $contexts = @(Get-NodeContextStrings -Node $Node)
+    foreach ($ctx in $contexts) {
+        $nctx = Normalize-Token $ctx
+        if ([string]::IsNullOrWhiteSpace($nctx)) { continue }
+
+        if ($nctx -eq $needle) { return $true }
+        if ($nctx.Contains($needle)) { return $true }
+        if ($needle.Contains($nctx)) { return $true }
     }
 
     return $false
@@ -355,14 +380,21 @@ function Clear-StoredPlatform {
         Write-Log "Cleared stored platform memory." "Gray"
     }
     catch {
-        Write-Log ("Stored platform clear skipped: {0}" -f $_.Exception.Message) "Gray"
+        $msg = $_.Exception.Message
+        if ($msg -match '\(400\)') {
+            Write-Log "Stored platform clear returned 400. Continuing." "Gray"
+        }
+        else {
+            Write-Log ("Stored platform clear skipped: {0}" -f $msg) "Gray"
+        }
     }
 }
 
 function Update-AllowSelectHTML5InXmlFile {
     param(
         [Parameter(Mandatory)][string]$XmlPath,
-        [string]$ConnectionComponentName
+        [string]$ConnectionComponentName,
+        [switch]$UseSingleBlockFallback
     )
 
     [xml]$xml = Get-Content -LiteralPath $XmlPath -Raw
@@ -375,18 +407,37 @@ function Update-AllowSelectHTML5InXmlFile {
     $userParamBlocks = @($xml.SelectNodes("//*[local-name()='UserParameters']"))
     if (-not $userParamBlocks -or $userParamBlocks.Count -eq 0) {
         return [pscustomobject]@{
-            Changed       = $false
-            UpdatedNodes  = 0
-            AddedNodes    = 0
-            BlocksTouched = 0
+            Changed            = $false
+            UpdatedNodes       = 0
+            AddedNodes         = 0
+            BlocksTouched      = 0
+            ContextsDiscovered = @()
         }
     }
 
+    $contextsDiscovered = New-Object System.Collections.Generic.List[string]
+    $matchedBlocks = New-Object System.Collections.Generic.List[System.Xml.XmlNode]
+
     foreach ($block in $userParamBlocks) {
-        if (-not (Test-XmlContextMatch -Node $block -ConnectionComponentName $ConnectionComponentName)) {
-            continue
+        $contexts = @(Get-NodeContextStrings -Node $block)
+        if ($contexts.Count -gt 0) {
+            $joined = ($contexts -join " | ")
+            if (-not $contextsDiscovered.Contains($joined)) {
+                $contextsDiscovered.Add($joined)
+            }
         }
 
+        if (Test-XmlContextMatch -Node $block -ConnectionComponentName $ConnectionComponentName) {
+            $matchedBlocks.Add($block)
+        }
+    }
+
+    if ($matchedBlocks.Count -eq 0 -and $UseSingleBlockFallback -and $userParamBlocks.Count -eq 1) {
+        Write-Log ("No component match found in [{0}], but only one UserParameters block exists. Using single-block fallback." -f $XmlPath) "Yellow"
+        $matchedBlocks.Add($userParamBlocks[0])
+    }
+
+    foreach ($block in $matchedBlocks) {
         $existingInBlock = @($block.SelectNodes("./*[local-name()='Parameter' and @Name='AllowSelectHTML5']"))
 
         if ($existingInBlock.Count -gt 0) {
@@ -399,11 +450,9 @@ function Update-AllowSelectHTML5InXmlFile {
                 Set-XmlAttribute -Element $element -Name "Required" -Value $OverrideParam.Required
                 Set-XmlAttribute -Element $element -Name "Value" -Value $OverrideParam.Value
                 Set-XmlAttribute -Element $element -Name "EnforceInDualControlRequest" -Value $OverrideParam.EnforceInDualControlRequest
-
                 $changed = $true
                 $updatedNodes++
             }
-
             $blocksTouched++
             continue
         }
@@ -424,7 +473,6 @@ function Update-AllowSelectHTML5InXmlFile {
         }
 
         $newElement = [System.Xml.XmlElement]$newNode
-
         Set-XmlAttribute -Element $newElement -Name "Name" -Value $OverrideParam.Name
         Set-XmlAttribute -Element $newElement -Name "DisplayName" -Value $OverrideParam.DisplayName
         Set-XmlAttribute -Element $newElement -Name "Visible" -Value $OverrideParam.Visible
@@ -434,7 +482,6 @@ function Update-AllowSelectHTML5InXmlFile {
         Set-XmlAttribute -Element $newElement -Name "EnforceInDualControlRequest" -Value $OverrideParam.EnforceInDualControlRequest
 
         [void]$block.AppendChild($newElement)
-
         $changed = $true
         $addedNodes++
         $blocksTouched++
@@ -445,10 +492,11 @@ function Update-AllowSelectHTML5InXmlFile {
     }
 
     return [pscustomobject]@{
-        Changed       = $changed
-        UpdatedNodes  = $updatedNodes
-        AddedNodes    = $addedNodes
-        BlocksTouched = $blocksTouched
+        Changed            = $changed
+        UpdatedNodes       = $updatedNodes
+        AddedNodes         = $addedNodes
+        BlocksTouched      = $blocksTouched
+        ContextsDiscovered = @($contextsDiscovered)
     }
 }
 
@@ -457,7 +505,8 @@ function Update-PlatformPackage {
         [Parameter(Mandatory)][string]$PlatformID,
         [Parameter(Mandatory)][string]$InputZip,
         [Parameter(Mandatory)][string]$WorkingRoot,
-        [string]$ConnectionComponentName
+        [string]$ConnectionComponentName,
+        [switch]$UseSingleBlockFallback
     )
 
     if (-not (Test-Path -LiteralPath $InputZip)) {
@@ -486,9 +535,19 @@ function Update-PlatformPackage {
         $updatedNodes    = 0
         $addedNodes      = 0
         $blocksTouched   = 0
+        $allContexts     = New-Object System.Collections.Generic.List[string]
 
         foreach ($xmlFile in $xmlFiles) {
-            $result = Update-AllowSelectHTML5InXmlFile -XmlPath $xmlFile.FullName -ConnectionComponentName $ConnectionComponentName
+            $result = Update-AllowSelectHTML5InXmlFile `
+                -XmlPath $xmlFile.FullName `
+                -ConnectionComponentName $ConnectionComponentName `
+                -UseSingleBlockFallback:$UseSingleBlockFallback
+
+            foreach ($ctx in @($result.ContextsDiscovered)) {
+                if (-not [string]::IsNullOrWhiteSpace($ctx) -and -not $allContexts.Contains($ctx)) {
+                    $allContexts.Add($ctx)
+                }
+            }
 
             if ($result.Changed) {
                 $xmlFilesChanged++
@@ -504,6 +563,14 @@ function Update-PlatformPackage {
             if ($ConnectionComponentName) {
                 $msg += " Component filter used: [$ConnectionComponentName]."
             }
+
+            if ($allContexts.Count -gt 0) {
+                $msg += " Discovered component contexts: " + (($allContexts | Select-Object -First 10) -join " || ")
+            }
+            else {
+                $msg += " No UserParameters component contexts were discovered."
+            }
+
             throw $msg
         }
 
@@ -514,11 +581,12 @@ function Update-PlatformPackage {
         [System.IO.Compression.ZipFile]::CreateFromDirectory($extractDir, $modifiedZip)
 
         return [pscustomobject]@{
-            ModifiedZip     = $modifiedZip
-            XmlFilesChanged = $xmlFilesChanged
-            UpdatedNodes    = $updatedNodes
-            AddedNodes      = $addedNodes
-            BlocksTouched   = $blocksTouched
+            ModifiedZip      = $modifiedZip
+            XmlFilesChanged  = $xmlFilesChanged
+            UpdatedNodes     = $updatedNodes
+            AddedNodes       = $addedNodes
+            BlocksTouched    = $blocksTouched
+            ContextsFound    = @($allContexts)
         }
     }
     finally {
@@ -528,7 +596,6 @@ function Update-PlatformPackage {
     }
 }
 
-# ---------------- VALIDATE CSV ----------------
 Write-Log ("Using embedded CSV path: {0}" -f $CsvPath) "Cyan"
 
 if (-not (Test-Path -LiteralPath $CsvPath)) {
@@ -551,7 +618,6 @@ if (-not $rows -or @($rows).Count -eq 0) {
     throw "CSV contains no usable PlatformID values."
 }
 
-# ---------------- MAIN ----------------
 $reportItems = New-Object System.Collections.Generic.List[object]
 
 Write-Log ("CSV loaded successfully. Platforms to process: {0}" -f @($rows).Count) "Green"
@@ -576,6 +642,7 @@ try {
             UserParamBlocksTouched  = 0
             UpdatedNodes            = 0
             AddedNodes              = 0
+            ContextsFound           = ""
             Result                  = ""
             Error                   = ""
         }
@@ -600,16 +667,22 @@ try {
                 -PlatformID $platformID `
                 -InputZip $exportZip `
                 -WorkingRoot $WorkRoot `
-                -ConnectionComponentName $componentName
+                -ConnectionComponentName $componentName `
+                -UseSingleBlockFallback:$UseSingleBlockFallback
 
             $report.ModifiedZip            = $packageUpdate.ModifiedZip
             $report.XmlFilesChanged        = $packageUpdate.XmlFilesChanged
             $report.UserParamBlocksTouched = $packageUpdate.BlocksTouched
             $report.UpdatedNodes           = $packageUpdate.UpdatedNodes
             $report.AddedNodes             = $packageUpdate.AddedNodes
+            $report.ContextsFound          = (@($packageUpdate.ContextsFound) -join " || ")
 
             Write-Log ("Package modified successfully. XML files changed: {0}; Updated nodes: {1}; Added nodes: {2}" -f `
                 $packageUpdate.XmlFilesChanged, $packageUpdate.UpdatedNodes, $packageUpdate.AddedNodes) "Green"
+
+            if ($report.ContextsFound) {
+                Write-Log ("Discovered component contexts: {0}" -f $report.ContextsFound) "Gray"
+            }
 
             if ($WhatIf) {
                 Write-Log "WHATIF enabled. Skipping import and platform overwrite." "Yellow"
@@ -657,7 +730,6 @@ finally {
     }
 }
 
-# ---------------- EXPORT REPORT ----------------
 $reportPath = Join-Path $ReportRoot ("Platform_HTML5_Override_Report_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
 $reportItems | Export-Csv -LiteralPath $reportPath -NoTypeInformation -Encoding UTF8
 
