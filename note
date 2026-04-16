@@ -1,19 +1,50 @@
-I am trying to add the below Override User Parameters at platform level, 
-I need to be able to specify the target platform in CSV by their ID name
-Using my usual login method below
-Draft a script to update the platform PSM component in csv with the overide parameter
-Research online for the right way to handle this
+PlatformID,ConnectionComponentName
+WinDomainLocal,PSM-RDP
+UnixSSH,PSM-SSH
+SQLServerLocal,
 
 
-Override User Parameters
-Name:AllowSelectHTML5
-DisplayName: Connect Via Browser
-Visible: Yes
-Type:CyberArk.TransparentConnection.BooleanUserParameter, CyberArk.PasswordVault.TransparentConnection
-Required: Yes
-Value: No
-EnforceInDualControlRequest: No
 
+[CmdletBinding()]
+param(
+    [string]$CsvPath    = "E:\Installation Media\Script\OnboardScript\csv\OverrideComponentPlatform.csvi",
+    [string]$OutputRoot = "E:\Installation Media\Script\OnboardScript\logs\Platform_HTML5_Override",
+    [switch]$WhatIf
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+# ---------------- CONSTANTS / TARGET OVERRIDE PARAMETER ----------------
+$OverrideParam = [ordered]@{
+    Name                        = "AllowSelectHTML5"
+    DisplayName                 = "Connect Via Browser"
+    Visible                     = "Yes"
+    Type                        = "CyberArk.TransparentConnection.BooleanUserParameter, CyberArk.PasswordVault.TransparentConnection"
+    Required                    = "Yes"
+    Value                       = "No"
+    EnforceInDualControlRequest = "No"
+}
+
+# ---------------- LOAD .NET ZIP SUPPORT ----------------
+try {
+    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+}
+catch {
+    # Safe to ignore if already loaded / available
+}
+
+# ---------------- LOGGING ----------------
+function Write-Log {
+    param(
+        [Parameter(Mandatory)][string]$Message,
+        [ValidateSet("Gray","Green","Yellow","Red","Cyan","White","Magenta")]
+        [string]$Color = "White"
+    )
+
+    $stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    Write-Host ("{0} | {1}" -f $stamp, $Message) -ForegroundColor $Color
+}
 
 # ---------------- LOAD psPAS ----------------
 try {
@@ -38,31 +69,82 @@ $CCPWindowsAuth  = $false
 $IdentityTenantURL = "https://aat4012.id.cyberark.cloud"
 $PCloudSubdomain   = "cna-prod"
 
-# ---------------- HELPERS ----------------
-function Join-Names {
-    param($arr)
+# ---------------- OUTPUT FOLDERS ----------------
+$BackupRoot  = Join-Path $OutputRoot "Backups"
+$WorkRoot    = Join-Path $OutputRoot "Work"
+$ReportRoot  = Join-Path $OutputRoot "Reports"
 
-    if (-not $arr) { return "" }
-
-    try {
-        return (($arr | ForEach-Object { $_.name } | Where-Object { $_ }) -join "; ")
-    }
-    catch {
-        return ""
+foreach ($folder in @($OutputRoot, $BackupRoot, $WorkRoot, $ReportRoot)) {
+    if (-not (Test-Path -LiteralPath $folder)) {
+        $null = New-Item -Path $folder -ItemType Directory -Force
     }
 }
 
-function Join-PropNames {
-    param($arr)
+# ---------------- HELPERS ----------------
+function Get-SafeFileName {
+    param([Parameter(Mandatory)][string]$Name)
+    return ($Name -replace '[\\/:*?"<>|]', '_')
+}
 
-    if (-not $arr) { return "" }
+function Get-OptionalCsvValue {
+    param(
+        [Parameter(Mandatory)]$Row,
+        [Parameter(Mandatory)][string]$ColumnName
+    )
 
-    try {
-        return (($arr | ForEach-Object { $_.name } | Where-Object { $_ }) -join "; ")
+    $prop = $Row.PSObject.Properties[$ColumnName]
+    if ($null -eq $prop) { return $null }
+
+    $value = [string]$prop.Value
+    if ([string]::IsNullOrWhiteSpace($value)) { return $null }
+
+    return $value.Trim()
+}
+
+function Set-XmlAttribute {
+    param(
+        [Parameter(Mandatory)][System.Xml.XmlElement]$Element,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$Value
+    )
+
+    $existing = $Element.GetAttributeNode($Name)
+    if ($null -eq $existing) {
+        $attr = $Element.OwnerDocument.CreateAttribute($Name)
+        $attr.Value = $Value
+        [void]$Element.Attributes.Append($attr)
     }
-    catch {
-        return ""
+    else {
+        $existing.Value = $Value
     }
+}
+
+function Test-XmlContextMatch {
+    param(
+        [Parameter(Mandatory)][System.Xml.XmlNode]$Node,
+        [string]$ConnectionComponentName
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ConnectionComponentName)) {
+        return $true
+    }
+
+    $current = $Node
+    while ($null -ne $current) {
+        if ($null -ne $current.Attributes) {
+            foreach ($attrName in @("Name","ID","Id","ComponentName","ConnectionComponent","PSMConnectorID","ConnectorID")) {
+                $attr = $current.Attributes[$attrName]
+                if ($null -ne $attr -and -not [string]::IsNullOrWhiteSpace($attr.Value)) {
+                    if ($attr.Value.IndexOf($ConnectionComponentName, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                        return $true
+                    }
+                }
+            }
+        }
+        $current = $current.ParentNode
+    }
+
+    return $false
 }
 
 function Start-PASSessionFromCCP {
@@ -100,9 +182,10 @@ function Start-PASSessionFromCCP {
         -IdentityTenantURL $IdentityTenantURL `
         -psPASFormat `
         -PCloudSubdomain $PCloudSubdomain `
-        -UPCreds $UPCred
+        -UPCreds $UPCred `
+        -ErrorAction Stop
 
-    Use-PASSession $headerSession
+    Use-PASSession $headerSession | Out-Null
 
     if (-not (Get-PASSession)) {
         throw "psPAS session not established."
@@ -111,25 +194,101 @@ function Start-PASSessionFromCCP {
     Write-Log ("PAS session established ({0})." -f $UPUser) "Green"
 }
 
-function Get-Platforms {
-    param([string]$QueryString)
+function Invoke-PlatformRest {
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet("GET","POST","PATCH","DELETE")]
+        [string]$Method,
+
+        [Parameter(Mandatory)]
+        [string]$RelativePath,
+
+        [object]$Body,
+
+        [switch]$UseLowercaseApi
+    )
 
     $s = Get-PASSession
     if (-not $s -or -not $s.WebSession) {
         throw "No psPAS WebSession found. Auth failed or session not set."
     }
 
-    $u1 = "https://{0}.privilegecloud.cyberark.cloud/PasswordVault/API/Platforms{1}" -f $PCloudSubdomain, $QueryString
-    $u2 = "https://{0}.privilegecloud.cyberark.cloud/PasswordVault/api/Platforms{1}" -f $PCloudSubdomain, $QueryString
+    $rel = $RelativePath.TrimStart('/')
+    if ($UseLowercaseApi) {
+        $rel = $rel -replace '^API/', 'api/'
+    }
+
+    $uri = "https://{0}.privilegecloud.cyberark.cloud/PasswordVault/{1}" -f $PCloudSubdomain, $rel
+
+    $params = @{
+        Uri         = $uri
+        Method      = $Method
+        WebSession  = $s.WebSession
+        ErrorAction = "Stop"
+    }
+
+    if ($null -ne $Body) {
+        $params["ContentType"] = "application/json"
+        $params["Body"]        = ($Body | ConvertTo-Json -Depth 50 -Compress)
+    }
 
     try {
-        Write-Log ("Calling: {0}" -f $u1) "Cyan"
-        return Invoke-RestMethod -Uri $u1 -Method GET -WebSession $s.WebSession -ErrorAction Stop
+        return Invoke-RestMethod @params
     }
     catch {
-        Write-Log ("First endpoint failed, trying lowercase path. Reason: {0}" -f $_.Exception.Message) "Yellow"
-        Write-Log ("Calling: {0}" -f $u2) "Cyan"
-        return Invoke-RestMethod -Uri $u2 -Method GET -WebSession $s.WebSession -ErrorAction Stop
+        if (-not $UseLowercaseApi -and $rel -match '^API/') {
+            Write-Log ("Primary API path failed, retrying lowercase path. Reason: {0}" -f $_.Exception.Message) "Yellow"
+            return Invoke-PlatformRest -Method $Method -RelativePath $RelativePath -Body $Body -UseLowercaseApi
+        }
+        throw
+    }
+}
+
+function Invoke-PlatformDownload {
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet("GET","POST")]
+        [string]$Method,
+
+        [Parameter(Mandatory)]
+        [string]$RelativePath,
+
+        [Parameter(Mandatory)]
+        [string]$OutFile,
+
+        [switch]$UseLowercaseApi
+    )
+
+    $s = Get-PASSession
+    if (-not $s -or -not $s.WebSession) {
+        throw "No psPAS WebSession found. Auth failed or session not set."
+    }
+
+    $rel = $RelativePath.TrimStart('/')
+    if ($UseLowercaseApi) {
+        $rel = $rel -replace '^API/', 'api/'
+    }
+
+    $uri = "https://{0}.privilegecloud.cyberark.cloud/PasswordVault/{1}" -f $PCloudSubdomain, $rel
+
+    $params = @{
+        Uri         = $uri
+        Method      = $Method
+        WebSession  = $s.WebSession
+        OutFile     = $OutFile
+        ErrorAction = "Stop"
+    }
+
+    try {
+        Invoke-WebRequest @params | Out-Null
+        return $OutFile
+    }
+    catch {
+        if (-not $UseLowercaseApi -and $rel -match '^API/') {
+            Write-Log ("Primary download path failed, retrying lowercase path. Reason: {0}" -f $_.Exception.Message) "Yellow"
+            return Invoke-PlatformDownload -Method $Method -RelativePath $RelativePath -OutFile $OutFile -UseLowercaseApi
+        }
+        throw
     }
 }
 
@@ -138,60 +297,378 @@ function Get-PlatformDetails {
         [Parameter(Mandatory)][string]$PlatformID
     )
 
-    $s = Get-PASSession
-    if (-not $s -or -not $s.WebSession) {
-        throw "No psPAS WebSession found. Auth failed or session not set."
-    }
-
     $encodedPlatformID = [uri]::EscapeDataString($PlatformID)
-
-    # Trailing slash helps when the platform name contains dots
-    $u1 = "https://{0}.privilegecloud.cyberark.cloud/PasswordVault/API/Platforms/{1}/" -f $PCloudSubdomain, $encodedPlatformID
-    $u2 = "https://{0}.privilegecloud.cyberark.cloud/PasswordVault/api/Platforms/{1}/" -f $PCloudSubdomain, $encodedPlatformID
-
-    try {
-        Write-Log ("Calling platform details: {0}" -f $u1) "Gray"
-        return Invoke-RestMethod -Uri $u1 -Method GET -WebSession $s.WebSession -ErrorAction Stop
-    }
-    catch {
-        Write-Log ("Platform details (uppercase path) failed for [{0}], trying lowercase path. Reason: {1}" -f $PlatformID, $_.Exception.Message) "Yellow"
-        Write-Log ("Calling platform details: {0}" -f $u2) "Gray"
-        return Invoke-RestMethod -Uri $u2 -Method GET -WebSession $s.WebSession -ErrorAction Stop
-    }
+    return Invoke-PlatformRest -Method GET -RelativePath ("API/Platforms/{0}/" -f $encodedPlatformID)
 }
 
-function Get-PlatformExportZip {
+function Export-PlatformZip {
+    param(
+        [Parameter(Mandatory)][string]$PlatformID,
+        [Parameter(Mandatory)][string]$DestinationFolder
+    )
+
+    $safeName = Get-SafeFileName -Name $PlatformID
+    $stamp    = Get-Date -Format "yyyyMMdd_HHmmss"
+    $zipPath  = Join-Path $DestinationFolder ("{0}_{1}.zip" -f $safeName, $stamp)
+
+    $encodedPlatformID = [uri]::EscapeDataString($PlatformID)
+    Write-Log ("Exporting platform package for [{0}]..." -f $PlatformID) "Cyan"
+
+    Invoke-PlatformDownload -Method POST -RelativePath ("API/Platforms/{0}/Export/" -f $encodedPlatformID) -OutFile $zipPath | Out-Null
+
+    if (-not (Test-Path -LiteralPath $zipPath)) {
+        throw "Platform export did not create ZIP file for [$PlatformID]."
+    }
+
+    Write-Log ("Platform package exported: {0}" -f $zipPath) "Green"
+    return $zipPath
+}
+
+function Import-PlatformZipToStorage {
+    param(
+        [Parameter(Mandatory)][string]$ZipPath
+    )
+
+    if (-not (Test-Path -LiteralPath $ZipPath)) {
+        throw "ZIP path not found: $ZipPath"
+    }
+
+    $bytes  = [System.IO.File]::ReadAllBytes($ZipPath)
+    $base64 = [System.Convert]::ToBase64String($bytes)
+
+    Write-Log ("Importing modified platform ZIP to stored-platform memory: {0}" -f $ZipPath) "Cyan"
+
+    return Invoke-PlatformRest -Method POST -RelativePath "API/Platforms/Import/" -Body @{ ImportFile = $base64 }
+}
+
+function Get-StoredPlatformDetails {
+    return Invoke-PlatformRest -Method GET -RelativePath "API/Platforms/Storage"
+}
+
+function Update-PlatformWithStored {
     param(
         [Parameter(Mandatory)][string]$PlatformID
     )
 
-    $s = Get-PASSession
-    if (-not $s -or -not $s.WebSession) {
-        throw "No psPAS WebSession found. Auth failed or session not set."
-    }
-
     $encodedPlatformID = [uri]::EscapeDataString($PlatformID)
+    Write-Log ("Overwriting existing platform [{0}] with stored platform..." -f $PlatformID) "Cyan"
 
-    $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("CA_PlatformExport_" + [guid]::NewGuid().ToString("N"))
-    $null = New-Item -ItemType Directory -Path $tempRoot -Force
-    $zipPath = Join-Path $tempRoot ($PlatformID + ".zip")
+    return Invoke-PlatformRest -Method POST -RelativePath ("API/Platforms/{0}/Update" -f $encodedPlatformID)
+}
 
-    $u1 = "https://{0}.privilegecloud.cyberark.cloud/PasswordVault/API/Platforms/{1}/Export/" -f $PCloudSubdomain, $encodedPlatformID
-    $u2 = "https://{0}.privilegecloud.cyberark.cloud/PasswordVault/api/Platforms/{1}/Export/" -f $PCloudSubdomain, $encodedPlatformID
-
+function Clear-StoredPlatform {
     try {
-        Write-Log ("Exporting platform package: {0}" -f $u1) "Gray"
-        Invoke-WebRequest -Uri $u1 -Method POST -WebSession $s.WebSession -OutFile $zipPath -ErrorAction Stop | Out-Null
+        Invoke-PlatformRest -Method DELETE -RelativePath "API/Platforms/Storage" | Out-Null
+        Write-Log "Cleared stored platform memory." "Gray"
     }
     catch {
-        Write-Log ("Platform export (uppercase path) failed for [{0}], trying lowercase path. Reason: {1}" -f $PlatformID, $_.Exception.Message) "Yellow"
-        Write-Log ("Exporting platform package: {0}" -f $u2) "Gray"
-        Invoke-WebRequest -Uri $u2 -Method POST -WebSession $s.WebSession -OutFile $zipPath -ErrorAction Stop | Out-Null
+        Write-Log ("Stored platform clear skipped: {0}" -f $_.Exception.Message) "Gray"
     }
-
-    if (-not (Test-Path $zipPath)) {
-        throw "Platform export did not produce a ZIP file."
-    }
-
-    return $zipPath
 }
+
+function Update-AllowSelectHTML5InXmlFile {
+    param(
+        [Parameter(Mandatory)][string]$XmlPath,
+        [string]$ConnectionComponentName
+    )
+
+    [xml]$xml = Get-Content -LiteralPath $XmlPath -Raw
+
+    $changed       = $false
+    $updatedNodes  = 0
+    $addedNodes    = 0
+    $blocksTouched = 0
+
+    $userParamBlocks = @($xml.SelectNodes("//*[local-name()='UserParameters']"))
+    if (-not $userParamBlocks -or $userParamBlocks.Count -eq 0) {
+        return [pscustomobject]@{
+            Changed       = $false
+            UpdatedNodes  = 0
+            AddedNodes    = 0
+            BlocksTouched = 0
+        }
+    }
+
+    foreach ($block in $userParamBlocks) {
+        if (-not (Test-XmlContextMatch -Node $block -ConnectionComponentName $ConnectionComponentName)) {
+            continue
+        }
+
+        $existingInBlock = @($block.SelectNodes("./*[local-name()='Parameter' and @Name='AllowSelectHTML5']"))
+
+        if ($existingInBlock.Count -gt 0) {
+            foreach ($node in $existingInBlock) {
+                $element = [System.Xml.XmlElement]$node
+                Set-XmlAttribute -Element $element -Name "Name" -Value $OverrideParam.Name
+                Set-XmlAttribute -Element $element -Name "DisplayName" -Value $OverrideParam.DisplayName
+                Set-XmlAttribute -Element $element -Name "Visible" -Value $OverrideParam.Visible
+                Set-XmlAttribute -Element $element -Name "Type" -Value $OverrideParam.Type
+                Set-XmlAttribute -Element $element -Name "Required" -Value $OverrideParam.Required
+                Set-XmlAttribute -Element $element -Name "Value" -Value $OverrideParam.Value
+                Set-XmlAttribute -Element $element -Name "EnforceInDualControlRequest" -Value $OverrideParam.EnforceInDualControlRequest
+
+                $changed = $true
+                $updatedNodes++
+            }
+
+            $blocksTouched++
+            continue
+        }
+
+        $templateNode = $block.SelectSingleNode("./*[local-name()='Parameter' and @Name='AllowMappingLocalDrives']")
+        $newNode = $null
+
+        if ($null -ne $templateNode) {
+            $newNode = $templateNode.CloneNode($true)
+        }
+        else {
+            if ([string]::IsNullOrWhiteSpace($block.NamespaceURI)) {
+                $newNode = $xml.CreateElement("Parameter")
+            }
+            else {
+                $newNode = $xml.CreateElement("Parameter", $block.NamespaceURI)
+            }
+        }
+
+        $newElement = [System.Xml.XmlElement]$newNode
+
+        Set-XmlAttribute -Element $newElement -Name "Name" -Value $OverrideParam.Name
+        Set-XmlAttribute -Element $newElement -Name "DisplayName" -Value $OverrideParam.DisplayName
+        Set-XmlAttribute -Element $newElement -Name "Visible" -Value $OverrideParam.Visible
+        Set-XmlAttribute -Element $newElement -Name "Type" -Value $OverrideParam.Type
+        Set-XmlAttribute -Element $newElement -Name "Required" -Value $OverrideParam.Required
+        Set-XmlAttribute -Element $newElement -Name "Value" -Value $OverrideParam.Value
+        Set-XmlAttribute -Element $newElement -Name "EnforceInDualControlRequest" -Value $OverrideParam.EnforceInDualControlRequest
+
+        [void]$block.AppendChild($newElement)
+
+        $changed = $true
+        $addedNodes++
+        $blocksTouched++
+    }
+
+    if ($changed) {
+        $xml.Save($XmlPath)
+    }
+
+    return [pscustomobject]@{
+        Changed       = $changed
+        UpdatedNodes  = $updatedNodes
+        AddedNodes    = $addedNodes
+        BlocksTouched = $blocksTouched
+    }
+}
+
+function Update-PlatformPackage {
+    param(
+        [Parameter(Mandatory)][string]$PlatformID,
+        [Parameter(Mandatory)][string]$InputZip,
+        [Parameter(Mandatory)][string]$WorkingRoot,
+        [string]$ConnectionComponentName
+    )
+
+    if (-not (Test-Path -LiteralPath $InputZip)) {
+        throw "Input ZIP not found: $InputZip"
+    }
+
+    $safeName    = Get-SafeFileName -Name $PlatformID
+    $extractDir  = Join-Path $WorkingRoot ("Extract_{0}_{1}" -f $safeName, ([guid]::NewGuid().ToString("N")))
+    $modifiedZip = Join-Path $WorkingRoot ("{0}_modified_{1}.zip" -f $safeName, (Get-Date -Format "yyyyMMdd_HHmmss"))
+
+    if (Test-Path -LiteralPath $extractDir) {
+        Remove-Item -LiteralPath $extractDir -Recurse -Force
+    }
+
+    $null = New-Item -Path $extractDir -ItemType Directory -Force
+
+    try {
+        [System.IO.Compression.ZipFile]::ExtractToDirectory($InputZip, $extractDir)
+
+        $xmlFiles = Get-ChildItem -LiteralPath $extractDir -Recurse -File -Filter "*.xml"
+        if (-not $xmlFiles -or $xmlFiles.Count -eq 0) {
+            throw "No XML files found in exported package."
+        }
+
+        $xmlFilesChanged = 0
+        $updatedNodes    = 0
+        $addedNodes      = 0
+        $blocksTouched   = 0
+
+        foreach ($xmlFile in $xmlFiles) {
+            $result = Update-AllowSelectHTML5InXmlFile -XmlPath $xmlFile.FullName -ConnectionComponentName $ConnectionComponentName
+
+            if ($result.Changed) {
+                $xmlFilesChanged++
+                $updatedNodes  += $result.UpdatedNodes
+                $addedNodes    += $result.AddedNodes
+                $blocksTouched += $result.BlocksTouched
+                Write-Log ("Updated XML: {0}" -f $xmlFile.FullName) "Gray"
+            }
+        }
+
+        if (($updatedNodes + $addedNodes) -lt 1) {
+            $msg = "No eligible UserParameters block was updated in exported package for [$PlatformID]."
+            if ($ConnectionComponentName) {
+                $msg += " Component filter used: [$ConnectionComponentName]."
+            }
+            throw $msg
+        }
+
+        if (Test-Path -LiteralPath $modifiedZip) {
+            Remove-Item -LiteralPath $modifiedZip -Force
+        }
+
+        [System.IO.Compression.ZipFile]::CreateFromDirectory($extractDir, $modifiedZip)
+
+        return [pscustomobject]@{
+            ModifiedZip     = $modifiedZip
+            XmlFilesChanged = $xmlFilesChanged
+            UpdatedNodes    = $updatedNodes
+            AddedNodes      = $addedNodes
+            BlocksTouched   = $blocksTouched
+        }
+    }
+    finally {
+        if (Test-Path -LiteralPath $extractDir) {
+            Remove-Item -LiteralPath $extractDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+# ---------------- VALIDATE CSV ----------------
+Write-Log ("Using embedded CSV path: {0}" -f $CsvPath) "Cyan"
+
+if (-not (Test-Path -LiteralPath $CsvPath)) {
+    throw "CSV not found: $CsvPath"
+}
+
+$rows = Import-Csv -LiteralPath $CsvPath
+if (-not $rows -or $rows.Count -eq 0) {
+    throw "CSV is empty: $CsvPath"
+}
+
+if (-not ($rows[0].PSObject.Properties.Name -contains "PlatformID")) {
+    throw "CSV must contain a column named 'PlatformID'. Optional column: 'ConnectionComponentName'."
+}
+
+$rows = @($rows | Where-Object { -not [string]::IsNullOrWhiteSpace($_.PlatformID) })
+if (-not $rows -or $rows.Count -eq 0) {
+    throw "CSV contains no usable PlatformID values."
+}
+
+# ---------------- MAIN ----------------
+$reportItems = New-Object System.Collections.Generic.List[object]
+
+Write-Log ("CSV loaded successfully. Platforms to process: {0}" -f $rows.Count) "Green"
+Write-Log ("Output root: {0}" -f $OutputRoot) "Gray"
+
+try {
+    Start-PASSessionFromCCP -ObjectName $CCPObject -UPUser $ServiceUPUser
+
+    $counter = 0
+    foreach ($row in $rows) {
+        $counter++
+        $platformID    = ([string]$row.PlatformID).Trim()
+        $componentName = Get-OptionalCsvValue -Row $row -ColumnName "ConnectionComponentName"
+
+        $report = [ordered]@{
+            Timestamp               = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            PlatformID              = $platformID
+            ConnectionComponentName = $componentName
+            BackupZip               = ""
+            ModifiedZip             = ""
+            XmlFilesChanged         = 0
+            UserParamBlocksTouched  = 0
+            UpdatedNodes            = 0
+            AddedNodes              = 0
+            Result                  = ""
+            Error                   = ""
+        }
+
+        Write-Log ("[{0}/{1}] Processing platform [{2}]..." -f $counter, $rows.Count, $platformID) "Magenta"
+        if ($componentName) {
+            Write-Log ("Connection component filter: {0}" -f $componentName) "Gray"
+        }
+        else {
+            Write-Log "No ConnectionComponentName provided. All eligible UserParameters sections in the package will be updated." "Gray"
+        }
+
+        try {
+            Clear-StoredPlatform
+
+            $null = Get-PlatformDetails -PlatformID $platformID
+
+            $exportZip = Export-PlatformZip -PlatformID $platformID -DestinationFolder $BackupRoot
+            $report.BackupZip = $exportZip
+
+            $packageUpdate = Update-PlatformPackage `
+                -PlatformID $platformID `
+                -InputZip $exportZip `
+                -WorkingRoot $WorkRoot `
+                -ConnectionComponentName $componentName
+
+            $report.ModifiedZip            = $packageUpdate.ModifiedZip
+            $report.XmlFilesChanged        = $packageUpdate.XmlFilesChanged
+            $report.UserParamBlocksTouched = $packageUpdate.BlocksTouched
+            $report.UpdatedNodes           = $packageUpdate.UpdatedNodes
+            $report.AddedNodes             = $packageUpdate.AddedNodes
+
+            Write-Log ("Package modified successfully. XML files changed: {0}; Updated nodes: {1}; Added nodes: {2}" -f `
+                $packageUpdate.XmlFilesChanged, $packageUpdate.UpdatedNodes, $packageUpdate.AddedNodes) "Green"
+
+            if ($WhatIf) {
+                Write-Log "WHATIF enabled. Skipping import and platform overwrite." "Yellow"
+                $report.Result = "WHATIF_ONLY"
+            }
+            else {
+                $null = Import-PlatformZipToStorage -ZipPath $packageUpdate.ModifiedZip
+
+                $storage = Get-StoredPlatformDetails
+                if ($null -eq $storage -or $null -eq $storage.StoredPlatformDetails) {
+                    throw "Stored platform details were not returned after import."
+                }
+
+                Write-Log ("Stored platform in memory: Id=[{0}] Name=[{1}] Version=[{2}]" -f `
+                    $storage.StoredPlatformDetails.Id,
+                    $storage.StoredPlatformDetails.Name,
+                    $storage.StoredPlatformDetails.Version) "Gray"
+
+                $null = Update-PlatformWithStored -PlatformID $platformID
+
+                Write-Log ("Platform [{0}] updated successfully." -f $platformID) "Green"
+                $report.Result = "UPDATED"
+            }
+        }
+        catch {
+            $report.Result = "FAILED"
+            $report.Error  = $_.Exception.Message
+            Write-Log ("FAILED for [{0}]: {1}" -f $platformID, $_.Exception.Message) "Red"
+        }
+        finally {
+            try { Clear-StoredPlatform } catch {}
+            $reportItems.Add([pscustomobject]$report)
+        }
+    }
+}
+finally {
+    try {
+        if (Get-Command Close-PASSession -ErrorAction SilentlyContinue) {
+            Close-PASSession | Out-Null
+            Write-Log "PAS session closed." "Gray"
+        }
+    }
+    catch {
+        Write-Log ("Session close warning: {0}" -f $_.Exception.Message) "Yellow"
+    }
+}
+
+# ---------------- EXPORT REPORT ----------------
+$reportPath = Join-Path $ReportRoot ("Platform_HTML5_Override_Report_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+$reportItems | Export-Csv -LiteralPath $reportPath -NoTypeInformation -Encoding UTF8
+
+Write-Log ("Report exported: {0}" -f $reportPath) "Green"
+
+$success = @($reportItems | Where-Object { $_.Result -eq "UPDATED" -or $_.Result -eq "WHATIF_ONLY" }).Count
+$failed  = @($reportItems | Where-Object { $_.Result -eq "FAILED" }).Count
+
+Write-Log ("Completed. Success/WhatIf: {0} | Failed: {1}" -f $success, $failed) "Cyan"
