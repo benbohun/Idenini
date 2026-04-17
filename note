@@ -19,9 +19,6 @@ $OverrideParam = [ordered]@{
     EnforceInDualControlRequest = "No"
 }
 
-# ---------------- ZIP SUPPORT ----------------
-try { Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop } catch {}
-
 # ---------------- LOGGING ----------------
 function Write-Log {
     param(
@@ -183,7 +180,6 @@ function Invoke-EPVRest {
 
     $webSession = Get-PASWebSession
     $path = $RelativePath.TrimStart('/')
-
     $lastError = $null
 
     foreach ($apiPrefix in @("API","api")) {
@@ -224,9 +220,8 @@ function Get-PlatformByStringId {
     $search = [uri]::EscapeDataString($PlatformID)
     $result = Invoke-EPVRest -Method GET -RelativePath ("API/Platforms/Targets?search={0}" -f $search)
 
-    $matches = @($result.Platforms | Where-Object {
-        $_.PlatformID -eq $PlatformID
-    })
+    $platforms = @($result.Platforms)
+    $matches = @($platforms | Where-Object { $_.PlatformID -eq $PlatformID })
 
     if ($matches.Count -eq 0) {
         throw "Platform [$PlatformID] was not found."
@@ -357,6 +352,48 @@ function Test-ComponentMatch {
     return $false
 }
 
+function Expand-ZipPackage {
+    param(
+        [Parameter(Mandatory)][string]$ZipPath,
+        [Parameter(Mandatory)][string]$DestinationPath
+    )
+
+    if (-not (Test-Path -LiteralPath $ZipPath)) {
+        throw "ZIP file not found: $ZipPath"
+    }
+
+    if (Test-Path -LiteralPath $DestinationPath) {
+        Remove-Item -LiteralPath $DestinationPath -Recurse -Force
+    }
+
+    $null = New-Item -Path $DestinationPath -ItemType Directory -Force
+
+    Expand-Archive -LiteralPath $ZipPath -DestinationPath $DestinationPath -Force
+}
+
+function Compress-ZipPackage {
+    param(
+        [Parameter(Mandatory)][string]$SourceDirectory,
+        [Parameter(Mandatory)][string]$ZipPath
+    )
+
+    if (-not (Test-Path -LiteralPath $SourceDirectory)) {
+        throw "Source directory not found: $SourceDirectory"
+    }
+
+    if (Test-Path -LiteralPath $ZipPath) {
+        Remove-Item -LiteralPath $ZipPath -Force
+    }
+
+    $items = @(Get-ChildItem -LiteralPath $SourceDirectory -Force)
+    if ($items.Count -eq 0) {
+        throw "Source directory is empty: $SourceDirectory"
+    }
+
+    $paths = @($items | ForEach-Object { $_.FullName })
+    Compress-Archive -Path $paths -DestinationPath $ZipPath -Force
+}
+
 function Get-PackageSignals {
     param([Parameter(Mandatory)][string]$ExtractDir)
 
@@ -375,10 +412,10 @@ function Get-PackageSignals {
 
             if ($hasUserParameters -or $hasAllowMapping -or $hasAllowSelect) {
                 $signalHits.Add([pscustomobject]@{
-                    FilePath             = $file.FullName
-                    HasUserParameters    = $hasUserParameters
-                    HasAllowMapping      = $hasAllowMapping
-                    HasAllowSelectHTML5  = $hasAllowSelect
+                    FilePath            = $file.FullName
+                    HasUserParameters   = $hasUserParameters
+                    HasAllowMapping     = $hasAllowMapping
+                    HasAllowSelectHTML5 = $hasAllowSelect
                 })
             }
         }
@@ -496,14 +533,9 @@ function Update-PlatformPackage {
     $extractDir  = Join-Path $WorkingRoot ("Extract_{0}_{1}" -f $safeName, ([guid]::NewGuid().ToString("N")))
     $modifiedZip = Join-Path $WorkingRoot ("{0}_modified_{1}.zip" -f $safeName, (Get-Date -Format "yyyyMMdd_HHmmss"))
 
-    if (Test-Path -LiteralPath $extractDir) {
-        Remove-Item -LiteralPath $extractDir -Recurse -Force
-    }
-    $null = New-Item -Path $extractDir -ItemType Directory -Force
+    Expand-ZipPackage -ZipPath $InputZip -DestinationPath $extractDir
 
     try {
-        [System.IO.Compression.ZipFile]::ExtractToDirectory($InputZip, $extractDir)
-
         $signals = @(Get-PackageSignals -ExtractDir $extractDir)
         if ($signals.Count -eq 0) {
             throw "Connector linkage and export were validated, but the package does not expose UserParameters or AllowMappingLocalDrives. No safe package-based override edit is possible for this export."
@@ -548,11 +580,7 @@ function Update-PlatformPackage {
             throw ("Export exposed signal files, but no editable UserParameters block was updated for this connector." + $ctxText)
         }
 
-        if (Test-Path -LiteralPath $modifiedZip) {
-            Remove-Item -LiteralPath $modifiedZip -Force
-        }
-
-        [System.IO.Compression.ZipFile]::CreateFromDirectory($extractDir, $modifiedZip)
+        Compress-ZipPackage -SourceDirectory $extractDir -ZipPath $modifiedZip
 
         return [pscustomobject]@{
             ModifiedZip      = $modifiedZip
@@ -655,7 +683,7 @@ try {
                 Write-Log ("Validated connector [{0}] on platform." -f $componentName) "Green"
             }
             else {
-                Write-Log ("Validated platform PSM linkage." ) "Green"
+                Write-Log "Validated platform PSM linkage." "Green"
             }
 
             $exportZip = Export-PlatformZip -PlatformID $platformID -DestinationFolder $BackupRoot
