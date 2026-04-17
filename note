@@ -26,7 +26,6 @@ function Write-Log {
         [ValidateSet("Gray","Green","Yellow","Red","Cyan","White","Magenta")]
         [string]$Color = "White"
     )
-
     $stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     Write-Host ("{0} | {1}" -f $stamp, $Message) -ForegroundColor $Color
 }
@@ -298,6 +297,39 @@ function Update-PlatformWithStored {
     return Invoke-EPVRest -Method POST -RelativePath ("API/Platforms/{0}/Update" -f $encoded)
 }
 
+function Expand-ZipPackage {
+    param(
+        [Parameter(Mandatory)][string]$ZipPath,
+        [Parameter(Mandatory)][string]$DestinationPath
+    )
+
+    if (Test-Path -LiteralPath $DestinationPath) {
+        Remove-Item -LiteralPath $DestinationPath -Recurse -Force
+    }
+
+    $null = New-Item -Path $DestinationPath -ItemType Directory -Force
+    Expand-Archive -LiteralPath $ZipPath -DestinationPath $DestinationPath -Force
+}
+
+function Compress-ZipPackage {
+    param(
+        [Parameter(Mandatory)][string]$SourceDirectory,
+        [Parameter(Mandatory)][string]$ZipPath
+    )
+
+    if (Test-Path -LiteralPath $ZipPath) {
+        Remove-Item -LiteralPath $ZipPath -Force
+    }
+
+    $items = @(Get-ChildItem -LiteralPath $SourceDirectory -Force)
+    if ($items.Count -eq 0) {
+        throw "Source directory is empty: $SourceDirectory"
+    }
+
+    $paths = @($items | ForEach-Object { $_.FullName })
+    Compress-Archive -Path $paths -DestinationPath $ZipPath -Force
+}
+
 function Get-NodeContextStrings {
     param([Parameter(Mandatory)]$Node)
 
@@ -346,47 +378,6 @@ function Test-ComponentMatch {
     return $false
 }
 
-function Expand-ZipPackage {
-    param(
-        [Parameter(Mandatory)][string]$ZipPath,
-        [Parameter(Mandatory)][string]$DestinationPath
-    )
-
-    if (-not (Test-Path -LiteralPath $ZipPath)) {
-        throw "ZIP file not found: $ZipPath"
-    }
-
-    if (Test-Path -LiteralPath $DestinationPath) {
-        Remove-Item -LiteralPath $DestinationPath -Recurse -Force
-    }
-
-    $null = New-Item -Path $DestinationPath -ItemType Directory -Force
-    Expand-Archive -LiteralPath $ZipPath -DestinationPath $DestinationPath -Force
-}
-
-function Compress-ZipPackage {
-    param(
-        [Parameter(Mandatory)][string]$SourceDirectory,
-        [Parameter(Mandatory)][string]$ZipPath
-    )
-
-    if (-not (Test-Path -LiteralPath $SourceDirectory)) {
-        throw "Source directory not found: $SourceDirectory"
-    }
-
-    if (Test-Path -LiteralPath $ZipPath) {
-        Remove-Item -LiteralPath $ZipPath -Force
-    }
-
-    $items = @(Get-ChildItem -LiteralPath $SourceDirectory -Force)
-    if ($items.Count -eq 0) {
-        throw "Source directory is empty: $SourceDirectory"
-    }
-
-    $paths = @($items | ForEach-Object { $_.FullName })
-    Compress-Archive -Path $paths -DestinationPath $ZipPath -Force
-}
-
 function Get-PackageSignals {
     param([Parameter(Mandatory)][string]$ExtractDir)
 
@@ -399,16 +390,16 @@ function Get-PackageSignals {
         try {
             $raw = Get-Content -LiteralPath $file.FullName -Raw -ErrorAction Stop
 
-            $hasUserParameters = $raw -match 'UserParameters'
-            $hasAllowMapping   = $raw -match 'AllowMappingLocalDrives'
-            $hasAllowSelect    = $raw -match 'AllowSelectHTML5'
+            $hasAllowMapping = $raw -match 'AllowMappingLocalDrives'
+            $hasAllowSelect  = $raw -match 'AllowSelectHTML5'
+            $hasOverrideText = $raw -match 'Override'
 
-            if ($hasUserParameters -or $hasAllowMapping -or $hasAllowSelect) {
+            if ($hasAllowMapping -or $hasAllowSelect -or $hasOverrideText) {
                 $signalHits += [pscustomobject]@{
                     FilePath            = $file.FullName
-                    HasUserParameters   = $hasUserParameters
                     HasAllowMapping     = $hasAllowMapping
                     HasAllowSelectHTML5 = $hasAllowSelect
+                    HasOverrideText     = $hasOverrideText
                 }
             }
         }
@@ -421,84 +412,83 @@ function Get-PackageSignals {
 function Update-AllowSelectHTML5InXml {
     param(
         [Parameter(Mandatory)][string]$XmlPath,
-        [string]$ConnectionComponentName,
-        [switch]$AllowSingleBlockFallback
+        [string]$ConnectionComponentName
     )
 
     [xml]$xml = Get-Content -LiteralPath $XmlPath -Raw
 
-    $allBlocks = @($xml.SelectNodes("//*[local-name()='UserParameters']"))
-    $contexts  = @()
-    $changed   = $false
-    $updated   = 0
-    $added     = 0
-    $touched   = 0
+    $contexts = @()
+    $changed  = $false
+    $updated  = 0
+    $added    = 0
+    $matchedSeedCount = 0
 
-    if ($allBlocks.Count -eq 0) {
-        return [pscustomobject]@{
-            Changed       = $false
-            UpdatedNodes  = 0
-            AddedNodes    = 0
-            BlocksTouched = 0
-            Contexts      = @()
-        }
-    }
+    # 1) Any existing AllowSelectHTML5 nodes first
+    $allowSelectNodes = @($xml.SelectNodes("//*[local-name()='Parameter' and @Name='AllowSelectHTML5']"))
+    foreach ($node in $allowSelectNodes) {
+        if (-not (Test-ComponentMatch -Node $node -ConnectionComponentName $ConnectionComponentName)) { continue }
 
-    $matchedBlocks = @()
-
-    foreach ($block in $allBlocks) {
-        $ctx = (Get-NodeContextStrings -Node $block) -join " | "
+        $ctx = (Get-NodeContextStrings -Node $node) -join " | "
         if (-not [string]::IsNullOrWhiteSpace($ctx) -and $contexts -notcontains $ctx) {
             $contexts += $ctx
         }
 
-        if (Test-ComponentMatch -Node $block -ConnectionComponentName $ConnectionComponentName) {
-            $matchedBlocks += $block
-        }
-    }
+        Set-XmlAttribute -Element $node -Name "Name" -Value $OverrideParam.Name
+        Set-XmlAttribute -Element $node -Name "DisplayName" -Value $OverrideParam.DisplayName
+        Set-XmlAttribute -Element $node -Name "Visible" -Value $OverrideParam.Visible
+        Set-XmlAttribute -Element $node -Name "Type" -Value $OverrideParam.Type
+        Set-XmlAttribute -Element $node -Name "Required" -Value $OverrideParam.Required
+        Set-XmlAttribute -Element $node -Name "Value" -Value $OverrideParam.Value
+        Set-XmlAttribute -Element $node -Name "EnforceInDualControlRequest" -Value $OverrideParam.EnforceInDualControlRequest
 
-    if ($matchedBlocks.Count -eq 0 -and $AllowSingleBlockFallback -and $allBlocks.Count -eq 1) {
-        $matchedBlocks = @($allBlocks[0])
-    }
-
-    foreach ($block in $matchedBlocks) {
-        $existing = @($block.SelectNodes("./*[local-name()='Parameter' and @Name='AllowSelectHTML5']"))
-
-        if ($existing.Count -gt 0) {
-            foreach ($node in $existing) {
-                $el = $node
-                Set-XmlAttribute -Element $el -Name "Name" -Value $OverrideParam.Name
-                Set-XmlAttribute -Element $el -Name "DisplayName" -Value $OverrideParam.DisplayName
-                Set-XmlAttribute -Element $el -Name "Visible" -Value $OverrideParam.Visible
-                Set-XmlAttribute -Element $el -Name "Type" -Value $OverrideParam.Type
-                Set-XmlAttribute -Element $el -Name "Required" -Value $OverrideParam.Required
-                Set-XmlAttribute -Element $el -Name "Value" -Value $OverrideParam.Value
-                Set-XmlAttribute -Element $el -Name "EnforceInDualControlRequest" -Value $OverrideParam.EnforceInDualControlRequest
-                $updated++
-                $changed = $true
-            }
-            $touched++
-            continue
-        }
-
-        $template = $block.SelectSingleNode("./*[local-name()='Parameter' and @Name='AllowMappingLocalDrives']")
-        if ($null -eq $template) { continue }
-
-        $newNode = $template.CloneNode($true)
-        $newEl   = $newNode
-
-        Set-XmlAttribute -Element $newEl -Name "Name" -Value $OverrideParam.Name
-        Set-XmlAttribute -Element $newEl -Name "DisplayName" -Value $OverrideParam.DisplayName
-        Set-XmlAttribute -Element $newEl -Name "Visible" -Value $OverrideParam.Visible
-        Set-XmlAttribute -Element $newEl -Name "Type" -Value $OverrideParam.Type
-        Set-XmlAttribute -Element $newEl -Name "Required" -Value $OverrideParam.Required
-        Set-XmlAttribute -Element $newEl -Name "Value" -Value $OverrideParam.Value
-        Set-XmlAttribute -Element $newEl -Name "EnforceInDualControlRequest" -Value $OverrideParam.EnforceInDualControlRequest
-
-        [void]$block.AppendChild($newEl)
-        $added++
-        $touched++
+        $updated++
         $changed = $true
+    }
+
+    # 2) If no existing AllowSelectHTML5 was updated, clone AllowMappingLocalDrives wherever it exists under the connector scope
+    if ($updated -eq 0) {
+        $seedNodes = @($xml.SelectNodes("//*[local-name()='Parameter' and @Name='AllowMappingLocalDrives']"))
+        $matchedSeeds = @()
+
+        foreach ($seed in $seedNodes) {
+            if (-not (Test-ComponentMatch -Node $seed -ConnectionComponentName $ConnectionComponentName)) { continue }
+            $matchedSeeds += $seed
+        }
+
+        # fallback: if connector context is not present in XML but there is exactly one seed node in the file, use it
+        if ($matchedSeeds.Count -eq 0 -and $seedNodes.Count -eq 1) {
+            $matchedSeeds = @($seedNodes[0])
+        }
+
+        $matchedSeedCount = $matchedSeeds.Count
+
+        foreach ($seed in $matchedSeeds) {
+            $ctx = (Get-NodeContextStrings -Node $seed) -join " | "
+            if (-not [string]::IsNullOrWhiteSpace($ctx) -and $contexts -notcontains $ctx) {
+                $contexts += $ctx
+            }
+
+            $parent = $seed.ParentNode
+            if ($null -eq $parent) { continue }
+
+            # do not add duplicate under the same parent
+            $siblingExists = @($parent.SelectNodes("./*[local-name()='Parameter' and @Name='AllowSelectHTML5']")).Count -gt 0
+            if ($siblingExists) { continue }
+
+            $newNode = $seed.CloneNode($true)
+
+            Set-XmlAttribute -Element $newNode -Name "Name" -Value $OverrideParam.Name
+            Set-XmlAttribute -Element $newNode -Name "DisplayName" -Value $OverrideParam.DisplayName
+            Set-XmlAttribute -Element $newNode -Name "Visible" -Value $OverrideParam.Visible
+            Set-XmlAttribute -Element $newNode -Name "Type" -Value $OverrideParam.Type
+            Set-XmlAttribute -Element $newNode -Name "Required" -Value $OverrideParam.Required
+            Set-XmlAttribute -Element $newNode -Name "Value" -Value $OverrideParam.Value
+            Set-XmlAttribute -Element $newNode -Name "EnforceInDualControlRequest" -Value $OverrideParam.EnforceInDualControlRequest
+
+            [void]$parent.AppendChild($newNode)
+            $added++
+            $changed = $true
+        }
     }
 
     if ($changed) {
@@ -506,11 +496,12 @@ function Update-AllowSelectHTML5InXml {
     }
 
     return [pscustomobject]@{
-        Changed       = $changed
-        UpdatedNodes  = $updated
-        AddedNodes    = $added
-        BlocksTouched = $touched
-        Contexts      = @($contexts)
+        Changed          = $changed
+        UpdatedNodes     = $updated
+        AddedNodes       = $added
+        Contexts         = @($contexts)
+        MatchedSeedCount = $matchedSeedCount
+        XmlPath          = $XmlPath
     }
 }
 
@@ -519,12 +510,14 @@ function Update-PlatformPackage {
         [Parameter(Mandatory)][string]$PlatformID,
         [Parameter(Mandatory)][string]$InputZip,
         [Parameter(Mandatory)][string]$WorkingRoot,
-        [string]$ConnectionComponentName
+        [string]$ConnectionComponentName,
+        [Parameter(Mandatory)][string]$DiagFolder
     )
 
     $safeName    = Get-SafeFileName -Name $PlatformID
     $extractDir  = Join-Path $WorkingRoot ("Extract_{0}_{1}" -f $safeName, ([guid]::NewGuid().ToString("N")))
     $modifiedZip = Join-Path $WorkingRoot ("{0}_modified_{1}.zip" -f $safeName, (Get-Date -Format "yyyyMMdd_HHmmss"))
+    $diagPath    = Join-Path $DiagFolder ("{0}_diag_{1}.txt" -f $safeName, (Get-Date -Format "yyyyMMdd_HHmmss"))
     $stage       = "start"
 
     try {
@@ -534,7 +527,7 @@ function Update-PlatformPackage {
         $stage = "inspect-package"
         $signals = @(Get-PackageSignals -ExtractDir $extractDir)
         if ($signals.Count -eq 0) {
-            throw "Connector linkage and export were validated, but the package does not expose UserParameters or AllowMappingLocalDrives."
+            throw "The exported package does not expose AllowMappingLocalDrives, AllowSelectHTML5, or override-related text."
         }
 
         $stage = "locate-xml"
@@ -547,14 +540,20 @@ function Update-PlatformPackage {
         $xmlChanged = 0
         $updated    = 0
         $added      = 0
-        $touched    = 0
         $contexts   = @()
+        $diagLines  = @()
+
+        foreach ($sig in $signals) {
+            $diagLines += ("SIGNAL FILE: {0}" -f $sig.FilePath)
+        }
 
         foreach ($xmlFile in $xmlFiles) {
             $result = Update-AllowSelectHTML5InXml `
                 -XmlPath $xmlFile.FullName `
-                -ConnectionComponentName $ConnectionComponentName `
-                -AllowSingleBlockFallback
+                -ConnectionComponentName $ConnectionComponentName
+
+            $diagLines += ("XML: {0}" -f $xmlFile.FullName)
+            $diagLines += ("  MatchedSeedCount={0}; Updated={1}; Added={2}" -f $result.MatchedSeedCount, $result.UpdatedNodes, $result.AddedNodes)
 
             foreach ($ctx in @($result.Contexts)) {
                 if (-not [string]::IsNullOrWhiteSpace($ctx) -and $contexts -notcontains $ctx) {
@@ -566,16 +565,18 @@ function Update-PlatformPackage {
                 $xmlChanged++
                 $updated += $result.UpdatedNodes
                 $added   += $result.AddedNodes
-                $touched += $result.BlocksTouched
             }
         }
+
+        $diagLines | Out-File -LiteralPath $diagPath -Encoding UTF8 -Force
 
         if (($updated + $added) -lt 1) {
             $ctxText = ""
             if ($contexts.Count -gt 0) {
                 $ctxText = " Candidate contexts: " + (($contexts | Select-Object -First 5) -join " || ")
             }
-            throw ("Export exposed signal files, but no editable UserParameters block was updated for this connector." + $ctxText)
+            throw ("No connector-scoped AllowMappingLocalDrives/AllowSelectHTML5 node was editable in the exported platform XML." + `
+                   " Seed Override Component Parameters once for this connector in the UI, then rerun." + $ctxText)
         }
 
         $stage = "repack-zip"
@@ -586,9 +587,9 @@ function Update-PlatformPackage {
             XmlFilesChanged  = $xmlChanged
             UpdatedNodes     = $updated
             AddedNodes       = $added
-            BlocksTouched    = $touched
             ContextsFound    = (@($contexts) -join " || ")
             SignalFiles      = (@($signals | ForEach-Object { $_.FilePath }) -join " || ")
+            DiagFile         = $diagPath
         }
     }
     catch {
@@ -649,6 +650,7 @@ try {
             AddedNodes              = 0
             ContextsFound           = ""
             SignalFiles             = ""
+            DiagFile                = ""
             Result                  = ""
             Error                   = ""
         }
@@ -696,7 +698,8 @@ try {
                 -PlatformID $platformID `
                 -InputZip $exportZip `
                 -WorkingRoot $WorkRoot `
-                -ConnectionComponentName $componentName
+                -ConnectionComponentName $componentName `
+                -DiagFolder $ReportRoot
 
             $report.ModifiedZip     = $packageUpdate.ModifiedZip
             $report.XmlFilesChanged = $packageUpdate.XmlFilesChanged
@@ -704,6 +707,7 @@ try {
             $report.AddedNodes      = $packageUpdate.AddedNodes
             $report.ContextsFound   = $packageUpdate.ContextsFound
             $report.SignalFiles     = $packageUpdate.SignalFiles
+            $report.DiagFile        = $packageUpdate.DiagFile
 
             if ($WhatIf) {
                 Write-Log ("Validated editable package. UpdatedNodes={0}; AddedNodes={1}. WHATIF only." -f `
