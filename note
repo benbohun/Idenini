@@ -117,6 +117,26 @@ function Get-PASWebSession {
     return $s.WebSession
 }
 
+function Get-HttpStatusCodeFromError {
+    param([Parameter(Mandatory)]$ErrorRecord)
+
+    try {
+        if ($ErrorRecord.Exception.Response -and $ErrorRecord.Exception.Response.StatusCode) {
+            return [int]$ErrorRecord.Exception.Response.StatusCode
+        }
+    }
+    catch {}
+
+    try {
+        if ($ErrorRecord.Exception.StatusCode) {
+            return [int]$ErrorRecord.Exception.StatusCode
+        }
+    }
+    catch {}
+
+    return $null
+}
+
 function Start-PASSessionFromCCP {
     param(
         [Parameter(Mandatory)][string]$ObjectName,
@@ -169,7 +189,7 @@ function Start-PASSessionFromCCP {
 function Invoke-EPVRest {
     param(
         [Parameter(Mandatory)]
-        [ValidateSet("GET","POST","PUT","DELETE")]
+        [ValidateSet("GET","POST","PUT","DELETE","PATCH")]
         [string]$Method,
 
         [Parameter(Mandatory)][string]$RelativePath,
@@ -240,6 +260,10 @@ function Get-PlatformSessionManagementByNumericId {
     return Invoke-EPVRest -Method GET -RelativePath ("API/Platforms/Targets/{0}/PrivilegedSessionManagement/" -f $PlatformNumericID)
 }
 
+function Get-StoredPlatformDetails {
+    return Invoke-EPVRest -Method GET -RelativePath "API/Platforms/Storage"
+}
+
 function Export-PlatformZip {
     param(
         [Parameter(Mandatory)][string]$PlatformID,
@@ -281,13 +305,61 @@ function Clear-StoredPlatformSilently {
     catch {}
 }
 
-function Import-PlatformZipToStorage {
+function Import-PlatformZipToStorageOrConflict {
     param([Parameter(Mandatory)][string]$ZipPath)
 
     $bytes  = [System.IO.File]::ReadAllBytes($ZipPath)
     $base64 = [System.Convert]::ToBase64String($bytes)
 
-    return Invoke-EPVRest -Method POST -RelativePath "API/Platforms/Import/" -Body @{ ImportFile = $base64 }
+    try {
+        $result = Invoke-EPVRest -Method POST -RelativePath "API/Platforms/Import/" -Body @{ ImportFile = $base64 }
+
+        return [pscustomobject]@{
+            ImportStatus = "CREATED"
+            Result       = $result
+        }
+    }
+    catch {
+        $status = Get-HttpStatusCodeFromError -ErrorRecord $_
+        if ($status -eq 409) {
+            return [pscustomobject]@{
+                ImportStatus = "CONFLICT_STORED"
+                Result       = $null
+            }
+        }
+
+        throw
+    }
+}
+
+function Confirm-StoredPlatformConflict {
+    param(
+        [Parameter(Mandatory)][string]$TargetPlatformID
+    )
+
+    $stored = Get-StoredPlatformDetails
+
+    $storedPlatformId = $null
+    try { $storedPlatformId = [string]$stored.StoredPlatformDetails.Id } catch {}
+
+    $conflicted = @()
+    try { $conflicted = @($stored.ConflictedPlatformsDetails) } catch {}
+
+    $matchedConflict = @($conflicted | Where-Object { $_.Id -eq $TargetPlatformID })
+
+    if ([string]::IsNullOrWhiteSpace($storedPlatformId)) {
+        throw "Stored platform details are empty after import/conflict."
+    }
+
+    if ($matchedConflict.Count -eq 0 -and $storedPlatformId -ne $TargetPlatformID) {
+        throw ("Stored platform exists, but target platform [{0}] is not listed as a conflicted platform." -f $TargetPlatformID)
+    }
+
+    return [pscustomobject]@{
+        StoredPlatformId = $storedPlatformId
+        StoredName       = [string]$stored.StoredPlatformDetails.Name
+        ConflictedIds    = (($conflicted | ForEach-Object { $_.Id }) -join "; ")
+    }
 }
 
 function Update-PlatformWithStored {
@@ -423,7 +495,6 @@ function Update-AllowSelectHTML5InXml {
     $added    = 0
     $matchedSeedCount = 0
 
-    # 1) Any existing AllowSelectHTML5 nodes first
     $allowSelectNodes = @($xml.SelectNodes("//*[local-name()='Parameter' and @Name='AllowSelectHTML5']"))
     foreach ($node in $allowSelectNodes) {
         if (-not (Test-ComponentMatch -Node $node -ConnectionComponentName $ConnectionComponentName)) { continue }
@@ -445,7 +516,6 @@ function Update-AllowSelectHTML5InXml {
         $changed = $true
     }
 
-    # 2) If no existing AllowSelectHTML5 was updated, clone AllowMappingLocalDrives wherever it exists under the connector scope
     if ($updated -eq 0) {
         $seedNodes = @($xml.SelectNodes("//*[local-name()='Parameter' and @Name='AllowMappingLocalDrives']"))
         $matchedSeeds = @()
@@ -455,7 +525,6 @@ function Update-AllowSelectHTML5InXml {
             $matchedSeeds += $seed
         }
 
-        # fallback: if connector context is not present in XML but there is exactly one seed node in the file, use it
         if ($matchedSeeds.Count -eq 0 -and $seedNodes.Count -eq 1) {
             $matchedSeeds = @($seedNodes[0])
         }
@@ -471,7 +540,6 @@ function Update-AllowSelectHTML5InXml {
             $parent = $seed.ParentNode
             if ($null -eq $parent) { continue }
 
-            # do not add duplicate under the same parent
             $siblingExists = @($parent.SelectNodes("./*[local-name()='Parameter' and @Name='AllowSelectHTML5']")).Count -gt 0
             if ($siblingExists) { continue }
 
@@ -651,6 +719,10 @@ try {
             ContextsFound           = ""
             SignalFiles             = ""
             DiagFile                = ""
+            ImportStatus            = ""
+            StoredPlatformId        = ""
+            StoredPlatformName      = ""
+            ConflictedIds           = ""
             Result                  = ""
             Error                   = ""
         }
@@ -716,7 +788,19 @@ try {
             }
             else {
                 Clear-StoredPlatformSilently
-                $null = Import-PlatformZipToStorage -ZipPath $packageUpdate.ModifiedZip
+
+                $importResult = Import-PlatformZipToStorageOrConflict -ZipPath $packageUpdate.ModifiedZip
+                $report.ImportStatus = $importResult.ImportStatus
+
+                if ($importResult.ImportStatus -eq "CONFLICT_STORED") {
+                    Write-Log "Import returned 409 conflict; proceeding with stored-platform overwrite flow." "Yellow"
+                }
+
+                $storedCheck = Confirm-StoredPlatformConflict -TargetPlatformID $platformID
+                $report.StoredPlatformId   = $storedCheck.StoredPlatformId
+                $report.StoredPlatformName = $storedCheck.StoredName
+                $report.ConflictedIds      = $storedCheck.ConflictedIds
+
                 $null = Update-PlatformWithStored -PlatformID $platformID
 
                 Write-Log ("Platform updated successfully. UpdatedNodes={0}; AddedNodes={1}" -f `
