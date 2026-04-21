@@ -1,22 +1,26 @@
 <#
-CNA_Create_Identity_WebApp_From_Json.ps1
+CNA_Create_Identity_WebApp_From_Json_v2.ps1
 
 Purpose
 - Authenticate to CCP and Privilege Cloud using the working CNA service-user pattern
 - Authenticate to CyberArk Identity
-- Use the provided exported Browser Extension (advanced) JSON as the source configuration
-- Create a NEW app from the app catalog template instead of cloning an existing app
-- Update the new app with the exported Browser Extension (advanced) settings
+- Create a NEW Browser Extension (advanced) style app from template candidates
+- Apply the exported Browser Extension (advanced) JSON to the new app
 - Rename the new app to the provided vaulted username
-- Validate the resulting app is still a Web / Browser Extension (advanced) app
+- Validate the resulting app is still a Web / Browser Extension app
 - Add direct application permissions for a target group
-- Validate/save the PAS Safe + Account input in the report for later credential workflow
+- Validate / record the PAS Safe + Account input for later credential workflow
 
-Notes
-- This script avoids Redrock for app creation.
-- It uses GetTemplatesAndCategories + ImportAppFromTemplate.
-- It uses UpdateApplicationDE adaptively because public docs do not enumerate every Browser Extension (advanced) field accepted in the update payload.
-- It validates the PAS account in the supplied Safe, but does not bind PAS credentials into the app because a public admin API for group-scoped shared vault binding was not clearly documented.
+Important
+- This version intentionally SKIPS GetUserInfo and any Redrock/query calls.
+- It also avoids catalog lookup unless you explicitly choose to add that later.
+- If app-management endpoints still return 401, the blocker is tenant-side authorization for the service account.
+
+Inputs you may still need to fill
+- TargetGroupInternalName (optional but helpful)
+- TargetGroupDirectoryServiceUuid (optional but helpful)
+
+ASCII only.
 #>
 
 [CmdletBinding()]
@@ -34,7 +38,8 @@ param(
     [string]$CCPObject         = 'cna-prod.cyberark.cloud-cnarestbot',
     [bool]$CCPWindowsAuth      = $false,
 
-    # ===== Target new app settings =====
+    # ===== New app settings =====
+    [string]$SourceAppName     = 'GCP - Okta Prod',
     [string]$NewAppName        = 'g-test-pam1',
     [string]$AppDescription    = 'GCP - Okta Prod created via CyberArk Identity API',
     [string]$TemplateIdOverride = '',
@@ -53,8 +58,8 @@ param(
     [string]$SourceAppExportJson = '',
 
     # ===== Logging =====
-    [string]$LogPath           = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_From_Json.log',
-    [string]$ReportCsvPath     = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_From_Json_Report.csv',
+    [string]$LogPath           = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_From_Json_v2.log',
+    [string]$ReportCsvPath     = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_From_Json_v2_Report.csv',
 
     # ===== Advanced =====
     [switch]$WhatIf
@@ -133,10 +138,24 @@ function Get-NormalizedIdentityTenant {
     return $value
 }
 
-function Escape-SqlLiteral {
-    param([AllowNull()][string]$Value)
-    if ($null -eq $Value) { return '' }
-    return ($Value -replace "'", "''")
+function Get-DirectField {
+    param(
+        [Parameter(Mandatory)]$Object,
+        [Parameter(Mandatory)][string]$FieldName
+    )
+
+    if ($null -eq $Object) { return $null }
+
+    if ($Object -is [System.Collections.IDictionary]) {
+        if ($Object.Contains($FieldName)) { return $Object[$FieldName] }
+        return $null
+    }
+
+    if ($Object.PSObject -and $Object.PSObject.Properties.Name -contains $FieldName) {
+        return $Object.$FieldName
+    }
+
+    return $null
 }
 
 function Get-DefaultSourceExportJson {
@@ -364,27 +383,6 @@ function Invoke-IdentityApiWithRetry {
     throw ("Unauthorized persisted for {0}. Details: {1}" -f $LogicalName, ($errors -join ' || '))
 }
 
-function Test-IdentityApiAccess {
-    $uri = $IdentityTenantURL.TrimEnd('/') + '/UserMgmt/GetUserInfo'
-    $resp = Invoke-IdentityApiWithRetry -AbsoluteUris @($uri) -LogicalName 'GetUserInfo'
-    if (-not $resp.success) { throw 'GetUserInfo returned success=false.' }
-
-    $name = $null
-    if ($resp.Result.Name) { $name = [string]$resp.Result.Name }
-    elseif ($resp.Result.DisplayName) { $name = [string]$resp.Result.DisplayName }
-    else { $name = 'Unknown' }
-
-    Write-Log ("Identity API sanity check passed. User='{0}' DirectoryServiceId='{1}'" -f $name, $resp.Result.DirectoryServiceId) 'Green'
-    Add-ReportRow -Step 'GetUserInfo' -Status 'SUCCESS' -Detail ("User={0}; DirectoryServiceId={1}" -f $name, $resp.Result.DirectoryServiceId)
-}
-
-function Get-DirectoryServices {
-    $uri = $IdentityTenantURL.TrimEnd('/') + '/Core/GetDirectoryServices'
-    $resp = Invoke-IdentityApiWithRetry -AbsoluteUris @($uri) -LogicalName 'GetDirectoryServices'
-    if (-not $resp.success) { throw 'GetDirectoryServices returned success=false.' }
-    return $resp.Result
-}
-
 # ------------------------------------------------------------
 # PAS account validation
 # ------------------------------------------------------------
@@ -461,120 +459,67 @@ function Get-ExportConfig {
 }
 
 # ------------------------------------------------------------
-# App template discovery and creation
+# App creation
 # ------------------------------------------------------------
-function Get-TemplatesAndCategories {
-    $uri = $IdentityTenantURL.TrimEnd('/') + '/SaasManage/GetTemplatesAndCategories'
-    $resp = Invoke-IdentityApiWithRetry -AbsoluteUris @($uri) -LogicalName 'GetTemplatesAndCategories'
-    if (-not $resp.success) { throw 'GetTemplatesAndCategories returned success=false.' }
-    return $resp.Result
-}
-
-function Resolve-TemplateId {
+function Import-AppFromTemplateAdaptive {
     param(
         [Parameter(Mandatory)][object]$Config,
         [string]$TemplateIdOverride = ''
     )
 
-    if (-not [string]::IsNullOrWhiteSpace($TemplateIdOverride)) {
-        Write-Log ("Using TemplateIdOverride '{0}'." -f $TemplateIdOverride) 'Green'
-        Add-ReportRow -Step 'Resolve Template ID' -Status 'SUCCESS' -Detail ("Override={0}" -f $TemplateIdOverride)
-        return $TemplateIdOverride
-    }
+    $candidates = New-Object System.Collections.Generic.List[string]
 
-    $templates = Get-TemplatesAndCategories
-
-    $rows = @()
-    try {
-        $rows = @($templates.AppTemplates.Results | ForEach-Object { $_.Row })
-    } catch {}
-
-    if (-not $rows -or $rows.Count -lt 1) {
-        throw 'GetTemplatesAndCategories did not return any catalog templates.'
-    }
-
-    $targetTemplateName = [string]$Config.TemplateName
-    $candidates = New-Object System.Collections.Generic.List[object]
-
-    foreach ($r in $rows) {
-        $score = 0
-
-        $id          = [string]$r.ID
-        $name        = [string]$r.Name
-        $displayName = [string]$r.DisplayName
-        $appTypeName = [string]$r.AppTypeDisplayName
-
-        if ($targetTemplateName -and $id -eq $targetTemplateName)          { $score += 100 }
-        if ($targetTemplateName -and $name -eq $targetTemplateName)        { $score += 100 }
-        if ($targetTemplateName -and $displayName -eq $targetTemplateName) { $score += 100 }
-
-        if ($id -match 'GenericBrowserExtensionScript')   { $score += 90 }
-        if ($name -match 'GenericBrowserExtensionScript') { $score += 90 }
-
-        if ($name -match 'Browser' -and $name -match 'Extension')               { $score += 30 }
-        if ($displayName -match 'Browser' -and $displayName -match 'Extension') { $score += 30 }
-        if ($name -match 'Advanced' -or $displayName -match 'Advanced')         { $score += 20 }
-        if ($id -match 'Script' -or $name -match 'Script')                      { $score += 15 }
-        if ($appTypeName -match 'Web')                                           { $score += 5 }
-
-        if ($score -gt 0) {
-            $candidates.Add([pscustomobject]@{
-                Score       = $score
-                ID          = $id
-                Name        = $name
-                DisplayName = $displayName
-                AppTypeName = $appTypeName
-            }) | Out-Null
+    foreach ($candidate in @(
+        $TemplateIdOverride,
+        [string]$Config.TemplateName,
+        'GenericBrowserExtensionScript',
+        'GenericBrowserExtension',
+        'BrowserExtensionScript'
+    )) {
+        if (-not [string]::IsNullOrWhiteSpace($candidate) -and -not $candidates.Contains($candidate)) {
+            $candidates.Add($candidate) | Out-Null
         }
     }
 
-    $sorted = @($candidates | Sort-Object Score -Descending)
-    if ($sorted.Count -gt 0) {
-        $best = $sorted[0]
-        Write-Log ("Resolved template ID '{0}' from catalog. Name='{1}' DisplayName='{2}' AppType='{3}' Score={4}" -f $best.ID, $best.Name, $best.DisplayName, $best.AppTypeName, $best.Score) 'Green'
-        Add-ReportRow -Step 'Resolve Template ID' -Status 'SUCCESS' -Detail ("ID={0}; Name={1}; DisplayName={2}; AppType={3}; Score={4}" -f $best.ID, $best.Name, $best.DisplayName, $best.AppTypeName, $best.Score)
-        return $best.ID
-    }
-
-    # Best-effort static fallbacks if the catalog row fields vary across tenants
-    foreach ($candidateId in @('GenericBrowserExtensionScript','GenericBrowserExtension','BrowserExtensionScript')) {
-        Write-Log ("No strong template match found. Falling back to candidate template ID '{0}'." -f $candidateId) 'Yellow'
-        Add-ReportRow -Step 'Resolve Template ID' -Status 'INFO' -Detail ("Fallback candidate={0}" -f $candidateId)
-        return $candidateId
-    }
-
-    throw 'Failed to resolve a Browser Extension (advanced) template ID from the catalog.'
-}
-
-function Import-AppFromTemplate {
-    param([Parameter(Mandatory)][string]$TemplateId)
-
     $uri = $IdentityTenantURL.TrimEnd('/') + '/SaasManage/ImportAppFromTemplate'
-    $body = @{ ID = @($TemplateId) }
 
-    $resp = Invoke-IdentityApiWithRetry -AbsoluteUris @($uri) -Body $body -LogicalName 'ImportAppFromTemplate'
-    if (-not $resp.success) {
-        throw ('ImportAppFromTemplate returned success=false: ' + ($resp.Message | Out-String))
+    foreach ($templateId in $candidates) {
+        try {
+            Write-Log ("Trying ImportAppFromTemplate with template ID '{0}'..." -f $templateId) 'Gray'
+            $body = @{ ID = @($templateId) }
+            $resp = Invoke-IdentityApiWithRetry -AbsoluteUris @($uri) -Body $body -LogicalName 'ImportAppFromTemplate'
+
+            if (-not $resp.success) {
+                throw ('ImportAppFromTemplate returned success=false: ' + ($resp.Message | Out-String))
+            }
+
+            $resultItems = @($resp.Result)
+            if ($resultItems.Count -lt 1) {
+                throw 'ImportAppFromTemplate returned no result items.'
+            }
+
+            $rowKey = $null
+            foreach ($item in $resultItems) {
+                $success = Get-DirectField -Object $item -FieldName 'success'
+                $rk1     = Get-DirectField -Object $item -FieldName '_RowKey'
+                $rk2     = Get-DirectField -Object $item -FieldName '_Rowkey'
+                if ($success -eq $true -and -not [string]::IsNullOrWhiteSpace([string]$rk1)) { $rowKey = [string]$rk1; break }
+                if ($success -eq $true -and -not [string]::IsNullOrWhiteSpace([string]$rk2)) { $rowKey = [string]$rk2; break }
+            }
+
+            if ([string]::IsNullOrWhiteSpace($rowKey)) {
+                throw ("Template '{0}' returned success but no app row key." -f $templateId)
+            }
+
+            Write-Log ("Imported new application from template '{0}'. New _RowKey='{1}'." -f $templateId, $rowKey) 'Green'
+            Add-ReportRow -Step 'Import App From Template' -Status 'SUCCESS' -Detail ("TemplateID={0}; AppRowKey={1}" -f $templateId, $rowKey)
+            return $rowKey
+        } catch {
+            Write-Log ("ImportAppFromTemplate failed for template '{0}': {1}" -f $templateId, $_.Exception.Message) 'Yellow'
+        }
     }
 
-    $resultItems = @($resp.Result)
-    if ($resultItems.Count -lt 1) {
-        throw 'ImportAppFromTemplate returned no result items.'
-    }
-
-    $first = $resultItems[0]
-    if (-not $first.success) {
-        throw ("ImportAppFromTemplate failed for template '{0}': {1}" -f $TemplateId, $first.Exception)
-    }
-
-    $rowKey = [string]$first._RowKey
-    if ([string]::IsNullOrWhiteSpace($rowKey)) {
-        throw ("ImportAppFromTemplate succeeded for template '{0}' but returned no _RowKey." -f $TemplateId)
-    }
-
-    Write-Log ("Imported new application from template '{0}'. New _RowKey='{1}'." -f $TemplateId, $rowKey) 'Green'
-    Add-ReportRow -Step 'Import App From Template' -Status 'SUCCESS' -Detail ("TemplateID={0}; AppRowKey={1}" -f $TemplateId, $rowKey)
-    return $rowKey
+    throw 'All ImportAppFromTemplate attempts failed.'
 }
 
 # ------------------------------------------------------------
@@ -595,17 +540,11 @@ function Assert-IdentityWebApp {
         [Parameter(Mandatory)][string]$Label
     )
 
-    $appTypeDisplay = $null
-    $appType        = $null
-    $webUPAppType   = $null
-    $templateName   = $null
-    $name           = $null
-
-    if ($AppDetails.PSObject.Properties.Name -contains 'AppTypeDisplayName') { $appTypeDisplay = [string]$AppDetails.AppTypeDisplayName }
-    if ($AppDetails.PSObject.Properties.Name -contains 'AppType')            { $appType        = [string]$AppDetails.AppType }
-    if ($AppDetails.PSObject.Properties.Name -contains 'WebUPAppType')       { $webUPAppType   = [string]$AppDetails.WebUPAppType }
-    if ($AppDetails.PSObject.Properties.Name -contains 'TemplateName')       { $templateName   = [string]$AppDetails.TemplateName }
-    if ($AppDetails.PSObject.Properties.Name -contains 'Name')               { $name           = [string]$AppDetails.Name }
+    $appTypeDisplay = [string](Get-DirectField -Object $AppDetails -FieldName 'AppTypeDisplayName')
+    $appType        = [string](Get-DirectField -Object $AppDetails -FieldName 'AppType')
+    $webUPAppType   = [string](Get-DirectField -Object $AppDetails -FieldName 'WebUPAppType')
+    $templateName   = [string](Get-DirectField -Object $AppDetails -FieldName 'TemplateName')
+    $name           = [string](Get-DirectField -Object $AppDetails -FieldName 'Name')
 
     $isWeb = $false
     if ($appTypeDisplay -match '^Web') { $isWeb = $true }
@@ -626,15 +565,15 @@ function Assert-AppScriptPresent {
         [Parameter(Mandatory)][string]$ExpectedUrl
     )
 
-    $scriptText = $null
-    if ($AppDetails.PSObject.Properties.Name -contains 'CBEScript') {
-        $scriptText = [string]$AppDetails.CBEScript
-    } elseif ($AppDetails.PSObject.Properties.Name -contains 'UserPassScript') {
-        $scriptText = [string]$AppDetails.UserPassScript
+    $scriptText = [string](Get-DirectField -Object $AppDetails -FieldName 'CBEScript')
+    if ([string]::IsNullOrWhiteSpace($scriptText)) {
+        $scriptText = [string](Get-DirectField -Object $AppDetails -FieldName 'UserPassScript')
     }
 
     if ([string]::IsNullOrWhiteSpace($scriptText)) {
-        throw 'Updated app does not appear to contain a Browser Extension script.'
+        Write-Log 'WARNING: Updated app does not appear to return CBEScript/UserPassScript in GetApplication.' 'Yellow'
+        Add-ReportRow -Step 'Validate Script' -Status 'WARNING' -Detail 'GetApplication did not return CBEScript/UserPassScript.'
+        return
     }
 
     if ($scriptText -notmatch [regex]::Escape($ExpectedUrl)) {
@@ -647,7 +586,7 @@ function Assert-AppScriptPresent {
     Add-ReportRow -Step 'Validate Script' -Status 'SUCCESS' -Detail ("applicationUrl {0} found in returned script." -f $ExpectedUrl)
 }
 
-function New-AppUpdatePayloadFull {
+function New-AppUpdatePayloadVariants {
     param(
         [Parameter(Mandatory)][string]$AppKey,
         [Parameter(Mandatory)][object]$Config,
@@ -655,8 +594,7 @@ function New-AppUpdatePayloadFull {
         [Parameter(Mandatory)][string]$DescriptionToUse
     )
 
-    $payload = [ordered]@{
-        _Rowkey               = $AppKey
+    $commonFull = [ordered]@{
         Name                  = $RenameTo
         DisplayName           = $RenameTo
         Description           = $DescriptionToUse
@@ -683,41 +621,44 @@ function New-AppUpdatePayloadFull {
     }
 
     if ($Config.PSObject.Properties.Name -contains 'Icon' -and -not [string]::IsNullOrWhiteSpace([string]$Config.Icon)) {
-        $payload['Icon'] = [string]$Config.Icon
-        $payload['IconUri'] = [string]$Config.Icon
+        $commonFull['Icon']    = [string]$Config.Icon
+        $commonFull['IconUri'] = [string]$Config.Icon
     }
 
-    return $payload
-}
-
-function New-AppUpdatePayloadMinimal {
-    param(
-        [Parameter(Mandatory)][string]$AppKey,
-        [Parameter(Mandatory)][object]$Config,
-        [Parameter(Mandatory)][string]$RenameTo,
-        [Parameter(Mandatory)][string]$DescriptionToUse
-    )
-
-    return [ordered]@{
-        _Rowkey               = $AppKey
-        Name                  = $RenameTo
-        Description           = $DescriptionToUse
-        AppType               = $(if ($Config.AppType) { [string]$Config.AppType } else { 'Web' })
-        TemplateName          = [string]$Config.TemplateName
-        WebAppType            = [string]$Config.WebAppType
-        WebUPAppType          = [string]$Config.WebUPAppType
-        UserNameStrategy      = [string]$Config.UserNameStrategy
-        IsSwsEnabled          = [bool]$Config.IsSwsEnabled
-        FormFillingEnabled    = [bool]$Config.FormFillingEnabled
-        Generic               = [bool]$Config.Generic
-        OnPrem                = [bool]$Config.OnPrem
-        DefaultAuthProfile    = [string]$Config.DefaultAuthProfile
-        DefaultAuthProfileInfo= $Config.DefaultAuthProfileInfo
-        AuthRules             = $Config.AuthRules
-        NotSelfService        = [bool]$Config.NotSelfService
-        CBEScript             = [string]$Config.CBEScript
-        UserPassScript        = [string]$Config.CBEScript
+    $commonMinimal = [ordered]@{
+        Name               = $RenameTo
+        Description        = $DescriptionToUse
+        AppType            = $(if ($Config.AppType) { [string]$Config.AppType } else { 'Web' })
+        TemplateName       = [string]$Config.TemplateName
+        WebAppType         = [string]$Config.WebAppType
+        WebUPAppType       = [string]$Config.WebUPAppType
+        UserNameStrategy   = [string]$Config.UserNameStrategy
+        IsSwsEnabled       = [bool]$Config.IsSwsEnabled
+        FormFillingEnabled = [bool]$Config.FormFillingEnabled
+        Generic            = [bool]$Config.Generic
+        OnPrem             = [bool]$Config.OnPrem
+        DefaultAuthProfile = [string]$Config.DefaultAuthProfile
+        AuthRules          = $Config.AuthRules
+        NotSelfService     = [bool]$Config.NotSelfService
+        CBEScript          = [string]$Config.CBEScript
+        UserPassScript     = [string]$Config.CBEScript
     }
+
+    $variants = @()
+
+    foreach ($rowKeyField in @('_Rowkey','_RowKey')) {
+        $full = [ordered]@{}
+        $full[$rowKeyField] = $AppKey
+        foreach ($k in $commonFull.Keys) { $full[$k] = $commonFull[$k] }
+        $variants += $full
+
+        $minimal = [ordered]@{}
+        $minimal[$rowKeyField] = $AppKey
+        foreach ($k in $commonMinimal.Keys) { $minimal[$k] = $commonMinimal[$k] }
+        $variants += $minimal
+    }
+
+    return $variants
 }
 
 function Update-IdentityApplicationFromConfig {
@@ -729,11 +670,7 @@ function Update-IdentityApplicationFromConfig {
     )
 
     $uri = $IdentityTenantURL.TrimEnd('/') + '/SaasManage/UpdateApplicationDE'
-
-    $payloads = @(
-        (New-AppUpdatePayloadFull -AppKey $AppKey -Config $Config -RenameTo $RenameTo -DescriptionToUse $DescriptionToUse),
-        (New-AppUpdatePayloadMinimal -AppKey $AppKey -Config $Config -RenameTo $RenameTo -DescriptionToUse $DescriptionToUse)
-    )
+    $payloads = New-AppUpdatePayloadVariants -AppKey $AppKey -Config $Config -RenameTo $RenameTo -DescriptionToUse $DescriptionToUse
 
     $attempt = 0
     foreach ($payload in $payloads) {
@@ -758,7 +695,7 @@ function Update-IdentityApplicationFromConfig {
 }
 
 # ------------------------------------------------------------
-# Application permissions
+# Permission helpers
 # ------------------------------------------------------------
 function Find-FirstPropertyValue {
     param(
@@ -791,15 +728,17 @@ function Find-FirstPropertyValue {
     }
 
     foreach ($name in $Names) {
-        if ($Object.PSObject.Properties.Name -contains $name) {
+        if ($Object.PSObject -and $Object.PSObject.Properties.Name -contains $name) {
             $v = $Object.$name
             if ($null -ne $v -and -not [string]::IsNullOrWhiteSpace([string]$v)) { return $v }
         }
     }
 
-    foreach ($p in $Object.PSObject.Properties) {
-        $v = Find-FirstPropertyValue -Object $p.Value -Names $Names -Depth ($Depth + 1) -MaxDepth $MaxDepth
-        if ($null -ne $v) { return $v }
+    if ($Object.PSObject) {
+        foreach ($p in $Object.PSObject.Properties) {
+            $v = Find-FirstPropertyValue -Object $p.Value -Names $Names -Depth ($Depth + 1) -MaxDepth $MaxDepth
+            if ($null -ne $v) { return $v }
+        }
     }
 
     return $null
@@ -819,11 +758,15 @@ function Find-GrantArray {
         $arr = @($Object)
         if ($arr.Count -gt 0) {
             $first = $arr[0]
-            if ($first -and $first.PSObject) {
+            $props = @()
+            if ($first -is [System.Collections.IDictionary]) {
+                $props = @($first.Keys)
+            } elseif ($first.PSObject) {
                 $props = @($first.PSObject.Properties.Name)
-                if (($props -contains 'Principal') -or ($props -contains 'PrincipalId') -or ($props -contains 'Rights') -or (($props -contains 'PType') -and ($props -contains 'Type'))) {
-                    return $arr
-                }
+            }
+
+            if (($props -contains 'Principal') -or ($props -contains 'PrincipalId') -or ($props -contains 'Rights') -or (($props -contains 'PType') -and ($props -contains 'Type'))) {
+                return $arr
             }
         }
 
@@ -842,9 +785,11 @@ function Find-GrantArray {
         return $null
     }
 
-    foreach ($p in $Object.PSObject.Properties) {
-        $found = Find-GrantArray -Object $p.Value -Depth ($Depth + 1) -MaxDepth $MaxDepth
-        if ($found) { return $found }
+    if ($Object.PSObject) {
+        foreach ($p in $Object.PSObject.Properties) {
+            $found = Find-GrantArray -Object $p.Value -Depth ($Depth + 1) -MaxDepth $MaxDepth
+            if ($found) { return $found }
+        }
     }
 
     return $null
@@ -879,69 +824,37 @@ function Get-AppPermissionState {
     }
 }
 
-function Get-EffectiveDirectoryServiceUuid {
-    if (-not [string]::IsNullOrWhiteSpace($TargetGroupDirectoryServiceUuid)) {
-        return $TargetGroupDirectoryServiceUuid
-    }
-
-    try {
-        $dirResult = Get-DirectoryServices
-        $rows = @($dirResult.Results | ForEach-Object { $_.Row })
-        if ($rows.Count -eq 1) {
-            $uuid = [string]$rows[0].DirectoryServiceUuid
-            if ([string]::IsNullOrWhiteSpace($uuid)) {
-                $uuid = [string]$rows[0].ID
-            }
-            if (-not [string]::IsNullOrWhiteSpace($uuid)) {
-                Write-Log ("DirectoryServiceUuid not provided. Using the only directory service UUID returned: {0}" -f $uuid) 'Yellow'
-                Add-ReportRow -Step 'Directory Service UUID' -Status 'INFO' -Detail ("Auto-selected single directory service UUID {0}" -f $uuid)
-                return $uuid
-            }
-        }
-    } catch {
-        Write-Log ("Could not auto-resolve DirectoryServiceUuid: {0}" -f $_.Exception.Message) 'Yellow'
-    }
-
-    return ''
-}
-
 function New-GrantCandidates {
     param([Parameter(Mandatory)][string]$Rights)
 
     $effectiveSystemName = if ([string]::IsNullOrWhiteSpace($TargetGroupSystemName)) { $TargetGroupDisplayName } else { $TargetGroupSystemName }
     $effectivePrincipal  = if ([string]::IsNullOrWhiteSpace($TargetGroupDisplayName)) { $effectiveSystemName } else { $TargetGroupDisplayName }
-    $effectiveDsUuid     = Get-EffectiveDirectoryServiceUuid
 
     $candidates = @()
 
-    # Fullest shape
     $candidates += [pscustomobject]@{
         Principal            = $effectivePrincipal
         PType                = 'Group'
         Rights               = $Rights
         PrincipalId          = $TargetGroupInternalName
-        DirectoryServiceUuid = $effectiveDsUuid
+        DirectoryServiceUuid = $TargetGroupDirectoryServiceUuid
         SystemName           = $effectiveSystemName
         Type                 = 'Group'
     }
 
-    # No PrincipalId
-    $candidates += [pscustomobject]@{
-        Principal            = $effectivePrincipal
-        PType                = 'Group'
-        Rights               = $Rights
-        DirectoryServiceUuid = $effectiveDsUuid
-        SystemName           = $effectiveSystemName
-        Type                 = 'Group'
-    }
-
-    # Leanest
     $candidates += [pscustomobject]@{
         Principal  = $effectivePrincipal
         PType      = 'Group'
         Rights     = $Rights
         SystemName = $effectiveSystemName
         Type       = 'Group'
+    }
+
+    $candidates += [pscustomobject]@{
+        Principal = $effectiveSystemName
+        PType     = 'Group'
+        Rights    = $Rights
+        Type      = 'Group'
     }
 
     return $candidates
@@ -954,6 +867,8 @@ function Get-MergedGrantSet {
     )
 
     if (-not $ExistingGrants -or @($ExistingGrants).Count -lt 1) {
+        Write-Log 'No existing grants were discovered. Will try applying only the target group grant.' 'Yellow'
+        Add-ReportRow -Step 'Inspect App Permissions' -Status 'INFO' -Detail 'No existing grants discovered; attempting to set only the target group grant.'
         return @($NewGrant)
     }
 
@@ -961,18 +876,15 @@ function Get-MergedGrantSet {
     $found = $false
 
     foreach ($g in @($ExistingGrants)) {
-        $principalId = $null
-        $systemName  = $null
-        $principal   = $null
-
-        if ($g.PSObject.Properties.Name -contains 'PrincipalId') { $principalId = [string]$g.PrincipalId }
-        if ($g.PSObject.Properties.Name -contains 'SystemName')  { $systemName  = [string]$g.SystemName }
-        if ($g.PSObject.Properties.Name -contains 'Principal')   { $principal   = [string]$g.Principal }
+        $principalId = [string](Get-DirectField -Object $g -FieldName 'PrincipalId')
+        $systemName  = [string](Get-DirectField -Object $g -FieldName 'SystemName')
+        $principal   = [string](Get-DirectField -Object $g -FieldName 'Principal')
 
         $isTarget = $false
         if (-not [string]::IsNullOrWhiteSpace($TargetGroupInternalName) -and $principalId -eq $TargetGroupInternalName) { $isTarget = $true }
         elseif (-not [string]::IsNullOrWhiteSpace($TargetGroupSystemName) -and $systemName -eq $TargetGroupSystemName) { $isTarget = $true }
         elseif (-not [string]::IsNullOrWhiteSpace($TargetGroupDisplayName) -and $principal -eq $TargetGroupDisplayName) { $isTarget = $true }
+        elseif (-not [string]::IsNullOrWhiteSpace($TargetGroupSystemName) -and $principal -eq $TargetGroupSystemName) { $isTarget = $true }
 
         if ($isTarget) {
             $merged.Add($NewGrant) | Out-Null
@@ -987,6 +899,38 @@ function Get-MergedGrantSet {
     }
 
     return @($merged)
+}
+
+function New-SetPermissionsBodies {
+    param(
+        [Parameter(Mandatory)][object[]]$Grants,
+        [Parameter(Mandatory)][object]$State
+    )
+
+    $bodies = @()
+
+    $base1 = [ordered]@{
+        Grants = $Grants
+        ID     = $(if ($State.ID) { $State.ID } else { '' })
+        RowKey = $(if ($State.RowKey) { $State.RowKey } else { '' })
+        PVID   = $(if ($State.PVID) { $State.PVID } else { '' })
+    }
+    $bodies += $base1
+
+    $base2 = [ordered]@{
+        Grants = $Grants
+        RowKey = $(if ($State.RowKey) { $State.RowKey } else { '' })
+        PVID   = $(if ($State.PVID) { $State.PVID } else { '' })
+    }
+    $bodies += $base2
+
+    $base3 = [ordered]@{
+        Grants = $Grants
+        RowKey = $(if ($State.RowKey) { $State.RowKey } else { '' })
+    }
+    $bodies += $base3
+
+    return $bodies
 }
 
 function Set-ApplicationPermissionsDirectGroup {
@@ -1005,26 +949,23 @@ function Set-ApplicationPermissionsDirectGroup {
         'View,Run,AutomaticallyDeploy'
     )
 
+    $uri = $IdentityTenantURL.TrimEnd('/') + '/SaasManage/SetApplicationPermissions'
+
     foreach ($rights in $rightsCandidates) {
         foreach ($grant in (New-GrantCandidates -Rights $rights)) {
-            $body = @{
-                Grants = (Get-MergedGrantSet -ExistingGrants @($state.Grants) -NewGrant $grant)
-                ID     = $(if ($state.ID) { $state.ID } else { '' })
-                RowKey = $(if ($state.RowKey) { $state.RowKey } else { $AppRowKey })
-                PVID   = $(if ($state.PVID) { $state.PVID } else { '' })
-            }
-
-            try {
-                Write-Log ("Trying SetApplicationPermissions with Rights='{0}' Principal='{1}' SystemName='{2}'..." -f $rights, $grant.Principal, $grant.SystemName) 'Gray'
-                $uri = $IdentityTenantURL.TrimEnd('/') + '/SaasManage/SetApplicationPermissions'
-                $resp = Invoke-IdentityApiWithRetry -AbsoluteUris @($uri) -Body $body -LogicalName 'SetApplicationPermissions'
-                if ($resp.success) {
-                    Write-Log ("Direct group permission assignment succeeded for group '{0}' using Rights='{1}'." -f $grant.SystemName, $rights) 'Green'
-                    Add-ReportRow -Step 'Set Application Permissions' -Status 'SUCCESS' -Detail ("Group={0}; Rights={1}; RowKey={2}" -f $grant.SystemName, $rights, $state.RowKey)
-                    return
+            $merged = Get-MergedGrantSet -ExistingGrants @($state.Grants) -NewGrant $grant
+            foreach ($body in (New-SetPermissionsBodies -Grants $merged -State $state)) {
+                try {
+                    Write-Log ("Trying SetApplicationPermissions with Rights='{0}' Principal='{1}' SystemName='{2}'..." -f $rights, $grant.Principal, $grant.SystemName) 'Gray'
+                    $resp = Invoke-IdentityApiWithRetry -AbsoluteUris @($uri) -Body $body -LogicalName 'SetApplicationPermissions'
+                    if ($resp.success) {
+                        Write-Log ("Direct group permission assignment succeeded for group '{0}' using Rights='{1}'." -f $grant.SystemName, $rights) 'Green'
+                        Add-ReportRow -Step 'Set Application Permissions' -Status 'SUCCESS' -Detail ("Group={0}; Rights={1}; RowKey={2}" -f $grant.SystemName, $rights, $state.RowKey)
+                        return
+                    }
+                } catch {
+                    Write-Log ("SetApplicationPermissions attempt failed with Rights='{0}' and grant Principal='{1}': {2}" -f $rights, $grant.Principal, $_.Exception.Message) 'Yellow'
                 }
-            } catch {
-                Write-Log ("SetApplicationPermissions attempt failed with Rights='{0}' and grant Principal='{1}': {2}" -f $rights, $grant.Principal, $_.Exception.Message) 'Yellow'
             }
         }
     }
@@ -1037,7 +978,6 @@ function Set-ApplicationPermissionsDirectGroup {
 # ------------------------------------------------------------
 $response      = $null
 $exportConfig  = $null
-$templateId    = $null
 $newAppKey     = $null
 $sourceDetails = $null
 $updatedDetails= $null
@@ -1076,27 +1016,23 @@ try {
     }
 
     Start-IdentityApiSession -TenantUrl $IdentityTenantURL -UserName $resolvedUser -Password $response.Content
-    Test-IdentityApiAccess
+    Write-Log "Skipping GetUserInfo sanity check and proceeding directly to app-management operations." "Yellow"
+    Add-ReportRow -Step 'GetUserInfo' -Status 'SKIPPED' -Detail 'Skipped generic user-function check and proceeded directly to app-management APIs.'
 
-    # Validate PAS account
     $vaultAccount = Find-VaultAccount -SafeName $SafeName -AccountIdentifier $AccountName
 
     Write-Log ("Using exported config Name='{0}', TemplateName='{1}', AppType='{2}', WebUPAppType='{3}', IsSwsEnabled='{4}'." -f $exportConfig.Name, $exportConfig.TemplateName, $exportConfig.AppType, $exportConfig.WebUPAppType, $exportConfig.IsSwsEnabled) 'Cyan'
-    Add-ReportRow -Step 'Input Summary' -Status 'INFO' -Detail ("ExportedName={0}; TemplateName={1}; NewAppName={2}; GroupDisplayName={3}; GroupSystemName={4}; GroupInternalName={5}; GroupDirectoryServiceUuid={6}; SafeName={7}; AccountName={8}" -f $exportConfig.Name, $exportConfig.TemplateName, $NewAppName, $TargetGroupDisplayName, $TargetGroupSystemName, $TargetGroupInternalName, $TargetGroupDirectoryServiceUuid, $SafeName, $AccountName)
-
-    # Resolve template and create new app
-    $templateId = Resolve-TemplateId -Config $exportConfig -TemplateIdOverride $TemplateIdOverride
+    Add-ReportRow -Step 'Input Summary' -Status 'INFO' -Detail ("SourceAppName={0}; ExportedTemplateName={1}; NewAppName={2}; GroupDisplayName={3}; GroupSystemName={4}; GroupInternalName={5}; GroupDirectoryServiceUuid={6}; SafeName={7}; AccountName={8}" -f $SourceAppName, $exportConfig.TemplateName, $NewAppName, $TargetGroupDisplayName, $TargetGroupSystemName, $TargetGroupInternalName, $TargetGroupDirectoryServiceUuid, $SafeName, $AccountName)
 
     if ($WhatIf) {
-        Write-Log ("WHATIF: Would import app from template ID '{0}'." -f $templateId) 'Yellow'
-        Add-ReportRow -Step 'Import App From Template' -Status 'WHATIF' -Detail ("TemplateID={0}" -f $templateId)
+        Write-Log ("WHATIF: Would import a new app from template candidates based on '{0}'." -f $exportConfig.TemplateName) 'Yellow'
+        Add-ReportRow -Step 'Import App From Template' -Status 'WHATIF' -Detail ("TemplateName={0}; Override={1}" -f $exportConfig.TemplateName, $TemplateIdOverride)
     } else {
-        $newAppKey = Import-AppFromTemplate -TemplateId $templateId
+        $newAppKey = Import-AppFromTemplateAdaptive -Config $exportConfig -TemplateIdOverride $TemplateIdOverride
         $sourceDetails = Get-IdentityApplicationDetails -AppKey $newAppKey
         Assert-IdentityWebApp -AppDetails $sourceDetails -Label 'Newly Created Application (pre-update)'
     }
 
-    # Update app from exported Browser Extension configuration
     if ($WhatIf) {
         Write-Log ("WHATIF: Would update new app '{0}' with exported Browser Extension configuration." -f $newAppKey) 'Yellow'
         Add-ReportRow -Step 'Update Application' -Status 'WHATIF' -Detail ("AppKey={0}; NewName={1}" -f $newAppKey, $NewAppName)
@@ -1107,7 +1043,6 @@ try {
         Assert-AppScriptPresent -AppDetails $updatedDetails -ExpectedUrl 'https://cna.okta.com/login/default'
     }
 
-    # Direct group permissions
     if ($WhatIf) {
         Write-Log ("WHATIF: Would add direct app permissions for group '{0}'." -f $(if ($TargetGroupSystemName) { $TargetGroupSystemName } else { $TargetGroupDisplayName })) 'Yellow'
         Add-ReportRow -Step 'Set Application Permissions' -Status 'WHATIF' -Detail ("AppKey={0}; Group={1}" -f $newAppKey, $(if ($TargetGroupSystemName) { $TargetGroupSystemName } else { $TargetGroupDisplayName }))
