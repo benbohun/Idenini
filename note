@@ -1,26 +1,16 @@
 <#
-CNA_Create_Identity_WebApp_From_Json_v2.ps1
+CNA_Create_Identity_WebApp_From_Json_v3.ps1
 
-Purpose
-- Authenticate to CCP and Privilege Cloud using the working CNA service-user pattern
-- Authenticate to CyberArk Identity
-- Create a NEW Browser Extension (advanced) style app from template candidates
-- Apply the exported Browser Extension (advanced) JSON to the new app
-- Rename the new app to the provided vaulted username
-- Validate the resulting app is still a Web / Browser Extension app
-- Add direct application permissions for a target group
-- Validate / record the PAS Safe + Account input for later credential workflow
+Changes in this version
+- PAS account lookup is restricted to the target safe only
+- PAS account match must be exact; it will not pick a fuzzy/partial match
+- Identity ImportAppFromTemplate now fails fast on 401 Unauthorized
+- Skips GetUserInfo and Redrock/query entirely
+- Keeps the create-from-exported-JSON workflow
 
-Important
-- This version intentionally SKIPS GetUserInfo and any Redrock/query calls.
-- It also avoids catalog lookup unless you explicitly choose to add that later.
-- If app-management endpoints still return 401, the blocker is tenant-side authorization for the service account.
-
-Inputs you may still need to fill
-- TargetGroupInternalName (optional but helpful)
-- TargetGroupDirectoryServiceUuid (optional but helpful)
-
-ASCII only.
+What still cannot be fixed in code
+- If ImportAppFromTemplate returns 401 Unauthorized, the service account still does not have
+  effective Identity app-management authorization in the tenant.
 #>
 
 [CmdletBinding()]
@@ -39,9 +29,9 @@ param(
     [bool]$CCPWindowsAuth      = $false,
 
     # ===== New app settings =====
-    [string]$SourceAppName     = 'GCP - Okta Prod',
-    [string]$NewAppName        = 'g-test-pam1',
-    [string]$AppDescription    = 'GCP - Okta Prod created via CyberArk Identity API',
+    [string]$SourceAppName      = 'GCP - Okta Prod',
+    [string]$NewAppName         = 'g-test-pam1',
+    [string]$AppDescription     = 'GCP - Okta Prod created via CyberArk Identity API',
     [string]$TemplateIdOverride = '',
 
     # ===== Identity application permission target =====
@@ -58,8 +48,8 @@ param(
     [string]$SourceAppExportJson = '',
 
     # ===== Logging =====
-    [string]$LogPath           = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_From_Json_v2.log',
-    [string]$ReportCsvPath     = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_From_Json_v2_Report.csv',
+    [string]$LogPath           = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_From_Json_v3.log',
+    [string]$ReportCsvPath     = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_From_Json_v3_Report.csv',
 
     # ===== Advanced =====
     [switch]$WhatIf
@@ -384,60 +374,144 @@ function Invoke-IdentityApiWithRetry {
 }
 
 # ------------------------------------------------------------
-# PAS account validation
+# PAS account validation - SAFE ONLY + EXACT MATCH
 # ------------------------------------------------------------
-function Find-VaultAccount {
+function Get-AccountCandidateFields {
+    param([Parameter(Mandatory)]$Account)
+
+    $fields = New-Object System.Collections.Generic.List[string]
+
+    foreach ($prop in @('name','Name','userName','UserName','address','Address')) {
+        $val = [string](Get-DirectField -Object $Account -FieldName $prop)
+        if (-not [string]::IsNullOrWhiteSpace($val) -and -not $fields.Contains($val)) {
+            $fields.Add($val) | Out-Null
+        }
+    }
+
+    $addr = [string](Get-DirectField -Object $Account -FieldName 'address')
+    if ([string]::IsNullOrWhiteSpace($addr)) { $addr = [string](Get-DirectField -Object $Account -FieldName 'Address') }
+
+    $usr = [string](Get-DirectField -Object $Account -FieldName 'userName')
+    if ([string]::IsNullOrWhiteSpace($usr)) { $usr = [string](Get-DirectField -Object $Account -FieldName 'UserName') }
+
+    if (-not [string]::IsNullOrWhiteSpace($addr) -and -not [string]::IsNullOrWhiteSpace($usr)) {
+        $composite = "$addr-$usr"
+        if (-not $fields.Contains($composite)) {
+            $fields.Add($composite) | Out-Null
+        }
+    }
+
+    return @($fields)
+}
+
+function Test-ExactAccountIdentifierMatch {
+    param(
+        [Parameter(Mandatory)]$Account,
+        [Parameter(Mandatory)][string]$Identifier
+    )
+
+    $needle = $Identifier.Trim().ToLowerInvariant()
+    foreach ($candidate in (Get-AccountCandidateFields -Account $Account)) {
+        if ($candidate.Trim().ToLowerInvariant() -eq $needle) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Find-VaultAccountInSafeOnly {
     param(
         [Parameter(Mandatory)][string]$SafeName,
         [Parameter(Mandatory)][string]$AccountIdentifier
     )
 
-    Write-Log ("Searching PAS account in Safe '{0}' using identifier '{1}'..." -f $SafeName, $AccountIdentifier) 'Cyan'
+    Write-Log ("Searching PAS account in Safe '{0}' using exact identifier '{1}' only..." -f $SafeName, $AccountIdentifier) 'Cyan'
 
-    $found = @()
+    $matches = @()
 
-    try {
-        $searchResults = Get-PASAccount -search $AccountIdentifier -ErrorAction Stop
-        if ($searchResults) {
-            $found = @($searchResults | Where-Object {
-                ($_.safeName -eq $SafeName) -or ($_.SafeName -eq $SafeName)
-            })
+    # Try direct REST search scoped to the safe first
+    $invokePasRest = Get-Command Invoke-PASRestMethod -ErrorAction SilentlyContinue
+    if ($invokePasRest) {
+        foreach ($filterExpr in @("safeName eq '$SafeName'","safeName eq $SafeName")) {
+            try {
+                $uri = "API/Accounts?search=$([uri]::EscapeDataString($AccountIdentifier))&filter=$([uri]::EscapeDataString($filterExpr))&limit=100"
+                Write-Log ("Trying PAS REST safe-scoped lookup with filter [{0}]..." -f $filterExpr) 'Gray'
+                $resp = Invoke-PASRestMethod -Uri $uri -Method GET -ErrorAction Stop
+
+                $items = @()
+                if ($resp.PSObject.Properties.Name -contains 'value') {
+                    $items = @($resp.value)
+                } elseif ($resp.PSObject.Properties.Name -contains 'Value') {
+                    $items = @($resp.Value)
+                } elseif ($resp -is [System.Collections.IEnumerable] -and -not ($resp -is [string])) {
+                    $items = @($resp)
+                }
+
+                $exact = @($items | Where-Object {
+                    (
+                        ([string](Get-DirectField -Object $_ -FieldName 'safeName') -eq $SafeName) -or
+                        ([string](Get-DirectField -Object $_ -FieldName 'SafeName') -eq $SafeName)
+                    ) -and (Test-ExactAccountIdentifierMatch -Account $_ -Identifier $AccountIdentifier)
+                })
+
+                if ($exact.Count -gt 0) {
+                    $matches = $exact
+                    break
+                }
+            } catch {
+                Write-Log ("PAS REST safe-scoped lookup failed with filter [{0}]: {1}" -f $filterExpr, $_.Exception.Message) 'Yellow'
+            }
         }
-    } catch {
-        Write-Log ("Initial Get-PASAccount search fallback engaged: {0}" -f $_.Exception.Message) 'Yellow'
     }
 
-    if (-not $found -or $found.Count -lt 1) {
+    # Try Get-PASAccount scoped to safe if supported
+    if ($matches.Count -lt 1) {
         try {
-            $all = Get-PASAccount -ErrorAction Stop
-            $found = @($all | Where-Object {
-                (
-                    ($_.safeName -eq $SafeName) -or ($_.SafeName -eq $SafeName)
-                ) -and (
-                    ($_.userName -eq $AccountIdentifier) -or
-                    ($_.UserName -eq $AccountIdentifier) -or
-                    ($_.name -eq $AccountIdentifier) -or
-                    ($_.Name -eq $AccountIdentifier) -or
-                    ($_.address -eq $AccountIdentifier) -or
-                    ($_.Address -eq $AccountIdentifier)
-                )
-            })
+            $getPasCmd = Get-Command Get-PASAccount -ErrorAction Stop
+            if ($getPasCmd.Parameters.ContainsKey('SafeName')) {
+                Write-Log "Trying Get-PASAccount -SafeName scoped lookup..." 'Gray'
+                $safeResults = @(Get-PASAccount -SafeName $SafeName -Search $AccountIdentifier -ErrorAction Stop)
+                $matches = @($safeResults | Where-Object { Test-ExactAccountIdentifierMatch -Account $_ -Identifier $AccountIdentifier })
+            }
         } catch {
-            throw ("Could not enumerate PAS accounts to locate '{0}' in Safe '{1}': {2}" -f $AccountIdentifier, $SafeName, $_.Exception.Message)
+            Write-Log ("Get-PASAccount -SafeName scoped lookup failed: {0}" -f $_.Exception.Message) 'Yellow'
         }
     }
 
-    if (-not $found -or $found.Count -lt 1) {
-        throw ("No PAS account found in Safe '{0}' for identifier '{1}'." -f $SafeName, $AccountIdentifier)
+    # Last fallback: enumerate only the safe, not all accounts
+    if ($matches.Count -lt 1) {
+        try {
+            $getPasCmd = Get-Command Get-PASAccount -ErrorAction Stop
+            if ($getPasCmd.Parameters.ContainsKey('SafeName')) {
+                Write-Log "Trying Get-PASAccount -SafeName enumeration for the target safe only..." 'Gray'
+                $safeAll = @(Get-PASAccount -SafeName $SafeName -ErrorAction Stop)
+                $matches = @($safeAll | Where-Object { Test-ExactAccountIdentifierMatch -Account $_ -Identifier $AccountIdentifier })
+            }
+        } catch {
+            Write-Log ("Get-PASAccount -SafeName enumeration failed: {0}" -f $_.Exception.Message) 'Yellow'
+        }
     }
 
-    if ($found.Count -gt 1) {
-        Write-Log ("Multiple PAS accounts matched. Using the first match with ID '{0}'." -f $found[0].id) 'Yellow'
+    if ($matches.Count -lt 1) {
+        throw ("No exact PAS account match was found in Safe '{0}' for identifier '{1}'. The script will not continue with a fuzzy match." -f $SafeName, $AccountIdentifier)
     }
 
-    $acct = $found[0]
-    Write-Log ("Matched PAS account ID '{0}' username '{1}' address '{2}'." -f $acct.id, $acct.userName, $acct.address) 'Green'
-    Add-ReportRow -Step 'Find Vault Account' -Status 'SUCCESS' -Detail ("Safe={0}; AccountID={1}; Username={2}; Address={3}" -f $SafeName, $acct.id, $acct.userName, $acct.address)
+    if ($matches.Count -gt 1) {
+        $ids = ($matches | ForEach-Object { [string](Get-DirectField -Object $_ -FieldName 'id') }) -join ','
+        throw ("Multiple exact PAS account matches were found in Safe '{0}' for identifier '{1}'. Matching Account IDs: {2}" -f $SafeName, $AccountIdentifier, $ids)
+    }
+
+    $acct = $matches[0]
+    $acctId = [string](Get-DirectField -Object $acct -FieldName 'id')
+    $acctUser = [string](Get-DirectField -Object $acct -FieldName 'userName')
+    if ([string]::IsNullOrWhiteSpace($acctUser)) { $acctUser = [string](Get-DirectField -Object $acct -FieldName 'UserName') }
+    $acctAddr = [string](Get-DirectField -Object $acct -FieldName 'address')
+    if ([string]::IsNullOrWhiteSpace($acctAddr)) { $acctAddr = [string](Get-DirectField -Object $acct -FieldName 'Address') }
+    $acctName = [string](Get-DirectField -Object $acct -FieldName 'name')
+    if ([string]::IsNullOrWhiteSpace($acctName)) { $acctName = [string](Get-DirectField -Object $acct -FieldName 'Name') }
+
+    Write-Log ("Matched exact PAS account. ID='{0}' Name='{1}' Username='{2}' Address='{3}'." -f $acctId, $acctName, $acctUser, $acctAddr) 'Green'
+    Add-ReportRow -Step 'Find Vault Account' -Status 'SUCCESS' -Detail ("Safe={0}; AccountID={1}; Name={2}; Username={3}; Address={4}" -f $SafeName, $acctId, $acctName, $acctUser, $acctAddr)
     return $acct
 }
 
@@ -515,7 +589,12 @@ function Import-AppFromTemplateAdaptive {
             Add-ReportRow -Step 'Import App From Template' -Status 'SUCCESS' -Detail ("TemplateID={0}; AppRowKey={1}" -f $templateId, $rowKey)
             return $rowKey
         } catch {
-            Write-Log ("ImportAppFromTemplate failed for template '{0}': {1}" -f $templateId, $_.Exception.Message) 'Yellow'
+            $msg = $_.Exception.Message
+            if ($msg -match 'Unauthorized persisted for ImportAppFromTemplate' -or $msg -match '\(401\).*Unauthorized') {
+                throw "ImportAppFromTemplate returned 401 Unauthorized. This is a tenant-side Identity authorization issue for the service account, not a template-ID issue."
+            }
+
+            Write-Log ("ImportAppFromTemplate failed for template '{0}': {1}" -f $templateId, $msg) 'Yellow'
         }
     }
 
@@ -686,7 +765,12 @@ function Update-IdentityApplicationFromConfig {
             Add-ReportRow -Step 'Update Application' -Status 'SUCCESS' -Detail ("Attempt={0}; AppKey={1}" -f $attempt, $AppKey)
             return
         } catch {
-            Write-Log ("UpdateApplicationDE attempt #{0} failed: {1}" -f $attempt, $_.Exception.Message) 'Yellow'
+            $msg = $_.Exception.Message
+            if ($msg -match 'Unauthorized persisted for UpdateApplicationDE' -or $msg -match '\(401\).*Unauthorized') {
+                throw "UpdateApplicationDE returned 401 Unauthorized. The service account can authenticate, but it is still not authorized for Identity app modification."
+            }
+
+            Write-Log ("UpdateApplicationDE attempt #{0} failed: {1}" -f $attempt, $msg) 'Yellow'
             if ($attempt -eq $payloads.Count) {
                 throw
             }
@@ -727,14 +811,14 @@ function Find-FirstPropertyValue {
         return $null
     }
 
-    foreach ($name in $Names) {
-        if ($Object.PSObject -and $Object.PSObject.Properties.Name -contains $name) {
-            $v = $Object.$name
-            if ($null -ne $v -and -not [string]::IsNullOrWhiteSpace([string]$v)) { return $v }
-        }
-    }
-
     if ($Object.PSObject) {
+        foreach ($name in $Names) {
+            if ($Object.PSObject.Properties.Name -contains $name) {
+                $v = $Object.$name
+                if ($null -ne $v -and -not [string]::IsNullOrWhiteSpace([string]$v)) { return $v }
+            }
+        }
+
         foreach ($p in $Object.PSObject.Properties) {
             $v = Find-FirstPropertyValue -Object $p.Value -Names $Names -Depth ($Depth + 1) -MaxDepth $MaxDepth
             if ($null -ne $v) { return $v }
@@ -909,26 +993,23 @@ function New-SetPermissionsBodies {
 
     $bodies = @()
 
-    $base1 = [ordered]@{
+    $bodies += [ordered]@{
         Grants = $Grants
         ID     = $(if ($State.ID) { $State.ID } else { '' })
         RowKey = $(if ($State.RowKey) { $State.RowKey } else { '' })
         PVID   = $(if ($State.PVID) { $State.PVID } else { '' })
     }
-    $bodies += $base1
 
-    $base2 = [ordered]@{
+    $bodies += [ordered]@{
         Grants = $Grants
         RowKey = $(if ($State.RowKey) { $State.RowKey } else { '' })
         PVID   = $(if ($State.PVID) { $State.PVID } else { '' })
     }
-    $bodies += $base2
 
-    $base3 = [ordered]@{
+    $bodies += [ordered]@{
         Grants = $Grants
         RowKey = $(if ($State.RowKey) { $State.RowKey } else { '' })
     }
-    $bodies += $base3
 
     return $bodies
 }
@@ -964,7 +1045,12 @@ function Set-ApplicationPermissionsDirectGroup {
                         return
                     }
                 } catch {
-                    Write-Log ("SetApplicationPermissions attempt failed with Rights='{0}' and grant Principal='{1}': {2}" -f $rights, $grant.Principal, $_.Exception.Message) 'Yellow'
+                    $msg = $_.Exception.Message
+                    if ($msg -match 'Unauthorized persisted for SetApplicationPermissions' -or $msg -match '\(401\).*Unauthorized') {
+                        throw "SetApplicationPermissions returned 401 Unauthorized. The service account is still not authorized for Identity application permission changes."
+                    }
+
+                    Write-Log ("SetApplicationPermissions attempt failed with Rights='{0}' and grant Principal='{1}': {2}" -f $rights, $grant.Principal, $msg) 'Yellow'
                 }
             }
         }
@@ -1019,7 +1105,7 @@ try {
     Write-Log "Skipping GetUserInfo sanity check and proceeding directly to app-management operations." "Yellow"
     Add-ReportRow -Step 'GetUserInfo' -Status 'SKIPPED' -Detail 'Skipped generic user-function check and proceeded directly to app-management APIs.'
 
-    $vaultAccount = Find-VaultAccount -SafeName $SafeName -AccountIdentifier $AccountName
+    $vaultAccount = Find-VaultAccountInSafeOnly -SafeName $SafeName -AccountIdentifier $AccountName
 
     Write-Log ("Using exported config Name='{0}', TemplateName='{1}', AppType='{2}', WebUPAppType='{3}', IsSwsEnabled='{4}'." -f $exportConfig.Name, $exportConfig.TemplateName, $exportConfig.AppType, $exportConfig.WebUPAppType, $exportConfig.IsSwsEnabled) 'Cyan'
     Add-ReportRow -Step 'Input Summary' -Status 'INFO' -Detail ("SourceAppName={0}; ExportedTemplateName={1}; NewAppName={2}; GroupDisplayName={3}; GroupSystemName={4}; GroupInternalName={5}; GroupDirectoryServiceUuid={6}; SafeName={7}; AccountName={8}" -f $SourceAppName, $exportConfig.TemplateName, $NewAppName, $TargetGroupDisplayName, $TargetGroupSystemName, $TargetGroupInternalName, $TargetGroupDirectoryServiceUuid, $SafeName, $AccountName)
