@@ -1,25 +1,22 @@
 <#
-CNA_Clone_Identity_WebApp_DirectGroupPermissions.ps1
+CNA_Clone_Identity_WebApp_DirectGroupPermissions_v2.ps1
 
-Purpose
-- Authenticate with the CNA CCP/service-user pattern
-- Authenticate to CyberArk Identity API
-- Clone an existing Identity application
-- Rename the cloned app to the provided vaulted CyberArk username
-- Validate the cloned app is still a Web App after rename
-- Resolve a target directory group from DSGroups
-- Add that group directly to the APPLICATION permissions (not via wrapper role)
-- Ensure the target group gets View + Run + Automatically Deploy
-- Prompt for Safe Name and Account Name and save them in the report for later Secure Access / credential binding
+Changes in this version
+- Keeps the Identity web session cookie from Start/AdvanceAuthentication
+- Retries Identity admin calls with:
+    1) Bearer + Cookie
+    2) Cookie only
+    3) Bearer only
+- Retries /Redrock/query and /Redrock/Query
+- Lets you bypass Redrock lookup entirely if you already know the source App Key
+- Hard-codes your current test values unless -UsePrompt is supplied
 
-Important notes
-- This script uses /SaasManage/SetApplicationPermissions.
-- To avoid accidentally replacing all app permissions, the script first tries to discover existing grants from GetApplication output and merge the new group grant into that set.
-- If existing grants cannot be discovered, the script STOPS by default.
-- You can override that behavior with -ForcePermissionReplace, but only do that if you are comfortable replacing the app's permission set.
-- Show in user app list must be enabled on the app for Automatically Deploy to surface the tile in the User Portal.
-
-ASCII only.
+Current test defaults
+- Source App      : GCP - Okta Prod
+- New App Name    : g-test-pam1
+- Target Group    : ca_PCloud_Admins
+- Safe Name       : CyberArkTestValidation
+- Account Name    : PC0VPXSB.cna.com-administrator
 #>
 
 [CmdletBinding()]
@@ -37,17 +34,26 @@ param(
     [string]$CCPObject         = 'cna-prod.cyberark.cloud-cnarestbot',
     [bool]$CCPWindowsAuth      = $false,
 
+    # ===== Test defaults =====
+    [string]$SourceAppInput    = 'GCP - Okta Prod',
+    [string]$SourceAppKey      = '',
+    [string]$VaultedUserName   = 'g-test-pam1',
+    [string]$TargetGroup       = 'ca_PCloud_Admins',
+    [string]$SafeName          = 'CyberArkTestValidation',
+    [string]$AccountName       = 'PC0VPXSB.cna.com-administrator',
+
     # ===== Logging / reporting =====
-    [string]$LogPath           = 'E:\Installation Media\Script\OnboardScript\data\Identity_DirectGroupPermissions.log',
-    [string]$ReportCsvPath     = 'E:\Installation Media\Script\OnboardScript\data\Identity_DirectGroupPermissions_Report.csv',
+    [string]$LogPath           = 'E:\Installation Media\Script\OnboardScript\data\Identity_DirectGroupPermissions_v2.log',
+    [string]$ReportCsvPath     = 'E:\Installation Media\Script\OnboardScript\data\Identity_DirectGroupPermissions_v2_Report.csv',
 
     # ===== Advanced =====
     [string]$CloneEndpointPath = '/SaasManage/CloneApplication',
     [switch]$ForcePermissionReplace,
+    [switch]$UsePrompt,
     [switch]$WhatIf
 )
 
-# --- Allow this process to load unsigned modules & unblock psPAS files (silent) ---
+# --- Allow process-scope execution / unblock psPAS files ---
 try { Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force -ErrorAction Stop } catch {}
 
 $psPASDirs = @(
@@ -60,10 +66,11 @@ foreach ($dir in $psPASDirs) {
 }
 
 # --- Globals ---
-$script:IdentityAuthToken = $null
-$script:IdentityUser      = $null
-$script:ReportRows        = New-Object System.Collections.Generic.List[object]
-$script:PasCredential     = $null
+$script:IdentityAuthToken  = $null
+$script:IdentityUser       = $null
+$script:IdentityWebSession = $null
+$script:PasCredential      = $null
+$script:ReportRows         = New-Object System.Collections.Generic.List[object]
 
 # --- Logging ---
 function Write-Log {
@@ -108,7 +115,6 @@ function Get-NormalizedIdentityTenant {
     $value = $TenantUrl.Trim()
     $value = $value -replace '^https?://', ''
     $value = $value.TrimEnd('/')
-
     return $value
 }
 
@@ -118,32 +124,20 @@ function Escape-SqlLiteral {
     return ($Value -replace "'", "''")
 }
 
-function Invoke-JsonPost {
-    param(
-        [Parameter(Mandatory)][string]$Uri,
-        [Parameter()][object]$Body,
-        [Parameter()][hashtable]$Headers
-    )
-
-    $json = $null
-    if ($PSBoundParameters.ContainsKey('Body') -and $null -ne $Body) {
-        $json = ($Body | ConvertTo-Json -Depth 30)
-    }
-
-    if ($json) {
-        return Invoke-RestMethod -Method POST -Uri $Uri -Headers $Headers -ContentType 'application/json' -Body $json -ErrorAction Stop
-    } else {
-        return Invoke-RestMethod -Method POST -Uri $Uri -Headers $Headers -ContentType 'application/json' -ErrorAction Stop
+function Get-HttpStatusCode {
+    param([Parameter(Mandatory)]$Exception)
+    try {
+        return [int]$Exception.Response.StatusCode.value__
+    } catch {
+        return $null
     }
 }
 
-function ConvertTo-Array {
-    param([Parameter(ValueFromPipeline = $true)]$InputObject)
-    process {
-        if ($null -eq $InputObject) { @() }
-        elseif ($InputObject -is [System.Collections.IEnumerable] -and -not ($InputObject -is [string])) { @($InputObject) }
-        else { @($InputObject) }
-    }
+function ConvertTo-JsonSafe {
+    param([Parameter()][object]$Object)
+
+    if ($null -eq $Object) { return $null }
+    return ($Object | ConvertTo-Json -Depth 30)
 }
 
 # --- Load psPAS ---
@@ -234,10 +228,13 @@ function Start-IdentityApiSession {
     $baseHeaders = @{
         'X-IDAP-NATIVE-CLIENT' = 'true'
         'Content-Type'         = 'application/json'
+        'Accept'               = 'application/json'
     }
 
     $startUri = ($TenantUrl.TrimEnd('/') + '/Security/StartAuthentication')
     $advUri   = ($TenantUrl.TrimEnd('/') + '/Security/AdvanceAuthentication')
+
+    $script:IdentityWebSession = New-Object Microsoft.PowerShell.Commands.WebRequestSession
 
     Write-Log ("Starting CyberArk Identity authentication for '{0}'..." -f $UserName) 'Cyan'
 
@@ -246,7 +243,9 @@ function Start-IdentityApiSession {
         Version = '1.0'
     }
 
-    $startResp = Invoke-JsonPost -Uri $startUri -Body $startBody -Headers $baseHeaders
+    $startJson = ConvertTo-JsonSafe -Object $startBody
+    $startResp = Invoke-RestMethod -Method POST -Uri $startUri -Headers $baseHeaders -WebSession $script:IdentityWebSession -ContentType 'application/json' -Body $startJson -ErrorAction Stop
+
     if (-not $startResp.success) {
         throw ('StartAuthentication failed: ' + ($startResp.Message | Out-String))
     }
@@ -278,7 +277,9 @@ function Start-IdentityApiSession {
         Answer      = $Password
     }
 
-    $advResp = Invoke-JsonPost -Uri $advUri -Body $advBody -Headers $baseHeaders
+    $advJson = ConvertTo-JsonSafe -Object $advBody
+    $advResp = Invoke-RestMethod -Method POST -Uri $advUri -Headers $baseHeaders -WebSession $script:IdentityWebSession -ContentType 'application/json' -Body $advJson -ErrorAction Stop
+
     if (-not $advResp.success) {
         throw ('AdvanceAuthentication failed: ' + ($advResp.Message | Out-String))
     }
@@ -291,31 +292,92 @@ function Start-IdentityApiSession {
     $script:IdentityAuthToken = $auth
     $script:IdentityUser      = $advResp.Result.User
 
-    Write-Log ("Identity API authentication succeeded as '{0}'." -f $script:IdentityUser) 'Green'
-    Add-ReportRow -Step 'Identity API Session' -Status 'SUCCESS' -Detail ("Authenticated as {0}" -f $script:IdentityUser)
+    $cookieCount = 0
+    try {
+        $cookieCount = $script:IdentityWebSession.Cookies.GetCookies($TenantUrl).Count
+    } catch {}
+
+    Write-Log ("Identity API authentication succeeded as '{0}'. CookieCount={1}" -f $script:IdentityUser, $cookieCount) 'Green'
+    Add-ReportRow -Step 'Identity API Session' -Status 'SUCCESS' -Detail ("Authenticated as {0}; CookieCount={1}" -f $script:IdentityUser, $cookieCount)
 }
 
-function Get-IdentityHeaders {
-    if ([string]::IsNullOrWhiteSpace($script:IdentityAuthToken)) {
-        throw 'Identity API token is not initialized.'
-    }
-
-    return @{
-        'Authorization'        = ("Bearer {0}" -f $script:IdentityAuthToken)
-        'X-IDAP-NATIVE-CLIENT' = 'true'
-        'Content-Type'         = 'application/json'
-    }
-}
-
-function Invoke-IdentityApi {
+function Invoke-IdentityPostRaw {
     param(
         [Parameter(Mandatory)][string]$Path,
-        [Parameter()][object]$Body
+        [Parameter()][object]$Body,
+        [ValidateSet('BearerCookie','CookieOnly','BearerOnly')][string]$AuthMode = 'BearerCookie'
     )
 
     $uri = $IdentityTenantURL.TrimEnd('/') + $Path
-    $headers = Get-IdentityHeaders
-    return Invoke-JsonPost -Uri $uri -Body $Body -Headers $headers
+
+    $headers = @{
+        'X-IDAP-NATIVE-CLIENT' = 'true'
+        'Content-Type'         = 'application/json'
+        'Accept'               = 'application/json'
+    }
+
+    if ($AuthMode -eq 'BearerCookie' -or $AuthMode -eq 'BearerOnly') {
+        if ([string]::IsNullOrWhiteSpace($script:IdentityAuthToken)) {
+            throw 'Identity bearer token is not initialized.'
+        }
+        $headers['Authorization'] = ("Bearer {0}" -f $script:IdentityAuthToken)
+    }
+
+    $json = ConvertTo-JsonSafe -Object $Body
+
+    $invokeParams = @{
+        Method      = 'POST'
+        Uri         = $uri
+        Headers     = $headers
+        ContentType = 'application/json'
+        ErrorAction = 'Stop'
+    }
+
+    if ($null -ne $json) {
+        $invokeParams['Body'] = $json
+    }
+
+    if (($AuthMode -eq 'BearerCookie' -or $AuthMode -eq 'CookieOnly') -and $null -ne $script:IdentityWebSession) {
+        $invokeParams['WebSession'] = $script:IdentityWebSession
+    }
+
+    return Invoke-RestMethod @invokeParams
+}
+
+function Invoke-IdentityApiWithRetry {
+    param(
+        [Parameter(Mandatory)][string[]]$Paths,
+        [Parameter()][object]$Body,
+        [string]$LogicalName = 'Identity API call'
+    )
+
+    $authModes = @('BearerCookie','CookieOnly','BearerOnly')
+    $errors = New-Object System.Collections.Generic.List[string]
+
+    foreach ($path in $Paths) {
+        foreach ($mode in $authModes) {
+            try {
+                Write-Log ("Trying {0} via path '{1}' using auth mode '{2}'..." -f $LogicalName, $path, $mode) 'Gray'
+                $resp = Invoke-IdentityPostRaw -Path $path -Body $Body -AuthMode $mode
+                Write-Log ("Succeeded: {0} via path '{1}' using auth mode '{2}'." -f $LogicalName, $path, $mode) 'Gray'
+                return $resp
+            } catch {
+                $status = Get-HttpStatusCode -Exception $_.Exception
+                $msg    = $_.Exception.Message
+                $errors.Add(("Path={0}; Mode={1}; Status={2}; Error={3}" -f $path, $mode, $status, $msg)) | Out-Null
+
+                if ($status -eq 401) {
+                    Write-Log ("401 on {0} via path '{1}' using auth mode '{2}'. Retrying..." -f $LogicalName, $path, $mode) 'Yellow'
+                    continue
+                }
+
+                throw
+            }
+        }
+    }
+
+    $detail = ($errors -join ' || ')
+    throw ("401 Unauthorized persisted for {0}. This usually means the service user is authenticated but still lacks the required Identity API/query/application rights, or the tenant API security / client allow-list is not configured for this flow. Details: {1}" -f $LogicalName, $detail)
 }
 
 function Invoke-RedrockQuery {
@@ -333,12 +395,23 @@ function Invoke-RedrockQuery {
         }
     }
 
-    return Invoke-IdentityApi -Path '/Redrock/query' -Body $body
+    return Invoke-IdentityApiWithRetry -Paths @('/Redrock/query','/Redrock/Query') -Body $body -LogicalName 'Redrock query'
 }
 
 # --- App helpers ---
 function Get-IdentityApplicationByNameOrId {
-    param([Parameter(Mandatory)][string]$NameOrId)
+    param(
+        [Parameter(Mandatory)][string]$NameOrId,
+        [string]$KnownAppKey = ''
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($KnownAppKey)) {
+        Write-Log ("Using provided SourceAppKey override: {0}" -f $KnownAppKey) 'Green'
+        return [pscustomobject]@{
+            ID   = $KnownAppKey
+            Name = $NameOrId
+        }
+    }
 
     if ($NameOrId -match '^[0-9a-fA-F-]{20,}$') {
         return [pscustomobject]@{
@@ -348,7 +421,7 @@ function Get-IdentityApplicationByNameOrId {
     }
 
     $escaped = Escape-SqlLiteral -Value $NameOrId
-    $query   = "SELECT ID, Name, Description FROM Application WHERE Name = '$escaped' ORDER BY Name COLLATE NOCASE"
+    $query   = "Select ID, Name, Description from Application where Name = '$escaped' ORDER BY Name COLLATE NOCASE"
 
     $resp = Invoke-RedrockQuery -Script $query
     $rows = @($resp.Result.Results)
@@ -368,7 +441,7 @@ function Get-IdentityApplicationByNameOrId {
 function Get-IdentityApplicationDetails {
     param([Parameter(Mandatory)][string]$AppKey)
 
-    $resp = Invoke-IdentityApi -Path '/SaasManage/GetApplication' -Body @{ _Rowkey = $AppKey }
+    $resp = Invoke-IdentityApiWithRetry -Paths @('/SaasManage/GetApplication') -Body @{ _Rowkey = $AppKey } -LogicalName 'GetApplication'
     if (-not $resp.success) {
         throw ('GetApplication failed: ' + ($resp.Message | Out-String))
     }
@@ -395,7 +468,7 @@ function Assert-IdentityWebApp {
 
     $isWeb = $false
     if ($appTypeDisplay -match '^Web') { $isWeb = $true }
-    elseif ($appType -eq 'Web')       { $isWeb = $true }
+    elseif ($appType -eq 'Web')        { $isWeb = $true }
     elseif (-not [string]::IsNullOrWhiteSpace($webUPAppType)) { $isWeb = $true }
 
     if (-not $isWeb) {
@@ -426,7 +499,7 @@ function Clone-IdentityApplicationAdaptive {
         foreach ($body in $candidateBodies) {
             try {
                 Write-Log ("Trying clone endpoint '{0}' with payload keys [{1}]" -f $path, ($body.Keys -join ',')) 'Gray'
-                $resp = Invoke-IdentityApi -Path $path -Body $body
+                $resp = Invoke-IdentityApiWithRetry -Paths @($path) -Body $body -LogicalName 'Clone application'
 
                 if ($resp.success) {
                     $newKey = $null
@@ -478,7 +551,7 @@ function Rename-IdentityApplication {
         $body['IconUri'] = $AppDetails.IconUri
     }
 
-    $resp = Invoke-IdentityApi -Path '/SaasManage/UpdateApplicationDE' -Body $body
+    $resp = Invoke-IdentityApiWithRetry -Paths @('/SaasManage/UpdateApplicationDE') -Body $body -LogicalName 'Rename application'
     if (-not $resp.success) {
         throw ('UpdateApplicationDE rename failed: ' + ($resp.Message | Out-String))
     }
@@ -530,7 +603,7 @@ ORDER BY DisplayName COLLATE NOCASE
     }
 }
 
-# --- Recursive object inspection for permissions metadata ---
+# --- Recursive inspection helpers for permission state ---
 function Find-FirstPropertyValue {
     param(
         [Parameter(Mandatory)]$Object,
@@ -604,12 +677,7 @@ function Find-GrantArray {
             $first = $arr[0]
             if ($first -and $first.PSObject) {
                 $props = @($first.PSObject.Properties.Name)
-                if (
-                    ($props -contains 'Principal') -or
-                    ($props -contains 'PrincipalId') -or
-                    ($props -contains 'Rights') -or
-                    (($props -contains 'PType') -and ($props -contains 'Type'))
-                ) {
+                if (($props -contains 'Principal') -or ($props -contains 'PrincipalId') -or ($props -contains 'Rights') -or (($props -contains 'PType') -and ($props -contains 'Type'))) {
                     return $arr
                 }
             }
@@ -695,7 +763,7 @@ function Get-MergedGrantSet {
     )
 
     $merged = New-Object System.Collections.Generic.List[object]
-    $found = $false
+    $found  = $false
 
     foreach ($g in @($ExistingGrants)) {
         $principalId = $null
@@ -770,7 +838,7 @@ function Set-ApplicationPermissionsDirectGroup {
 
         try {
             Write-Log ("Trying SetApplicationPermissions with Rights='{0}'..." -f $rights) 'Gray'
-            $resp = Invoke-IdentityApi -Path '/SaasManage/SetApplicationPermissions' -Body $body
+            $resp = Invoke-IdentityApiWithRetry -Paths @('/SaasManage/SetApplicationPermissions') -Body $body -LogicalName 'SetApplicationPermissions'
             if ($resp.success) {
                 Write-Log ("Direct group permission assignment succeeded for group '{0}' using Rights='{1}'." -f $GroupObject.SystemName, $rights) 'Green'
                 Add-ReportRow -Step 'Set Application Permissions' -Status 'SUCCESS' -Detail ("Group={0}; Rights={1}; RowKey={2}" -f $GroupObject.SystemName, $rights, $state.RowKey)
@@ -787,18 +855,12 @@ function Set-ApplicationPermissionsDirectGroup {
 # =========================
 # MAIN
 # =========================
-$response         = $null
-$sourceAppInput   = $null
-$sourceApp        = $null
-$sourceDetails    = $null
-$clonedAppKey     = $null
-$clonedDetails    = $null
-$newAppName       = $null
-$groupInput       = $null
-$groupObject      = $null
-$safeName         = $null
-$accountName      = $null
-$vaultedUserName  = $null
+$response      = $null
+$sourceApp     = $null
+$sourceDetails = $null
+$clonedAppKey  = $null
+$clonedDetails = $null
+$groupObject   = $null
 
 try {
     $response = Start-PASSessionFromCCP -ObjectName $CCPObject
@@ -816,34 +878,25 @@ try {
 
     Start-IdentityApiSession -TenantUrl $IdentityTenantURL -UserName $resolvedUser -Password $response.Content
 
-    $sourceAppInput = Read-Host 'Enter the SOURCE Identity application name (exact) or App Key'
-    if ([string]::IsNullOrWhiteSpace($sourceAppInput)) {
-        throw 'Source application cannot be empty.'
+    if ($UsePrompt) {
+        $SourceAppInput  = Read-Host 'Enter the SOURCE Identity application name (exact) or App Key'
+        $VaultedUserName = Read-Host 'Enter the vaulted CyberArk username to stamp as the NEW app name'
+        $TargetGroup     = Read-Host 'Enter the target GROUP to add directly to the application Permissions page'
+        $SafeName        = Read-Host 'Enter the Vault Safe Name (saved to report for later credential binding)'
+        $AccountName     = Read-Host 'Enter the Vault Account Name / Identifier (saved to report for later credential binding)'
+    } else {
+        Write-Log ("Using built-in test values: SourceApp='{0}', NewAppName='{1}', TargetGroup='{2}', SafeName='{3}', AccountName='{4}'" -f $SourceAppInput, $VaultedUserName, $TargetGroup, $SafeName, $AccountName) 'Cyan'
     }
 
-    $vaultedUserName = Read-Host 'Enter the vaulted CyberArk username to stamp as the NEW app name'
-    if ([string]::IsNullOrWhiteSpace($vaultedUserName)) {
-        throw 'Vaulted username cannot be empty.'
-    }
+    if ([string]::IsNullOrWhiteSpace($SourceAppInput))  { throw 'Source application cannot be empty.' }
+    if ([string]::IsNullOrWhiteSpace($VaultedUserName)) { throw 'Vaulted username cannot be empty.' }
+    if ([string]::IsNullOrWhiteSpace($TargetGroup))     { throw 'Target group cannot be empty.' }
+    if ([string]::IsNullOrWhiteSpace($SafeName))        { throw 'Safe Name cannot be empty.' }
+    if ([string]::IsNullOrWhiteSpace($AccountName))     { throw 'Account Name cannot be empty.' }
 
-    $groupInput = Read-Host 'Enter the target GROUP to add directly to the application Permissions page'
-    if ([string]::IsNullOrWhiteSpace($groupInput)) {
-        throw 'Target group cannot be empty.'
-    }
+    Add-ReportRow -Step 'Input Summary' -Status 'INFO' -Detail ("SourceApp={0}; SourceAppKey={1}; NewAppName={2}; TargetGroup={3}; SafeName={4}; AccountName={5}" -f $SourceAppInput, $SourceAppKey, $VaultedUserName, $TargetGroup, $SafeName, $AccountName)
 
-    $safeName = Read-Host 'Enter the Vault Safe Name (saved to report for later credential binding)'
-    if ([string]::IsNullOrWhiteSpace($safeName)) {
-        throw 'Safe Name cannot be empty.'
-    }
-
-    $accountName = Read-Host 'Enter the Vault Account Name / Identifier (saved to report for later credential binding)'
-    if ([string]::IsNullOrWhiteSpace($accountName)) {
-        throw 'Account Name cannot be empty.'
-    }
-
-    Add-ReportRow -Step 'Input Summary' -Status 'INFO' -Detail ("SourceApp={0}; NewAppName={1}; TargetGroup={2}; SafeName={3}; AccountName={4}" -f $sourceAppInput, $vaultedUserName, $groupInput, $safeName, $accountName)
-
-    $sourceApp     = Get-IdentityApplicationByNameOrId -NameOrId $sourceAppInput
+    $sourceApp     = Get-IdentityApplicationByNameOrId -NameOrId $SourceAppInput -KnownAppKey $SourceAppKey
     $sourceDetails = Get-IdentityApplicationDetails -AppKey $sourceApp.ID
     Assert-IdentityWebApp -AppDetails $sourceDetails -Label 'Source Application'
 
@@ -856,18 +909,16 @@ try {
         Assert-IdentityWebApp -AppDetails $clonedDetails -Label 'Cloned Application (pre-rename)'
     }
 
-    $newAppName = $vaultedUserName
-
     if ($WhatIf) {
-        Write-Log ("WHATIF: Would rename cloned app to '{0}'." -f $newAppName) 'Yellow'
-        Add-ReportRow -Step 'Rename Application' -Status 'WHATIF' -Detail ("NewName={0}" -f $newAppName)
+        Write-Log ("WHATIF: Would rename cloned app to '{0}'." -f $VaultedUserName) 'Yellow'
+        Add-ReportRow -Step 'Rename Application' -Status 'WHATIF' -Detail ("NewName={0}" -f $VaultedUserName)
     } else {
-        Rename-IdentityApplication -AppKey $clonedAppKey -NewName $newAppName -AppDetails $clonedDetails
+        Rename-IdentityApplication -AppKey $clonedAppKey -NewName $VaultedUserName -AppDetails $clonedDetails
         $clonedDetails = Get-IdentityApplicationDetails -AppKey $clonedAppKey
         Assert-IdentityWebApp -AppDetails $clonedDetails -Label 'Cloned Application (post-rename)'
     }
 
-    $groupObject = Resolve-IdentityGroupFromDSGroups -GroupInput $groupInput
+    $groupObject = Resolve-IdentityGroupFromDSGroups -GroupInput $TargetGroup
 
     if ($WhatIf) {
         Write-Log ("WHATIF: Would add group '{0}' directly to app permissions with View + Run + Automatically Deploy." -f $groupObject.SystemName) 'Yellow'
@@ -876,7 +927,7 @@ try {
         Set-ApplicationPermissionsDirectGroup -AppRowKey $clonedAppKey -AppId $sourceApp.ID -GroupObject $groupObject
     }
 
-    Write-Log ("Completed direct-group permission workflow. Safe '{0}' and Account '{1}' were saved in the report for later credential binding." -f $safeName, $accountName) 'Green'
+    Write-Log ("Completed direct-group permission workflow. Safe '{0}' and Account '{1}' were saved in the report for later credential binding." -f $SafeName, $AccountName) 'Green'
     Add-ReportRow -Step 'Overall' -Status 'SUCCESS' -Detail 'Clone / rename / validate / direct-group-permission workflow completed.'
 }
 catch {
