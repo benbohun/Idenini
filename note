@@ -1,899 +1,447 @@
-PlatformID,SourceConnectionComponentName,TargetConnectionComponentName
-Prd_WinDom_Adm_HTML5,PSM-HTML_OVERIDE,PSM-RDP
-Prd_WinDom_Adm_HTML5,PSM-HTML_OVERIDE,PSM-SSH
-Prd_WinDom_Adm_HTML5,PSM-HTML_OVERIDE,PSM-SQL
 
 
+
+Use Login Method below
+
+
+I need a script for CyberArk Identity
+
+Login using
+1. Duplicate/clone an existing Application with all its settings 
+2. rename the new Identity Web App with a provided vaulted cyberark username (Prompt)
+3. For the permission, Prompt for the group permission to be provided and add with automatic deploy and run permission
+3. Once setup, add the vaulted account to the User Identity for the newly created app in Secure  Access
+4. I think Safe Name and Account Name is required but help research, prompt for that as well and save.
+
+Use the API guide below to suggest method
+
+https://api-docs.cyberark.com/
+
+https://api-docs.cyberark.com/identity-docs-api/docs/saas-manage-api#/Application%20Management/clone-an-application
+
+https://api-docs.cyberark.com/identity-docs-api/docs/identity-apis
+
+Do research on this extensively
+
+<#
+Autoonboardingscript_UPDATED.ps1
+
+CNA SAFE AUTO-ONBOARDING
+- Authenticates to CCP using Object:
+    cna-prod.cyberark.cloud-cnarestbot
+- Authenticates to Privilege Cloud using psPAS Identity header
+- Creates Safe
+- Adds required members
+- Does NOT add cnarestbot@cyberark.cloud.6679 (default member already present)
+- Does NOT remove CA_PAMDiscovery_SVC@cna.com (legacy logic removed)
+#>
 
 [CmdletBinding()]
 param(
-    [string]$CsvPath    = "E:\Installation Media\Script\OnboardScript\csv\OverrideComponentPlatform.csv",
-    [string]$OutputRoot = "E:\Installation Media\Script\OnboardScript\logs\Platform_HTML5_Override",
-    [switch]$WhatIf
+    # ===== CNA Identity / Privilege Cloud =====
+    [string]$IdentityTenantURL = 'https://aat4012.id.cyberark.cloud',
+    [string]$PCloudSubdomain   = 'cna-prod',
+    [string]$PrivilegeCloudURL = 'https://cna-prod.privilegecloud.cyberark.cloud',
+
+    # ===== CCP settings (CNA) =====
+    [string]$CCPAddress      = 'https://vskau1p1231.cna.com',
+    [string]$CCPLocation     = 'AIMWebService',
+    [string]$CCPAppID        = 'PAMDiscovery',
+    [string]$CCPSafe         = 'CA_PCloud_Admins',
+    [string]$CCPObject       = 'cna-prod.cyberark.cloud-cnarestbot',
+    [bool]$CCPWindowsAuth    = $false,
+
+    # ===== Members to evaluate / add =====
+    [string]$AdminGroup      = 'CA_PCloud_Admins@cna.com',
+    [string]$AdminMember     = 'cna_pas_admin@cyberark.cloud.6679',
+    [string]$IdentityMember  = 'identity-privilege-integration-user$@cyberark.cloud.6679',
+
+    # ===== Safe defaults =====
+    [string]$ManagingCPM     = 'CNA_PASS_MANG',
+    [int]$RetentionDays      = 120,
+
+    # ===== AD Group lookup =====
+    [string]$SearchBaseOU    = 'OU=Groups,OU=CyberArk,DC=cna,DC=com',
+
+    # ===== Logging =====
+    [string]$LogPath         = 'E:\Installation Media\Script\OnboardScript\data\accountonboarding.txt'
 )
 
-Set-StrictMode -Version Latest
-$ErrorActionPreference = "Stop"
+# --- Allow this process to load unsigned modules & unblock psPAS files (silent) ---
+try { Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force -ErrorAction Stop } catch {}
 
-# ---------------- LOGGING ----------------
-function Write-Log {
-    param(
-        [Parameter(Mandatory)][string]$Message,
-        [ValidateSet("Gray","Green","Yellow","Red","Cyan","White","Magenta")]
-        [string]$Color = "White"
-    )
-    $stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    Write-Host ("{0} | {1}" -f $stamp, $Message) -ForegroundColor $Color
+$psPASDirs = @(
+    "$env:ProgramFiles\WindowsPowerShell\Modules\psPAS\6.4.85",
+    "$HOME\Documents\WindowsPowerShell\Modules\psPAS\6.4.85"
+) | Where-Object { Test-Path $_ }
+
+foreach ($dir in $psPASDirs) {
+    try { Get-ChildItem -Path $dir -Recurse -File | Unblock-File -ErrorAction SilentlyContinue } catch {}
 }
 
-# ---------------- LOAD psPAS ----------------
+# --- Logging Utility ---
+function Write-Log {
+    param(
+        [string]$Message,
+        [string]$Color = "White"
+    )
+    $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $LogEntry = "$Timestamp - $Message"
+    try { Write-Host $LogEntry -ForegroundColor $Color } catch { Write-Host $LogEntry }
+    try {
+        $parent = Split-Path -Path $LogPath -Parent
+        if ($parent -and -not (Test-Path $parent)) {
+            New-Item -Path $parent -ItemType Directory -Force | Out-Null
+        }
+        Add-Content -Path $LogPath -Value $LogEntry
+    } catch {}
+}
+
+# --- Console "box" helper (for fallback dialog text) ---
+function Show-Box {
+    param(
+        [string]$Title,
+        [string]$BodyLine1 = "",
+        [string]$BodyLine2 = ""
+    )
+    $line = ('=' * 72)
+    Write-Host $line -ForegroundColor DarkGray
+    if ($Title)     { Write-Host ("[ " + $Title + " ]") -ForegroundColor Gray }
+    if ($BodyLine1) { Write-Host $BodyLine1 -ForegroundColor Gray }
+    if ($BodyLine2) { Write-Host $BodyLine2 -ForegroundColor Gray }
+    Write-Host $line -ForegroundColor DarkGray
+}
+
+# --- Normalize IdentityTenantURL for Get-IdentityHeader ---
+function Get-NormalizedIdentityTenant {
+    param([Parameter(Mandatory)][string]$TenantUrl)
+
+    $value = $TenantUrl.Trim()
+    $value = $value -replace '^https?://', ''
+    $value = $value.TrimEnd('/')
+
+    return $value
+}
+
+# --- Load psPAS ---
 try {
     Import-Module psPAS -Force -ErrorAction Stop
     $mod = Get-Module psPAS
     Write-Log ("psPAS loaded ({0})." -f $mod.Version) "Green"
-}
-catch {
-    Write-Log ("ERROR: psPAS module not found/loaded: {0}" -f $_.Exception.Message) "Red"
+} catch {
+    Write-Log ("❌ psPAS module not found/loaded: {0}" -f $_.Exception.Message) "Red"
     exit 1
 }
 
-# ---------------- CYBERARK SETTINGS ----------------
-$CCPAddress      = "https://vskau1p1231.cna.com"
-$CCPLocation     = "AIMWebService"
-$CCPAppID        = "PAMDiscovery"
-$CCPSafe         = "CA_PCloud_Admins"
-$CCPObject       = "cna.com-CA_PAMDiscovery_SVC"
-$ServiceUPUser   = "CA_PAMDiscovery_SVC"
-$CCPWindowsAuth  = $false
-
-$IdentityTenantURL = "https://aat4012.id.cyberark.cloud"
-$PCloudSubdomain   = "cna-prod"
-
-# ---------------- HTML5 OVERRIDE PARAM ----------------
-$AllowSelectHtml5Param = [ordered]@{
-    Name                        = "AllowSelectHTML5"
-    DisplayName                 = "Connect Via Browser"
-    Visible                     = "Yes"
-    Type                        = "CyberArk.TransparentConnection.BooleanUserParameter, CyberArk.PasswordVault.TransparentConnection"
-    Required                    = "Yes"
-    Value                       = "No"
-    EnforceInDualControlRequest = "No"
+# --- Try to import AD module for OU validation (non-fatal if missing) ---
+$ADModuleLoaded = $false
+try {
+    Import-Module ActiveDirectory -ErrorAction Stop
+    $ADModuleLoaded = $true
+    Write-Log "ActiveDirectory module loaded." "Green"
+} catch {
+    Write-Log "⚠️ ActiveDirectory module not available; will still try to add group by UPN." "Yellow"
 }
 
-# ---------------- OUTPUT PATHS ----------------
-$BackupRoot = Join-Path $OutputRoot "Backups"
-$WorkRoot   = Join-Path $OutputRoot "Work"
-$ReportRoot = Join-Path $OutputRoot "Reports"
+# --- CCP parameters (shared) ---
+$headers = @{ "Content-Type" = "application/json" }
 
-foreach ($folder in @($OutputRoot, $BackupRoot, $WorkRoot, $ReportRoot)) {
-    if (-not (Test-Path -LiteralPath $folder)) {
-        $null = New-Item -Path $folder -ItemType Directory -Force
-    }
+# --- Permissions (psPAS-friendly) ---
+$LimitedPermPAS = [PSCustomObject]@{
+    UseAccounts                            = $true
+    RetrieveAccounts                       = $true
+    ListAccounts                           = $true
+    AddAccounts                            = $false
+    UpdateAccountContent                   = $true
+    UpdateAccountProperties                = $false
+    InitiateCPMAccountManagementOperations = $true
+    SpecifyNextAccountContent              = $true
+    RenameAccounts                         = $false
+    DeleteAccounts                         = $false
+    UnlockAccounts                         = $false
+    ManageSafe                             = $false
+    ManageSafeMembers                      = $false
+    BackupSafe                             = $false
+    ViewAuditLog                           = $true
+    ViewSafeMembers                        = $true
+    AccessWithoutConfirmation              = $true
+    CreateFolders                          = $false
+    DeleteFolders                          = $false
+    MoveAccountsAndFolders                 = $false
+    RequestsAuthorizationLevel1            = $true
+    RequestsAuthorizationLevel2            = $false
 }
 
-# ---------------- HELPERS ----------------
-function Normalize-Token {
-    param([string]$Value)
-    if ([string]::IsNullOrWhiteSpace($Value)) { return "" }
-    return (($Value.ToLowerInvariant()) -replace '[^a-z0-9]', '')
+$FullPermPAS = [PSCustomObject]@{
+    UseAccounts                            = $true
+    RetrieveAccounts                       = $true
+    ListAccounts                           = $true
+    AddAccounts                            = $true
+    UpdateAccountContent                   = $true
+    UpdateAccountProperties                = $true
+    InitiateCPMAccountManagementOperations = $true
+    SpecifyNextAccountContent              = $true
+    RenameAccounts                         = $true
+    DeleteAccounts                         = $true
+    UnlockAccounts                         = $true
+    ManageSafe                             = $true
+    ManageSafeMembers                      = $true
+    BackupSafe                             = $true
+    ViewAuditLog                           = $true
+    ViewSafeMembers                        = $true
+    AccessWithoutConfirmation              = $true
+    CreateFolders                          = $true
+    DeleteFolders                          = $true
+    MoveAccountsAndFolders                 = $true
+    RequestsAuthorizationLevel1            = $true
+    RequestsAuthorizationLevel2            = $false
 }
 
-function Get-SafeFileName {
-    param([Parameter(Mandatory)][string]$Name)
-    return ($Name -replace '[\\/:*?"<>|]', '_')
-}
+# --- AD Group validation helper ---
+function Read-ValidGroup {
+    while ($true) {
+        $g = Read-Host "Enter the AD Safe Group (sAMAccountName only, e.g., ca_xxx_xxx_prod)"
 
-function Get-OptionalCsvValue {
-    param(
-        [Parameter(Mandatory)]$Row,
-        [Parameter(Mandatory)][string]$ColumnName
-    )
+        if ([string]::IsNullOrWhiteSpace($g)) {
+            Write-Log "❌ Group cannot be empty." "Red"
+            continue
+        }
 
-    $prop = $Row.PSObject.Properties[$ColumnName]
-    if ($null -eq $prop) { return $null }
+        if ($g -notmatch '^[A-Za-z0-9_\-\.]+$') {
+            Write-Log "❌ Invalid characters in group name. Try again." "Red"
+            continue
+        }
 
-    $value = [string]$prop.Value
-    if ([string]::IsNullOrWhiteSpace($value)) { return $null }
-
-    return $value.Trim()
-}
-
-function Set-XmlAttribute {
-    param(
-        [Parameter(Mandatory)]$Element,
-        [Parameter(Mandatory)][string]$Name,
-        [Parameter(Mandatory)][string]$Value
-    )
-
-    $existing = $Element.GetAttributeNode($Name)
-    if ($null -eq $existing) {
-        $attr = $Element.OwnerDocument.CreateAttribute($Name)
-        $attr.Value = $Value
-        [void]$Element.Attributes.Append($attr)
-    }
-    else {
-        $existing.Value = $Value
-    }
-}
-
-function Apply-AllowSelectHtml5Values {
-    param([Parameter(Mandatory)]$ParameterNode)
-
-    Set-XmlAttribute -Element $ParameterNode -Name "Name" -Value $AllowSelectHtml5Param.Name
-    Set-XmlAttribute -Element $ParameterNode -Name "DisplayName" -Value $AllowSelectHtml5Param.DisplayName
-    Set-XmlAttribute -Element $ParameterNode -Name "Visible" -Value $AllowSelectHtml5Param.Visible
-    Set-XmlAttribute -Element $ParameterNode -Name "Type" -Value $AllowSelectHtml5Param.Type
-    Set-XmlAttribute -Element $ParameterNode -Name "Required" -Value $AllowSelectHtml5Param.Required
-    Set-XmlAttribute -Element $ParameterNode -Name "Value" -Value $AllowSelectHtml5Param.Value
-    Set-XmlAttribute -Element $ParameterNode -Name "EnforceInDualControlRequest" -Value $AllowSelectHtml5Param.EnforceInDualControlRequest
-}
-
-function Get-PASWebSession {
-    $s = Get-PASSession
-    if (-not $s -or -not $s.WebSession) {
-        throw "No psPAS WebSession found."
-    }
-    return $s.WebSession
-}
-
-function Get-HttpStatusCodeFromError {
-    param([Parameter(Mandatory)]$ErrorRecord)
-
-    try {
-        if ($ErrorRecord.Exception.Response -and $ErrorRecord.Exception.Response.StatusCode) {
-            return [int]$ErrorRecord.Exception.Response.StatusCode
+        if ($ADModuleLoaded) {
+            try {
+                $adGroup = Get-ADGroup -LDAPFilter "(|(sAMAccountName=$g)(userPrincipalName=$g@cna.com))" -SearchBase $SearchBaseOU -ErrorAction Stop
+                if ($adGroup) {
+                    Write-Log ("✅ Found AD Group in {0}: {1} (sAM={2})" -f $SearchBaseOU, $adGroup.Name, $adGroup.SamAccountName) "Green"
+                    return $adGroup.SamAccountName
+                } else {
+                    Write-Log ("❌ Group not found under {0}. Re-enter." -f $SearchBaseOU) "Red"
+                }
+            } catch {
+                Write-Log ("❌ Error searching AD for '{0}' in {1}: {2}" -f $g, $SearchBaseOU, $_.Exception.Message) "Red"
+            }
+        } else {
+            Write-Log "⚠️ AD module not loaded, proceeding with provided group name (will add as UPN)." "Yellow"
+            return $g
         }
     }
-    catch {}
-
-    try {
-        if ($ErrorRecord.Exception.StatusCode) {
-            return [int]$ErrorRecord.Exception.StatusCode
-        }
-    }
-    catch {}
-
-    return $null
 }
 
-# ---------------- AUTH ----------------
+# --- Helper: safely get current Safe members ---
+function Get-ExistingSafeMembers {
+    param(
+        [Parameter(Mandatory)][string]$SafeName
+    )
+
+    $memberSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+
+    try {
+        $members = Get-PASSafeMember -SafeName $SafeName -ErrorAction Stop
+        foreach ($m in $members) {
+            $name = $null
+
+            if ($m.PSObject.Properties.Name -contains 'MemberName') {
+                $name = [string]$m.MemberName
+            } elseif ($m.PSObject.Properties.Name -contains 'UserName') {
+                $name = [string]$m.UserName
+            } elseif ($m.PSObject.Properties.Name -contains 'Username') {
+                $name = [string]$m.Username
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace($name)) {
+                [void]$memberSet.Add($name)
+            }
+        }
+    } catch {
+        Write-Log ("ℹ️ Could not list current members for Safe '{0}': {1}" -f $SafeName, $_.Exception.Message) "Yellow"
+    }
+
+    Write-Output -NoEnumerate $memberSet
+}
+
+# --- Member add helper (psPAS) ---
+function Add-MemberToSafe {
+    param(
+        [Parameter(Mandatory)][string]$SafeName,
+        [Parameter(Mandatory)][string]$MemberName,
+        [Parameter(Mandatory)][ValidateSet("Group","User","Role")][string]$MemberType,
+        [Parameter(Mandatory)][pscustomobject]$Permissions,
+        [Parameter()][object]$ExistingMembers
+    )
+
+    try {
+        if ($ExistingMembers -and $ExistingMembers.Contains($MemberName)) {
+            Write-Log ("ℹ️ Skipping {0} '{1}' because it already exists in Safe '{2}'." -f $MemberType, $MemberName, $SafeName) "Yellow"
+            return $true
+        }
+
+        Write-Log ("Adding {0} '{1}' to {2}..." -f $MemberType, $MemberName, $SafeName)
+
+        $Permissions | Add-PASSafeMember -SafeName $SafeName -MemberType $MemberType -MemberName $MemberName -ErrorAction Stop | Out-Null
+
+        try {
+            if ($ExistingMembers -and ($ExistingMembers -is [System.Collections.Generic.HashSet[string]])) {
+                [void]$ExistingMembers.Add($MemberName)
+            }
+        } catch {
+            Write-Log ("ℹ️ Member was added, but cache update was skipped for '{0}': {1}" -f $MemberName, $_.Exception.Message) "Yellow"
+        }
+
+        Write-Log ("✅ Added {0}: {1}." -f $MemberType, $MemberName) "Green"
+        return $true
+    } catch {
+        Write-Log ("❌ Failed to add '{0}' - {1}" -f $MemberName, $_.Exception.Message) "Red"
+        return $false
+    }
+}
+
+# --- Helper: start PAS session from CCP creds using SAME working pattern ---
 function Start-PASSessionFromCCP {
     param(
-        [Parameter(Mandatory)][string]$ObjectName,
-        [Parameter(Mandatory)][string]$UPUser
+        [Parameter(Mandatory)][string]$ObjectName
     )
 
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-
-    $ccpUrl = "{0}/{1}/api/Accounts?AppID={2}&Safe={3}&Object={4}" -f `
-        $CCPAddress.TrimEnd('/'),
-        $CCPLocation.Trim('/'),
-        $CCPAppID,
-        $CCPSafe,
-        $ObjectName
-
-    Write-Log "Retrieving API credentials from CCP..." "Cyan"
-
-    $resp = Invoke-RestMethod `
-        -Uri $ccpUrl `
-        -Method GET `
-        -Headers @{ "Content-Type" = "application/json" } `
-        -UseDefaultCredentials:$CCPWindowsAuth `
-        -ErrorAction Stop
-
-    if (-not $resp -or -not $resp.Content) {
-        throw "Empty CCP response (missing Content)."
-    }
-
-    $UPPass = ConvertTo-SecureString $resp.Content -AsPlainText -Force
-    $UPCred = [PSCredential]::new($UPUser, $UPPass)
-
-    Write-Log ("Authenticating to Privilege Cloud via Identity header as {0}..." -f $UPUser) "Cyan"
-
-    $headerSession = Get-IdentityHeader `
-        -IdentityTenantURL $IdentityTenantURL `
-        -psPASFormat `
-        -PCloudSubdomain $PCloudSubdomain `
-        -UPCreds $UPCred `
-        -ErrorAction Stop
-
-    Use-PASSession $headerSession | Out-Null
-
-    if (-not (Get-PASSession)) {
-        throw "psPAS session not established."
-    }
-
-    Write-Log ("PAS session established ({0})." -f $UPUser) "Green"
-}
-
-# ---------------- REST ----------------
-function Invoke-EPVRest {
-    param(
-        [Parameter(Mandatory)]
-        [ValidateSet("GET","POST","PUT","DELETE","PATCH")]
-        [string]$Method,
-
-        [Parameter(Mandatory)][string]$RelativePath,
-        [object]$Body
-    )
-
-    $webSession = Get-PASWebSession
-    $path = $RelativePath.TrimStart('/')
-    $lastError = $null
-
-    foreach ($apiPrefix in @("API","api")) {
-        $candidatePath = $path -replace '^(API|api)', $apiPrefix
-        $uri = "https://{0}.privilegecloud.cyberark.cloud/PasswordVault/{1}" -f $PCloudSubdomain, $candidatePath
-
-        try {
-            $params = @{
-                Uri         = $uri
-                Method      = $Method
-                WebSession  = $webSession
-                ErrorAction = "Stop"
-            }
-
-            if ($null -ne $Body) {
-                $params["ContentType"] = "application/json"
-                $params["Body"] = ($Body | ConvertTo-Json -Depth 50 -Compress)
-            }
-
-            return Invoke-RestMethod @params
-        }
-        catch {
-            $lastError = $_
-        }
-    }
-
-    throw $lastError
-}
-
-function Get-PlatformByStringId {
-    param([Parameter(Mandatory)][string]$PlatformID)
-
-    $search = [uri]::EscapeDataString($PlatformID)
-    $result = Invoke-EPVRest -Method GET -RelativePath ("API/Platforms/Targets?search={0}" -f $search)
-
-    $platforms = @($result.Platforms)
-    $matches = @($platforms | Where-Object { $_.PlatformID -eq $PlatformID })
-
-    if ($matches.Count -eq 0) {
-        throw "Platform [$PlatformID] was not found."
-    }
-
-    if ($matches.Count -gt 1) {
-        throw "Multiple exact matches returned for platform [$PlatformID]."
-    }
-
-    return $matches[0]
-}
-
-function Get-PlatformSessionManagementByNumericId {
-    param([Parameter(Mandatory)][int]$PlatformNumericID)
-
-    return Invoke-EPVRest -Method GET -RelativePath ("API/Platforms/Targets/{0}/PrivilegedSessionManagement/" -f $PlatformNumericID)
-}
-
-function Get-StoredPlatformDetails {
-    return Invoke-EPVRest -Method GET -RelativePath "API/Platforms/Storage"
-}
-
-function Export-PlatformZip {
-    param(
-        [Parameter(Mandatory)][string]$PlatformID,
-        [Parameter(Mandatory)][string]$DestinationFolder
-    )
-
-    $safeName = Get-SafeFileName -Name $PlatformID
-    $stamp    = Get-Date -Format "yyyyMMdd_HHmmss"
-    $zipPath  = Join-Path $DestinationFolder ("{0}_{1}.zip" -f $safeName, $stamp)
-
-    $webSession = Get-PASWebSession
-    $encoded = [uri]::EscapeDataString($PlatformID)
-    $lastError = $null
-
-    foreach ($apiPrefix in @("API","api")) {
-        $uri = "https://{0}.privilegecloud.cyberark.cloud/PasswordVault/{1}/Platforms/{2}/Export/" -f `
-            $PCloudSubdomain, $apiPrefix, $encoded
-
-        try {
-            Invoke-WebRequest -Uri $uri -Method POST -WebSession $webSession -OutFile $zipPath -ErrorAction Stop | Out-Null
-            break
-        }
-        catch {
-            $lastError = $_
-        }
-    }
-
-    if (-not (Test-Path -LiteralPath $zipPath)) {
-        throw $lastError
-    }
-
-    return $zipPath
-}
-
-function Clear-StoredPlatformSilently {
-    try {
-        Invoke-EPVRest -Method DELETE -RelativePath "API/Platforms/Storage" | Out-Null
-    }
-    catch {}
-}
-
-function Import-PlatformZipToStorageOrConflict {
-    param([Parameter(Mandatory)][string]$ZipPath)
-
-    $bytes  = [System.IO.File]::ReadAllBytes($ZipPath)
-    $base64 = [System.Convert]::ToBase64String($bytes)
+    $ccpUrl = "$CCPAddress/$CCPLocation/api/Accounts?AppID=$CCPAppID&Safe=$CCPSafe&Object=$ObjectName"
+    Write-Log ("Retrieving CyberArk API credentials from CCP using Object='{0}'..." -f $ObjectName)
+    Write-Log ("CCP URL: {0}" -f $ccpUrl) "Gray"
 
     try {
-        $result = Invoke-EPVRest -Method POST -RelativePath "API/Platforms/Import/" -Body @{ ImportFile = $base64 }
+        $resp = Invoke-RestMethod -Uri $ccpUrl -Method 'GET' -Headers $headers -UseDefaultCredentials:$CCPWindowsAuth -ErrorAction Stop
+        if (-not $resp -or -not $resp.Content) {
+            throw "Empty CCP response"
+        }
 
-        return [pscustomobject]@{
-            ImportStatus = "CREATED"
-            Result       = $result
+        $resolvedUser = $null
+        if ($resp.PSObject.Properties.Name -contains 'Username') {
+            $resolvedUser = [string]$resp.Username
+        } elseif ($resp.PSObject.Properties.Name -contains 'UserName') {
+            $resolvedUser = [string]$resp.UserName
         }
-    }
-    catch {
-        $status = Get-HttpStatusCodeFromError -ErrorRecord $_
-        if ($status -eq 409) {
-            return [pscustomobject]@{
-                ImportStatus = "CONFLICT_STORED"
-                Result       = $null
-            }
+
+        if ([string]::IsNullOrWhiteSpace($resolvedUser)) {
+            throw "CCP returned password but no Username/UserName field."
         }
+
+        Write-Log ("✅ Successfully retrieved credentials for user: {0}" -f $resolvedUser) "Green"
+    } catch {
+        Write-Log ("❌ ERROR: CCP credential fetch failed - {0}" -f $_.Exception.Message) "Red"
         throw
     }
-}
-
-function Confirm-StoredPlatformConflict {
-    param([Parameter(Mandatory)][string]$TargetPlatformID)
-
-    $stored = Get-StoredPlatformDetails
-
-    $storedPlatformId = ""
-    try { $storedPlatformId = [string]$stored.StoredPlatformDetails.Id } catch {}
-
-    $conflicted = @()
-    try { $conflicted = @($stored.ConflictedPlatformsDetails) } catch {}
-
-    $matchedConflict = @($conflicted | Where-Object { $_.Id -eq $TargetPlatformID })
-
-    if ([string]::IsNullOrWhiteSpace($storedPlatformId)) {
-        throw "Stored platform details are empty after import/conflict."
-    }
-
-    if ($matchedConflict.Count -eq 0 -and $storedPlatformId -ne $TargetPlatformID) {
-        throw ("Stored platform exists, but target platform [{0}] is not listed as a conflicted platform." -f $TargetPlatformID)
-    }
-
-    return [pscustomobject]@{
-        StoredPlatformId = $storedPlatformId
-        StoredName       = [string]$stored.StoredPlatformDetails.Name
-        ConflictedIds    = (($conflicted | ForEach-Object { $_.Id }) -join "; ")
-    }
-}
-
-function Update-PlatformWithStored {
-    param([Parameter(Mandatory)][string]$PlatformID)
-
-    $encoded = [uri]::EscapeDataString($PlatformID)
-    return Invoke-EPVRest -Method POST -RelativePath ("API/Platforms/{0}/Update" -f $encoded)
-}
-
-# ---------------- ZIP ----------------
-function Expand-ZipPackage {
-    param(
-        [Parameter(Mandatory)][string]$ZipPath,
-        [Parameter(Mandatory)][string]$DestinationPath
-    )
-
-    if (Test-Path -LiteralPath $DestinationPath) {
-        Remove-Item -LiteralPath $DestinationPath -Recurse -Force
-    }
-
-    $null = New-Item -Path $DestinationPath -ItemType Directory -Force
-    Expand-Archive -LiteralPath $ZipPath -DestinationPath $DestinationPath -Force
-}
-
-function Compress-ZipPackage {
-    param(
-        [Parameter(Mandatory)][string]$SourceDirectory,
-        [Parameter(Mandatory)][string]$ZipPath
-    )
-
-    if (Test-Path -LiteralPath $ZipPath) {
-        Remove-Item -LiteralPath $ZipPath -Force
-    }
-
-    $items = @(Get-ChildItem -LiteralPath $SourceDirectory -Force)
-    if ($items.Count -eq 0) {
-        throw "Source directory is empty: $SourceDirectory"
-    }
-
-    $paths = @($items | ForEach-Object { $_.FullName })
-    Compress-Archive -Path $paths -DestinationPath $ZipPath -Force
-}
-
-function Get-XmlFilesFromFolder {
-    param([Parameter(Mandatory)][string]$Folder)
-    return @(Get-ChildItem -LiteralPath $Folder -Recurse -File -Filter "*.xml")
-}
-
-# ---------------- XML HELPER LOGIC ----------------
-function Get-ParameterName {
-    param([Parameter(Mandatory)]$Node)
 
     try {
-        $n = [string]$Node.GetAttribute("Name")
-        if (-not [string]::IsNullOrWhiteSpace($n)) { return $n }
-    }
-    catch {}
+        $normalizedTenant = Get-NormalizedIdentityTenant -TenantUrl $IdentityTenantURL
 
-    return ""
-}
+        Write-Log ("Requesting CyberArk PAS authentication (psPAS Identity header) as {0}..." -f $resolvedUser)
+        Write-Log ("IdentityTenantURL passed to Get-IdentityHeader: {0}" -f $normalizedTenant) "Gray"
 
-function Get-ParameterValue {
-    param([Parameter(Mandatory)]$Node)
+        $UPPass = ConvertTo-SecureString $resp.Content -AsPlainText -Force
+        $UPCred = [PSCredential]::new($resolvedUser, $UPPass)
 
-    try {
-        $v = [string]$Node.GetAttribute("Value")
-        if (-not [string]::IsNullOrWhiteSpace($v)) { return $v }
-    }
-    catch {}
+        $header = Get-IdentityHeader `
+            -IdentityTenantURL $normalizedTenant `
+            -psPASFormat `
+            -PCloudSubdomain $PCloudSubdomain `
+            -UPCreds $UPCred
 
-    try {
-        $v2 = [string]$Node.InnerText
-        if (-not [string]::IsNullOrWhiteSpace($v2)) { return $v2.Trim() }
-    }
-    catch {}
+        Use-PASSession $header | Out-Null
 
-    return ""
-}
-
-function Get-NodeContextStrings {
-    param([Parameter(Mandatory)]$Node)
-
-    $items = @()
-    $current = $Node
-
-    while ($null -ne $current) {
-        if ($null -ne $current.Attributes) {
-            foreach ($attrName in @("Name","ID","Id","ComponentName","ConnectionComponent","PSMConnectorID","ConnectorID","DisplayName","Value")) {
-                $attr = $current.Attributes[$attrName]
-                if ($null -ne $attr -and -not [string]::IsNullOrWhiteSpace($attr.Value)) {
-                    $val = $attr.Value.Trim()
-                    if ($items -notcontains $val) {
-                        $items += $val
-                    }
-                }
-            }
+        if (-not (Get-PASSession)) {
+            throw "psPAS session not established"
         }
 
-        try {
-            $inner = [string]$current.InnerText
-            if (-not [string]::IsNullOrWhiteSpace($inner)) {
-                $trimmed = $inner.Trim()
-                if ($trimmed.Length -le 200 -and $items -notcontains $trimmed) {
-                    $items += $trimmed
-                }
-            }
-        }
-        catch {}
-
-        $current = $current.ParentNode
+        Write-Log ("✅ Authentication successful, PAS session established ({0})." -f $resolvedUser) "Green"
+    } catch {
+        Write-Log ("❌ Failed to authenticate via psPAS Identity header: {0}" -f $_.Exception.Message) "Red"
+        throw
     }
 
-    return @($items)
+    return $resp
 }
 
-function Test-ComponentMatch {
-    param(
-        [Parameter(Mandatory)]$Node,
-        [Parameter(Mandatory)][string]$ConnectionComponentName
-    )
-
-    $needle = Normalize-Token $ConnectionComponentName
-    $contexts = @(Get-NodeContextStrings -Node $Node)
-
-    foreach ($ctx in $contexts) {
-        $norm = Normalize-Token $ctx
-        if ([string]::IsNullOrWhiteSpace($norm)) { continue }
-        if ($norm -eq $needle) { return $true }
-        if ($norm.Contains($needle)) { return $true }
-        if ($needle.Contains($norm)) { return $true }
-    }
-
-    return $false
+# =========================
+# MAIN
+# =========================
+$response = $null
+try {
+    $response = Start-PASSessionFromCCP -ObjectName $CCPObject
+} catch {
+    exit 1
 }
-
-function Get-ConnectorIdParameterNodes {
-    param(
-        [Parameter(Mandatory)]$Xml,
-        [Parameter(Mandatory)][string]$ConnectorID
-    )
-
-    $nodes = @($Xml.SelectNodes("//*[local-name()='Parameter']"))
-    $hits = @()
-
-    foreach ($node in $nodes) {
-        $name  = Get-ParameterName -Node $node
-        $value = Get-ParameterValue -Node $node
-
-        if ((Normalize-Token $name) -eq "id" -and (Normalize-Token $value) -eq (Normalize-Token $ConnectorID)) {
-            $hits += $node
-        }
-    }
-
-    return @($hits)
-}
-
-function Get-NearestNamedAncestor {
-    param(
-        [Parameter(Mandatory)]$StartNode,
-        [Parameter(Mandatory)][string]$ExpectedLocalName
-    )
-
-    $current = $StartNode
-    while ($null -ne $current) {
-        try {
-            if ($current.LocalName -eq $ExpectedLocalName) {
-                return $current
-            }
-        }
-        catch {}
-        $current = $current.ParentNode
-    }
-
-    return $null
-}
-
-function Get-SourceOverrideTemplate {
-    param(
-        [Parameter(Mandatory)][string]$ExtractDir,
-        [Parameter(Mandatory)][string]$SourceConnectorID
-    )
-
-    $xmlFiles = Get-XmlFilesFromFolder -Folder $ExtractDir
-
-    foreach ($xmlFile in $xmlFiles) {
-        [xml]$xml = Get-Content -LiteralPath $xmlFile.FullName -Raw
-
-        $allowSelectNodes = @($xml.SelectNodes("//*[local-name()='Parameter']"))
-        foreach ($node in $allowSelectNodes) {
-            $name = Get-ParameterName -Node $node
-            if ($name -ne "AllowSelectHTML5") { continue }
-            if (-not (Test-ComponentMatch -Node $node -ConnectionComponentName $SourceConnectorID)) { continue }
-
-            $sourceBlock = $node.ParentNode
-            $sourceConnectorContainer = $null
-            if ($null -ne $sourceBlock) {
-                $sourceConnectorContainer = $sourceBlock.ParentNode
-            }
-
-            if ($null -eq $sourceBlock) { continue }
-
-            return [pscustomobject]@{
-                XmlPath                     = $xmlFile.FullName
-                SourceParamNode             = $node
-                SourceBlockTemplate         = $sourceBlock.CloneNode($true)
-                SourceBlockLocalName        = [string]$sourceBlock.LocalName
-                SourceConnectorContainerName = $(if ($null -ne $sourceConnectorContainer) { [string]$sourceConnectorContainer.LocalName } else { "" })
-            }
-        }
-    }
-
-    throw ("Source connector [{0}] does not contain AllowSelectHTML5 in the exported platform XML." -f $SourceConnectorID)
-}
-
-function Add-AllowSelectToTargetConnector {
-    param(
-        [Parameter(Mandatory)][string]$ExtractDir,
-        [Parameter(Mandatory)]$SourceTemplate,
-        [Parameter(Mandatory)][string]$TargetConnectorID
-    )
-
-    $xmlFiles = Get-XmlFilesFromFolder -Folder $ExtractDir
-
-    foreach ($xmlFile in $xmlFiles) {
-        [xml]$xml = Get-Content -LiteralPath $xmlFile.FullName -Raw
-
-        $existingAllowSelect = @($xml.SelectNodes("//*[local-name()='Parameter']") | Where-Object {
-            (Get-ParameterName -Node $_) -eq "AllowSelectHTML5" -and
-            (Test-ComponentMatch -Node $_ -ConnectionComponentName $TargetConnectorID)
-        })
-
-        if ($existingAllowSelect.Count -gt 0) {
-            return [pscustomobject]@{
-                Updated   = $false
-                Already   = $true
-                XmlPath   = $xmlFile.FullName
-            }
-        }
-
-        $targetIdNodes = @(Get-ConnectorIdParameterNodes -Xml $xml -ConnectorID $TargetConnectorID)
-        if ($targetIdNodes.Count -eq 0) { continue }
-
-        foreach ($idNode in $targetIdNodes) {
-            $targetConnectorContainer = $null
-
-            if (-not [string]::IsNullOrWhiteSpace($SourceTemplate.SourceConnectorContainerName)) {
-                $targetConnectorContainer = Get-NearestNamedAncestor -StartNode $idNode -ExpectedLocalName $SourceTemplate.SourceConnectorContainerName
-            }
-
-            if ($null -eq $targetConnectorContainer) {
-                if ($null -ne $idNode.ParentNode -and $null -ne $idNode.ParentNode.ParentNode) {
-                    $targetConnectorContainer = $idNode.ParentNode.ParentNode
-                }
-                elseif ($null -ne $idNode.ParentNode) {
-                    $targetConnectorContainer = $idNode.ParentNode
-                }
-            }
-
-            if ($null -eq $targetConnectorContainer) { continue }
-
-            $existingBlock = $null
-            if (-not [string]::IsNullOrWhiteSpace($SourceTemplate.SourceBlockLocalName)) {
-                $children = @($targetConnectorContainer.ChildNodes | Where-Object {
-                    $_.NodeType -eq [System.Xml.XmlNodeType]::Element -and $_.LocalName -eq $SourceTemplate.SourceBlockLocalName
-                })
-                if ($children.Count -gt 0) {
-                    $existingBlock = $children[0]
-                }
-            }
-
-            if ($null -ne $existingBlock) {
-                $paramClone = $xml.ImportNode($SourceTemplate.SourceParamNode, $true)
-                Apply-AllowSelectHtml5Values -ParameterNode $paramClone
-                [void]$existingBlock.AppendChild($paramClone)
-            }
-            else {
-                $blockClone = $xml.ImportNode($SourceTemplate.SourceBlockTemplate, $true)
-
-                $paramNodes = @($blockClone.SelectNodes(".//*[local-name()='Parameter']"))
-                foreach ($p in $paramNodes) {
-                    if ((Get-ParameterName -Node $p) -eq "AllowSelectHTML5") {
-                        Apply-AllowSelectHtml5Values -ParameterNode $p
-                    }
-                }
-
-                [void]$targetConnectorContainer.AppendChild($blockClone)
-            }
-
-            $xml.Save($xmlFile.FullName)
-
-            return [pscustomobject]@{
-                Updated = $true
-                Already = $false
-                XmlPath = $xmlFile.FullName
-            }
-        }
-    }
-
-    throw ("Could not find a writable target connector node for [{0}] in the exported platform XML." -f $TargetConnectorID)
-}
-
-function Clone-AllowSelectWithinPlatformPackage {
-    param(
-        [Parameter(Mandatory)][string]$InputZip,
-        [Parameter(Mandatory)][string]$WorkingRoot,
-        [Parameter(Mandatory)][string]$PlatformID,
-        [Parameter(Mandatory)]$PlatformRows
-    )
-
-    $safeName    = Get-SafeFileName -Name $PlatformID
-    $extractDir  = Join-Path $WorkingRoot ("Extract_{0}_{1}" -f $safeName, ([guid]::NewGuid().ToString("N")))
-    $modifiedZip = Join-Path $WorkingRoot ("{0}_modified_{1}.zip" -f $safeName, (Get-Date -Format "yyyyMMdd_HHmmss"))
-
-    try {
-        Expand-ZipPackage -ZipPath $InputZip -DestinationPath $extractDir
-
-        $details = @()
-        foreach ($row in $PlatformRows) {
-            $sourceConnector = Get-OptionalCsvValue -Row $row -ColumnName "SourceConnectionComponentName"
-            $targetConnector = Get-OptionalCsvValue -Row $row -ColumnName "TargetConnectionComponentName"
-
-            if ([string]::IsNullOrWhiteSpace($sourceConnector)) {
-                throw "SourceConnectionComponentName is required."
-            }
-            if ([string]::IsNullOrWhiteSpace($targetConnector)) {
-                throw "TargetConnectionComponentName is required."
-            }
-
-            $sourceTemplate = Get-SourceOverrideTemplate -ExtractDir $extractDir -SourceConnectorID $sourceConnector
-            $applyResult = Add-AllowSelectToTargetConnector `
-                -ExtractDir $extractDir `
-                -SourceTemplate $sourceTemplate `
-                -TargetConnectorID $targetConnector
-
-            $details += [pscustomobject]@{
-                PlatformID                 = $PlatformID
-                SourceConnectionComponent  = $sourceConnector
-                TargetConnectionComponent  = $targetConnector
-                XmlPath                    = $applyResult.XmlPath
-                AlreadyPresent             = $applyResult.Already
-                Applied                    = $applyResult.Updated
-            }
-        }
-
-        Compress-ZipPackage -SourceDirectory $extractDir -ZipPath $modifiedZip
-
-        return [pscustomobject]@{
-            ModifiedZip = $modifiedZip
-            Details     = @($details)
-        }
-    }
-    finally {
-        if (Test-Path -LiteralPath $extractDir) {
-            Remove-Item -LiteralPath $extractDir -Recurse -Force -ErrorAction SilentlyContinue
-        }
-    }
-}
-
-# ---------------- CSV VALIDATION ----------------
-Write-Log ("Using CSV path: {0}" -f $CsvPath) "Cyan"
-
-if (-not (Test-Path -LiteralPath $CsvPath)) {
-    throw "CSV not found: $CsvPath"
-}
-
-$rows = @(Import-Csv -LiteralPath $CsvPath)
-if ($rows.Count -eq 0) {
-    throw "CSV is empty: $CsvPath"
-}
-
-$requiredCols = @("PlatformID","SourceConnectionComponentName","TargetConnectionComponentName")
-foreach ($col in $requiredCols) {
-    if (-not ($rows[0].PSObject.Properties.Name -contains $col)) {
-        throw "CSV must contain column '$col'."
-    }
-}
-
-$rows = @($rows | Where-Object { -not [string]::IsNullOrWhiteSpace($_.PlatformID) })
-if ($rows.Count -eq 0) {
-    throw "CSV contains no usable PlatformID values."
-}
-
-# ---------------- MAIN ----------------
-$reportItems = @()
-Write-Log ("Platforms to process: {0}" -f (@($rows | Group-Object PlatformID).Count)) "Green"
 
 try {
-    Start-PASSessionFromCCP -ObjectName $CCPObject -UPUser $ServiceUPUser
+    # Prompt for Safe Name
+    $SafeName = Read-Host "Enter the Safe Name"
 
-    $platformGroups = @($rows | Group-Object PlatformID)
-    $platformIndex = 0
-
-    foreach ($group in $platformGroups) {
-        $platformIndex++
-        $platformID = [string]$group.Name
-        $platformRows = @($group.Group)
-
-        $report = [ordered]@{
-            Timestamp         = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-            PlatformID        = $platformID
-            PlatformNumericID = ""
-            PSMServerId       = ""
-            LinkedConnectorIDs = ""
-            BackupZip         = ""
-            ModifiedZip       = ""
-            ImportStatus      = ""
-            StoredPlatformId  = ""
-            StoredPlatformName = ""
-            ConflictedIds     = ""
-            Result            = ""
-            Error             = ""
-        }
-
-        Write-Log ("[{0}/{1}] {2}" -f $platformIndex, $platformGroups.Count, $platformID) "Magenta"
-
-        try {
-            $platformLookup = Get-PlatformByStringId -PlatformID $platformID
-            $platformNumericID = [int]$platformLookup.ID
-            $report.PlatformNumericID = $platformNumericID
-
-            $psmPolicy = Get-PlatformSessionManagementByNumericId -PlatformNumericID $platformNumericID
-            $connectorList = @($psmPolicy.PSMConnectors)
-            $report.PSMServerId = [string]$psmPolicy.PSMServerId
-            $report.LinkedConnectorIDs = (($connectorList | ForEach-Object { $_.PSMConnectorID }) -join "; ")
-
-            if ($connectorList.Count -eq 0) {
-                throw "No PSM connectors are linked to this platform."
-            }
-
-            foreach ($row in $platformRows) {
-                $src = Get-OptionalCsvValue -Row $row -ColumnName "SourceConnectionComponentName"
-                $tgt = Get-OptionalCsvValue -Row $row -ColumnName "TargetConnectionComponentName"
-
-                $srcOk = @($connectorList | Where-Object {
-                    -not [string]::IsNullOrWhiteSpace($_.PSMConnectorID) -and
-                    (Normalize-Token $_.PSMConnectorID) -eq (Normalize-Token $src)
-                }).Count -gt 0
-
-                $tgtOk = @($connectorList | Where-Object {
-                    -not [string]::IsNullOrWhiteSpace($_.PSMConnectorID) -and
-                    (Normalize-Token $_.PSMConnectorID) -eq (Normalize-Token $tgt)
-                }).Count -gt 0
-
-                if (-not $srcOk) {
-                    throw ("Source connector [{0}] is not linked to platform [{1}]." -f $src, $platformID)
-                }
-                if (-not $tgtOk) {
-                    throw ("Target connector [{0}] is not linked to platform [{1}]." -f $tgt, $platformID)
-                }
-            }
-
-            Write-Log "Validated platform connector scope." "Green"
-
-            $targetZip = Export-PlatformZip -PlatformID $platformID -DestinationFolder $BackupRoot
-            $report.BackupZip = $targetZip
-            Write-Log "Platform export validated." "Green"
-
-            $cloneResult = Clone-AllowSelectWithinPlatformPackage `
-                -InputZip $targetZip `
-                -WorkingRoot $WorkRoot `
-                -PlatformID $platformID `
-                -PlatformRows $platformRows
-
-            $report.ModifiedZip = $cloneResult.ModifiedZip
-
-            foreach ($d in $cloneResult.Details) {
-                if ($d.AlreadyPresent) {
-                    Write-Log ("Skipped [{0}] because AllowSelectHTML5 already exists." -f $d.TargetConnectionComponent) "Gray"
-                }
-                elseif ($d.Applied) {
-                    Write-Log ("Prepared AllowSelectHTML5 for [{0}] from [{1}]." -f $d.TargetConnectionComponent, $d.SourceConnectionComponent) "Green"
-                }
-            }
-
-            if ($WhatIf) {
-                Write-Log "Modified package prepared. WHATIF only." "Yellow"
-                $report.Result = "WHATIF_ONLY"
-            }
-            else {
-                Clear-StoredPlatformSilently
-
-                $importResult = Import-PlatformZipToStorageOrConflict -ZipPath $cloneResult.ModifiedZip
-                $report.ImportStatus = $importResult.ImportStatus
-
-                if ($importResult.ImportStatus -eq "CONFLICT_STORED") {
-                    Write-Log "Import returned 409 conflict; proceeding with stored-platform overwrite flow." "Yellow"
-                }
-
-                $storedCheck = Confirm-StoredPlatformConflict -TargetPlatformID $platformID
-                $report.StoredPlatformId   = $storedCheck.StoredPlatformId
-                $report.StoredPlatformName = $storedCheck.StoredName
-                $report.ConflictedIds      = $storedCheck.ConflictedIds
-
-                $null = Update-PlatformWithStored -PlatformID $platformID
-
-                Write-Log "Platform updated successfully." "Green"
-                $report.Result = "UPDATED"
-            }
-        }
-        catch {
-            $report.Result = "FAILED"
-            $report.Error  = $_.Exception.Message
-            Write-Log ("FAILED: {0}" -f $_.Exception.Message) "Red"
-        }
-        finally {
-            $reportItems += [pscustomobject]$report
-        }
+    # GUI InputBox for description; fallback to Read-Host
+    $DescriptionRaw = $null
+    try {
+        Add-Type -AssemblyName Microsoft.VisualBasic -ErrorAction Stop
+        $DescriptionRaw = [Microsoft.VisualBasic.Interaction]::InputBox(
+            "Paste a single-line description for the Safe (max 200 chars).",
+            "Safe Description",
+            ""
+        )
+    } catch {
+        Show-Box -Title "Safe Description" `
+            -BodyLine1 "Paste a single-line description for the Safe (max 200 characters)." `
+            -BodyLine2 "Example: 'Service accounts for AppX PROD'."
+        $DescriptionRaw = Read-Host "Enter the Safe Description (single line, up to 200 chars)"
     }
+
+    if ([string]::IsNullOrWhiteSpace($SafeName)) {
+        Write-Log "❌ ERROR: Safe Name cannot be empty. Exiting..." "Red"
+        exit 1
+    }
+
+    if ([string]::IsNullOrWhiteSpace($DescriptionRaw)) {
+        Write-Log "❌ ERROR: Safe Description cannot be empty. Exiting..." "Red"
+        exit 1
+    }
+
+    $Description = $DescriptionRaw.Trim()
+    if ($Description.Length -gt 200) {
+        Write-Log "ℹ️ Safe Description >200 chars, auto-truncating." "Yellow"
+        $Description = $Description.Substring(0,200)
+    }
+
+    # Create Safe
+    try {
+        Write-Log ("🔹 Creating Safe: {0}..." -f $SafeName)
+        Add-PASSafe -SafeName $SafeName -ManagingCPM $ManagingCPM -Description $Description -NumberOfDaysRetention $RetentionDays -ErrorAction Stop | Out-Null
+        Write-Log ("✅ Successfully created Safe: {0}." -f $SafeName) "Green"
+    } catch {
+        Write-Log ("⚠️ Could not create Safe '{0}': {1}. Continuing to member add..." -f $SafeName, $_.Exception.Message) "Yellow"
+    }
+
+    # Read target AD group
+    $GroupSam       = Read-ValidGroup
+    $TargetGroupUPN = "$GroupSam@cna.com"
+
+    # Get existing members to avoid duplicate add failures
+    $existingMembers = Get-ExistingSafeMembers -SafeName $SafeName
+
+    # Members to add
+    $MembersToAdd = @(
+        @{ Name = $TargetGroupUPN; Type = "Group"; Perm = $LimitedPermPAS },
+        @{ Name = $AdminGroup;     Type = "Group"; Perm = $FullPermPAS    },
+        @{ Name = $AdminMember;    Type = "User";  Perm = $FullPermPAS    },
+        @{ Name = $IdentityMember; Type = "User";  Perm = $FullPermPAS    }
+    )
+
+    foreach ($m in $MembersToAdd) {
+        [void](Add-MemberToSafe -SafeName $SafeName -MemberName $m.Name -MemberType $m.Type -Permissions $m.Perm -ExistingMembers $existingMembers)
+    }
+
+    Write-Log "✅ Safe member addition process completed." "Green"
+    Write-Log "✅ Completed Safe creation and member onboarding using cnarestbot CCP authentication." "Green"
 }
 finally {
     try {
-        if (Get-Command Close-PASSession -ErrorAction SilentlyContinue) {
-            Close-PASSession | Out-Null
-        }
-    }
-    catch {}
+        Close-PASSession | Out-Null
+        Write-Log "✅ PAS session closed." "Green"
+    } catch {}
 }
-
-$reportPath = Join-Path $ReportRoot ("Platform_HTML5_Clone_Report_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
-$reportItems | Export-Csv -LiteralPath $reportPath -NoTypeInformation -Encoding UTF8
-
-$success = @($reportItems | Where-Object { $_.Result -eq "UPDATED" -or $_.Result -eq "WHATIF_ONLY" }).Count
-$failed  = @($reportItems | Where-Object { $_.Result -eq "FAILED" }).Count
-
-Write-Log ("Report exported: {0}" -f $reportPath) "Green"
-Write-Log ("Completed. Success/WhatIf: {0} | Failed: {1}" -f $success, $failed) "Cyan"
