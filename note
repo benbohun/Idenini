@@ -1,39 +1,25 @@
-
-
-
-Use Login Method below
-
-
-I need a script for CyberArk Identity
-
-Login using
-1. Duplicate/clone an existing Application with all its settings 
-2. rename the new Identity Web App with a provided vaulted cyberark username (Prompt)
-3. For the permission, Prompt for the group permission to be provided and add with automatic deploy and run permission
-3. Once setup, add the vaulted account to the User Identity for the newly created app in Secure  Access
-4. I think Safe Name and Account Name is required but help research, prompt for that as well and save.
-
-Use the API guide below to suggest method
-
-https://api-docs.cyberark.com/
-
-https://api-docs.cyberark.com/identity-docs-api/docs/saas-manage-api#/Application%20Management/clone-an-application
-
-https://api-docs.cyberark.com/identity-docs-api/docs/identity-apis
-
-Do research on this extensively
-
 <#
-Autoonboardingscript_UPDATED.ps1
+CNA_Clone_Identity_WebApp_DirectGroupPermissions.ps1
 
-CNA SAFE AUTO-ONBOARDING
-- Authenticates to CCP using Object:
-    cna-prod.cyberark.cloud-cnarestbot
-- Authenticates to Privilege Cloud using psPAS Identity header
-- Creates Safe
-- Adds required members
-- Does NOT add cnarestbot@cyberark.cloud.6679 (default member already present)
-- Does NOT remove CA_PAMDiscovery_SVC@cna.com (legacy logic removed)
+Purpose
+- Authenticate with the CNA CCP/service-user pattern
+- Authenticate to CyberArk Identity API
+- Clone an existing Identity application
+- Rename the cloned app to the provided vaulted CyberArk username
+- Validate the cloned app is still a Web App after rename
+- Resolve a target directory group from DSGroups
+- Add that group directly to the APPLICATION permissions (not via wrapper role)
+- Ensure the target group gets View + Run + Automatically Deploy
+- Prompt for Safe Name and Account Name and save them in the report for later Secure Access / credential binding
+
+Important notes
+- This script uses /SaasManage/SetApplicationPermissions.
+- To avoid accidentally replacing all app permissions, the script first tries to discover existing grants from GetApplication output and merge the new group grant into that set.
+- If existing grants cannot be discovered, the script STOPS by default.
+- You can override that behavior with -ForcePermissionReplace, but only do that if you are comfortable replacing the app's permission set.
+- Show in user app list must be enabled on the app for Automatically Deploy to surface the tile in the User Portal.
+
+ASCII only.
 #>
 
 [CmdletBinding()]
@@ -44,27 +30,21 @@ param(
     [string]$PrivilegeCloudURL = 'https://cna-prod.privilegecloud.cyberark.cloud',
 
     # ===== CCP settings (CNA) =====
-    [string]$CCPAddress      = 'https://vskau1p1231.cna.com',
-    [string]$CCPLocation     = 'AIMWebService',
-    [string]$CCPAppID        = 'PAMDiscovery',
-    [string]$CCPSafe         = 'CA_PCloud_Admins',
-    [string]$CCPObject       = 'cna-prod.cyberark.cloud-cnarestbot',
-    [bool]$CCPWindowsAuth    = $false,
+    [string]$CCPAddress        = 'https://vskau1p1231.cna.com',
+    [string]$CCPLocation       = 'AIMWebService',
+    [string]$CCPAppID          = 'PAMDiscovery',
+    [string]$CCPSafe           = 'CA_PCloud_Admins',
+    [string]$CCPObject         = 'cna-prod.cyberark.cloud-cnarestbot',
+    [bool]$CCPWindowsAuth      = $false,
 
-    # ===== Members to evaluate / add =====
-    [string]$AdminGroup      = 'CA_PCloud_Admins@cna.com',
-    [string]$AdminMember     = 'cna_pas_admin@cyberark.cloud.6679',
-    [string]$IdentityMember  = 'identity-privilege-integration-user$@cyberark.cloud.6679',
+    # ===== Logging / reporting =====
+    [string]$LogPath           = 'E:\Installation Media\Script\OnboardScript\data\Identity_DirectGroupPermissions.log',
+    [string]$ReportCsvPath     = 'E:\Installation Media\Script\OnboardScript\data\Identity_DirectGroupPermissions_Report.csv',
 
-    # ===== Safe defaults =====
-    [string]$ManagingCPM     = 'CNA_PASS_MANG',
-    [int]$RetentionDays      = 120,
-
-    # ===== AD Group lookup =====
-    [string]$SearchBaseOU    = 'OU=Groups,OU=CyberArk,DC=cna,DC=com',
-
-    # ===== Logging =====
-    [string]$LogPath         = 'E:\Installation Media\Script\OnboardScript\data\accountonboarding.txt'
+    # ===== Advanced =====
+    [string]$CloneEndpointPath = '/SaasManage/CloneApplication',
+    [switch]$ForcePermissionReplace,
+    [switch]$WhatIf
 )
 
 # --- Allow this process to load unsigned modules & unblock psPAS files (silent) ---
@@ -79,40 +59,49 @@ foreach ($dir in $psPASDirs) {
     try { Get-ChildItem -Path $dir -Recurse -File | Unblock-File -ErrorAction SilentlyContinue } catch {}
 }
 
-# --- Logging Utility ---
+# --- Globals ---
+$script:IdentityAuthToken = $null
+$script:IdentityUser      = $null
+$script:ReportRows        = New-Object System.Collections.Generic.List[object]
+$script:PasCredential     = $null
+
+# --- Logging ---
 function Write-Log {
     param(
-        [string]$Message,
-        [string]$Color = "White"
+        [Parameter(Mandatory)][string]$Message,
+        [ValidateSet('White','Gray','Green','Yellow','Red','Cyan')][string]$Color = 'White'
     )
-    $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $LogEntry = "$Timestamp - $Message"
-    try { Write-Host $LogEntry -ForegroundColor $Color } catch { Write-Host $LogEntry }
+
+    $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $line = "$ts - $Message"
+
+    try { Write-Host $line -ForegroundColor $Color } catch { Write-Host $line }
+
     try {
         $parent = Split-Path -Path $LogPath -Parent
         if ($parent -and -not (Test-Path $parent)) {
             New-Item -Path $parent -ItemType Directory -Force | Out-Null
         }
-        Add-Content -Path $LogPath -Value $LogEntry
+        Add-Content -Path $LogPath -Value $line
     } catch {}
 }
 
-# --- Console "box" helper (for fallback dialog text) ---
-function Show-Box {
+function Add-ReportRow {
     param(
-        [string]$Title,
-        [string]$BodyLine1 = "",
-        [string]$BodyLine2 = ""
+        [string]$Step,
+        [string]$Status,
+        [string]$Detail
     )
-    $line = ('=' * 72)
-    Write-Host $line -ForegroundColor DarkGray
-    if ($Title)     { Write-Host ("[ " + $Title + " ]") -ForegroundColor Gray }
-    if ($BodyLine1) { Write-Host $BodyLine1 -ForegroundColor Gray }
-    if ($BodyLine2) { Write-Host $BodyLine2 -ForegroundColor Gray }
-    Write-Host $line -ForegroundColor DarkGray
+
+    $script:ReportRows.Add([pscustomobject]@{
+        Timestamp = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+        Step      = $Step
+        Status    = $Status
+        Detail    = $Detail
+    }) | Out-Null
 }
 
-# --- Normalize IdentityTenantURL for Get-IdentityHeader ---
+# --- Helpers ---
 function Get-NormalizedIdentityTenant {
     param([Parameter(Mandatory)][string]$TenantUrl)
 
@@ -123,196 +112,66 @@ function Get-NormalizedIdentityTenant {
     return $value
 }
 
+function Escape-SqlLiteral {
+    param([AllowNull()][string]$Value)
+    if ($null -eq $Value) { return '' }
+    return ($Value -replace "'", "''")
+}
+
+function Invoke-JsonPost {
+    param(
+        [Parameter(Mandatory)][string]$Uri,
+        [Parameter()][object]$Body,
+        [Parameter()][hashtable]$Headers
+    )
+
+    $json = $null
+    if ($PSBoundParameters.ContainsKey('Body') -and $null -ne $Body) {
+        $json = ($Body | ConvertTo-Json -Depth 30)
+    }
+
+    if ($json) {
+        return Invoke-RestMethod -Method POST -Uri $Uri -Headers $Headers -ContentType 'application/json' -Body $json -ErrorAction Stop
+    } else {
+        return Invoke-RestMethod -Method POST -Uri $Uri -Headers $Headers -ContentType 'application/json' -ErrorAction Stop
+    }
+}
+
+function ConvertTo-Array {
+    param([Parameter(ValueFromPipeline = $true)]$InputObject)
+    process {
+        if ($null -eq $InputObject) { @() }
+        elseif ($InputObject -is [System.Collections.IEnumerable] -and -not ($InputObject -is [string])) { @($InputObject) }
+        else { @($InputObject) }
+    }
+}
+
 # --- Load psPAS ---
 try {
     Import-Module psPAS -Force -ErrorAction Stop
     $mod = Get-Module psPAS
-    Write-Log ("psPAS loaded ({0})." -f $mod.Version) "Green"
+    Write-Log ("psPAS loaded ({0})." -f $mod.Version) 'Green'
+    Add-ReportRow -Step 'Load psPAS' -Status 'SUCCESS' -Detail ("Version {0}" -f $mod.Version)
 } catch {
-    Write-Log ("❌ psPAS module not found/loaded: {0}" -f $_.Exception.Message) "Red"
+    Write-Log ("FAILED: psPAS module not found/loaded: {0}" -f $_.Exception.Message) 'Red'
+    Add-ReportRow -Step 'Load psPAS' -Status 'FAILED' -Detail $_.Exception.Message
     exit 1
 }
 
-# --- Try to import AD module for OU validation (non-fatal if missing) ---
-$ADModuleLoaded = $false
-try {
-    Import-Module ActiveDirectory -ErrorAction Stop
-    $ADModuleLoaded = $true
-    Write-Log "ActiveDirectory module loaded." "Green"
-} catch {
-    Write-Log "⚠️ ActiveDirectory module not available; will still try to add group by UPN." "Yellow"
-}
-
-# --- CCP parameters (shared) ---
-$headers = @{ "Content-Type" = "application/json" }
-
-# --- Permissions (psPAS-friendly) ---
-$LimitedPermPAS = [PSCustomObject]@{
-    UseAccounts                            = $true
-    RetrieveAccounts                       = $true
-    ListAccounts                           = $true
-    AddAccounts                            = $false
-    UpdateAccountContent                   = $true
-    UpdateAccountProperties                = $false
-    InitiateCPMAccountManagementOperations = $true
-    SpecifyNextAccountContent              = $true
-    RenameAccounts                         = $false
-    DeleteAccounts                         = $false
-    UnlockAccounts                         = $false
-    ManageSafe                             = $false
-    ManageSafeMembers                      = $false
-    BackupSafe                             = $false
-    ViewAuditLog                           = $true
-    ViewSafeMembers                        = $true
-    AccessWithoutConfirmation              = $true
-    CreateFolders                          = $false
-    DeleteFolders                          = $false
-    MoveAccountsAndFolders                 = $false
-    RequestsAuthorizationLevel1            = $true
-    RequestsAuthorizationLevel2            = $false
-}
-
-$FullPermPAS = [PSCustomObject]@{
-    UseAccounts                            = $true
-    RetrieveAccounts                       = $true
-    ListAccounts                           = $true
-    AddAccounts                            = $true
-    UpdateAccountContent                   = $true
-    UpdateAccountProperties                = $true
-    InitiateCPMAccountManagementOperations = $true
-    SpecifyNextAccountContent              = $true
-    RenameAccounts                         = $true
-    DeleteAccounts                         = $true
-    UnlockAccounts                         = $true
-    ManageSafe                             = $true
-    ManageSafeMembers                      = $true
-    BackupSafe                             = $true
-    ViewAuditLog                           = $true
-    ViewSafeMembers                        = $true
-    AccessWithoutConfirmation              = $true
-    CreateFolders                          = $true
-    DeleteFolders                          = $true
-    MoveAccountsAndFolders                 = $true
-    RequestsAuthorizationLevel1            = $true
-    RequestsAuthorizationLevel2            = $false
-}
-
-# --- AD Group validation helper ---
-function Read-ValidGroup {
-    while ($true) {
-        $g = Read-Host "Enter the AD Safe Group (sAMAccountName only, e.g., ca_xxx_xxx_prod)"
-
-        if ([string]::IsNullOrWhiteSpace($g)) {
-            Write-Log "❌ Group cannot be empty." "Red"
-            continue
-        }
-
-        if ($g -notmatch '^[A-Za-z0-9_\-\.]+$') {
-            Write-Log "❌ Invalid characters in group name. Try again." "Red"
-            continue
-        }
-
-        if ($ADModuleLoaded) {
-            try {
-                $adGroup = Get-ADGroup -LDAPFilter "(|(sAMAccountName=$g)(userPrincipalName=$g@cna.com))" -SearchBase $SearchBaseOU -ErrorAction Stop
-                if ($adGroup) {
-                    Write-Log ("✅ Found AD Group in {0}: {1} (sAM={2})" -f $SearchBaseOU, $adGroup.Name, $adGroup.SamAccountName) "Green"
-                    return $adGroup.SamAccountName
-                } else {
-                    Write-Log ("❌ Group not found under {0}. Re-enter." -f $SearchBaseOU) "Red"
-                }
-            } catch {
-                Write-Log ("❌ Error searching AD for '{0}' in {1}: {2}" -f $g, $SearchBaseOU, $_.Exception.Message) "Red"
-            }
-        } else {
-            Write-Log "⚠️ AD module not loaded, proceeding with provided group name (will add as UPN)." "Yellow"
-            return $g
-        }
-    }
-}
-
-# --- Helper: safely get current Safe members ---
-function Get-ExistingSafeMembers {
-    param(
-        [Parameter(Mandatory)][string]$SafeName
-    )
-
-    $memberSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-
-    try {
-        $members = Get-PASSafeMember -SafeName $SafeName -ErrorAction Stop
-        foreach ($m in $members) {
-            $name = $null
-
-            if ($m.PSObject.Properties.Name -contains 'MemberName') {
-                $name = [string]$m.MemberName
-            } elseif ($m.PSObject.Properties.Name -contains 'UserName') {
-                $name = [string]$m.UserName
-            } elseif ($m.PSObject.Properties.Name -contains 'Username') {
-                $name = [string]$m.Username
-            }
-
-            if (-not [string]::IsNullOrWhiteSpace($name)) {
-                [void]$memberSet.Add($name)
-            }
-        }
-    } catch {
-        Write-Log ("ℹ️ Could not list current members for Safe '{0}': {1}" -f $SafeName, $_.Exception.Message) "Yellow"
-    }
-
-    Write-Output -NoEnumerate $memberSet
-}
-
-# --- Member add helper (psPAS) ---
-function Add-MemberToSafe {
-    param(
-        [Parameter(Mandatory)][string]$SafeName,
-        [Parameter(Mandatory)][string]$MemberName,
-        [Parameter(Mandatory)][ValidateSet("Group","User","Role")][string]$MemberType,
-        [Parameter(Mandatory)][pscustomobject]$Permissions,
-        [Parameter()][object]$ExistingMembers
-    )
-
-    try {
-        if ($ExistingMembers -and $ExistingMembers.Contains($MemberName)) {
-            Write-Log ("ℹ️ Skipping {0} '{1}' because it already exists in Safe '{2}'." -f $MemberType, $MemberName, $SafeName) "Yellow"
-            return $true
-        }
-
-        Write-Log ("Adding {0} '{1}' to {2}..." -f $MemberType, $MemberName, $SafeName)
-
-        $Permissions | Add-PASSafeMember -SafeName $SafeName -MemberType $MemberType -MemberName $MemberName -ErrorAction Stop | Out-Null
-
-        try {
-            if ($ExistingMembers -and ($ExistingMembers -is [System.Collections.Generic.HashSet[string]])) {
-                [void]$ExistingMembers.Add($MemberName)
-            }
-        } catch {
-            Write-Log ("ℹ️ Member was added, but cache update was skipped for '{0}': {1}" -f $MemberName, $_.Exception.Message) "Yellow"
-        }
-
-        Write-Log ("✅ Added {0}: {1}." -f $MemberType, $MemberName) "Green"
-        return $true
-    } catch {
-        Write-Log ("❌ Failed to add '{0}' - {1}" -f $MemberName, $_.Exception.Message) "Red"
-        return $false
-    }
-}
-
-# --- Helper: start PAS session from CCP creds using SAME working pattern ---
+# --- PAS auth from CCP ---
 function Start-PASSessionFromCCP {
-    param(
-        [Parameter(Mandatory)][string]$ObjectName
-    )
+    param([Parameter(Mandatory)][string]$ObjectName)
 
-    $ccpUrl = "$CCPAddress/$CCPLocation/api/Accounts?AppID=$CCPAppID&Safe=$CCPSafe&Object=$ObjectName"
-    Write-Log ("Retrieving CyberArk API credentials from CCP using Object='{0}'..." -f $ObjectName)
-    Write-Log ("CCP URL: {0}" -f $ccpUrl) "Gray"
+    $headers = @{ 'Content-Type' = 'application/json' }
+    $ccpUrl  = "$CCPAddress/$CCPLocation/api/Accounts?AppID=$CCPAppID&Safe=$CCPSafe&Object=$ObjectName"
+
+    Write-Log ("Retrieving CyberArk API credentials from CCP using Object='{0}'..." -f $ObjectName) 'Cyan'
+    Write-Log ("CCP URL: {0}" -f $ccpUrl) 'Gray'
 
     try {
-        $resp = Invoke-RestMethod -Uri $ccpUrl -Method 'GET' -Headers $headers -UseDefaultCredentials:$CCPWindowsAuth -ErrorAction Stop
+        $resp = Invoke-RestMethod -Uri $ccpUrl -Method GET -Headers $headers -UseDefaultCredentials:$CCPWindowsAuth -ErrorAction Stop
         if (-not $resp -or -not $resp.Content) {
-            throw "Empty CCP response"
+            throw 'Empty CCP response.'
         }
 
         $resolvedUser = $null
@@ -323,125 +182,724 @@ function Start-PASSessionFromCCP {
         }
 
         if ([string]::IsNullOrWhiteSpace($resolvedUser)) {
-            throw "CCP returned password but no Username/UserName field."
+            throw 'CCP returned password but no Username/UserName field.'
         }
 
-        Write-Log ("✅ Successfully retrieved credentials for user: {0}" -f $resolvedUser) "Green"
+        $secure = ConvertTo-SecureString $resp.Content -AsPlainText -Force
+        $script:PasCredential = [PSCredential]::new($resolvedUser, $secure)
+
+        Write-Log ("Successfully retrieved credentials for service user: {0}" -f $resolvedUser) 'Green'
+        Add-ReportRow -Step 'CCP Retrieve' -Status 'SUCCESS' -Detail ("User {0}" -f $resolvedUser)
     } catch {
-        Write-Log ("❌ ERROR: CCP credential fetch failed - {0}" -f $_.Exception.Message) "Red"
+        Write-Log ("FAILED: CCP credential fetch failed - {0}" -f $_.Exception.Message) 'Red'
+        Add-ReportRow -Step 'CCP Retrieve' -Status 'FAILED' -Detail $_.Exception.Message
         throw
     }
 
     try {
         $normalizedTenant = Get-NormalizedIdentityTenant -TenantUrl $IdentityTenantURL
 
-        Write-Log ("Requesting CyberArk PAS authentication (psPAS Identity header) as {0}..." -f $resolvedUser)
-        Write-Log ("IdentityTenantURL passed to Get-IdentityHeader: {0}" -f $normalizedTenant) "Gray"
-
-        $UPPass = ConvertTo-SecureString $resp.Content -AsPlainText -Force
-        $UPCred = [PSCredential]::new($resolvedUser, $UPPass)
-
+        Write-Log 'Requesting PAS session via psPAS Identity header...' 'Cyan'
         $header = Get-IdentityHeader `
             -IdentityTenantURL $normalizedTenant `
             -psPASFormat `
             -PCloudSubdomain $PCloudSubdomain `
-            -UPCreds $UPCred
+            -UPCreds $script:PasCredential
 
         Use-PASSession $header | Out-Null
 
         if (-not (Get-PASSession)) {
-            throw "psPAS session not established"
+            throw 'psPAS session not established.'
         }
 
-        Write-Log ("✅ Authentication successful, PAS session established ({0})." -f $resolvedUser) "Green"
+        Write-Log ("PAS session established ({0})." -f $script:PasCredential.UserName) 'Green'
+        Add-ReportRow -Step 'PAS Session' -Status 'SUCCESS' -Detail ("Authenticated as {0}" -f $script:PasCredential.UserName)
     } catch {
-        Write-Log ("❌ Failed to authenticate via psPAS Identity header: {0}" -f $_.Exception.Message) "Red"
+        Write-Log ("FAILED: PAS authentication failed: {0}" -f $_.Exception.Message) 'Red'
+        Add-ReportRow -Step 'PAS Session' -Status 'FAILED' -Detail $_.Exception.Message
         throw
     }
 
     return $resp
 }
 
+# --- Identity auth ---
+function Start-IdentityApiSession {
+    param(
+        [Parameter(Mandatory)][string]$TenantUrl,
+        [Parameter(Mandatory)][string]$UserName,
+        [Parameter(Mandatory)][string]$Password
+    )
+
+    $baseHeaders = @{
+        'X-IDAP-NATIVE-CLIENT' = 'true'
+        'Content-Type'         = 'application/json'
+    }
+
+    $startUri = ($TenantUrl.TrimEnd('/') + '/Security/StartAuthentication')
+    $advUri   = ($TenantUrl.TrimEnd('/') + '/Security/AdvanceAuthentication')
+
+    Write-Log ("Starting CyberArk Identity authentication for '{0}'..." -f $UserName) 'Cyan'
+
+    $startBody = @{
+        User    = $UserName
+        Version = '1.0'
+    }
+
+    $startResp = Invoke-JsonPost -Uri $startUri -Body $startBody -Headers $baseHeaders
+    if (-not $startResp.success) {
+        throw ('StartAuthentication failed: ' + ($startResp.Message | Out-String))
+    }
+
+    $sessionId = $startResp.Result.SessionId
+    if ([string]::IsNullOrWhiteSpace($sessionId)) {
+        throw 'StartAuthentication did not return SessionId.'
+    }
+
+    $mechanism = $null
+    foreach ($challenge in @($startResp.Result.Challenges)) {
+        foreach ($mech in @($challenge.Mechanisms)) {
+            if ($mech.Name -eq 'UP' -or $mech.PromptSelectMech -match 'Password') {
+                $mechanism = $mech
+                break
+            }
+        }
+        if ($mechanism) { break }
+    }
+
+    if (-not $mechanism) {
+        throw 'Could not find a username/password mechanism in StartAuthentication response.'
+    }
+
+    $advBody = @{
+        SessionId   = $sessionId
+        MechanismId = $mechanism.MechanismId
+        Action      = 'Answer'
+        Answer      = $Password
+    }
+
+    $advResp = Invoke-JsonPost -Uri $advUri -Body $advBody -Headers $baseHeaders
+    if (-not $advResp.success) {
+        throw ('AdvanceAuthentication failed: ' + ($advResp.Message | Out-String))
+    }
+
+    $auth = $advResp.Result.Auth
+    if ([string]::IsNullOrWhiteSpace($auth)) {
+        throw 'AdvanceAuthentication did not return Auth token.'
+    }
+
+    $script:IdentityAuthToken = $auth
+    $script:IdentityUser      = $advResp.Result.User
+
+    Write-Log ("Identity API authentication succeeded as '{0}'." -f $script:IdentityUser) 'Green'
+    Add-ReportRow -Step 'Identity API Session' -Status 'SUCCESS' -Detail ("Authenticated as {0}" -f $script:IdentityUser)
+}
+
+function Get-IdentityHeaders {
+    if ([string]::IsNullOrWhiteSpace($script:IdentityAuthToken)) {
+        throw 'Identity API token is not initialized.'
+    }
+
+    return @{
+        'Authorization'        = ("Bearer {0}" -f $script:IdentityAuthToken)
+        'X-IDAP-NATIVE-CLIENT' = 'true'
+        'Content-Type'         = 'application/json'
+    }
+}
+
+function Invoke-IdentityApi {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter()][object]$Body
+    )
+
+    $uri = $IdentityTenantURL.TrimEnd('/') + $Path
+    $headers = Get-IdentityHeaders
+    return Invoke-JsonPost -Uri $uri -Body $Body -Headers $headers
+}
+
+function Invoke-RedrockQuery {
+    param([Parameter(Mandatory)][string]$Script)
+
+    $body = @{
+        Script = $Script
+        Args   = @{
+            PageNumber = 1
+            PageSize   = 100
+            Limit      = 10000
+            SortBy     = ''
+            direction  = 'False'
+            Caching    = -1
+        }
+    }
+
+    return Invoke-IdentityApi -Path '/Redrock/query' -Body $body
+}
+
+# --- App helpers ---
+function Get-IdentityApplicationByNameOrId {
+    param([Parameter(Mandatory)][string]$NameOrId)
+
+    if ($NameOrId -match '^[0-9a-fA-F-]{20,}$') {
+        return [pscustomobject]@{
+            ID   = $NameOrId
+            Name = $NameOrId
+        }
+    }
+
+    $escaped = Escape-SqlLiteral -Value $NameOrId
+    $query   = "SELECT ID, Name, Description FROM Application WHERE Name = '$escaped' ORDER BY Name COLLATE NOCASE"
+
+    $resp = Invoke-RedrockQuery -Script $query
+    $rows = @($resp.Result.Results)
+
+    if (-not $rows -or $rows.Count -lt 1) {
+        throw ("Application not found by exact name: {0}" -f $NameOrId)
+    }
+
+    $row = $rows[0].Row
+    return [pscustomobject]@{
+        ID          = $row.ID
+        Name        = $row.Name
+        Description = $row.Description
+    }
+}
+
+function Get-IdentityApplicationDetails {
+    param([Parameter(Mandatory)][string]$AppKey)
+
+    $resp = Invoke-IdentityApi -Path '/SaasManage/GetApplication' -Body @{ _Rowkey = $AppKey }
+    if (-not $resp.success) {
+        throw ('GetApplication failed: ' + ($resp.Message | Out-String))
+    }
+    return $resp.Result
+}
+
+function Assert-IdentityWebApp {
+    param(
+        [Parameter(Mandatory)][object]$AppDetails,
+        [Parameter(Mandatory)][string]$Label
+    )
+
+    $appTypeDisplay = $null
+    $appType        = $null
+    $webUPAppType   = $null
+    $templateName   = $null
+    $name           = $null
+
+    if ($AppDetails.PSObject.Properties.Name -contains 'AppTypeDisplayName') { $appTypeDisplay = [string]$AppDetails.AppTypeDisplayName }
+    if ($AppDetails.PSObject.Properties.Name -contains 'AppType')            { $appType        = [string]$AppDetails.AppType }
+    if ($AppDetails.PSObject.Properties.Name -contains 'WebUPAppType')       { $webUPAppType   = [string]$AppDetails.WebUPAppType }
+    if ($AppDetails.PSObject.Properties.Name -contains 'TemplateName')       { $templateName   = [string]$AppDetails.TemplateName }
+    if ($AppDetails.PSObject.Properties.Name -contains 'Name')               { $name           = [string]$AppDetails.Name }
+
+    $isWeb = $false
+    if ($appTypeDisplay -match '^Web') { $isWeb = $true }
+    elseif ($appType -eq 'Web')       { $isWeb = $true }
+    elseif (-not [string]::IsNullOrWhiteSpace($webUPAppType)) { $isWeb = $true }
+
+    if (-not $isWeb) {
+        throw ("{0} is not a Web App. Name='{1}' AppTypeDisplayName='{2}' AppType='{3}' WebUPAppType='{4}'" -f $Label, $name, $appTypeDisplay, $appType, $webUPAppType)
+    }
+
+    Write-Log ("Validated {0} as Web App. Name='{1}' Template='{2}' AppTypeDisplayName='{3}' WebUPAppType='{4}'" -f $Label, $name, $templateName, $appTypeDisplay, $webUPAppType) 'Green'
+    Add-ReportRow -Step ("Validate {0}" -f $Label) -Status 'SUCCESS' -Detail ("Web App; Name={0}; Template={1}; AppTypeDisplayName={2}; WebUPAppType={3}" -f $name, $templateName, $appTypeDisplay, $webUPAppType)
+}
+
+function Clone-IdentityApplicationAdaptive {
+    param([Parameter(Mandatory)][string]$SourceAppKey)
+
+    $candidatePaths = @(
+        $CloneEndpointPath,
+        '/SaasManage/CloneExistingApplication'
+    ) | Select-Object -Unique
+
+    $candidateBodies = @(
+        @{ _RowKey = $SourceAppKey },
+        @{ _Rowkey = $SourceAppKey },
+        @{ appKey  = $SourceAppKey },
+        @{ AppKey  = $SourceAppKey },
+        @{ ID      = $SourceAppKey }
+    )
+
+    foreach ($path in $candidatePaths) {
+        foreach ($body in $candidateBodies) {
+            try {
+                Write-Log ("Trying clone endpoint '{0}' with payload keys [{1}]" -f $path, ($body.Keys -join ',')) 'Gray'
+                $resp = Invoke-IdentityApi -Path $path -Body $body
+
+                if ($resp.success) {
+                    $newKey = $null
+
+                    if ($resp.Result -is [string]) {
+                        $newKey = [string]$resp.Result
+                    } elseif ($resp.Result -is [System.Collections.IEnumerable] -and -not ($resp.Result -is [string])) {
+                        $first = @($resp.Result)[0]
+                        if ($first -and $first.PSObject.Properties.Name -contains '_RowKey') { $newKey = [string]$first._RowKey }
+                        elseif ($first -and $first.PSObject.Properties.Name -contains '_Rowkey') { $newKey = [string]$first._Rowkey }
+                        elseif ($first -and $first.PSObject.Properties.Name -contains 'ID') { $newKey = [string]$first.ID }
+                    } else {
+                        if ($resp.Result.PSObject.Properties.Name -contains '_RowKey') { $newKey = [string]$resp.Result._RowKey }
+                        elseif ($resp.Result.PSObject.Properties.Name -contains '_Rowkey') { $newKey = [string]$resp.Result._Rowkey }
+                        elseif ($resp.Result.PSObject.Properties.Name -contains 'ID') { $newKey = [string]$resp.Result.ID }
+                    }
+
+                    if (-not [string]::IsNullOrWhiteSpace($newKey)) {
+                        Write-Log ("Clone succeeded on path '{0}'. New app key: {1}" -f $path, $newKey) 'Green'
+                        Add-ReportRow -Step 'Clone Application' -Status 'SUCCESS' -Detail ("Path={0}; NewAppKey={1}" -f $path, $newKey)
+                        return $newKey
+                    }
+                }
+            } catch {
+                Write-Log ("Clone attempt failed on '{0}' with keys [{1}]: {2}" -f $path, ($body.Keys -join ','), $_.Exception.Message) 'Yellow'
+            }
+        }
+    }
+
+    throw 'All clone endpoint/payload attempts failed. Validate the clone operation path/body in your tenant API hub.'
+}
+
+function Rename-IdentityApplication {
+    param(
+        [Parameter(Mandatory)][string]$AppKey,
+        [Parameter(Mandatory)][string]$NewName,
+        [Parameter()][object]$AppDetails
+    )
+
+    $body = @{
+        _Rowkey = $AppKey
+        Name    = $NewName
+    }
+
+    if ($AppDetails -and $AppDetails.PSObject.Properties.Name -contains 'Description' -and $AppDetails.Description) {
+        $body['Description'] = $AppDetails.Description
+    }
+    if ($AppDetails -and $AppDetails.PSObject.Properties.Name -contains 'IconUri' -and $AppDetails.IconUri) {
+        $body['IconUri'] = $AppDetails.IconUri
+    }
+
+    $resp = Invoke-IdentityApi -Path '/SaasManage/UpdateApplicationDE' -Body $body
+    if (-not $resp.success) {
+        throw ('UpdateApplicationDE rename failed: ' + ($resp.Message | Out-String))
+    }
+
+    Write-Log ("Application renamed to '{0}'." -f $NewName) 'Green'
+    Add-ReportRow -Step 'Rename Application' -Status 'SUCCESS' -Detail ("Renamed to {0}" -f $NewName)
+}
+
+# --- Group lookup helpers ---
+function Resolve-IdentityGroupFromDSGroups {
+    param([Parameter(Mandatory)][string]$GroupInput)
+
+    $escaped = Escape-SqlLiteral -Value $GroupInput
+    $query = @"
+SELECT InternalName, SystemName, DisplayName, DirectoryServiceUuid, ServiceInstance, ServiceType
+FROM DSGroups
+WHERE SystemName = '$escaped'
+   OR DisplayName = '$escaped'
+   OR InternalName = '$escaped'
+ORDER BY DisplayName COLLATE NOCASE
+"@
+
+    $resp = Invoke-RedrockQuery -Script $query
+    $rows = @($resp.Result.Results)
+
+    if (-not $rows -or $rows.Count -lt 1) {
+        throw ("Group not found in DSGroups: {0}" -f $GroupInput)
+    }
+
+    $selected = $rows[0].Row
+
+    foreach ($r in $rows) {
+        if ($r.Row.SystemName -eq $GroupInput) {
+            $selected = $r.Row
+            break
+        }
+    }
+
+    Write-Log ("Resolved target group. DisplayName='{0}' SystemName='{1}' InternalName='{2}' DirectoryServiceUuid='{3}'" -f $selected.DisplayName, $selected.SystemName, $selected.InternalName, $selected.DirectoryServiceUuid) 'Green'
+    Add-ReportRow -Step 'Resolve Group' -Status 'SUCCESS' -Detail ("DisplayName={0}; SystemName={1}; InternalName={2}; DirectoryServiceUuid={3}" -f $selected.DisplayName, $selected.SystemName, $selected.InternalName, $selected.DirectoryServiceUuid)
+
+    return [pscustomobject]@{
+        DisplayName          = [string]$selected.DisplayName
+        SystemName           = [string]$selected.SystemName
+        InternalName         = [string]$selected.InternalName
+        DirectoryServiceUuid = [string]$selected.DirectoryServiceUuid
+        ServiceInstance      = [string]$selected.ServiceInstance
+        ServiceType          = [string]$selected.ServiceType
+    }
+}
+
+# --- Recursive object inspection for permissions metadata ---
+function Find-FirstPropertyValue {
+    param(
+        [Parameter(Mandatory)]$Object,
+        [Parameter(Mandatory)][string[]]$Names,
+        [int]$Depth = 0,
+        [int]$MaxDepth = 8
+    )
+
+    if ($null -eq $Object) { return $null }
+    if ($Depth -gt $MaxDepth) { return $null }
+
+    if ($Object -is [string] -or $Object -is [ValueType]) {
+        return $null
+    }
+
+    if ($Object -is [System.Collections.IDictionary]) {
+        foreach ($name in $Names) {
+            if ($Object.Contains($name) -and $null -ne $Object[$name]) {
+                return $Object[$name]
+            }
+        }
+        foreach ($key in $Object.Keys) {
+            $v = Find-FirstPropertyValue -Object $Object[$key] -Names $Names -Depth ($Depth + 1) -MaxDepth $MaxDepth
+            if ($null -ne $v) { return $v }
+        }
+        return $null
+    }
+
+    if ($Object -is [System.Collections.IEnumerable] -and -not ($Object -is [string])) {
+        foreach ($item in $Object) {
+            $v = Find-FirstPropertyValue -Object $item -Names $Names -Depth ($Depth + 1) -MaxDepth $MaxDepth
+            if ($null -ne $v) { return $v }
+        }
+        return $null
+    }
+
+    foreach ($name in $Names) {
+        if ($Object.PSObject.Properties.Name -contains $name) {
+            $v = $Object.$name
+            if ($null -ne $v -and -not [string]::IsNullOrWhiteSpace([string]$v)) {
+                return $v
+            }
+        }
+    }
+
+    foreach ($p in $Object.PSObject.Properties) {
+        $v = Find-FirstPropertyValue -Object $p.Value -Names $Names -Depth ($Depth + 1) -MaxDepth $MaxDepth
+        if ($null -ne $v) { return $v }
+    }
+
+    return $null
+}
+
+function Find-GrantArray {
+    param(
+        [Parameter(Mandatory)]$Object,
+        [int]$Depth = 0,
+        [int]$MaxDepth = 8
+    )
+
+    if ($null -eq $Object) { return $null }
+    if ($Depth -gt $MaxDepth) { return $null }
+
+    if ($Object -is [string] -or $Object -is [ValueType]) {
+        return $null
+    }
+
+    if ($Object -is [System.Collections.IEnumerable] -and -not ($Object -is [string])) {
+        $arr = @($Object)
+        if ($arr.Count -gt 0) {
+            $first = $arr[0]
+            if ($first -and $first.PSObject) {
+                $props = @($first.PSObject.Properties.Name)
+                if (
+                    ($props -contains 'Principal') -or
+                    ($props -contains 'PrincipalId') -or
+                    ($props -contains 'Rights') -or
+                    (($props -contains 'PType') -and ($props -contains 'Type'))
+                ) {
+                    return $arr
+                }
+            }
+        }
+
+        foreach ($item in $arr) {
+            $found = Find-GrantArray -Object $item -Depth ($Depth + 1) -MaxDepth $MaxDepth
+            if ($found) { return $found }
+        }
+        return $null
+    }
+
+    if ($Object -is [System.Collections.IDictionary]) {
+        foreach ($key in $Object.Keys) {
+            $found = Find-GrantArray -Object $Object[$key] -Depth ($Depth + 1) -MaxDepth $MaxDepth
+            if ($found) { return $found }
+        }
+        return $null
+    }
+
+    foreach ($p in $Object.PSObject.Properties) {
+        $found = Find-GrantArray -Object $p.Value -Depth ($Depth + 1) -MaxDepth $MaxDepth
+        if ($found) { return $found }
+    }
+
+    return $null
+}
+
+function Get-AppPermissionState {
+    param(
+        [Parameter(Mandatory)][string]$AppRowKey,
+        [Parameter()][string]$FallbackId
+    )
+
+    $details = Get-IdentityApplicationDetails -AppKey $AppRowKey
+
+    $rowKey = $AppRowKey
+    $idVal  = $FallbackId
+    $pvid   = $null
+
+    $tmpRowKey = Find-FirstPropertyValue -Object $details -Names @('_RowKey','_Rowkey','RowKey')
+    if ($tmpRowKey) { $rowKey = [string]$tmpRowKey }
+
+    $tmpId = Find-FirstPropertyValue -Object $details -Names @('ID','AppID')
+    if ($tmpId) { $idVal = [string]$tmpId }
+
+    $tmpPvid = Find-FirstPropertyValue -Object $details -Names @('PVID','PVId','PermissionVersionId')
+    if ($tmpPvid) { $pvid = [string]$tmpPvid }
+
+    $grants = Find-GrantArray -Object $details
+
+    return [pscustomobject]@{
+        Details = $details
+        RowKey  = $rowKey
+        ID      = $idVal
+        PVID    = $pvid
+        Grants  = $grants
+    }
+}
+
+function New-GrantFromResolvedGroup {
+    param(
+        [Parameter(Mandatory)][object]$GroupObject,
+        [Parameter(Mandatory)][string]$Rights
+    )
+
+    return [pscustomobject]@{
+        Principal            = $(if ($GroupObject.SystemName) { $GroupObject.SystemName } else { $GroupObject.DisplayName })
+        PType                = 'Group'
+        Rights               = $Rights
+        PrincipalId          = $GroupObject.InternalName
+        DirectoryServiceUuid = $GroupObject.DirectoryServiceUuid
+        SystemName           = $GroupObject.SystemName
+        Type                 = 'Group'
+    }
+}
+
+function Get-MergedGrantSet {
+    param(
+        [Parameter()][object[]]$ExistingGrants,
+        [Parameter(Mandatory)][object]$GroupObject,
+        [Parameter(Mandatory)][string]$Rights
+    )
+
+    $merged = New-Object System.Collections.Generic.List[object]
+    $found = $false
+
+    foreach ($g in @($ExistingGrants)) {
+        $principalId = $null
+        $systemName  = $null
+        $principal   = $null
+
+        if ($g.PSObject.Properties.Name -contains 'PrincipalId') { $principalId = [string]$g.PrincipalId }
+        if ($g.PSObject.Properties.Name -contains 'SystemName')  { $systemName  = [string]$g.SystemName }
+        if ($g.PSObject.Properties.Name -contains 'Principal')   { $principal   = [string]$g.Principal }
+
+        $isTarget = $false
+        if ($principalId -and $principalId -eq $GroupObject.InternalName) { $isTarget = $true }
+        elseif ($systemName -and $systemName -eq $GroupObject.SystemName) { $isTarget = $true }
+        elseif ($principal -and $principal -eq $GroupObject.SystemName)   { $isTarget = $true }
+        elseif ($principal -and $principal -eq $GroupObject.DisplayName)  { $isTarget = $true }
+
+        if ($isTarget) {
+            $merged.Add((New-GrantFromResolvedGroup -GroupObject $GroupObject -Rights $Rights)) | Out-Null
+            $found = $true
+        } else {
+            $merged.Add($g) | Out-Null
+        }
+    }
+
+    if (-not $found) {
+        $merged.Add((New-GrantFromResolvedGroup -GroupObject $GroupObject -Rights $Rights)) | Out-Null
+    }
+
+    return @($merged)
+}
+
+function Set-ApplicationPermissionsDirectGroup {
+    param(
+        [Parameter(Mandatory)][string]$AppRowKey,
+        [Parameter()][string]$AppId,
+        [Parameter(Mandatory)][object]$GroupObject
+    )
+
+    $state = Get-AppPermissionState -AppRowKey $AppRowKey -FallbackId $AppId
+
+    $existingGrantCount = 0
+    if ($state.Grants) { $existingGrantCount = @($state.Grants).Count }
+
+    Write-Log ("Discovered app permission metadata. RowKey='{0}' ID='{1}' PVID='{2}' ExistingGrantCount='{3}'" -f $state.RowKey, $state.ID, $state.PVID, $existingGrantCount) 'Gray'
+    Add-ReportRow -Step 'Inspect App Permissions' -Status 'SUCCESS' -Detail ("RowKey={0}; ID={1}; PVID={2}; ExistingGrantCount={3}" -f $state.RowKey, $state.ID, $state.PVID, $existingGrantCount)
+
+    if ((-not $state.Grants -or @($state.Grants).Count -lt 1) -and (-not $ForcePermissionReplace)) {
+        throw 'No existing grant list could be safely discovered from GetApplication output. Aborting to avoid replacing all app permissions. Re-run with -ForcePermissionReplace only if you are comfortable replacing the permission set.'
+    }
+
+    $rightsCandidates = @(
+        'View,Run,AutoDeploy',
+        'View,Run,Automatically Deploy',
+        'View,Run,AutomaticallyDeploy'
+    )
+
+    foreach ($rights in $rightsCandidates) {
+        $grantsToSend = $null
+
+        if ($state.Grants -and @($state.Grants).Count -ge 1) {
+            $grantsToSend = Get-MergedGrantSet -ExistingGrants @($state.Grants) -GroupObject $GroupObject -Rights $rights
+        } else {
+            $grantsToSend = @((New-GrantFromResolvedGroup -GroupObject $GroupObject -Rights $rights))
+        }
+
+        $body = @{
+            Grants = $grantsToSend
+            ID     = $(if ($state.ID) { $state.ID } else { '' })
+            RowKey = $(if ($state.RowKey) { $state.RowKey } else { $AppRowKey })
+            PVID   = $(if ($state.PVID) { $state.PVID } else { '' })
+        }
+
+        try {
+            Write-Log ("Trying SetApplicationPermissions with Rights='{0}'..." -f $rights) 'Gray'
+            $resp = Invoke-IdentityApi -Path '/SaasManage/SetApplicationPermissions' -Body $body
+            if ($resp.success) {
+                Write-Log ("Direct group permission assignment succeeded for group '{0}' using Rights='{1}'." -f $GroupObject.SystemName, $rights) 'Green'
+                Add-ReportRow -Step 'Set Application Permissions' -Status 'SUCCESS' -Detail ("Group={0}; Rights={1}; RowKey={2}" -f $GroupObject.SystemName, $rights, $state.RowKey)
+                return
+            }
+        } catch {
+            Write-Log ("SetApplicationPermissions attempt failed with Rights='{0}': {1}" -f $rights, $_.Exception.Message) 'Yellow'
+        }
+    }
+
+    throw 'All SetApplicationPermissions attempts failed. Review the logged payload metadata and tenant-specific rights format.'
+}
+
 # =========================
 # MAIN
 # =========================
-$response = $null
+$response         = $null
+$sourceAppInput   = $null
+$sourceApp        = $null
+$sourceDetails    = $null
+$clonedAppKey     = $null
+$clonedDetails    = $null
+$newAppName       = $null
+$groupInput       = $null
+$groupObject      = $null
+$safeName         = $null
+$accountName      = $null
+$vaultedUserName  = $null
+
 try {
     $response = Start-PASSessionFromCCP -ObjectName $CCPObject
-} catch {
-    exit 1
+
+    $resolvedUser = $null
+    if ($response.PSObject.Properties.Name -contains 'Username') {
+        $resolvedUser = [string]$response.Username
+    } elseif ($response.PSObject.Properties.Name -contains 'UserName') {
+        $resolvedUser = [string]$response.UserName
+    }
+
+    if ([string]::IsNullOrWhiteSpace($resolvedUser)) {
+        throw 'Unable to resolve service username from CCP response.'
+    }
+
+    Start-IdentityApiSession -TenantUrl $IdentityTenantURL -UserName $resolvedUser -Password $response.Content
+
+    $sourceAppInput = Read-Host 'Enter the SOURCE Identity application name (exact) or App Key'
+    if ([string]::IsNullOrWhiteSpace($sourceAppInput)) {
+        throw 'Source application cannot be empty.'
+    }
+
+    $vaultedUserName = Read-Host 'Enter the vaulted CyberArk username to stamp as the NEW app name'
+    if ([string]::IsNullOrWhiteSpace($vaultedUserName)) {
+        throw 'Vaulted username cannot be empty.'
+    }
+
+    $groupInput = Read-Host 'Enter the target GROUP to add directly to the application Permissions page'
+    if ([string]::IsNullOrWhiteSpace($groupInput)) {
+        throw 'Target group cannot be empty.'
+    }
+
+    $safeName = Read-Host 'Enter the Vault Safe Name (saved to report for later credential binding)'
+    if ([string]::IsNullOrWhiteSpace($safeName)) {
+        throw 'Safe Name cannot be empty.'
+    }
+
+    $accountName = Read-Host 'Enter the Vault Account Name / Identifier (saved to report for later credential binding)'
+    if ([string]::IsNullOrWhiteSpace($accountName)) {
+        throw 'Account Name cannot be empty.'
+    }
+
+    Add-ReportRow -Step 'Input Summary' -Status 'INFO' -Detail ("SourceApp={0}; NewAppName={1}; TargetGroup={2}; SafeName={3}; AccountName={4}" -f $sourceAppInput, $vaultedUserName, $groupInput, $safeName, $accountName)
+
+    $sourceApp     = Get-IdentityApplicationByNameOrId -NameOrId $sourceAppInput
+    $sourceDetails = Get-IdentityApplicationDetails -AppKey $sourceApp.ID
+    Assert-IdentityWebApp -AppDetails $sourceDetails -Label 'Source Application'
+
+    if ($WhatIf) {
+        Write-Log ("WHATIF: Would clone source app '{0}' ({1})." -f $sourceApp.Name, $sourceApp.ID) 'Yellow'
+        Add-ReportRow -Step 'Clone Application' -Status 'WHATIF' -Detail ("Source={0}; AppKey={1}" -f $sourceApp.Name, $sourceApp.ID)
+    } else {
+        $clonedAppKey  = Clone-IdentityApplicationAdaptive -SourceAppKey $sourceApp.ID
+        $clonedDetails = Get-IdentityApplicationDetails -AppKey $clonedAppKey
+        Assert-IdentityWebApp -AppDetails $clonedDetails -Label 'Cloned Application (pre-rename)'
+    }
+
+    $newAppName = $vaultedUserName
+
+    if ($WhatIf) {
+        Write-Log ("WHATIF: Would rename cloned app to '{0}'." -f $newAppName) 'Yellow'
+        Add-ReportRow -Step 'Rename Application' -Status 'WHATIF' -Detail ("NewName={0}" -f $newAppName)
+    } else {
+        Rename-IdentityApplication -AppKey $clonedAppKey -NewName $newAppName -AppDetails $clonedDetails
+        $clonedDetails = Get-IdentityApplicationDetails -AppKey $clonedAppKey
+        Assert-IdentityWebApp -AppDetails $clonedDetails -Label 'Cloned Application (post-rename)'
+    }
+
+    $groupObject = Resolve-IdentityGroupFromDSGroups -GroupInput $groupInput
+
+    if ($WhatIf) {
+        Write-Log ("WHATIF: Would add group '{0}' directly to app permissions with View + Run + Automatically Deploy." -f $groupObject.SystemName) 'Yellow'
+        Add-ReportRow -Step 'Set Application Permissions' -Status 'WHATIF' -Detail ("Group={0}; AppRowKey={1}" -f $groupObject.SystemName, $clonedAppKey)
+    } else {
+        Set-ApplicationPermissionsDirectGroup -AppRowKey $clonedAppKey -AppId $sourceApp.ID -GroupObject $groupObject
+    }
+
+    Write-Log ("Completed direct-group permission workflow. Safe '{0}' and Account '{1}' were saved in the report for later credential binding." -f $safeName, $accountName) 'Green'
+    Add-ReportRow -Step 'Overall' -Status 'SUCCESS' -Detail 'Clone / rename / validate / direct-group-permission workflow completed.'
 }
-
-try {
-    # Prompt for Safe Name
-    $SafeName = Read-Host "Enter the Safe Name"
-
-    # GUI InputBox for description; fallback to Read-Host
-    $DescriptionRaw = $null
-    try {
-        Add-Type -AssemblyName Microsoft.VisualBasic -ErrorAction Stop
-        $DescriptionRaw = [Microsoft.VisualBasic.Interaction]::InputBox(
-            "Paste a single-line description for the Safe (max 200 chars).",
-            "Safe Description",
-            ""
-        )
-    } catch {
-        Show-Box -Title "Safe Description" `
-            -BodyLine1 "Paste a single-line description for the Safe (max 200 characters)." `
-            -BodyLine2 "Example: 'Service accounts for AppX PROD'."
-        $DescriptionRaw = Read-Host "Enter the Safe Description (single line, up to 200 chars)"
-    }
-
-    if ([string]::IsNullOrWhiteSpace($SafeName)) {
-        Write-Log "❌ ERROR: Safe Name cannot be empty. Exiting..." "Red"
-        exit 1
-    }
-
-    if ([string]::IsNullOrWhiteSpace($DescriptionRaw)) {
-        Write-Log "❌ ERROR: Safe Description cannot be empty. Exiting..." "Red"
-        exit 1
-    }
-
-    $Description = $DescriptionRaw.Trim()
-    if ($Description.Length -gt 200) {
-        Write-Log "ℹ️ Safe Description >200 chars, auto-truncating." "Yellow"
-        $Description = $Description.Substring(0,200)
-    }
-
-    # Create Safe
-    try {
-        Write-Log ("🔹 Creating Safe: {0}..." -f $SafeName)
-        Add-PASSafe -SafeName $SafeName -ManagingCPM $ManagingCPM -Description $Description -NumberOfDaysRetention $RetentionDays -ErrorAction Stop | Out-Null
-        Write-Log ("✅ Successfully created Safe: {0}." -f $SafeName) "Green"
-    } catch {
-        Write-Log ("⚠️ Could not create Safe '{0}': {1}. Continuing to member add..." -f $SafeName, $_.Exception.Message) "Yellow"
-    }
-
-    # Read target AD group
-    $GroupSam       = Read-ValidGroup
-    $TargetGroupUPN = "$GroupSam@cna.com"
-
-    # Get existing members to avoid duplicate add failures
-    $existingMembers = Get-ExistingSafeMembers -SafeName $SafeName
-
-    # Members to add
-    $MembersToAdd = @(
-        @{ Name = $TargetGroupUPN; Type = "Group"; Perm = $LimitedPermPAS },
-        @{ Name = $AdminGroup;     Type = "Group"; Perm = $FullPermPAS    },
-        @{ Name = $AdminMember;    Type = "User";  Perm = $FullPermPAS    },
-        @{ Name = $IdentityMember; Type = "User";  Perm = $FullPermPAS    }
-    )
-
-    foreach ($m in $MembersToAdd) {
-        [void](Add-MemberToSafe -SafeName $SafeName -MemberName $m.Name -MemberType $m.Type -Permissions $m.Perm -ExistingMembers $existingMembers)
-    }
-
-    Write-Log "✅ Safe member addition process completed." "Green"
-    Write-Log "✅ Completed Safe creation and member onboarding using cnarestbot CCP authentication." "Green"
+catch {
+    Write-Log ("FAILED: {0}" -f $_.Exception.Message) 'Red'
+    Add-ReportRow -Step 'Overall' -Status 'FAILED' -Detail $_.Exception.Message
 }
 finally {
     try {
+        $csvDir = Split-Path -Path $ReportCsvPath -Parent
+        if ($csvDir -and -not (Test-Path $csvDir)) {
+            New-Item -Path $csvDir -ItemType Directory -Force | Out-Null
+        }
+
+        if ($script:ReportRows.Count -gt 0) {
+            $script:ReportRows | Export-Csv -Path $ReportCsvPath -NoTypeInformation -Force
+            Write-Log ("Report exported: {0}" -f $ReportCsvPath) 'Green'
+        }
+    } catch {
+        Write-Log ("Could not export report CSV: {0}" -f $_.Exception.Message) 'Yellow'
+    }
+
+    try {
         Close-PASSession | Out-Null
-        Write-Log "✅ PAS session closed." "Green"
+        Write-Log 'PAS session closed.' 'Green'
     } catch {}
 }
