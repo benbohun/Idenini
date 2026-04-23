@@ -1,22 +1,20 @@
 <#
-CNA_Create_Identity_WebApp_From_Json_RegularUser_Final.ps1
+CNA_Create_Identity_WebApp_From_Json_RegularUser_Final_v2.ps1
 
-Best-preferred flow for your tenant:
+Best-preferred flow:
 1) Login to PAS as a regular user
 2) Validate the PAS account in the target Safe using exact match only
 3) Login to Identity as the same regular user
 4) Import the app from template
-5) Wait for app propagation
-6) Retry UpdateApplicationDE until the app is ready
-7) Retry SetApplicationPermissions until the app is ready
+5) Poll GetApplication until the app is visible/ready
+6) Build update payload from the actual returned app object
+7) Call UpdateApplicationDE
+8) Apply direct application permissions to the target group
 
-This script intentionally does NOT call:
-- GetApplication
-- GetUserInfo
-- Redrock/query
-
-It validates the PAS account and records it for downstream use,
-but does not fake an undocumented "bind vaulted PAS account into app" admin API.
+Changes requested:
+- Template default changed to GCP-AccountsTemplate
+- Identity password challenge reuses the same password entered initially
+- Update path now uses GetApplication after create, which aligns better with CyberArk's documented update flow
 #>
 
 [CmdletBinding()]
@@ -39,7 +37,7 @@ param(
     [string]$SourceAppName        = 'GCP - Okta Prod',
     [string]$NewAppName           = 'g-test-pam1',
     [string]$AppDescription       = 'GCP - Okta Prod created via CyberArk Identity API',
-    [string]$TemplateIdOverride   = '',
+    [string]$TemplateIdOverride   = 'GCP-AccountsTemplate',
 
     # ===== Identity application permission target =====
     [string]$TargetGroupDisplayName          = 'ca_PCloud_Admins',
@@ -55,14 +53,15 @@ param(
     [string]$SourceAppExportJson  = '',
 
     # ===== Retry tuning =====
-    [int]$InitialPostCreateDelaySeconds = 180,
-    [int]$UpdateRetryWindowSeconds      = 420,
+    [int]$InitialPostCreateDelaySeconds = 60,
+    [int]$GetApplicationRetryWindowSeconds = 420,
+    [int]$UpdateRetryWindowSeconds      = 300,
     [int]$PermissionRetryWindowSeconds  = 300,
     [int]$RetryIntervalSeconds          = 20,
 
     # ===== Logging =====
-    [string]$LogPath              = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_RegularUser_Final.log',
-    [string]$ReportCsvPath        = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_RegularUser_Final_Report.csv',
+    [string]$LogPath              = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_RegularUser_Final_v2.log',
+    [string]$ReportCsvPath        = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_RegularUser_Final_v2_Report.csv',
 
     # ===== Advanced =====
     [switch]$WhatIf
@@ -82,11 +81,12 @@ foreach ($dir in $psPASDirs) {
     try { Get-ChildItem -Path $dir -Recurse -File | Unblock-File -ErrorAction SilentlyContinue } catch {}
 }
 
-$script:IdentityAuthToken  = $null
-$script:IdentityUser       = $null
-$script:IdentityWebSession = $null
-$script:PasCredential      = $null
-$script:ReportRows         = New-Object System.Collections.Generic.List[object]
+$script:IdentityAuthToken       = $null
+$script:IdentityUser            = $null
+$script:IdentityWebSession      = $null
+$script:PasCredential           = $null
+$script:RegularUserPlainPassword = $null
+$script:ReportRows              = New-Object System.Collections.Generic.List[object]
 
 function Write-Log {
     param(
@@ -126,7 +126,7 @@ function Add-ReportRow {
 function ConvertTo-JsonSafe {
     param([Parameter()][object]$Object)
     if ($null -eq $Object) { return $null }
-    return ($Object | ConvertTo-Json -Depth 60)
+    return ($Object | ConvertTo-Json -Depth 80)
 }
 
 function Get-HttpStatusCode {
@@ -162,6 +162,20 @@ function Get-DirectField {
     return $null
 }
 
+function Set-ObjectProperty {
+    param(
+        [Parameter(Mandatory)]$Object,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter()]$Value
+    )
+
+    if ($Object.PSObject.Properties.Name -contains $Name) {
+        $Object.$Name = $Value
+    } else {
+        $Object | Add-Member -NotePropertyName $Name -NotePropertyValue $Value
+    }
+}
+
 function Convert-SecureStringToPlainText {
     param([Parameter(Mandatory)][SecureString]$SecureString)
 
@@ -181,13 +195,16 @@ function Get-RegularCredential {
         if ($null -eq $script:PasCredential) {
             throw 'Credential prompt was cancelled.'
         }
+        $script:RegularUserPlainPassword = Convert-SecureStringToPlainText -SecureString $script:PasCredential.Password
         return
     }
 
     if ([string]::IsNullOrWhiteSpace($RegularUserPassword)) {
         $secure = Read-Host "Enter password for $RegularUserName" -AsSecureString
+        $script:RegularUserPlainPassword = Convert-SecureStringToPlainText -SecureString $secure
     } else {
         $secure = ConvertTo-SecureString $RegularUserPassword -AsPlainText -Force
+        $script:RegularUserPlainPassword = $RegularUserPassword
     }
 
     $script:PasCredential = [pscredential]::new($RegularUserName, $secure)
@@ -237,9 +254,9 @@ function Invoke-EventuallyConsistentStep {
         $attempt++
         try {
             Write-Log ("{0} attempt #{1}..." -f $OperationName, $attempt) 'Gray'
-            & $Operation
+            $result = & $Operation
             Write-Log ("{0} succeeded on attempt #{1}." -f $OperationName, $attempt) 'Green'
-            return
+            return $result
         } catch {
             $lastMessage = $_.Exception.Message
             if (-not (Should-RetryPostCreate -Message $lastMessage)) {
@@ -359,10 +376,10 @@ function Get-MechanismPrompt {
     $type   = [string](Get-DirectField -Object $Mechanism -FieldName 'AnswerType')
 
     if ($name -eq 'UP' -or $prompt -match 'Password') {
-        if (-not [string]::IsNullOrWhiteSpace($RegularUserPassword)) {
+        if (-not [string]::IsNullOrWhiteSpace($script:RegularUserPlainPassword)) {
             return @{
                 Action = 'Answer'
-                Answer = $RegularUserPassword
+                Answer = $script:RegularUserPlainPassword
             }
         }
 
@@ -646,14 +663,20 @@ function Get-ExportConfig {
     }
 
     try {
-        return ($JsonText | ConvertFrom-Json -ErrorAction Stop)
+        $cfg = ($JsonText | ConvertFrom-Json -ErrorAction Stop)
+
+        if (-not [string]::IsNullOrWhiteSpace($TemplateIdOverride)) {
+            Set-ObjectProperty -Object $cfg -Name 'TemplateName' -Value $TemplateIdOverride
+        }
+
+        return $cfg
     } catch {
         throw ("Failed to parse SourceAppExportJson: {0}" -f $_.Exception.Message)
     }
 }
 
 # ------------------------------------------------------------
-# App creation / update
+# App creation / retrieval / update
 # ------------------------------------------------------------
 function Import-AppFromTemplateAdaptive {
     param(
@@ -665,6 +688,7 @@ function Import-AppFromTemplateAdaptive {
     foreach ($candidate in @(
         $TemplateIdOverride,
         [string]$Config.TemplateName,
+        'GCP-AccountsTemplate',
         'GenericBrowserExtensionScript',
         'GenericBrowserExtension',
         'BrowserExtensionScript'
@@ -720,83 +744,77 @@ function Import-AppFromTemplateAdaptive {
     throw 'All ImportAppFromTemplate attempts failed.'
 }
 
-function New-AppUpdatePayloadVariants {
+function Invoke-GetApplicationOperation {
+    param([Parameter(Mandatory)][string]$AppKey)
+
+    $base = $IdentityApiTenantURL.TrimEnd('/')
+    $uri = $base + '/SaasManage/GetApplication?_RowKey=' + [uri]::EscapeDataString($AppKey)
+
+    $resp = Invoke-IdentityApiWithRetry -AbsoluteUris @($uri) -LogicalName 'GetApplication'
+    if (-not $resp.success) {
+        throw ('GetApplication returned success=false: ' + ($resp.Message | Out-String))
+    }
+
+    return $resp.Result
+}
+
+function Wait-ForCreatedApplication {
+    param([Parameter(Mandatory)][string]$AppKey)
+
+    return Invoke-EventuallyConsistentStep `
+        -Operation { Invoke-GetApplicationOperation -AppKey $AppKey } `
+        -OperationName 'GetApplication' `
+        -MaxWaitSeconds $GetApplicationRetryWindowSeconds `
+        -InitialDelaySeconds $InitialPostCreateDelaySeconds `
+        -IntervalSeconds $RetryIntervalSeconds
+}
+
+function Build-UpdatePayloadFromExistingApp {
     param(
-        [Parameter(Mandatory)][string]$AppKey,
+        [Parameter(Mandatory)]$ExistingApp,
         [Parameter(Mandatory)][object]$Config,
+        [Parameter(Mandatory)][string]$AppKey,
         [Parameter(Mandatory)][string]$RenameTo,
         [Parameter(Mandatory)][string]$DescriptionToUse
     )
 
-    $commonFull = [ordered]@{
-        Name                   = $RenameTo
-        DisplayName            = $RenameTo
-        Description            = $DescriptionToUse
-        AppType                = $(if ($Config.AppType) { [string]$Config.AppType } else { 'Web' })
-        TemplateName           = [string]$Config.TemplateName
-        WebAppType             = [string]$Config.WebAppType
-        WebUPAppType           = [string]$Config.WebUPAppType
-        UserNameStrategy       = [string]$Config.UserNameStrategy
-        OnPrem                 = [bool]$Config.OnPrem
-        IsSwsEnabled           = [bool]$Config.IsSwsEnabled
-        ShowRegistration       = [bool]$Config.ShowRegistration
-        FormFillingEnabled     = [bool]$Config.FormFillingEnabled
-        Generic                = [bool]$Config.Generic
-        DefaultAuthProfile     = [string]$Config.DefaultAuthProfile
-        DefaultAuthProfileInfo = $Config.DefaultAuthProfileInfo
-        AuthRules              = $Config.AuthRules
-        NotSelfService         = [bool]$Config.NotSelfService
-        LocalizationEnabled    = [bool]$Config.LocalizationEnabled
-        Notes                  = [string]$Config.Notes
-        Category               = [string]$Config.Category
-        AdminTag               = [string]$Config.AdminTag
-        CBEScript              = [string]$Config.CBEScript
-        UserPassScript         = [string]$Config.CBEScript
+    $payload = ($ExistingApp | ConvertTo-Json -Depth 80 | ConvertFrom-Json -Depth 80)
+
+    foreach ($rk in @('_RowKey','_Rowkey')) {
+        if ($payload.PSObject.Properties.Name -contains $rk) {
+            Set-ObjectProperty -Object $payload -Name $rk -Value $AppKey
+        }
+    }
+    if (-not ($payload.PSObject.Properties.Name -contains '_RowKey') -and -not ($payload.PSObject.Properties.Name -contains '_Rowkey')) {
+        Set-ObjectProperty -Object $payload -Name '_RowKey' -Value $AppKey
+    }
+
+    Set-ObjectProperty -Object $payload -Name 'Name'        -Value $RenameTo
+    Set-ObjectProperty -Object $payload -Name 'DisplayName' -Value $RenameTo
+    Set-ObjectProperty -Object $payload -Name 'Description' -Value $DescriptionToUse
+
+    foreach ($field in @(
+        'AppType','TemplateName','WebAppType','WebUPAppType','UserNameStrategy',
+        'OnPrem','IsSwsEnabled','ShowRegistration','FormFillingEnabled','Generic',
+        'DefaultAuthProfile','DefaultAuthProfileInfo','AuthRules','NotSelfService',
+        'LocalizationEnabled','Notes','Category','AdminTag','CBEScript','UserPassScript'
+    )) {
+        if ($Config.PSObject.Properties.Name -contains $field) {
+            Set-ObjectProperty -Object $payload -Name $field -Value (Get-DirectField -Object $Config -FieldName $field)
+        }
     }
 
     if ($Config.PSObject.Properties.Name -contains 'Icon' -and -not [string]::IsNullOrWhiteSpace([string]$Config.Icon)) {
-        $commonFull['Icon']    = [string]$Config.Icon
-        $commonFull['IconUri'] = [string]$Config.Icon
+        Set-ObjectProperty -Object $payload -Name 'Icon' -Value ([string]$Config.Icon)
+        Set-ObjectProperty -Object $payload -Name 'IconUri' -Value ([string]$Config.Icon)
     }
 
-    $commonMinimal = [ordered]@{
-        Name               = $RenameTo
-        Description        = $DescriptionToUse
-        AppType            = $(if ($Config.AppType) { [string]$Config.AppType } else { 'Web' })
-        TemplateName       = [string]$Config.TemplateName
-        WebAppType         = [string]$Config.WebAppType
-        WebUPAppType       = [string]$Config.WebUPAppType
-        UserNameStrategy   = [string]$Config.UserNameStrategy
-        IsSwsEnabled       = [bool]$Config.IsSwsEnabled
-        FormFillingEnabled = [bool]$Config.FormFillingEnabled
-        Generic            = [bool]$Config.Generic
-        OnPrem             = [bool]$Config.OnPrem
-        DefaultAuthProfile = [string]$Config.DefaultAuthProfile
-        AuthRules          = $Config.AuthRules
-        NotSelfService     = [bool]$Config.NotSelfService
-        CBEScript          = [string]$Config.CBEScript
-        UserPassScript     = [string]$Config.CBEScript
-    }
-
-    $variants = @()
-
-    foreach ($rowKeyField in @('_Rowkey','_RowKey')) {
-        $full = [ordered]@{}
-        $full[$rowKeyField] = $AppKey
-        foreach ($k in $commonFull.Keys) { $full[$k] = $commonFull[$k] }
-        $variants += $full
-
-        $minimal = [ordered]@{}
-        $minimal[$rowKeyField] = $AppKey
-        foreach ($k in $commonMinimal.Keys) { $minimal[$k] = $commonMinimal[$k] }
-        $variants += $minimal
-    }
-
-    return $variants
+    return $payload
 }
 
 function Invoke-UpdateApplicationOperation {
     param(
+        [Parameter(Mandatory)]$ExistingApp,
         [Parameter(Mandatory)][string]$AppKey,
         [Parameter(Mandatory)][object]$Config,
         [Parameter(Mandatory)][string]$RenameTo,
@@ -804,32 +822,66 @@ function Invoke-UpdateApplicationOperation {
     )
 
     $uri = $IdentityApiTenantURL.TrimEnd('/') + '/SaasManage/UpdateApplicationDE'
-    $payloads = New-AppUpdatePayloadVariants -AppKey $AppKey -Config $Config -RenameTo $RenameTo -DescriptionToUse $DescriptionToUse
+    $payload = Build-UpdatePayloadFromExistingApp -ExistingApp $ExistingApp -Config $Config -AppKey $AppKey -RenameTo $RenameTo -DescriptionToUse $DescriptionToUse
 
-    $attempt = 0
-    foreach ($payload in $payloads) {
-        $attempt++
-        try {
-            Write-Log ("Trying UpdateApplicationDE payload variant #{0}..." -f $attempt) 'Gray'
-            $resp = Invoke-IdentityApiWithRetry -AbsoluteUris @($uri) -Body $payload -LogicalName 'UpdateApplicationDE'
-            if (-not $resp.success) {
-                throw ('UpdateApplicationDE returned success=false: ' + ($resp.Message | Out-String))
-            }
-
-            Add-ReportRow -Step 'Update Application' -Status 'SUCCESS' -Detail ("Variant={0}; AppKey={1}" -f $attempt, $AppKey)
-            return
-        } catch {
-            if ($attempt -eq $payloads.Count) {
-                throw
-            }
-            Write-Log ("UpdateApplicationDE variant #{0} failed: {1}" -f $attempt, $_.Exception.Message) 'Yellow'
-        }
+    $resp = Invoke-IdentityApiWithRetry -AbsoluteUris @($uri) -Body $payload -LogicalName 'UpdateApplicationDE'
+    if (-not $resp.success) {
+        throw ('UpdateApplicationDE returned success=false: ' + ($resp.Message | Out-String))
     }
+
+    Add-ReportRow -Step 'Update Application' -Status 'SUCCESS' -Detail ("AppKey={0}; NewName={1}" -f $AppKey, $RenameTo)
 }
 
 # ------------------------------------------------------------
-# Blind permission write - no GetApplication
+# Permissions
 # ------------------------------------------------------------
+function Find-FirstPropertyValue {
+    param(
+        [Parameter(Mandatory)]$Object,
+        [Parameter(Mandatory)][string[]]$Names,
+        [int]$Depth = 0,
+        [int]$MaxDepth = 8
+    )
+
+    if ($null -eq $Object -or $Depth -gt $MaxDepth) { return $null }
+    if ($Object -is [string] -or $Object -is [ValueType]) { return $null }
+
+    if ($Object -is [System.Collections.IDictionary]) {
+        foreach ($name in $Names) {
+            if ($Object.Contains($name) -and $null -ne $Object[$name]) { return $Object[$name] }
+        }
+        foreach ($key in $Object.Keys) {
+            $v = Find-FirstPropertyValue -Object $Object[$key] -Names $Names -Depth ($Depth + 1) -MaxDepth $MaxDepth
+            if ($null -ne $v) { return $v }
+        }
+        return $null
+    }
+
+    if ($Object -is [System.Collections.IEnumerable] -and -not ($Object -is [string])) {
+        foreach ($item in $Object) {
+            $v = Find-FirstPropertyValue -Object $item -Names $Names -Depth ($Depth + 1) -MaxDepth $MaxDepth
+            if ($null -ne $v) { return $v }
+        }
+        return $null
+    }
+
+    if ($Object.PSObject) {
+        foreach ($name in $Names) {
+            if ($Object.PSObject.Properties.Name -contains $name) {
+                $v = $Object.$name
+                if ($null -ne $v -and -not [string]::IsNullOrWhiteSpace([string]$v)) { return $v }
+            }
+        }
+
+        foreach ($p in $Object.PSObject.Properties) {
+            $v = Find-FirstPropertyValue -Object $p.Value -Names $Names -Depth ($Depth + 1) -MaxDepth $MaxDepth
+            if ($null -ne $v) { return $v }
+        }
+    }
+
+    return $null
+}
+
 function New-GrantCandidates {
     param([Parameter(Mandatory)][string]$Rights)
 
@@ -866,10 +918,12 @@ function New-GrantCandidates {
     return $candidates
 }
 
-function New-SetPermissionsBodiesBlind {
+function New-SetPermissionsBodies {
     param(
         [Parameter(Mandatory)][object[]]$Grants,
-        [Parameter(Mandatory)][string]$AppRowKey
+        [Parameter(Mandatory)][string]$AppRowKey,
+        [string]$IdValue,
+        [string]$PvidValue
     )
 
     $bodies = @()
@@ -877,20 +931,26 @@ function New-SetPermissionsBodiesBlind {
     $bodies += [ordered]@{
         Grants = $Grants
         RowKey = $AppRowKey
+        ID     = $(if ($IdValue) { $IdValue } else { '' })
+        PVID   = $(if ($PvidValue) { $PvidValue } else { '' })
     }
 
     $bodies += [ordered]@{
         Grants = $Grants
         RowKey = $AppRowKey
-        ID     = ''
-        PVID   = ''
     }
 
     return $bodies
 }
 
 function Invoke-SetPermissionsOperation {
-    param([Parameter(Mandatory)][string]$AppRowKey)
+    param(
+        [Parameter(Mandatory)]$ExistingApp,
+        [Parameter(Mandatory)][string]$AppRowKey
+    )
+
+    $idValue   = [string](Find-FirstPropertyValue -Object $ExistingApp -Names @('ID','AppID'))
+    $pvidValue = [string](Find-FirstPropertyValue -Object $ExistingApp -Names @('PVID','PVId','PermissionVersionId'))
 
     $rightsCandidates = @(
         'View,Run,AutoDeploy',
@@ -903,22 +963,22 @@ function Invoke-SetPermissionsOperation {
     foreach ($rights in $rightsCandidates) {
         foreach ($grant in (New-GrantCandidates -Rights $rights)) {
             $grantArray = @($grant)
-            foreach ($body in (New-SetPermissionsBodiesBlind -Grants $grantArray -AppRowKey $AppRowKey)) {
+            foreach ($body in (New-SetPermissionsBodies -Grants $grantArray -AppRowKey $AppRowKey -IdValue $idValue -PvidValue $pvidValue)) {
                 try {
-                    Write-Log ("Trying blind SetApplicationPermissions with Rights='{0}' Principal='{1}' SystemName='{2}'..." -f $rights, $grant.Principal, $grant.SystemName) 'Gray'
+                    Write-Log ("Trying SetApplicationPermissions with Rights='{0}' Principal='{1}' SystemName='{2}'..." -f $rights, $grant.Principal, $grant.SystemName) 'Gray'
                     $resp = Invoke-IdentityApiWithRetry -AbsoluteUris @($uri) -Body $body -LogicalName 'SetApplicationPermissions'
                     if ($resp.success) {
                         Add-ReportRow -Step 'Set Application Permissions' -Status 'SUCCESS' -Detail ("Group={0}; Rights={1}; RowKey={2}" -f $grant.SystemName, $rights, $AppRowKey)
                         return
                     }
                 } catch {
-                    Write-Log ("Blind SetApplicationPermissions failed with Rights='{0}' and Principal='{1}': {2}" -f $rights, $grant.Principal, $_.Exception.Message) 'Yellow'
+                    Write-Log ("SetApplicationPermissions failed with Rights='{0}' and Principal='{1}': {2}" -f $rights, $grant.Principal, $_.Exception.Message) 'Yellow'
                 }
             }
         }
     }
 
-    throw 'All blind SetApplicationPermissions attempts failed. Review the target group metadata and tenant-specific Rights value.'
+    throw 'All SetApplicationPermissions attempts failed. Review the target group metadata and tenant-specific Rights value.'
 }
 
 # ------------------------------------------------------------
@@ -926,6 +986,7 @@ function Invoke-SetPermissionsOperation {
 # ------------------------------------------------------------
 $exportConfig = $null
 $newAppKey    = $null
+$appDetails   = $null
 
 try {
     if ([string]::IsNullOrWhiteSpace($SourceAppExportJson)) {
@@ -966,19 +1027,20 @@ try {
         Add-ReportRow -Step 'Import App From Template' -Status 'WHATIF' -Detail ("TemplateName={0}; Override={1}" -f $exportConfig.TemplateName, $TemplateIdOverride)
     } else {
         $newAppKey = Import-AppFromTemplateAdaptive -Config $exportConfig -TemplateIdOverride $TemplateIdOverride
+        $appDetails = Wait-ForCreatedApplication -AppKey $newAppKey
     }
 
     if ($WhatIf) {
-        Write-Log ("WHATIF: Would update new app '{0}' with exported Browser Extension configuration." -f $newAppKey) 'Yellow'
+        Write-Log ("WHATIF: Would update new app '{0}' with exported configuration after retrieval." -f $newAppKey) 'Yellow'
         Add-ReportRow -Step 'Update Application' -Status 'WHATIF' -Detail ("AppKey={0}; NewName={1}" -f $newAppKey, $NewAppName)
     } else {
         Invoke-EventuallyConsistentStep `
             -Operation {
-                Invoke-UpdateApplicationOperation -AppKey $newAppKey -Config $exportConfig -RenameTo $NewAppName -DescriptionToUse $AppDescription
+                Invoke-UpdateApplicationOperation -ExistingApp $appDetails -AppKey $newAppKey -Config $exportConfig -RenameTo $NewAppName -DescriptionToUse $AppDescription
             } `
             -OperationName 'UpdateApplicationDE' `
             -MaxWaitSeconds $UpdateRetryWindowSeconds `
-            -InitialDelaySeconds $InitialPostCreateDelaySeconds `
+            -InitialDelaySeconds 0 `
             -IntervalSeconds $RetryIntervalSeconds
     }
 
@@ -988,7 +1050,7 @@ try {
     } else {
         Invoke-EventuallyConsistentStep `
             -Operation {
-                Invoke-SetPermissionsOperation -AppRowKey $newAppKey
+                Invoke-SetPermissionsOperation -ExistingApp $appDetails -AppRowKey $newAppKey
             } `
             -OperationName 'SetApplicationPermissions' `
             -MaxWaitSeconds $PermissionRetryWindowSeconds `
@@ -997,7 +1059,7 @@ try {
     }
 
     Write-Log ("Completed create-from-JSON workflow. New app key='{0}'. PAS account '{1}' in Safe '{2}' was validated and recorded in the report." -f $newAppKey, $AccountName, $SafeName) 'Green'
-    Add-ReportRow -Step 'Overall' -Status 'SUCCESS' -Detail ("NewAppKey={0}; Workflow completed without GetApplication." -f $newAppKey)
+    Add-ReportRow -Step 'Overall' -Status 'SUCCESS' -Detail ("NewAppKey={0}; Workflow completed." -f $newAppKey)
 }
 catch {
     Write-Log ("FAILED: {0}" -f $_.Exception.Message) 'Red'
