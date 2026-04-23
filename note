@@ -1,46 +1,58 @@
 <#
-CNA_Lookup_Clone_And_Rename_Identity_App.ps1
+CNA_Create_Identity_WebApp_Baseline.ps1
 
-What this script does
-1) Login to CyberArk Identity as a regular user
-2) Query the Application table via /Redrock/query to confirm the source app exists
-3) Export the exact match and a broader app listing for troubleshooting
-4) Attempt clone only AFTER the source app is confirmed
-5) Rename the cloned app with UpdateApplicationDE
+Purpose
+- Roll back to the last known-good flow
+- Use a regular user to authenticate to PAS and CyberArk Identity
+- Validate the PAS account in the target Safe
+- Create a new app directly from GenericBrowserExtensionScript
+- Stop after successful creation and report the new _RowKey
 
-Important
-- The lookup portion is fully documented by CyberArk.
-- The clone operation is known to exist, but the exact route/body were not exposed
-  in the public pages I could verify, so CloneApiPath is parameterized and the script
-  also tries the two legacy guesses you already tested.
-- If you later capture the exact clone route from your tenant or Postman, place it in
-  -CloneApiPath and rerun.
+Notes
+- This script does NOT call:
+    * GetTemplatesAndCategories
+    * GetApplication
+    * UpdateApplicationDE
+    * SetApplicationPermissions
+- Use this baseline first because ImportAppFromTemplate with GenericBrowserExtensionScript
+  already proved successful in your tenant.
 #>
 
 [CmdletBinding()]
 param(
+    # ===== PAS / Identity auth =====
+    [string]$IdentityTenantURL    = 'https://aat4012.id.cyberark.cloud',
     [string]$IdentityApiTenantURL = 'https://aat4012.id.cyberark.cloud',
+    [string]$PCloudSubdomain      = 'cna-prod',
+    [string]$PrivilegeCloudURL    = 'https://cna-prod.privilegecloud.cyberark.cloud',
 
+    # ===== Regular user login =====
     [string]$RegularUserName      = '',
     [string]$RegularUserPassword  = '',
 
-    [string]$SourceAppKey         = '31946715-3381-489a-8fd1-4903eb8cce4b',
+    # ===== App creation =====
+    [string]$TemplateId           = 'GenericBrowserExtensionScript',
     [string]$NewAppName           = 'g-test-pam1',
-    [string]$AppDescription       = 'Cloned and renamed via CyberArk Identity API',
 
-    # Optional exact clone path if you capture it from Postman/browser network
-    # Example format: '/SaasManage/<ExactClonePath>'
-    [string]$CloneApiPath         = '',
+    # ===== PAS validation =====
+    [string]$SafeName             = 'CyberArkTestValidation',
+    [string]$AccountName          = 'PC0VPXSB.cna.com-administrator',
 
-    [int]$PageSize                = 500,
-    [int]$RenameRetryWindowSeconds = 300,
-    [int]$RetryIntervalSeconds     = 20,
-
-    [string]$LogPath              = 'E:\Installation Media\Script\OnboardScript\data\Identity_Lookup_Clone_Rename.log',
-    [string]$ExactCsvPath         = 'E:\Installation Media\Script\OnboardScript\data\Identity_App_Lookup_Exact.csv',
-    [string]$NearbyCsvPath        = 'E:\Installation Media\Script\OnboardScript\data\Identity_App_Lookup_Nearby.csv',
-    [string]$ReportCsvPath        = 'E:\Installation Media\Script\OnboardScript\data\Identity_Lookup_Clone_Rename_Report.csv'
+    # ===== Logging =====
+    [string]$LogPath              = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_Baseline.log',
+    [string]$ReportCsvPath        = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_Baseline_Report.csv'
 )
+
+try { Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force -ErrorAction Stop } catch {}
+
+$psPASDirs = @(
+    "$env:ProgramFiles\WindowsPowerShell\Modules\psPAS\6.4.85",
+    "$HOME\Documents\WindowsPowerShell\Modules\psPAS\6.4.85"
+) | Where-Object { Test-Path $_ }
+
+foreach ($dir in $psPASDirs) {
+    try { Get-ChildItem -Path $dir -Recurse -File | Unblock-File -ErrorAction SilentlyContinue } catch {}
+}
 
 $script:IdentityAuthToken         = $null
 $script:IdentityUser              = $null
@@ -57,6 +69,7 @@ function Write-Log {
 
     $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     $line = "$ts - $Message"
+
     try { Write-Host $line -ForegroundColor $Color } catch { Write-Host $line }
 
     try {
@@ -85,12 +98,20 @@ function Add-ReportRow {
 function ConvertTo-JsonSafe {
     param([Parameter()][object]$Object)
     if ($null -eq $Object) { return $null }
-    return ($Object | ConvertTo-Json -Depth 80)
+    return ($Object | ConvertTo-Json -Depth 50)
 }
 
 function Get-HttpStatusCode {
     param([Parameter(Mandatory)]$Exception)
     try { return [int]$Exception.Response.StatusCode.value__ } catch { return $null }
+}
+
+function Get-NormalizedIdentityTenant {
+    param([Parameter(Mandatory)][string]$TenantUrl)
+    $value = $TenantUrl.Trim()
+    $value = $value -replace '^https?://', ''
+    $value = $value.TrimEnd('/')
+    return $value
 }
 
 function Get-DirectField {
@@ -128,7 +149,7 @@ function Convert-SecureStringToPlainText {
 
 function Get-RegularCredential {
     if ([string]::IsNullOrWhiteSpace($RegularUserName)) {
-        $script:PasCredential = Get-Credential -Message 'Enter REGULAR user credential for CyberArk Identity'
+        $script:PasCredential = Get-Credential -Message 'Enter REGULAR user credential for PAS and Identity APIs'
         if ($null -eq $script:PasCredential) {
             throw 'Credential prompt was cancelled.'
         }
@@ -147,56 +168,51 @@ function Get-RegularCredential {
     $script:PasCredential = [pscredential]::new($RegularUserName, $secure)
 }
 
-function Should-Retry {
-    param([string]$Message)
-
-    if ([string]::IsNullOrWhiteSpace($Message)) { return $false }
-
-    return (
-        $Message -match '\b401\b' -or
-        $Message -match '\b404\b' -or
-        $Message -match '\b409\b' -or
-        $Message -match 'Unauthorized persisted' -or
-        $Message -match 'not found' -or
-        $Message -match 'temporar' -or
-        $Message -match 'conflict'
-    )
+# ------------------------------------------------------------
+# Load psPAS
+# ------------------------------------------------------------
+try {
+    Import-Module psPAS -Force -ErrorAction Stop
+    $mod = Get-Module psPAS
+    Write-Log ("psPAS loaded ({0})." -f $mod.Version) 'Green'
+    Add-ReportRow -Step 'Load psPAS' -Status 'SUCCESS' -Detail ("Version {0}" -f $mod.Version)
+} catch {
+    Write-Log ("FAILED: psPAS module not found/loaded: {0}" -f $_.Exception.Message) 'Red'
+    Add-ReportRow -Step 'Load psPAS' -Status 'FAILED' -Detail $_.Exception.Message
+    exit 1
 }
 
-function Invoke-EventuallyConsistentStep {
-    param(
-        [Parameter(Mandatory)][scriptblock]$Operation,
-        [Parameter(Mandatory)][string]$OperationName,
-        [Parameter(Mandatory)][int]$MaxWaitSeconds,
-        [int]$IntervalSeconds = 15
-    )
-
-    $deadline = (Get-Date).AddSeconds($MaxWaitSeconds)
-    $attempt = 0
-    $lastMessage = $null
-
-    while ((Get-Date) -lt $deadline) {
-        $attempt++
-        try {
-            Write-Log ("{0} attempt #{1}..." -f $OperationName, $attempt) 'Gray'
-            $result = & $Operation
-            Write-Log ("{0} succeeded on attempt #{1}." -f $OperationName, $attempt) 'Green'
-            return $result
-        } catch {
-            $lastMessage = $_.Exception.Message
-            if (-not (Should-Retry -Message $lastMessage)) {
-                throw
-            }
-
-            $remaining = [int][Math]::Max(0, ($deadline - (Get-Date)).TotalSeconds)
-            Write-Log ("{0} not ready yet on attempt #{1}. Retrying in {2}s. Remaining window: {3}s. Last error: {4}" -f $OperationName, $attempt, $IntervalSeconds, $remaining, $lastMessage) 'Yellow'
-            Start-Sleep -Seconds $IntervalSeconds
-        }
+# ------------------------------------------------------------
+# PAS login
+# ------------------------------------------------------------
+function Start-PASSessionFromRegularUser {
+    if ($null -eq $script:PasCredential) {
+        throw 'Regular user credential is not initialized.'
     }
 
-    throw ("{0} did not succeed within {1} seconds. Last error: {2}" -f $OperationName, $MaxWaitSeconds, $lastMessage)
+    $normalizedTenant = Get-NormalizedIdentityTenant -TenantUrl $IdentityTenantURL
+
+    Write-Log ("Attempting PAS login as regular user '{0}'..." -f $script:PasCredential.UserName) 'Cyan'
+
+    $header = Get-IdentityHeader `
+        -IdentityTenantURL $normalizedTenant `
+        -psPASFormat `
+        -PCloudSubdomain $PCloudSubdomain `
+        -UPCreds $script:PasCredential
+
+    Use-PASSession $header | Out-Null
+
+    if (-not (Get-PASSession)) {
+        throw 'psPAS session not established.'
+    }
+
+    Write-Log ("PAS session established ({0})." -f $script:PasCredential.UserName) 'Green'
+    Add-ReportRow -Step 'PAS Session' -Status 'SUCCESS' -Detail ("Authenticated as {0}" -f $script:PasCredential.UserName)
 }
 
+# ------------------------------------------------------------
+# Identity interactive auth
+# ------------------------------------------------------------
 function Get-AuthPayload {
     param([Parameter(Mandatory)]$Response)
 
@@ -272,8 +288,8 @@ function Start-IdentityRegularUserSession {
         throw 'Regular user credential is not initialized.'
     }
 
-    $tenantUrl = $IdentityApiTenantURL
-    $userName  = $script:PasCredential.UserName
+    $TenantUrl = $IdentityApiTenantURL
+    $UserName  = $script:PasCredential.UserName
 
     $baseHeaders = @{
         'X-IDAP-NATIVE-CLIENT' = 'true'
@@ -281,15 +297,15 @@ function Start-IdentityRegularUserSession {
         'Accept'               = 'application/json'
     }
 
-    $startUri = ($tenantUrl.TrimEnd('/') + '/Security/StartAuthentication')
-    $advUri   = ($tenantUrl.TrimEnd('/') + '/Security/AdvanceAuthentication')
+    $startUri = ($TenantUrl.TrimEnd('/') + '/Security/StartAuthentication')
+    $advUri   = ($TenantUrl.TrimEnd('/') + '/Security/AdvanceAuthentication')
 
     $script:IdentityWebSession = New-Object Microsoft.PowerShell.Commands.WebRequestSession
 
-    Write-Log ("Starting interactive CyberArk Identity authentication for regular user '{0}'..." -f $userName) 'Cyan'
+    Write-Log ("Starting interactive CyberArk Identity authentication for regular user '{0}'..." -f $UserName) 'Cyan'
 
     $startBody = @{
-        User    = $userName
+        User    = $UserName
         Version = '1.0'
     }
 
@@ -303,11 +319,12 @@ function Start-IdentityRegularUserSession {
         if ($summary -eq 'LoginSuccess' -or -not [string]::IsNullOrWhiteSpace($authVal)) {
             $script:IdentityAuthToken = $authVal
             $script:IdentityUser      = Get-AuthUserValue -Payload $payload
+
             $cookieCount = 0
-            try { $cookieCount = $script:IdentityWebSession.Cookies.GetCookies($tenantUrl).Count } catch {}
+            try { $cookieCount = $script:IdentityWebSession.Cookies.GetCookies($TenantUrl).Count } catch {}
 
             Write-Log ("Identity API authentication succeeded as '{0}'. CookieCount={1}" -f $script:IdentityUser, $cookieCount) 'Green'
-            Add-ReportRow -Step 'Identity Login' -Status 'SUCCESS' -Detail ("Authenticated as {0}" -f $script:IdentityUser)
+            Add-ReportRow -Step 'Identity API Session' -Status 'SUCCESS' -Detail ("Authenticated as {0}; CookieCount={1}" -f $script:IdentityUser, $cookieCount)
             return
         }
 
@@ -343,275 +360,258 @@ function Start-IdentityRegularUserSession {
     throw 'Interactive Identity authentication did not complete after multiple challenge rounds.'
 }
 
-function Invoke-IdentityRequest {
+# ------------------------------------------------------------
+# Generic API request helper
+# ------------------------------------------------------------
+function Invoke-IdentityRequestRaw {
     param(
+        [Parameter(Mandatory)][ValidateSet('POST')][string]$Method,
         [Parameter(Mandatory)][string]$AbsoluteUri,
-        [Parameter()][object]$Body
+        [Parameter()][object]$Body,
+        [ValidateSet('BearerCookie','CookieOnly','BearerOnly')][string]$AuthMode = 'BearerCookie'
     )
 
     $headers = @{
         'X-IDAP-NATIVE-CLIENT' = 'true'
         'Accept'               = 'application/json'
         'Content-Type'         = 'application/json'
-        'Authorization'        = ("Bearer {0}" -f $script:IdentityAuthToken)
     }
 
-    return Invoke-RestMethod -Method POST -Uri $AbsoluteUri -Headers $headers -WebSession $script:IdentityWebSession -ContentType 'application/json' -Body (ConvertTo-JsonSafe $Body) -ErrorAction Stop
+    if ($AuthMode -eq 'BearerCookie' -or $AuthMode -eq 'BearerOnly') {
+        if ([string]::IsNullOrWhiteSpace($script:IdentityAuthToken)) {
+            throw 'Identity auth token is not initialized.'
+        }
+        $headers['Authorization'] = ("Bearer {0}" -f $script:IdentityAuthToken)
+    }
+
+    $invokeParams = @{
+        Method      = $Method
+        Uri         = $AbsoluteUri
+        Headers     = $headers
+        ContentType = 'application/json'
+        ErrorAction = 'Stop'
+    }
+
+    $json = ConvertTo-JsonSafe -Object $Body
+    if ($null -ne $json) { $invokeParams['Body'] = $json }
+
+    if (($AuthMode -eq 'BearerCookie' -or $AuthMode -eq 'CookieOnly') -and $null -ne $script:IdentityWebSession) {
+        $invokeParams['WebSession'] = $script:IdentityWebSession
+    }
+
+    return Invoke-RestMethod @invokeParams
 }
 
-function Convert-RedrockResultsToRows {
-    param([Parameter(Mandatory)]$Response)
-
-    $rows = @()
-    $result = Get-DirectField -Object $Response -FieldName 'Result'
-    if ($null -eq $result) { return @() }
-
-    $results = Get-DirectField -Object $result -FieldName 'Results'
-    if ($results -is [System.Collections.IEnumerable] -and -not ($results -is [string])) {
-        foreach ($item in $results) {
-            $row = Get-DirectField -Object $item -FieldName 'Row'
-            if ($null -ne $row) {
-                $rows += $row
-            }
-        }
-    }
-
-    return ,$rows
-}
-
-function Lookup-ApplicationByKey {
-    param([Parameter(Mandatory)][string]$AppKey)
-
-    $uri = $IdentityApiTenantURL.TrimEnd('/') + '/Redrock/query'
-
-    $exactQuery = @{
-        Script = "Select ID, Name, DisplayName, Description, TemplateName, AppType, WebAppType, Category, OnPrem, Generic, NotSelfService from Application WHERE ID = '$AppKey'"
-        Args   = @{
-            PageNumber = 1
-            PageSize   = $PageSize
-            Limit      = $PageSize
-            Caching    = -1
-        }
-    }
-
-    Write-Log "Querying Application table for exact app key..." "Cyan"
-    $exactResp = Invoke-IdentityRequest -AbsoluteUri $uri -Body $exactQuery
-    $exactRows = Convert-RedrockResultsToRows -Response $exactResp
-
-    $nearbyQuery = @{
-        Script = "Select ID, Name, DisplayName, Description, TemplateName, AppType, WebAppType, Category, OnPrem, Generic, NotSelfService from Application ORDER BY Name COLLATE NOCASE"
-        Args   = @{
-            PageNumber = 1
-            PageSize   = $PageSize
-            Limit      = $PageSize
-            Caching    = -1
-        }
-    }
-
-    Write-Log "Querying broader Application listing for troubleshooting..." "Cyan"
-    $nearbyResp = Invoke-IdentityRequest -AbsoluteUri $uri -Body $nearbyQuery
-    $nearbyRows = Convert-RedrockResultsToRows -Response $nearbyResp
-
-    return [pscustomobject]@{
-        Exact  = $exactRows
-        Nearby = $nearbyRows
-    }
-}
-
-function Parse-CloneResponseRowKey {
-    param([Parameter(Mandatory)]$Response)
-
-    $result = Get-DirectField -Object $Response -FieldName 'Result'
-    if ($null -ne $result) {
-        if ($result -is [System.Collections.IEnumerable] -and -not ($result -is [string])) {
-            foreach ($item in $result) {
-                $rk = [string](Get-DirectField -Object $item -FieldName '_RowKey')
-                if ([string]::IsNullOrWhiteSpace($rk)) { $rk = [string](Get-DirectField -Object $item -FieldName '_Rowkey') }
-                if (-not [string]::IsNullOrWhiteSpace($rk)) { return $rk }
-            }
-        } else {
-            $rk = [string](Get-DirectField -Object $result -FieldName '_RowKey')
-            if ([string]::IsNullOrWhiteSpace($rk)) { $rk = [string](Get-DirectField -Object $result -FieldName '_Rowkey') }
-            if (-not [string]::IsNullOrWhiteSpace($rk)) { return $rk }
-        }
-    }
-
-    $rk2 = [string](Get-DirectField -Object $Response -FieldName '_RowKey')
-    if ([string]::IsNullOrWhiteSpace($rk2)) { $rk2 = [string](Get-DirectField -Object $Response -FieldName '_Rowkey') }
-    return $rk2
-}
-
-function Get-CloneCandidateUris {
-    $uris = @()
-
-    if (-not [string]::IsNullOrWhiteSpace($CloneApiPath)) {
-        if ($CloneApiPath.StartsWith('http')) {
-            $uris += $CloneApiPath
-        } else {
-            $uris += ($IdentityApiTenantURL.TrimEnd('/') + $CloneApiPath)
-        }
-    }
-
-    # Previously tried guesses kept as fallbacks
-    $uris += ($IdentityApiTenantURL.TrimEnd('/') + '/SaasManage/CloneApplication')
-    $uris += ($IdentityApiTenantURL.TrimEnd('/') + '/SaasManage/CloneExistingApplication')
-
-    return ,($uris | Select-Object -Unique)
-}
-
-function Clone-AppFromExisting {
-    param([Parameter(Mandatory)][string]$SourceKey)
-
-    $candidateUris = Get-CloneCandidateUris
-
-    $payloads = @(
-        @{ _RowKey        = $SourceKey },
-        @{ _Rowkey        = $SourceKey },
-        @{ ID             = $SourceKey },
-        @{ appkey         = $SourceKey },
-        @{ Application    = $SourceKey },
-        @{ ApplicationKey = $SourceKey }
+function Invoke-IdentityRequestWithRetry {
+    param(
+        [Parameter(Mandatory)][ValidateSet('POST')][string]$Method,
+        [Parameter(Mandatory)][string[]]$AbsoluteUris,
+        [Parameter()][object]$Body,
+        [string]$LogicalName = 'Identity API call'
     )
 
-    foreach ($uri in $candidateUris) {
-        foreach ($payload in $payloads) {
+    $authModes = @('BearerCookie','CookieOnly','BearerOnly')
+    $errors = @()
+
+    foreach ($uri in $AbsoluteUris) {
+        foreach ($mode in $authModes) {
             try {
-                Write-Log ("Trying clone using URI '{0}' and payload keys [{1}]..." -f $uri, (($payload.Keys) -join ',')) 'Gray'
-                $resp = Invoke-IdentityRequest -AbsoluteUri $uri -Body $payload
-
-                $success = Get-DirectField -Object $resp -FieldName 'success'
-                if ($success -ne $true) {
-                    $msg = [string](Get-DirectField -Object $resp -FieldName 'Message')
-                    throw ("Clone call returned success=false. Message={0}" -f $msg)
-                }
-
-                $rowKey = Parse-CloneResponseRowKey -Response $resp
-                if ([string]::IsNullOrWhiteSpace($rowKey)) {
-                    throw 'Clone call succeeded but did not return a new _RowKey.'
-                }
-
-                Write-Log ("Cloned source application '{0}'. New cloned app _RowKey='{1}'." -f $SourceKey, $rowKey) 'Green'
-                Add-ReportRow -Step 'Clone Application' -Status 'SUCCESS' -Detail ("SourceAppKey={0}; NewRowKey={1}; Uri={2}; PayloadKeys={3}" -f $SourceKey, $rowKey, $uri, (($payload.Keys) -join ','))
-                return $rowKey
+                Write-Log ("Trying {0} via URI '{1}' using auth mode '{2}'..." -f $LogicalName, $uri, $mode) 'Gray'
+                $resp = Invoke-IdentityRequestRaw -Method $Method -AbsoluteUri $uri -Body $Body -AuthMode $mode
+                Write-Log ("Succeeded: {0} via URI '{1}' using auth mode '{2}'." -f $LogicalName, $uri, $mode) 'Gray'
+                return $resp
             } catch {
-                Write-Log ("Clone attempt failed on URI '{0}' with payload keys [{1}]: {2}" -f $uri, (($payload.Keys) -join ','), $_.Exception.Message) 'Yellow'
+                $status = Get-HttpStatusCode -Exception $_.Exception
+                $msg    = $_.Exception.Message
+                $errors += ("URI={0}; Mode={1}; Status={2}; Error={3}" -f $uri, $mode, $status, $msg)
+
+                if ($status -eq 401) {
+                    Write-Log ("401 on {0} via URI '{1}' using auth mode '{2}'. Retrying..." -f $LogicalName, $uri, $mode) 'Yellow'
+                    continue
+                }
+
+                throw
             }
         }
     }
 
-    throw 'All clone endpoint/payload variants failed after source app lookup succeeded.'
+    throw ("Unauthorized persisted for {0}. Details: {1}" -f $LogicalName, ($errors -join ' || '))
 }
 
-function New-RenamePayloadVariants {
-    param(
-        [Parameter(Mandatory)][string]$RowKey,
-        [Parameter(Mandatory)][string]$NewName,
-        [Parameter(Mandatory)][string]$Description
-    )
+# ------------------------------------------------------------
+# PAS account validation - safe only + exact match
+# ------------------------------------------------------------
+function Get-AccountCandidateFields {
+    param([Parameter(Mandatory)]$Account)
 
-    return @(
-        [ordered]@{
-            _Rowkey     = $RowKey
-            Name        = $NewName
-            Description = $Description
-        },
-        [ordered]@{
-            _RowKey     = $RowKey
-            Name        = $NewName
-            Description = $Description
-        },
-        [ordered]@{
-            _Rowkey     = $RowKey
-            Name        = $NewName
-            DisplayName = $NewName
-            Description = $Description
-        },
-        [ordered]@{
-            _RowKey     = $RowKey
-            Name        = $NewName
-            DisplayName = $NewName
-            Description = $Description
+    $fields = @()
+
+    foreach ($prop in @('name','Name','userName','UserName','address','Address')) {
+        $val = [string](Get-DirectField -Object $Account -FieldName $prop)
+        if (-not [string]::IsNullOrWhiteSpace($val) -and $fields -notcontains $val) {
+            $fields += $val
         }
-    )
+    }
+
+    $addr = [string](Get-DirectField -Object $Account -FieldName 'address')
+    if ([string]::IsNullOrWhiteSpace($addr)) { $addr = [string](Get-DirectField -Object $Account -FieldName 'Address') }
+
+    $usr = [string](Get-DirectField -Object $Account -FieldName 'userName')
+    if ([string]::IsNullOrWhiteSpace($usr)) { $usr = [string](Get-DirectField -Object $Account -FieldName 'UserName') }
+
+    if (-not [string]::IsNullOrWhiteSpace($addr) -and -not [string]::IsNullOrWhiteSpace($usr)) {
+        $composite = "$addr-$usr"
+        if ($fields -notcontains $composite) {
+            $fields += $composite
+        }
+    }
+
+    return ,$fields
 }
 
-function Rename-ClonedApplication {
+function Test-ExactAccountIdentifierMatch {
     param(
-        [Parameter(Mandatory)][string]$RowKey,
-        [Parameter(Mandatory)][string]$NewName,
-        [Parameter(Mandatory)][string]$Description
+        [Parameter(Mandatory)]$Account,
+        [Parameter(Mandatory)][string]$Identifier
     )
 
-    $uri = $IdentityApiTenantURL.TrimEnd('/') + '/SaasManage/UpdateApplicationDE'
-    $variants = New-RenamePayloadVariants -RowKey $RowKey -NewName $NewName -Description $Description
+    $needle = $Identifier.Trim().ToLowerInvariant()
+    foreach ($candidate in (Get-AccountCandidateFields -Account $Account)) {
+        if ($candidate.Trim().ToLowerInvariant() -eq $needle) {
+            return $true
+        }
+    }
+    return $false
+}
 
-    foreach ($payload in $variants) {
+function Find-VaultAccountInSafeOnly {
+    param(
+        [Parameter(Mandatory)][string]$SafeName,
+        [Parameter(Mandatory)][string]$AccountIdentifier
+    )
+
+    Write-Log ("Searching PAS account in Safe '{0}' using exact identifier '{1}' only..." -f $SafeName, $AccountIdentifier) 'Cyan'
+
+    $matches = @()
+    $getPasCmd = Get-Command Get-PASAccount -ErrorAction Stop
+
+    if ($getPasCmd.Parameters.ContainsKey('SafeName')) {
         try {
-            Write-Log ("Trying rename with UpdateApplicationDE payload keys [{0}]..." -f (($payload.Keys) -join ',')) 'Gray'
-            $resp = Invoke-IdentityRequest -AbsoluteUri $uri -Body $payload
-            $success = Get-DirectField -Object $resp -FieldName 'success'
-            if ($success -ne $true) {
-                $msg = [string](Get-DirectField -Object $resp -FieldName 'Message')
-                throw ("UpdateApplicationDE returned success=false. Message={0}" -f $msg)
-            }
-
-            Write-Log ("Rename succeeded for cloned app '{0}' -> '{1}'." -f $RowKey, $NewName) 'Green'
-            Add-ReportRow -Step 'Rename Cloned Application' -Status 'SUCCESS' -Detail ("RowKey={0}; NewName={1}; PayloadKeys={2}" -f $RowKey, $NewName, (($payload.Keys) -join ','))
-            return
+            Write-Log "Trying Get-PASAccount -SafeName scoped lookup..." 'Gray'
+            $safeSearch = @(Get-PASAccount -SafeName $SafeName -Search $AccountIdentifier -ErrorAction Stop)
+            $matches = @($safeSearch | Where-Object { Test-ExactAccountIdentifierMatch -Account $_ -Identifier $AccountIdentifier })
         } catch {
-            Write-Log ("Rename payload failed [{0}]: {1}" -f (($payload.Keys) -join ','), $_.Exception.Message) 'Yellow'
+            Write-Log ("Get-PASAccount -SafeName scoped lookup failed: {0}" -f $_.Exception.Message) 'Yellow'
         }
+
+        if ($matches.Count -lt 1) {
+            Write-Log "Trying Get-PASAccount -SafeName enumeration for the target safe only..." 'Gray'
+            $safeAll = @(Get-PASAccount -SafeName $SafeName -ErrorAction Stop)
+            $matches = @($safeAll | Where-Object { Test-ExactAccountIdentifierMatch -Account $_ -Identifier $AccountIdentifier })
+        }
+    } else {
+        throw 'Get-PASAccount does not expose -SafeName in this environment.'
     }
 
-    throw 'All direct UpdateApplicationDE rename payloads failed.'
+    if ($matches.Count -lt 1) {
+        throw ("No exact PAS account match was found in Safe '{0}' for identifier '{1}'." -f $SafeName, $AccountIdentifier)
+    }
+
+    if ($matches.Count -gt 1) {
+        $ids = ($matches | ForEach-Object { [string](Get-DirectField -Object $_ -FieldName 'id') }) -join ','
+        throw ("Multiple exact PAS account matches were found in Safe '{0}' for identifier '{1}'. Matching Account IDs: {2}" -f $SafeName, $AccountIdentifier, $ids)
+    }
+
+    $acct = $matches[0]
+    $acctId   = [string](Get-DirectField -Object $acct -FieldName 'id')
+    $acctUser = [string](Get-DirectField -Object $acct -FieldName 'userName')
+    if ([string]::IsNullOrWhiteSpace($acctUser)) { $acctUser = [string](Get-DirectField -Object $acct -FieldName 'UserName') }
+    $acctAddr = [string](Get-DirectField -Object $acct -FieldName 'address')
+    if ([string]::IsNullOrWhiteSpace($acctAddr)) { $acctAddr = [string](Get-DirectField -Object $acct -FieldName 'Address') }
+    $acctName = [string](Get-DirectField -Object $acct -FieldName 'name')
+    if ([string]::IsNullOrWhiteSpace($acctName)) { $acctName = [string](Get-DirectField -Object $acct -FieldName 'Name') }
+
+    Write-Log ("Matched exact PAS account. ID='{0}' Name='{1}' Username='{2}' Address='{3}'." -f $acctId, $acctName, $acctUser, $acctAddr) 'Green'
+    Add-ReportRow -Step 'Find Vault Account' -Status 'SUCCESS' -Detail ("Safe={0}; AccountID={1}; Name={2}; Username={3}; Address={4}" -f $SafeName, $acctId, $acctName, $acctUser, $acctAddr)
+    return $acct
 }
 
-$clonedRowKey = $null
-$lookup = $null
+# ------------------------------------------------------------
+# Direct app creation only
+# ------------------------------------------------------------
+function Import-AppFromTemplate {
+    param([Parameter(Mandatory)][string]$TemplateId)
+
+    $uri = $IdentityApiTenantURL.TrimEnd('/') + '/SaasManage/ImportAppFromTemplate'
+    $body = @{ ID = @($TemplateId) }
+
+    $resp = Invoke-IdentityRequestWithRetry -Method 'POST' -AbsoluteUris @($uri) -Body $body -LogicalName 'ImportAppFromTemplate'
+    if (-not $resp.success) {
+        throw ('ImportAppFromTemplate returned success=false: ' + ($resp.Message | Out-String))
+    }
+
+    $resultItems = @($resp.Result)
+    if ($resultItems.Count -lt 1) {
+        throw 'ImportAppFromTemplate returned no result items.'
+    }
+
+    $first = $resultItems[0]
+    $created = Get-DirectField -Object $first -FieldName 'success'
+    if ($created -ne $true) {
+        $idVal = [string](Get-DirectField -Object $first -FieldName 'ID')
+        $msg = [string](Get-DirectField -Object $first -FieldName 'Message')
+        throw ("ImportAppFromTemplate result item failed. ID={0}; Message={1}" -f $idVal, $msg)
+    }
+
+    $rowKey = [string](Get-DirectField -Object $first -FieldName '_RowKey')
+    if ([string]::IsNullOrWhiteSpace($rowKey)) {
+        $rowKey = [string](Get-DirectField -Object $first -FieldName '_Rowkey')
+    }
+
+    if ([string]::IsNullOrWhiteSpace($rowKey)) {
+        throw 'ImportAppFromTemplate did not return _RowKey.'
+    }
+
+    Write-Log ("Imported new application from template '{0}'. New _RowKey='{1}'." -f $TemplateId, $rowKey) 'Green'
+    Add-ReportRow -Step 'Import App From Template' -Status 'SUCCESS' -Detail ("TemplateID={0}; RowKey={1}" -f $TemplateId, $rowKey)
+    return $rowKey
+}
+
+# ------------------------------------------------------------
+# MAIN
+# ------------------------------------------------------------
+$newAppKey = $null
 
 try {
-    if ([string]::IsNullOrWhiteSpace($SourceAppKey)) { throw 'SourceAppKey cannot be empty.' }
-    if ([string]::IsNullOrWhiteSpace($NewAppName))   { throw 'NewAppName cannot be empty.' }
+    if ([string]::IsNullOrWhiteSpace($TemplateId)) {
+        throw 'TemplateId cannot be empty.'
+    }
+    if ([string]::IsNullOrWhiteSpace($NewAppName)) {
+        throw 'NewAppName cannot be empty.'
+    }
+    if ([string]::IsNullOrWhiteSpace($SafeName)) {
+        throw 'SafeName cannot be empty.'
+    }
+    if ([string]::IsNullOrWhiteSpace($AccountName)) {
+        throw 'AccountName cannot be empty.'
+    }
 
     Get-RegularCredential
+
+    Write-Log ("Using regular user credential '{0}' for both PAS and Identity login." -f $script:PasCredential.UserName) 'Cyan'
+    Add-ReportRow -Step 'Credential Mode' -Status 'INFO' -Detail ("Regular user login as {0}" -f $script:PasCredential.UserName)
+
+    Start-PASSessionFromRegularUser
+    $null = Find-VaultAccountInSafeOnly -SafeName $SafeName -AccountIdentifier $AccountName
+
     Start-IdentityRegularUserSession
+    Write-Log "Using regular user Identity login for app-management operations." "Yellow"
+    Add-ReportRow -Step 'Identity Login Mode' -Status 'INFO' -Detail 'Regular user login'
 
-    Write-Log ("Looking up source app key '{0}' before clone..." -f $SourceAppKey) 'Cyan'
-    $lookup = Lookup-ApplicationByKey -AppKey $SourceAppKey
+    $newAppKey = Import-AppFromTemplate -TemplateId $TemplateId
 
-    $exactRows  = @($lookup.Exact)
-    $nearbyRows = @($lookup.Nearby)
-
-    if ($nearbyRows.Count -gt 0) {
-        $nearbyRows | Export-Csv -Path $NearbyCsvPath -NoTypeInformation -Force
-        Write-Log ("Broader app listing export written to: {0}" -f $NearbyCsvPath) 'Green'
-    }
-
-    if ($exactRows.Count -lt 1) {
-        throw ("Source app key '{0}' was not found in the Application table. Clone will not be attempted." -f $SourceAppKey)
-    }
-
-    $exactRows | Export-Csv -Path $ExactCsvPath -NoTypeInformation -Force
-    Write-Log ("Exact-match export written to: {0}" -f $ExactCsvPath) 'Green'
-
-    foreach ($row in $exactRows) {
-        Write-Log ("Found source app -> ID='{0}' Name='{1}' DisplayName='{2}' TemplateName='{3}' AppType='{4}' WebAppType='{5}'" -f $row.ID, $row.Name, $row.DisplayName, $row.TemplateName, $row.AppType, $row.WebAppType) 'Green'
-    }
-
-    Add-ReportRow -Step 'Lookup Source App' -Status 'SUCCESS' -Detail ("SourceAppKey={0}; ExactMatches={1}" -f $SourceAppKey, $exactRows.Count)
-
-    $clonedRowKey = Clone-AppFromExisting -SourceKey $SourceAppKey
-
-    Invoke-EventuallyConsistentStep `
-        -Operation {
-            Rename-ClonedApplication -RowKey $clonedRowKey -NewName $NewAppName -Description $AppDescription
-        } `
-        -OperationName 'Rename Cloned Application' `
-        -MaxWaitSeconds $RenameRetryWindowSeconds `
-        -IntervalSeconds $RetryIntervalSeconds
-
-    Write-Log ("Lookup + clone + rename completed successfully. New app row key is '{0}'." -f $clonedRowKey) 'Green'
-    Add-ReportRow -Step 'Overall' -Status 'SUCCESS' -Detail ("SourceAppKey={0}; NewRowKey={1}; NewAppName={2}" -f $SourceAppKey, $clonedRowKey, $NewAppName)
+    Write-Log ("Baseline create completed successfully. Requested final app name was '{0}'. Created app row key is '{1}'." -f $NewAppName, $newAppKey) 'Green'
+    Add-ReportRow -Step 'Overall' -Status 'SUCCESS' -Detail ("RequestedNewAppName={0}; CreatedRowKey={1}" -f $NewAppName, $newAppKey)
 }
 catch {
     Write-Log ("FAILED: {0}" -f $_.Exception.Message) 'Red'
@@ -619,9 +619,9 @@ catch {
 }
 finally {
     try {
-        $reportDir = Split-Path -Path $ReportCsvPath -Parent
-        if ($reportDir -and -not (Test-Path $reportDir)) {
-            New-Item -Path $reportDir -ItemType Directory -Force | Out-Null
+        $csvDir = Split-Path -Path $ReportCsvPath -Parent
+        if ($csvDir -and -not (Test-Path $csvDir)) {
+            New-Item -Path $csvDir -ItemType Directory -Force | Out-Null
         }
 
         if ($script:ReportRows.Count -gt 0) {
@@ -631,4 +631,9 @@ finally {
     } catch {
         Write-Log ("Could not export report CSV: {0}" -f $_.Exception.Message) 'Yellow'
     }
+
+    try {
+        Close-PASSession | Out-Null
+        Write-Log 'PAS session closed.' 'Green'
+    } catch {}
 }
