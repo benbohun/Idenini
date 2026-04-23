@@ -1,14 +1,15 @@
 <#
-CNA_Create_And_Update_Identity_WebApp_Reauth_CCP.ps1
+CNA_Create_And_Update_Identity_WebApp_Reauth_PromptOnly.ps1
 
 Purpose
-- Prompt once for app Name
-- Attempt to use CCP credential first for CyberArk Identity login
-- Fallback to interactive credential prompt if CCP retrieval fails (or if enabled)
+- Use normal interactive CyberArk Identity authentication only
+- Prompt for app Name
 - Create app from GenericBrowserExtensionScript
+- Wait after create
 - Re-establish CyberArk Identity session for update
 - Update the newly created app using the returned _RowKey
 - Apply non-script settings and Browser Extension advanced script
+- No CCP
 - No PAS validation
 - No psPAS dependency
 #>
@@ -17,24 +18,14 @@ Purpose
 param(
     [string]$IdentityApiTenantURL      = 'https://aat4012.id.cyberark.cloud',
 
-    # ===== CCP settings (used first) =====
-    [bool]$UseCCPFirst                 = $true,
-    [bool]$FallbackToPromptOnCCPFail   = $true,
-    [string]$CCPAddress                = 'https://vskau1p1231.cna.com',
-    [string]$CCPLocation               = 'AIMWebService',
-    [string]$CCPAppID                  = 'PAMDiscovery',
-    [string]$CCPSafe                   = 'CA_PCloud_Admins',
-    [string]$CCPObject                 = 'cna-prod.cyberark.cloud-cnarestbot',
-    [bool]$CCPWindowsAuth              = $false,
-
-    # ===== Manual fallback credential =====
+    # Manual credential
     [string]$RegularUserName           = '',
     [string]$RegularUserPassword       = '',
 
-    # ===== Create =====
+    # Create
     [string]$TemplateId                = 'GenericBrowserExtensionScript',
 
-    # ===== App settings =====
+    # App settings
     [string]$Name                      = 'g-test-pam1',
     [string]$DisplayName               = 'GCP - Okta Prod',
     [string]$Category                  = '_I18N_AppCategory_Other',
@@ -57,7 +48,7 @@ param(
     [string]$WebUPAppType              = 'BrowserExtensionScript',
     [bool]$NotSelfService              = $true,
 
-    # ===== Advanced Browser Extension workflow =====
+    # Advanced Browser Extension workflow
     [string]$AdvancedScript            = @'
 loginData.applicationUrl = "https://cna.okta.com/login/default";
 loginData.addField("username", "input#input28", LoginUsername + "@cna.com");
@@ -71,15 +62,15 @@ loginData.order = [
 ];
 '@,
 
-    # ===== Timing / retries =====
+    # Timing / retries
     [int]$PreUpdateDelaySeconds        = 15,
     [int]$UpdateRetryWindowSeconds     = 300,
     [int]$RetryIntervalSeconds         = 20,
     [int]$MaxUpdateReauthAttempts      = 2,
 
-    # ===== Logging =====
-    [string]$LogPath                   = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_And_Update_Reauth_CCP.log',
-    [string]$ReportCsvPath             = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_And_Update_Reauth_CCP_Report.csv'
+    # Logging
+    [string]$LogPath                   = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_And_Update_Reauth_PromptOnly.log',
+    [string]$ReportCsvPath             = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_And_Update_Reauth_PromptOnly_Report.csv'
 )
 
 $script:IdentityAuthToken         = $null
@@ -162,53 +153,6 @@ function Convert-SecureStringToPlainText {
     }
 }
 
-function Get-CCPUrl {
-    $qp = @(
-        'AppID='  + [uri]::EscapeDataString($CCPAppID)
-        'Safe='   + [uri]::EscapeDataString($CCPSafe)
-        'Object=' + [uri]::EscapeDataString($CCPObject)
-    ) -join '&'
-
-    return ('{0}/{1}/api/Accounts?{2}' -f $CCPAddress.TrimEnd('/'), $CCPLocation.Trim('/'), $qp)
-}
-
-function Try-GetCredentialFromCCP {
-    try {
-        $ccpUrl = Get-CCPUrl
-        Write-Log ("Attempting CCP credential retrieval from: {0}" -f $ccpUrl) 'Cyan'
-
-        $headers = @{ 'Content-Type' = 'application/json' }
-        $resp = Invoke-RestMethod -Uri $ccpUrl -Method GET -Headers $headers -UseDefaultCredentials:$CCPWindowsAuth -ErrorAction Stop
-
-        if (-not $resp -or -not $resp.Content) {
-            throw 'CCP returned empty password content.'
-        }
-
-        $resolvedUser = $null
-        if ($resp.PSObject.Properties.Name -contains 'Username') {
-            $resolvedUser = [string]$resp.Username
-        } elseif ($resp.PSObject.Properties.Name -contains 'UserName') {
-            $resolvedUser = [string]$resp.UserName
-        }
-
-        if ([string]::IsNullOrWhiteSpace($resolvedUser)) {
-            throw 'CCP response did not include Username/UserName.'
-        }
-
-        $secure = ConvertTo-SecureString $resp.Content -AsPlainText -Force
-        $script:RegularCredential = [pscredential]::new($resolvedUser, $secure)
-        $script:RegularUserPlainPassword = $resp.Content
-
-        Write-Log ("CCP credential retrieval succeeded for: {0}" -f $resolvedUser) 'Green'
-        Add-ReportRow -Step 'Credential Source' -Status 'SUCCESS' -Detail ("CCP user {0}" -f $resolvedUser)
-        return $true
-    } catch {
-        Write-Log ("CCP credential retrieval failed: {0}" -f $_.Exception.Message) 'Yellow'
-        Add-ReportRow -Step 'Credential Source' -Status 'FAILED' -Detail ("CCP failed: {0}" -f $_.Exception.Message)
-        return $false
-    }
-}
-
 function Prompt-ForRegularCredential {
     if ([string]::IsNullOrWhiteSpace($RegularUserName)) {
         $script:RegularCredential = Get-Credential -Message 'Enter REGULAR user credential for CyberArk Identity'
@@ -228,20 +172,6 @@ function Prompt-ForRegularCredential {
     }
 
     $script:RegularCredential = [pscredential]::new($RegularUserName, $secure)
-}
-
-function Get-WorkingCredential {
-    if ($UseCCPFirst) {
-        $ok = Try-GetCredentialFromCCP
-        if ($ok) { return }
-        if (-not $FallbackToPromptOnCCPFail) {
-            throw 'CCP credential retrieval failed and fallback to prompt is disabled.'
-        }
-    }
-
-    Write-Log 'Falling back to interactive/manual credential entry...' 'Yellow'
-    Prompt-ForRegularCredential
-    Add-ReportRow -Step 'Credential Source' -Status 'SUCCESS' -Detail ("Manual user {0}" -f $script:RegularCredential.UserName)
 }
 
 function Get-ResolvedAppName {
@@ -742,11 +672,12 @@ try {
         throw 'TemplateId cannot be empty.'
     }
 
-    Get-WorkingCredential
+    Prompt-ForRegularCredential
     $resolvedName = Get-ResolvedAppName
 
     Write-Log ("Using credential '{0}' for create + reauth + update flow." -f $script:RegularCredential.UserName) 'Cyan'
     Write-Log ("Resolved app Name: '{0}'." -f $resolvedName) 'Cyan'
+    Add-ReportRow -Step 'Credential Source' -Status 'SUCCESS' -Detail ("Manual user {0}" -f $script:RegularCredential.UserName)
     Add-ReportRow -Step 'Resolved App Name' -Status 'INFO' -Detail ("Name={0}" -f $resolvedName)
 
     # Phase 1: create
