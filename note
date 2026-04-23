@@ -1,38 +1,48 @@
 <#
-CNA_Create_Identity_WebApp_From_Json_v3.ps1
+CNA_Create_Identity_WebApp_From_Json_NonServiceUser.ps1
 
-Changes in this version
-- PAS account lookup is restricted to the target safe only
-- PAS account match must be exact; it will not pick a fuzzy/partial match
-- Identity ImportAppFromTemplate now fails fast on 401 Unauthorized
-- Skips GetUserInfo and Redrock/query entirely
-- Keeps the create-from-exported-JSON workflow
+Purpose
+- Use CCP/service-user only for PAS lookup
+- Use an interactive NON-SERVICE Identity admin user for Identity app-management APIs
+- Create a new Browser Extension (advanced) style app from exported JSON
+- Update the app with the exported configuration
+- Rename the app
+- Apply direct application permissions to a target group
 
-What still cannot be fixed in code
-- If ImportAppFromTemplate returns 401 Unauthorized, the service account still does not have
-  effective Identity app-management authorization in the tenant.
+Notes
+- IdentityApiTenantURL should be your preferred tenant URL if available, for example:
+    https://yourtenant.my.idaptive.app
+- Supports password and simple text/OTP challenge prompts for Identity auth.
+- Skips GetUserInfo and skips Redrock/query entirely.
 #>
 
 [CmdletBinding()]
 param(
-    # ===== CNA Identity / Privilege Cloud =====
-    [string]$IdentityTenantURL = 'https://aat4012.id.cyberark.cloud',
-    [string]$PCloudSubdomain   = 'cna-prod',
-    [string]$PrivilegeCloudURL = 'https://cna-prod.privilegecloud.cyberark.cloud',
+    # ===== PAS / Privilege Cloud auth path =====
+    [string]$IdentityTenantURL    = 'https://aat4012.id.cyberark.cloud',
 
-    # ===== CCP settings (CNA) =====
-    [string]$CCPAddress        = 'https://vskau1p1231.cna.com',
-    [string]$CCPLocation       = 'AIMWebService',
-    [string]$CCPAppID          = 'PAMDiscovery',
-    [string]$CCPSafe           = 'CA_PCloud_Admins',
-    [string]$CCPObject         = 'cna-prod.cyberark.cloud-cnarestbot',
-    [bool]$CCPWindowsAuth      = $false,
+    # ===== Identity API path =====
+    [string]$IdentityApiTenantURL = 'https://aat4012.id.cyberark.cloud',
+
+    [string]$PCloudSubdomain      = 'cna-prod',
+    [string]$PrivilegeCloudURL    = 'https://cna-prod.privilegecloud.cyberark.cloud',
+
+    # ===== CCP settings (for PAS only) =====
+    [string]$CCPAddress           = 'https://vskau1p1231.cna.com',
+    [string]$CCPLocation          = 'AIMWebService',
+    [string]$CCPAppID             = 'PAMDiscovery',
+    [string]$CCPSafe              = 'CA_PCloud_Admins',
+    [string]$CCPObject            = 'cna-prod.cyberark.cloud-cnarestbot',
+    [bool]$CCPWindowsAuth         = $false,
+
+    # ===== Interactive Identity admin login =====
+    [string]$IdentityAdminUserName = '',
 
     # ===== New app settings =====
-    [string]$SourceAppName      = 'GCP - Okta Prod',
-    [string]$NewAppName         = 'g-test-pam1',
-    [string]$AppDescription     = 'GCP - Okta Prod created via CyberArk Identity API',
-    [string]$TemplateIdOverride = '',
+    [string]$SourceAppName        = 'GCP - Okta Prod',
+    [string]$NewAppName           = 'g-test-pam1',
+    [string]$AppDescription       = 'GCP - Okta Prod created via CyberArk Identity API',
+    [string]$TemplateIdOverride   = '',
 
     # ===== Identity application permission target =====
     [string]$TargetGroupDisplayName          = 'ca_PCloud_Admins',
@@ -41,15 +51,15 @@ param(
     [string]$TargetGroupDirectoryServiceUuid = '',
 
     # ===== PAS validation / reporting =====
-    [string]$SafeName          = 'CyberArkTestValidation',
-    [string]$AccountName       = 'PC0VPXSB.cna.com-administrator',
+    [string]$SafeName             = 'CyberArkTestValidation',
+    [string]$AccountName          = 'PC0VPXSB.cna.com-administrator',
 
     # ===== Optional exported app JSON =====
-    [string]$SourceAppExportJson = '',
+    [string]$SourceAppExportJson  = '',
 
     # ===== Logging =====
-    [string]$LogPath           = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_From_Json_v3.log',
-    [string]$ReportCsvPath     = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_From_Json_v3_Report.csv',
+    [string]$LogPath              = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_From_Json_NonServiceUser.log',
+    [string]$ReportCsvPath        = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_From_Json_NonServiceUser_Report.csv',
 
     # ===== Advanced =====
     [switch]$WhatIf
@@ -112,7 +122,7 @@ function Add-ReportRow {
 function ConvertTo-JsonSafe {
     param([Parameter()][object]$Object)
     if ($null -eq $Object) { return $null }
-    return ($Object | ConvertTo-Json -Depth 50)
+    return ($Object | ConvertTo-Json -Depth 60)
 }
 
 function Get-HttpStatusCode {
@@ -146,6 +156,19 @@ function Get-DirectField {
     }
 
     return $null
+}
+
+function Convert-SecureStringToPlainText {
+    param([Parameter(Mandatory)][SecureString]$SecureString)
+
+    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureString)
+    try {
+        return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+    } finally {
+        if ($bstr -ne [IntPtr]::Zero) {
+            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+        }
+    }
 }
 
 function Get-DefaultSourceExportJson {
@@ -199,7 +222,7 @@ function Start-PASSessionFromCCP {
     $secure = ConvertTo-SecureString $resp.Content -AsPlainText -Force
     $script:PasCredential = [PSCredential]::new($resolvedUser, $secure)
 
-    Write-Log ("Successfully retrieved credentials for service user: {0}" -f $resolvedUser) 'Green'
+    Write-Log ("Successfully retrieved credentials for PAS service user: {0}" -f $resolvedUser) 'Green'
     Add-ReportRow -Step 'CCP Retrieve' -Status 'SUCCESS' -Detail ("User {0}" -f $resolvedUser)
 
     $normalizedTenant = Get-NormalizedIdentityTenant -TenantUrl $IdentityTenantURL
@@ -224,14 +247,96 @@ function Start-PASSessionFromCCP {
 }
 
 # ------------------------------------------------------------
-# Identity authentication
+# Interactive Identity authentication (non-service user)
 # ------------------------------------------------------------
-function Start-IdentityApiSession {
+function Get-AuthPayload {
+    param([Parameter(Mandatory)]$Response)
+
+    if ($Response.PSObject -and $Response.PSObject.Properties.Name -contains 'Result' -and $null -ne $Response.Result) {
+        return $Response.Result
+    }
+
+    return $Response
+}
+
+function Get-AuthSummaryValue {
+    param([Parameter(Mandatory)]$Payload)
+    return [string](Get-DirectField -Object $Payload -FieldName 'Summary')
+}
+
+function Get-AuthSessionId {
+    param([Parameter(Mandatory)]$Payload)
+    return [string](Get-DirectField -Object $Payload -FieldName 'SessionId')
+}
+
+function Get-AuthTokenValue {
+    param([Parameter(Mandatory)]$Payload)
+    return [string](Get-DirectField -Object $Payload -FieldName 'Auth')
+}
+
+function Get-AuthUserValue {
+    param([Parameter(Mandatory)]$Payload)
+    return [string](Get-DirectField -Object $Payload -FieldName 'User')
+}
+
+function Get-FirstMechanism {
+    param([Parameter(Mandatory)]$Payload)
+
+    $challenges = @(Get-DirectField -Object $Payload -FieldName 'Challenges')
+    foreach ($challenge in $challenges) {
+        $mechs = @(Get-DirectField -Object $challenge -FieldName 'Mechanisms')
+        foreach ($mech in $mechs) {
+            $mechId = [string](Get-DirectField -Object $mech -FieldName 'MechanismId')
+            if (-not [string]::IsNullOrWhiteSpace($mechId)) {
+                return $mech
+            }
+        }
+    }
+
+    return $null
+}
+
+function Get-MechanismPrompt {
+    param([Parameter(Mandatory)]$Mechanism)
+
+    $name   = [string](Get-DirectField -Object $Mechanism -FieldName 'Name')
+    $prompt = [string](Get-DirectField -Object $Mechanism -FieldName 'PromptSelectMech')
+    $type   = [string](Get-DirectField -Object $Mechanism -FieldName 'AnswerType')
+
+    if ($name -eq 'UP' -or $prompt -match 'Password') {
+        $secure = Read-Host "Enter password for the Identity admin account" -AsSecureString
+        return @{
+            Action = 'Answer'
+            Answer = (Convert-SecureStringToPlainText -SecureString $secure)
+            Name   = $name
+            Prompt = $prompt
+        }
+    }
+
+    $display = if (-not [string]::IsNullOrWhiteSpace($prompt)) { $prompt } else { $name }
+    $answer = Read-Host ("Enter response for challenge [{0}] {1}" -f $type, $display)
+
+    return @{
+        Action = 'Answer'
+        Answer = $answer
+        Name   = $name
+        Prompt = $prompt
+    }
+}
+
+function Start-IdentityInteractiveSession {
     param(
         [Parameter(Mandatory)][string]$TenantUrl,
-        [Parameter(Mandatory)][string]$UserName,
-        [Parameter(Mandatory)][string]$Password
+        [string]$UserName
     )
+
+    if ([string]::IsNullOrWhiteSpace($UserName)) {
+        $UserName = Read-Host 'Enter the NON-SERVICE Identity admin username'
+    }
+
+    if ([string]::IsNullOrWhiteSpace($UserName)) {
+        throw 'Identity admin username cannot be empty.'
+    }
 
     $baseHeaders = @{
         'X-IDAP-NATIVE-CLIENT' = 'true'
@@ -244,7 +349,7 @@ function Start-IdentityApiSession {
 
     $script:IdentityWebSession = New-Object Microsoft.PowerShell.Commands.WebRequestSession
 
-    Write-Log ("Starting CyberArk Identity authentication for '{0}'..." -f $UserName) 'Cyan'
+    Write-Log ("Starting interactive CyberArk Identity authentication for '{0}'..." -f $UserName) 'Cyan'
 
     $startBody = @{
         User    = $UserName
@@ -252,55 +357,54 @@ function Start-IdentityApiSession {
     }
 
     $startResp = Invoke-RestMethod -Method POST -Uri $startUri -Headers $baseHeaders -WebSession $script:IdentityWebSession -ContentType 'application/json' -Body (ConvertTo-JsonSafe $startBody) -ErrorAction Stop
-    if (-not $startResp.success) {
-        throw ('StartAuthentication failed: ' + ($startResp.Message | Out-String))
-    }
+    $payload = Get-AuthPayload -Response $startResp
 
-    $sessionId = $startResp.Result.SessionId
-    if ([string]::IsNullOrWhiteSpace($sessionId)) {
-        throw 'StartAuthentication did not return SessionId.'
-    }
+    for ($i = 0; $i -lt 10; $i++) {
+        $summary = Get-AuthSummaryValue -Payload $payload
+        $authVal = Get-AuthTokenValue -Payload $payload
 
-    $mechanism = $null
-    foreach ($challenge in @($startResp.Result.Challenges)) {
-        foreach ($mech in @($challenge.Mechanisms)) {
-            if ($mech.Name -eq 'UP' -or $mech.PromptSelectMech -match 'Password') {
-                $mechanism = $mech
-                break
-            }
+        if ($summary -eq 'LoginSuccess' -or -not [string]::IsNullOrWhiteSpace($authVal)) {
+            $script:IdentityAuthToken = $authVal
+            $script:IdentityUser      = Get-AuthUserValue -Payload $payload
+
+            $cookieCount = 0
+            try { $cookieCount = $script:IdentityWebSession.Cookies.GetCookies($TenantUrl).Count } catch {}
+
+            Write-Log ("Identity API authentication succeeded as '{0}'. CookieCount={1}" -f $script:IdentityUser, $cookieCount) 'Green'
+            Add-ReportRow -Step 'Identity API Session' -Status 'SUCCESS' -Detail ("Authenticated as {0}; CookieCount={1}" -f $script:IdentityUser, $cookieCount)
+            return
         }
-        if ($mechanism) { break }
+
+        $sessionId = Get-AuthSessionId -Payload $payload
+        if ([string]::IsNullOrWhiteSpace($sessionId)) {
+            throw 'Authentication package did not include SessionId.'
+        }
+
+        $mechanism = Get-FirstMechanism -Payload $payload
+        if ($null -eq $mechanism) {
+            throw 'No supported authentication mechanism was returned. Use a password or text/OTP-based admin flow for this test.'
+        }
+
+        $mechId = [string](Get-DirectField -Object $mechanism -FieldName 'MechanismId')
+        $name   = [string](Get-DirectField -Object $mechanism -FieldName 'Name')
+        $prompt = [string](Get-DirectField -Object $mechanism -FieldName 'PromptSelectMech')
+
+        Write-Log ("Responding to Identity challenge. Mechanism='{0}' Prompt='{1}'." -f $name, $prompt) 'Gray'
+
+        $response = Get-MechanismPrompt -Mechanism $mechanism
+
+        $advBody = @{
+            SessionId   = $sessionId
+            MechanismId = $mechId
+            Action      = $response.Action
+            Answer      = $response.Answer
+        }
+
+        $advResp = Invoke-RestMethod -Method POST -Uri $advUri -Headers $baseHeaders -WebSession $script:IdentityWebSession -ContentType 'application/json' -Body (ConvertTo-JsonSafe $advBody) -ErrorAction Stop
+        $payload = Get-AuthPayload -Response $advResp
     }
 
-    if (-not $mechanism) {
-        throw 'Could not find a username/password mechanism in StartAuthentication response.'
-    }
-
-    $advBody = @{
-        SessionId   = $sessionId
-        MechanismId = $mechanism.MechanismId
-        Action      = 'Answer'
-        Answer      = $Password
-    }
-
-    $advResp = Invoke-RestMethod -Method POST -Uri $advUri -Headers $baseHeaders -WebSession $script:IdentityWebSession -ContentType 'application/json' -Body (ConvertTo-JsonSafe $advBody) -ErrorAction Stop
-    if (-not $advResp.success) {
-        throw ('AdvanceAuthentication failed: ' + ($advResp.Message | Out-String))
-    }
-
-    $auth = $advResp.Result.Auth
-    if ([string]::IsNullOrWhiteSpace($auth)) {
-        throw 'AdvanceAuthentication did not return Auth token.'
-    }
-
-    $script:IdentityAuthToken = $auth
-    $script:IdentityUser      = $advResp.Result.User
-
-    $cookieCount = 0
-    try { $cookieCount = $script:IdentityWebSession.Cookies.GetCookies($TenantUrl).Count } catch {}
-
-    Write-Log ("Identity API authentication succeeded as '{0}'. CookieCount={1}" -f $script:IdentityUser, $cookieCount) 'Green'
-    Add-ReportRow -Step 'Identity API Session' -Status 'SUCCESS' -Detail ("Authenticated as {0}; CookieCount={1}" -f $script:IdentityUser, $cookieCount)
+    throw 'Interactive Identity authentication did not complete after multiple challenge rounds.'
 }
 
 function Invoke-IdentityPostRaw {
@@ -317,6 +421,9 @@ function Invoke-IdentityPostRaw {
     }
 
     if ($AuthMode -eq 'BearerCookie' -or $AuthMode -eq 'BearerOnly') {
+        if ([string]::IsNullOrWhiteSpace($script:IdentityAuthToken)) {
+            throw 'Identity auth token is not initialized.'
+        }
         $headers['Authorization'] = ("Bearer {0}" -f $script:IdentityAuthToken)
     }
 
@@ -374,7 +481,7 @@ function Invoke-IdentityApiWithRetry {
 }
 
 # ------------------------------------------------------------
-# PAS account validation - SAFE ONLY + EXACT MATCH
+# PAS account validation - safe only + exact match
 # ------------------------------------------------------------
 function Get-AccountCandidateFields {
     param([Parameter(Mandatory)]$Account)
@@ -429,67 +536,28 @@ function Find-VaultAccountInSafeOnly {
 
     $matches = @()
 
-    # Try direct REST search scoped to the safe first
-    $invokePasRest = Get-Command Invoke-PASRestMethod -ErrorAction SilentlyContinue
-    if ($invokePasRest) {
-        foreach ($filterExpr in @("safeName eq '$SafeName'","safeName eq $SafeName")) {
+    try {
+        $getPasCmd = Get-Command Get-PASAccount -ErrorAction Stop
+
+        if ($getPasCmd.Parameters.ContainsKey('SafeName')) {
             try {
-                $uri = "API/Accounts?search=$([uri]::EscapeDataString($AccountIdentifier))&filter=$([uri]::EscapeDataString($filterExpr))&limit=100"
-                Write-Log ("Trying PAS REST safe-scoped lookup with filter [{0}]..." -f $filterExpr) 'Gray'
-                $resp = Invoke-PASRestMethod -Uri $uri -Method GET -ErrorAction Stop
-
-                $items = @()
-                if ($resp.PSObject.Properties.Name -contains 'value') {
-                    $items = @($resp.value)
-                } elseif ($resp.PSObject.Properties.Name -contains 'Value') {
-                    $items = @($resp.Value)
-                } elseif ($resp -is [System.Collections.IEnumerable] -and -not ($resp -is [string])) {
-                    $items = @($resp)
-                }
-
-                $exact = @($items | Where-Object {
-                    (
-                        ([string](Get-DirectField -Object $_ -FieldName 'safeName') -eq $SafeName) -or
-                        ([string](Get-DirectField -Object $_ -FieldName 'SafeName') -eq $SafeName)
-                    ) -and (Test-ExactAccountIdentifierMatch -Account $_ -Identifier $AccountIdentifier)
-                })
-
-                if ($exact.Count -gt 0) {
-                    $matches = $exact
-                    break
-                }
-            } catch {
-                Write-Log ("PAS REST safe-scoped lookup failed with filter [{0}]: {1}" -f $filterExpr, $_.Exception.Message) 'Yellow'
-            }
-        }
-    }
-
-    # Try Get-PASAccount scoped to safe if supported
-    if ($matches.Count -lt 1) {
-        try {
-            $getPasCmd = Get-Command Get-PASAccount -ErrorAction Stop
-            if ($getPasCmd.Parameters.ContainsKey('SafeName')) {
                 Write-Log "Trying Get-PASAccount -SafeName scoped lookup..." 'Gray'
-                $safeResults = @(Get-PASAccount -SafeName $SafeName -Search $AccountIdentifier -ErrorAction Stop)
-                $matches = @($safeResults | Where-Object { Test-ExactAccountIdentifierMatch -Account $_ -Identifier $AccountIdentifier })
+                $safeSearch = @(Get-PASAccount -SafeName $SafeName -Search $AccountIdentifier -ErrorAction Stop)
+                $matches = @($safeSearch | Where-Object { Test-ExactAccountIdentifierMatch -Account $_ -Identifier $AccountIdentifier })
+            } catch {
+                Write-Log ("Get-PASAccount -SafeName scoped lookup failed: {0}" -f $_.Exception.Message) 'Yellow'
             }
-        } catch {
-            Write-Log ("Get-PASAccount -SafeName scoped lookup failed: {0}" -f $_.Exception.Message) 'Yellow'
-        }
-    }
 
-    # Last fallback: enumerate only the safe, not all accounts
-    if ($matches.Count -lt 1) {
-        try {
-            $getPasCmd = Get-Command Get-PASAccount -ErrorAction Stop
-            if ($getPasCmd.Parameters.ContainsKey('SafeName')) {
+            if ($matches.Count -lt 1) {
                 Write-Log "Trying Get-PASAccount -SafeName enumeration for the target safe only..." 'Gray'
                 $safeAll = @(Get-PASAccount -SafeName $SafeName -ErrorAction Stop)
                 $matches = @($safeAll | Where-Object { Test-ExactAccountIdentifierMatch -Account $_ -Identifier $AccountIdentifier })
             }
-        } catch {
-            Write-Log ("Get-PASAccount -SafeName enumeration failed: {0}" -f $_.Exception.Message) 'Yellow'
+        } else {
+            throw 'Get-PASAccount does not expose -SafeName in this environment.'
         }
+    } catch {
+        throw ("Safe-only PAS lookup failed: {0}" -f $_.Exception.Message)
     }
 
     if ($matches.Count -lt 1) {
@@ -502,7 +570,7 @@ function Find-VaultAccountInSafeOnly {
     }
 
     $acct = $matches[0]
-    $acctId = [string](Get-DirectField -Object $acct -FieldName 'id')
+    $acctId   = [string](Get-DirectField -Object $acct -FieldName 'id')
     $acctUser = [string](Get-DirectField -Object $acct -FieldName 'userName')
     if ([string]::IsNullOrWhiteSpace($acctUser)) { $acctUser = [string](Get-DirectField -Object $acct -FieldName 'UserName') }
     $acctAddr = [string](Get-DirectField -Object $acct -FieldName 'address')
@@ -533,7 +601,7 @@ function Get-ExportConfig {
 }
 
 # ------------------------------------------------------------
-# App creation
+# App creation / update
 # ------------------------------------------------------------
 function Import-AppFromTemplateAdaptive {
     param(
@@ -542,7 +610,6 @@ function Import-AppFromTemplateAdaptive {
     )
 
     $candidates = New-Object System.Collections.Generic.List[string]
-
     foreach ($candidate in @(
         $TemplateIdOverride,
         [string]$Config.TemplateName,
@@ -555,7 +622,7 @@ function Import-AppFromTemplateAdaptive {
         }
     }
 
-    $uri = $IdentityTenantURL.TrimEnd('/') + '/SaasManage/ImportAppFromTemplate'
+    $uri = $IdentityApiTenantURL.TrimEnd('/') + '/SaasManage/ImportAppFromTemplate'
 
     foreach ($templateId in $candidates) {
         try {
@@ -591,7 +658,7 @@ function Import-AppFromTemplateAdaptive {
         } catch {
             $msg = $_.Exception.Message
             if ($msg -match 'Unauthorized persisted for ImportAppFromTemplate' -or $msg -match '\(401\).*Unauthorized') {
-                throw "ImportAppFromTemplate returned 401 Unauthorized. This is a tenant-side Identity authorization issue for the service account, not a template-ID issue."
+                throw "ImportAppFromTemplate returned 401 Unauthorized for the interactive admin account. Check the account's effective Application Management rights and the IdentityApiTenantURL value."
             }
 
             Write-Log ("ImportAppFromTemplate failed for template '{0}': {1}" -f $templateId, $msg) 'Yellow'
@@ -601,13 +668,10 @@ function Import-AppFromTemplateAdaptive {
     throw 'All ImportAppFromTemplate attempts failed.'
 }
 
-# ------------------------------------------------------------
-# App inspection / update
-# ------------------------------------------------------------
 function Get-IdentityApplicationDetails {
     param([Parameter(Mandatory)][string]$AppKey)
 
-    $uri = $IdentityTenantURL.TrimEnd('/') + '/SaasManage/GetApplication?_RowKey=' + [uri]::EscapeDataString($AppKey)
+    $uri = $IdentityApiTenantURL.TrimEnd('/') + '/SaasManage/GetApplication?_RowKey=' + [uri]::EscapeDataString($AppKey)
     $resp = Invoke-IdentityApiWithRetry -AbsoluteUris @($uri) -LogicalName 'GetApplication'
     if (-not $resp.success) { throw ('GetApplication failed: ' + ($resp.Message | Out-String)) }
     return $resp.Result
@@ -674,29 +738,29 @@ function New-AppUpdatePayloadVariants {
     )
 
     $commonFull = [ordered]@{
-        Name                  = $RenameTo
-        DisplayName           = $RenameTo
-        Description           = $DescriptionToUse
-        AppType               = $(if ($Config.AppType) { [string]$Config.AppType } else { 'Web' })
-        TemplateName          = [string]$Config.TemplateName
-        WebAppType            = [string]$Config.WebAppType
-        WebUPAppType          = [string]$Config.WebUPAppType
-        UserNameStrategy      = [string]$Config.UserNameStrategy
-        OnPrem                = [bool]$Config.OnPrem
-        IsSwsEnabled          = [bool]$Config.IsSwsEnabled
-        ShowRegistration      = [bool]$Config.ShowRegistration
-        FormFillingEnabled    = [bool]$Config.FormFillingEnabled
-        Generic               = [bool]$Config.Generic
-        DefaultAuthProfile    = [string]$Config.DefaultAuthProfile
-        DefaultAuthProfileInfo= $Config.DefaultAuthProfileInfo
-        AuthRules             = $Config.AuthRules
-        NotSelfService        = [bool]$Config.NotSelfService
-        LocalizationEnabled   = [bool]$Config.LocalizationEnabled
-        Notes                 = [string]$Config.Notes
-        Category              = [string]$Config.Category
-        AdminTag              = [string]$Config.AdminTag
-        CBEScript             = [string]$Config.CBEScript
-        UserPassScript        = [string]$Config.CBEScript
+        Name                   = $RenameTo
+        DisplayName            = $RenameTo
+        Description            = $DescriptionToUse
+        AppType                = $(if ($Config.AppType) { [string]$Config.AppType } else { 'Web' })
+        TemplateName           = [string]$Config.TemplateName
+        WebAppType             = [string]$Config.WebAppType
+        WebUPAppType           = [string]$Config.WebUPAppType
+        UserNameStrategy       = [string]$Config.UserNameStrategy
+        OnPrem                 = [bool]$Config.OnPrem
+        IsSwsEnabled           = [bool]$Config.IsSwsEnabled
+        ShowRegistration       = [bool]$Config.ShowRegistration
+        FormFillingEnabled     = [bool]$Config.FormFillingEnabled
+        Generic                = [bool]$Config.Generic
+        DefaultAuthProfile     = [string]$Config.DefaultAuthProfile
+        DefaultAuthProfileInfo = $Config.DefaultAuthProfileInfo
+        AuthRules              = $Config.AuthRules
+        NotSelfService         = [bool]$Config.NotSelfService
+        LocalizationEnabled    = [bool]$Config.LocalizationEnabled
+        Notes                  = [string]$Config.Notes
+        Category               = [string]$Config.Category
+        AdminTag               = [string]$Config.AdminTag
+        CBEScript              = [string]$Config.CBEScript
+        UserPassScript         = [string]$Config.CBEScript
     }
 
     if ($Config.PSObject.Properties.Name -contains 'Icon' -and -not [string]::IsNullOrWhiteSpace([string]$Config.Icon)) {
@@ -748,7 +812,7 @@ function Update-IdentityApplicationFromConfig {
         [Parameter(Mandatory)][string]$DescriptionToUse
     )
 
-    $uri = $IdentityTenantURL.TrimEnd('/') + '/SaasManage/UpdateApplicationDE'
+    $uri = $IdentityApiTenantURL.TrimEnd('/') + '/SaasManage/UpdateApplicationDE'
     $payloads = New-AppUpdatePayloadVariants -AppKey $AppKey -Config $Config -RenameTo $RenameTo -DescriptionToUse $DescriptionToUse
 
     $attempt = 0
@@ -767,7 +831,7 @@ function Update-IdentityApplicationFromConfig {
         } catch {
             $msg = $_.Exception.Message
             if ($msg -match 'Unauthorized persisted for UpdateApplicationDE' -or $msg -match '\(401\).*Unauthorized') {
-                throw "UpdateApplicationDE returned 401 Unauthorized. The service account can authenticate, but it is still not authorized for Identity app modification."
+                throw "UpdateApplicationDE returned 401 Unauthorized for the interactive admin account. Check effective Application Management rights and IdentityApiTenantURL."
             }
 
             Write-Log ("UpdateApplicationDE attempt #{0} failed: {1}" -f $attempt, $msg) 'Yellow'
@@ -1017,7 +1081,42 @@ function New-SetPermissionsBodies {
 function Set-ApplicationPermissionsDirectGroup {
     param([Parameter(Mandatory)][string]$AppRowKey)
 
-    $state = Get-AppPermissionState -AppRowKey $AppRowKey
+    $state = Get-AppPermissionState -AppKey $AppRowKey
+}
+
+function Get-AppPermissionState {
+    param([Parameter(Mandatory)][string]$AppKey)
+
+    $details = Get-IdentityApplicationDetails -AppKey $AppKey
+
+    $rowKey = $AppKey
+    $idVal  = $null
+    $pvid   = $null
+
+    $tmpRowKey = Find-FirstPropertyValue -Object $details -Names @('_RowKey','_Rowkey','RowKey')
+    if ($tmpRowKey) { $rowKey = [string]$tmpRowKey }
+
+    $tmpId = Find-FirstPropertyValue -Object $details -Names @('ID','AppID')
+    if ($tmpId) { $idVal = [string]$tmpId }
+
+    $tmpPvid = Find-FirstPropertyValue -Object $details -Names @('PVID','PVId','PermissionVersionId')
+    if ($tmpPvid) { $pvid = [string]$tmpPvid }
+
+    $grants = Find-GrantArray -Object $details
+
+    return [pscustomobject]@{
+        Details = $details
+        RowKey  = $rowKey
+        ID      = $idVal
+        PVID    = $pvid
+        Grants  = $grants
+    }
+}
+
+function Set-ApplicationPermissionsDirectGroup {
+    param([Parameter(Mandatory)][string]$AppRowKey)
+
+    $state = Get-AppPermissionState -AppKey $AppRowKey
     $existingGrantCount = 0
     if ($state.Grants) { $existingGrantCount = @($state.Grants).Count }
 
@@ -1030,7 +1129,7 @@ function Set-ApplicationPermissionsDirectGroup {
         'View,Run,AutomaticallyDeploy'
     )
 
-    $uri = $IdentityTenantURL.TrimEnd('/') + '/SaasManage/SetApplicationPermissions'
+    $uri = $IdentityApiTenantURL.TrimEnd('/') + '/SaasManage/SetApplicationPermissions'
 
     foreach ($rights in $rightsCandidates) {
         foreach ($grant in (New-GrantCandidates -Rights $rights)) {
@@ -1047,7 +1146,7 @@ function Set-ApplicationPermissionsDirectGroup {
                 } catch {
                     $msg = $_.Exception.Message
                     if ($msg -match 'Unauthorized persisted for SetApplicationPermissions' -or $msg -match '\(401\).*Unauthorized') {
-                        throw "SetApplicationPermissions returned 401 Unauthorized. The service account is still not authorized for Identity application permission changes."
+                        throw "SetApplicationPermissions returned 401 Unauthorized for the interactive admin account."
                     }
 
                     Write-Log ("SetApplicationPermissions attempt failed with Rights='{0}' and grant Principal='{1}': {2}" -f $rights, $grant.Principal, $msg) 'Yellow'
@@ -1062,11 +1161,11 @@ function Set-ApplicationPermissionsDirectGroup {
 # ------------------------------------------------------------
 # MAIN
 # ------------------------------------------------------------
-$response      = $null
-$exportConfig  = $null
-$newAppKey     = $null
-$sourceDetails = $null
-$updatedDetails= $null
+$response       = $null
+$exportConfig   = $null
+$newAppKey      = $null
+$createdDetails = $null
+$updatedDetails = $null
 
 try {
     if ([string]::IsNullOrWhiteSpace($SourceAppExportJson)) {
@@ -1089,34 +1188,22 @@ try {
     }
 
     $response = Start-PASSessionFromCCP -ObjectName $CCPObject
-
-    $resolvedUser = $null
-    if ($response.PSObject.Properties.Name -contains 'Username') {
-        $resolvedUser = [string]$response.Username
-    } elseif ($response.PSObject.Properties.Name -contains 'UserName') {
-        $resolvedUser = [string]$response.UserName
-    }
-
-    if ([string]::IsNullOrWhiteSpace($resolvedUser)) {
-        throw 'Unable to resolve service username from CCP response.'
-    }
-
-    Start-IdentityApiSession -TenantUrl $IdentityTenantURL -UserName $resolvedUser -Password $response.Content
-    Write-Log "Skipping GetUserInfo sanity check and proceeding directly to app-management operations." "Yellow"
-    Add-ReportRow -Step 'GetUserInfo' -Status 'SKIPPED' -Detail 'Skipped generic user-function check and proceeded directly to app-management APIs.'
-
     $vaultAccount = Find-VaultAccountInSafeOnly -SafeName $SafeName -AccountIdentifier $AccountName
 
+    Start-IdentityInteractiveSession -TenantUrl $IdentityApiTenantURL -UserName $IdentityAdminUserName
+    Write-Log "Using interactive non-service Identity admin login for app-management operations." "Yellow"
+    Add-ReportRow -Step 'Identity Login Mode' -Status 'INFO' -Detail 'Interactive non-service admin login'
+
     Write-Log ("Using exported config Name='{0}', TemplateName='{1}', AppType='{2}', WebUPAppType='{3}', IsSwsEnabled='{4}'." -f $exportConfig.Name, $exportConfig.TemplateName, $exportConfig.AppType, $exportConfig.WebUPAppType, $exportConfig.IsSwsEnabled) 'Cyan'
-    Add-ReportRow -Step 'Input Summary' -Status 'INFO' -Detail ("SourceAppName={0}; ExportedTemplateName={1}; NewAppName={2}; GroupDisplayName={3}; GroupSystemName={4}; GroupInternalName={5}; GroupDirectoryServiceUuid={6}; SafeName={7}; AccountName={8}" -f $SourceAppName, $exportConfig.TemplateName, $NewAppName, $TargetGroupDisplayName, $TargetGroupSystemName, $TargetGroupInternalName, $TargetGroupDirectoryServiceUuid, $SafeName, $AccountName)
+    Add-ReportRow -Step 'Input Summary' -Status 'INFO' -Detail ("SourceAppName={0}; ExportedTemplateName={1}; NewAppName={2}; GroupDisplayName={3}; GroupSystemName={4}; GroupInternalName={5}; GroupDirectoryServiceUuid={6}; SafeName={7}; AccountName={8}; IdentityApiTenantURL={9}" -f $SourceAppName, $exportConfig.TemplateName, $NewAppName, $TargetGroupDisplayName, $TargetGroupSystemName, $TargetGroupInternalName, $TargetGroupDirectoryServiceUuid, $SafeName, $AccountName, $IdentityApiTenantURL)
 
     if ($WhatIf) {
         Write-Log ("WHATIF: Would import a new app from template candidates based on '{0}'." -f $exportConfig.TemplateName) 'Yellow'
         Add-ReportRow -Step 'Import App From Template' -Status 'WHATIF' -Detail ("TemplateName={0}; Override={1}" -f $exportConfig.TemplateName, $TemplateIdOverride)
     } else {
         $newAppKey = Import-AppFromTemplateAdaptive -Config $exportConfig -TemplateIdOverride $TemplateIdOverride
-        $sourceDetails = Get-IdentityApplicationDetails -AppKey $newAppKey
-        Assert-IdentityWebApp -AppDetails $sourceDetails -Label 'Newly Created Application (pre-update)'
+        $createdDetails = Get-IdentityApplicationDetails -AppKey $newAppKey
+        Assert-IdentityWebApp -AppDetails $createdDetails -Label 'Newly Created Application (pre-update)'
     }
 
     if ($WhatIf) {
