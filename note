@@ -1,21 +1,19 @@
 <#
-CNA_Create_And_Update_Identity_WebApp.ps1
+CNA_Clone_And_Rename_Identity_App.ps1
 
-Flow
-1) Login to PAS as a regular user
-2) Validate the PAS account in the target Safe using exact match only
-3) Login to Identity as the same regular user
-4) Import app from GenericBrowserExtensionScript
-5) Wait/poll GetApplication until the app is ready
-6) Update the app using the provided exported app JSON as source parameters
-   - tries CBEScript first
-   - then tries documented Script field
-   - then narrows payload if needed
+Goal
+- Use a regular user to authenticate to PAS and CyberArk Identity
+- Validate the PAS account in the target Safe
+- Clone an existing app by source key
+- Prompt for the new cloned app name (default: g-test-pam1)
+- Rename the cloned app using direct UpdateApplicationDE
+- Avoid GetApplication entirely
 
-Notes
-- Reuses the SAME password entered initially
-- Keeps PAS lookup scoped to the target Safe only
-- Create step uses the already proven working template path
+Why this tactic
+- Import/create works in your tenant
+- GetApplication is returning 401
+- CyberArk supports cloning apps and later renaming them
+- UpdateApplicationDE supports minimal rename payloads keyed by _Rowkey
 #>
 
 [CmdletBinding()]
@@ -30,29 +28,23 @@ param(
     [string]$RegularUserName      = '',
     [string]$RegularUserPassword  = '',
 
-    # ===== Create / update settings =====
-    [string]$TemplateId           = 'GenericBrowserExtensionScript',
-    [string]$NewAppName           = 'g-test-pam1',
-    [string]$AppDescription       = 'GCP - Okta Prod created via CyberArk Identity API',
-
-    # ===== Export JSON from another app (used as source settings) =====
-    [string]$TemplateAppExportJson = @'
-{"CBEScript":"loginData.applicationUrl = \"https://cna.okta.com/login/default\";\n \nloginData.addField(\"username\", \"input#input28\", LoginUsername + \"@cna.com\");\nloginData.addField(\"password\", \"input[name='credentials.passcode']\", LoginPassword);\n \nloginData.formPattern = \"form\";\nloginData.globalSelectorTimeout = 10000;\n \nloginData.order = [\n  [\"fill\", \"username\"],\n  [\"fill\", \"password\"],\n  [\"click\", \"input[type='submit'][value='Sign in']\"]\n];","Name":"GCP - Okta Prod","Category":"_I18N_AppCategory_Other","DefaultAuthProfileInfo":{"Uuid":"AlwaysAllowed"},"DisplayName":"GCP - Okta Prod","OnPrem":true,"IsSwsEnabled":true,"ShowRegistration":false,"AdminTag":"_I18N_AppCategory_Other","UserNameStrategy":"SetByUser","Description":"_I18N_AppDesc_Generic_BE_Script","FormFillingEnabled":true,"Generic":true,"AppType":"Web","DefaultAuthProfile":"AlwaysAllowed","Icon":"/vfslow/lib/application/icons/GenericBrowserExtension.svg","AuthRules":{"_UniqueKey":"Condition","_Value":[],"Enabled":true,"_Type":"RowSet"},"WebAppType":"UsernamePassword","TemplateName":"GenericBrowserExtensionScript","Notes":"","LocalizationEnabled":false,"WebUPAppType":"BrowserExtensionScript","NotSelfService":true}
-'@,
+    # ===== Clone / rename settings =====
+    [string]$SourceAppKey         = '31946715-3381-489a-8fd1-4903eb8cce4b',
+    [string]$NewAppName           = '',
+    [string]$DefaultNewAppName    = 'g-test-pam1',
+    [string]$AppDescription       = 'Cloned and renamed via CyberArk Identity API',
 
     # ===== PAS validation =====
     [string]$SafeName             = 'CyberArkTestValidation',
     [string]$AccountName          = 'PC0VPXSB.cna.com-administrator',
 
     # ===== Retry tuning =====
-    [int]$InitialPostCreateDelaySeconds = 45,
-    [int]$GetApplicationRetryWindowSeconds = 420,
-    [int]$UpdateRetryWindowSeconds      = 300,
-    [int]$RetryIntervalSeconds          = 20,
+    [int]$RenameRetryWindowSeconds = 300,
+    [int]$RetryIntervalSeconds     = 20,
 
     # ===== Logging =====
-    [string]$LogPath              = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_And_Update.log',
-    [string]$ReportCsvPath        = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_And_Update_Report.csv'
+    [string]$LogPath              = 'E:\Installation Media\Script\OnboardScript\data\Identity_Clone_And_Rename.log',
+    [string]$ReportCsvPath        = 'E:\Installation Media\Script\OnboardScript\data\Identity_Clone_And_Rename_Report.csv'
 )
 
 try { Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force -ErrorAction Stop } catch {}
@@ -71,7 +63,6 @@ $script:IdentityUser              = $null
 $script:IdentityWebSession        = $null
 $script:PasCredential             = $null
 $script:RegularUserPlainPassword  = $null
-$script:ExportConfig              = $null
 $script:ReportRows                = @()
 
 function Write-Log {
@@ -111,7 +102,7 @@ function Add-ReportRow {
 function ConvertTo-JsonSafe {
     param([Parameter()][object]$Object)
     if ($null -eq $Object) { return $null }
-    return ($Object | ConvertTo-Json -Depth 100)
+    return ($Object | ConvertTo-Json -Depth 60)
 }
 
 function Get-HttpStatusCode {
@@ -181,18 +172,17 @@ function Get-RegularCredential {
     $script:PasCredential = [pscredential]::new($RegularUserName, $secure)
 }
 
-function Import-ExportConfig {
-    if ([string]::IsNullOrWhiteSpace($TemplateAppExportJson)) {
-        throw 'TemplateAppExportJson cannot be empty.'
+function Get-NewAppNameInteractive {
+    if (-not [string]::IsNullOrWhiteSpace($NewAppName)) {
+        return $NewAppName
     }
 
-    try {
-        $script:ExportConfig = $TemplateAppExportJson | ConvertFrom-Json -ErrorAction Stop
-        Write-Log "Source app JSON parsed successfully." "Green"
-        Add-ReportRow -Step 'Parse Source JSON' -Status 'SUCCESS' -Detail 'Source app JSON loaded'
-    } catch {
-        throw ("Failed to parse TemplateAppExportJson: {0}" -f $_.Exception.Message)
+    $entered = Read-Host ("Enter the new cloned app name [{0}]" -f $DefaultNewAppName)
+    if ([string]::IsNullOrWhiteSpace($entered)) {
+        return $DefaultNewAppName
     }
+
+    return $entered.Trim()
 }
 
 function Should-Retry {
@@ -216,14 +206,8 @@ function Invoke-EventuallyConsistentStep {
         [Parameter(Mandatory)][scriptblock]$Operation,
         [Parameter(Mandatory)][string]$OperationName,
         [Parameter(Mandatory)][int]$MaxWaitSeconds,
-        [int]$InitialDelaySeconds = 0,
         [int]$IntervalSeconds = 15
     )
-
-    if ($InitialDelaySeconds -gt 0) {
-        Write-Log ("Waiting {0} second(s) before starting {1}..." -f $InitialDelaySeconds, $OperationName) 'Yellow'
-        Start-Sleep -Seconds $InitialDelaySeconds
-    }
 
     $deadline = (Get-Date).AddSeconds($MaxWaitSeconds)
     $attempt = 0
@@ -294,7 +278,7 @@ function Start-PASSessionFromRegularUser {
 }
 
 # ------------------------------------------------------------
-# Identity interactive auth
+# Identity auth
 # ------------------------------------------------------------
 function Get-AuthPayload {
     param([Parameter(Mandatory)]$Response)
@@ -620,236 +604,157 @@ function Find-VaultAccountInSafeOnly {
 }
 
 # ------------------------------------------------------------
-# App create + get + update
+# Clone + rename
 # ------------------------------------------------------------
-function Import-AppFromTemplate {
-    param([Parameter(Mandatory)][string]$TemplateId)
+function Parse-CloneResponseRowKey {
+    param([Parameter(Mandatory)]$Response)
 
-    $uri = $IdentityApiTenantURL.TrimEnd('/') + '/SaasManage/ImportAppFromTemplate'
-    $body = @{ ID = @($TemplateId) }
-
-    $resp = Invoke-IdentityRequestWithRetry -Method 'POST' -AbsoluteUris @($uri) -Body $body -LogicalName 'ImportAppFromTemplate'
-    if (-not $resp.success) {
-        throw ('ImportAppFromTemplate returned success=false: ' + ($resp.Message | Out-String))
+    $result = Get-DirectField -Object $Response -FieldName 'Result'
+    if ($null -ne $result) {
+        if ($result -is [System.Collections.IEnumerable] -and -not ($result -is [string])) {
+            foreach ($item in $result) {
+                $rk = [string](Get-DirectField -Object $item -FieldName '_RowKey')
+                if ([string]::IsNullOrWhiteSpace($rk)) { $rk = [string](Get-DirectField -Object $item -FieldName '_Rowkey') }
+                if (-not [string]::IsNullOrWhiteSpace($rk)) { return $rk }
+            }
+        } else {
+            $rk = [string](Get-DirectField -Object $result -FieldName '_RowKey')
+            if ([string]::IsNullOrWhiteSpace($rk)) { $rk = [string](Get-DirectField -Object $result -FieldName '_Rowkey') }
+            if (-not [string]::IsNullOrWhiteSpace($rk)) { return $rk }
+        }
     }
 
-    $resultItems = @($resp.Result)
-    if ($resultItems.Count -lt 1) {
-        throw 'ImportAppFromTemplate returned no result items.'
-    }
-
-    $first = $resultItems[0]
-    $created = Get-DirectField -Object $first -FieldName 'success'
-    if ($created -ne $true) {
-        $idVal = [string](Get-DirectField -Object $first -FieldName 'ID')
-        $msg = [string](Get-DirectField -Object $first -FieldName 'Message')
-        throw ("ImportAppFromTemplate result item failed. ID={0}; Message={1}" -f $idVal, $msg)
-    }
-
-    $rowKey = [string](Get-DirectField -Object $first -FieldName '_RowKey')
-    if ([string]::IsNullOrWhiteSpace($rowKey)) {
-        $rowKey = [string](Get-DirectField -Object $first -FieldName '_Rowkey')
-    }
-
-    if ([string]::IsNullOrWhiteSpace($rowKey)) {
-        throw 'ImportAppFromTemplate did not return _RowKey.'
-    }
-
-    Write-Log ("Imported new application from template '{0}'. New _RowKey='{1}'." -f $TemplateId, $rowKey) 'Green'
-    Add-ReportRow -Step 'Import App From Template' -Status 'SUCCESS' -Detail ("TemplateID={0}; RowKey={1}" -f $TemplateId, $rowKey)
-    return $rowKey
+    $rk2 = [string](Get-DirectField -Object $Response -FieldName '_RowKey')
+    if ([string]::IsNullOrWhiteSpace($rk2)) { $rk2 = [string](Get-DirectField -Object $Response -FieldName '_Rowkey') }
+    return $rk2
 }
 
-function Get-ApplicationByRowKey {
-    param([Parameter(Mandatory)][string]$RowKey)
+function Clone-AppFromExisting {
+    param([Parameter(Mandatory)][string]$SourceKey)
 
-    $uri = $IdentityApiTenantURL.TrimEnd('/') + '/SaasManage/GetApplication'
-    $body = @{ _Rowkey = $RowKey }
-
-    $resp = Invoke-IdentityRequestWithRetry -Method 'POST' -AbsoluteUris @($uri) -Body $body -LogicalName 'GetApplication'
-    if (-not $resp.success) {
-        throw ('GetApplication returned success=false: ' + ($resp.Message | Out-String))
-    }
-
-    return $resp.Result
-}
-
-function Wait-ForCreatedApplication {
-    param([Parameter(Mandatory)][string]$RowKey)
-
-    return Invoke-EventuallyConsistentStep `
-        -Operation { Get-ApplicationByRowKey -RowKey $RowKey } `
-        -OperationName 'GetApplication' `
-        -MaxWaitSeconds $GetApplicationRetryWindowSeconds `
-        -InitialDelaySeconds $InitialPostCreateDelaySeconds `
-        -IntervalSeconds $RetryIntervalSeconds
-}
-
-function Get-CommonUpdateFields {
-    param(
-        [Parameter(Mandatory)][string]$RowKey,
-        [Parameter(Mandatory)][string]$NewName,
-        [Parameter(Mandatory)][string]$Description,
-        [Parameter(Mandatory)]$ExportConfig
+    $candidateUris = @(
+        ($IdentityApiTenantURL.TrimEnd('/') + '/SaasManage/CloneApplication'),
+        ($IdentityApiTenantURL.TrimEnd('/') + '/SaasManage/CloneExistingApplication')
     )
 
-    $h = [ordered]@{
-        _Rowkey     = $RowKey
-        Name        = $NewName
-        Description = $Description
-        DisplayName = $NewName
-    }
+    $payloads = @(
+        @{ _RowKey = $SourceKey },
+        @{ _Rowkey = $SourceKey },
+        @{ ID      = $SourceKey },
+        @{ Application = $SourceKey }
+    )
 
-    foreach ($field in @(
-        'AppType','WebAppType','WebUPAppType','UserNameStrategy',
-        'OnPrem','IsSwsEnabled','ShowRegistration','FormFillingEnabled','Generic',
-        'DefaultAuthProfile','DefaultAuthProfileInfo','AuthRules','NotSelfService',
-        'LocalizationEnabled','Notes','Category','AdminTag'
-    )) {
-        if ($ExportConfig.PSObject.Properties.Name -contains $field) {
-            $value = $ExportConfig.$field
-            if ($null -ne $value) {
-                $h[$field] = $value
+    foreach ($uri in $candidateUris) {
+        foreach ($payload in $payloads) {
+            try {
+                Write-Log ("Trying clone using URI '{0}' and payload keys [{1}]..." -f $uri, (($payload.Keys) -join ',')) 'Gray'
+                $resp = Invoke-IdentityRequestWithRetry -Method 'POST' -AbsoluteUris @($uri) -Body $payload -LogicalName 'CloneApplication'
+
+                $success = Get-DirectField -Object $resp -FieldName 'success'
+                if ($success -ne $true) {
+                    $msg = [string](Get-DirectField -Object $resp -FieldName 'Message')
+                    throw ("Clone call returned success=false. Message={0}" -f $msg)
+                }
+
+                $rowKey = Parse-CloneResponseRowKey -Response $resp
+                if ([string]::IsNullOrWhiteSpace($rowKey)) {
+                    throw 'Clone call succeeded but did not return a new _RowKey.'
+                }
+
+                Write-Log ("Cloned source application '{0}'. New cloned app _RowKey='{1}'." -f $SourceKey, $rowKey) 'Green'
+                Add-ReportRow -Step 'Clone Application' -Status 'SUCCESS' -Detail ("SourceAppKey={0}; NewRowKey={1}; Uri={2}; PayloadKeys={3}" -f $SourceKey, $rowKey, $uri, (($payload.Keys) -join ','))
+                return $rowKey
+            } catch {
+                Write-Log ("Clone attempt failed on URI '{0}' with payload keys [{1}]: {2}" -f $uri, (($payload.Keys) -join ','), $_.Exception.Message) 'Yellow'
             }
         }
     }
 
-    if ($ExportConfig.PSObject.Properties.Name -contains 'Icon' -and -not [string]::IsNullOrWhiteSpace([string]$ExportConfig.Icon)) {
-        $h['IconUri'] = [string]$ExportConfig.Icon
-    }
-
-    return $h
+    throw 'All clone endpoint/payload variants failed.'
 }
 
-function New-UpdatePayloadVariants {
+function New-RenamePayloadVariants {
     param(
         [Parameter(Mandatory)][string]$RowKey,
         [Parameter(Mandatory)][string]$NewName,
-        [Parameter(Mandatory)][string]$Description,
-        [Parameter(Mandatory)]$ExportConfig
+        [Parameter(Mandatory)][string]$Description
     )
 
-    $base = Get-CommonUpdateFields -RowKey $RowKey -NewName $NewName -Description $Description -ExportConfig $ExportConfig
-    $scriptText = [string]$ExportConfig.CBEScript
-
-    $variants = @()
-
-    # Broad payload with inferred CBEScript
-    $v1 = [ordered]@{}
-    foreach ($k in $base.Keys) { $v1[$k] = $base[$k] }
-    $v1['CBEScript'] = $scriptText
-    $variants += ,$v1
-
-    # Broad payload with documented Script
-    $v2 = [ordered]@{}
-    foreach ($k in $base.Keys) { $v2[$k] = $base[$k] }
-    $v2['Script'] = $scriptText
-    $variants += ,$v2
-
-    # Broad payload with both
-    $v3 = [ordered]@{}
-    foreach ($k in $base.Keys) { $v3[$k] = $base[$k] }
-    $v3['CBEScript'] = $scriptText
-    $v3['Script']    = $scriptText
-    $variants += ,$v3
-
-    # Narrow payload with CBEScript
-    $v4 = [ordered]@{
-        _Rowkey     = $RowKey
-        Name        = $NewName
-        Description = $Description
-        DisplayName = $NewName
-        CBEScript   = $scriptText
-    }
-    $variants += ,$v4
-
-    # Narrow payload with Script
-    $v5 = [ordered]@{
-        _Rowkey     = $RowKey
-        Name        = $NewName
-        Description = $Description
-        DisplayName = $NewName
-        Script      = $scriptText
-    }
-    $variants += ,$v5
-
-    # Minimal documented payload
-    $v6 = [ordered]@{
-        _Rowkey     = $RowKey
-        Name        = $NewName
-        Description = $Description
-    }
-    if ($base.Contains('IconUri')) { $v6['IconUri'] = $base['IconUri'] }
-    $variants += ,$v6
-
-    # Try _RowKey casing variants too
-    $expanded = @()
-    foreach ($v in $variants) {
-        $expanded += ,$v
-
-        $alt = [ordered]@{}
-        foreach ($k in $v.Keys) {
-            if ($k -eq '_Rowkey') {
-                $alt['_RowKey'] = $v[$k]
-            } else {
-                $alt[$k] = $v[$k]
-            }
+    return @(
+        [ordered]@{
+            _Rowkey     = $RowKey
+            Name        = $NewName
+            Description = $Description
+        },
+        [ordered]@{
+            _RowKey     = $RowKey
+            Name        = $NewName
+            Description = $Description
+        },
+        [ordered]@{
+            _Rowkey     = $RowKey
+            Name        = $NewName
+            DisplayName = $NewName
+            Description = $Description
+        },
+        [ordered]@{
+            _RowKey     = $RowKey
+            Name        = $NewName
+            DisplayName = $NewName
+            Description = $Description
         }
-        $expanded += ,$alt
-    }
-
-    return ,$expanded
+    )
 }
 
-function Update-ApplicationWithFallbacks {
+function Rename-ClonedApplication {
     param(
         [Parameter(Mandatory)][string]$RowKey,
         [Parameter(Mandatory)][string]$NewName,
-        [Parameter(Mandatory)][string]$Description,
-        [Parameter(Mandatory)]$ExportConfig
+        [Parameter(Mandatory)][string]$Description
     )
 
     $uri = $IdentityApiTenantURL.TrimEnd('/') + '/SaasManage/UpdateApplicationDE'
-    $variants = New-UpdatePayloadVariants -RowKey $RowKey -NewName $NewName -Description $Description -ExportConfig $ExportConfig
+    $variants = New-RenamePayloadVariants -RowKey $RowKey -NewName $NewName -Description $Description
 
-    $attempt = 0
     foreach ($payload in $variants) {
-        $attempt++
         try {
-            Write-Log ("Trying UpdateApplicationDE payload variant #{0}..." -f $attempt) 'Gray'
+            Write-Log ("Trying rename with UpdateApplicationDE payload keys [{0}]..." -f (($payload.Keys) -join ',')) 'Gray'
             $resp = Invoke-IdentityRequestWithRetry -Method 'POST' -AbsoluteUris @($uri) -Body $payload -LogicalName 'UpdateApplicationDE'
-            if (-not $resp.success) {
-                throw ('UpdateApplicationDE returned success=false: ' + ($resp.Message | Out-String))
+            $success = Get-DirectField -Object $resp -FieldName 'success'
+            if ($success -ne $true) {
+                $msg = [string](Get-DirectField -Object $resp -FieldName 'Message')
+                throw ("UpdateApplicationDE returned success=false. Message={0}" -f $msg)
             }
 
-            Write-Log ("UpdateApplicationDE succeeded on payload variant #{0}." -f $attempt) 'Green'
-            Add-ReportRow -Step 'Update Application' -Status 'SUCCESS' -Detail ("RowKey={0}; Variant={1}" -f $RowKey, $attempt)
+            Write-Log ("Rename succeeded for cloned app '{0}' -> '{1}'." -f $RowKey, $NewName) 'Green'
+            Add-ReportRow -Step 'Rename Cloned Application' -Status 'SUCCESS' -Detail ("RowKey={0}; NewName={1}; PayloadKeys={2}" -f $RowKey, $NewName, (($payload.Keys) -join ','))
             return
         } catch {
-            Write-Log ("UpdateApplicationDE variant #{0} failed: {1}" -f $attempt, $_.Exception.Message) 'Yellow'
+            Write-Log ("Rename payload failed [{0}]: {1}" -f (($payload.Keys) -join ','), $_.Exception.Message) 'Yellow'
         }
     }
 
-    throw 'All UpdateApplicationDE payload variants failed.'
+    throw 'All direct UpdateApplicationDE rename payloads failed.'
 }
 
 # ------------------------------------------------------------
 # MAIN
 # ------------------------------------------------------------
-$newAppKey  = $null
-$appDetails = $null
+$resolvedNewAppName = $null
+$clonedRowKey = $null
 
 try {
-    if ([string]::IsNullOrWhiteSpace($TemplateId))   { throw 'TemplateId cannot be empty.' }
-    if ([string]::IsNullOrWhiteSpace($NewAppName))   { throw 'NewAppName cannot be empty.' }
-    if ([string]::IsNullOrWhiteSpace($SafeName))     { throw 'SafeName cannot be empty.' }
-    if ([string]::IsNullOrWhiteSpace($AccountName))  { throw 'AccountName cannot be empty.' }
+    if ([string]::IsNullOrWhiteSpace($SourceAppKey)) { throw 'SourceAppKey cannot be empty.' }
+    if ([string]::IsNullOrWhiteSpace($SafeName))    { throw 'SafeName cannot be empty.' }
+    if ([string]::IsNullOrWhiteSpace($AccountName)) { throw 'AccountName cannot be empty.' }
 
     Get-RegularCredential
-    Import-ExportConfig
+    $resolvedNewAppName = Get-NewAppNameInteractive
 
     Write-Log ("Using regular user credential '{0}' for both PAS and Identity login." -f $script:PasCredential.UserName) 'Cyan'
+    Write-Log ("Requested cloned app name: '{0}'." -f $resolvedNewAppName) 'Cyan'
     Add-ReportRow -Step 'Credential Mode' -Status 'INFO' -Detail ("Regular user login as {0}" -f $script:PasCredential.UserName)
+    Add-ReportRow -Step 'Requested Name' -Status 'INFO' -Detail ("NewAppName={0}" -f $resolvedNewAppName)
 
     Start-PASSessionFromRegularUser
     $null = Find-VaultAccountInSafeOnly -SafeName $SafeName -AccountIdentifier $AccountName
@@ -858,20 +763,18 @@ try {
     Write-Log "Using regular user Identity login for app-management operations." "Yellow"
     Add-ReportRow -Step 'Identity Login Mode' -Status 'INFO' -Detail 'Regular user login'
 
-    $newAppKey = Import-AppFromTemplate -TemplateId $TemplateId
-    $appDetails = Wait-ForCreatedApplication -RowKey $newAppKey
+    $clonedRowKey = Clone-AppFromExisting -SourceKey $SourceAppKey
 
     Invoke-EventuallyConsistentStep `
         -Operation {
-            Update-ApplicationWithFallbacks -RowKey $newAppKey -NewName $NewAppName -Description $AppDescription -ExportConfig $script:ExportConfig
+            Rename-ClonedApplication -RowKey $clonedRowKey -NewName $resolvedNewAppName -Description $AppDescription
         } `
-        -OperationName 'UpdateApplicationDE' `
-        -MaxWaitSeconds $UpdateRetryWindowSeconds `
-        -InitialDelaySeconds 0 `
+        -OperationName 'Rename Cloned Application' `
+        -MaxWaitSeconds $RenameRetryWindowSeconds `
         -IntervalSeconds $RetryIntervalSeconds
 
-    Write-Log ("Create + update completed successfully. Created/updated app row key is '{0}'." -f $newAppKey) 'Green'
-    Add-ReportRow -Step 'Overall' -Status 'SUCCESS' -Detail ("RowKey={0}; FinalName={1}" -f $newAppKey, $NewAppName)
+    Write-Log ("Clone + rename completed successfully. New app row key is '{0}'." -f $clonedRowKey) 'Green'
+    Add-ReportRow -Step 'Overall' -Status 'SUCCESS' -Detail ("SourceAppKey={0}; NewRowKey={1}; NewAppName={2}" -f $SourceAppKey, $clonedRowKey, $resolvedNewAppName)
 }
 catch {
     Write-Log ("FAILED: {0}" -f $_.Exception.Message) 'Red'
