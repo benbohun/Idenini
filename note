@@ -1,5 +1,5 @@
 <#
-CNA_Create_Identity_WebApp_From_Json_RegularUser.ps1
+CNA_Create_Identity_WebApp_From_Json_RegularUser_NoGetApplication.ps1
 
 Purpose
 - Use a REGULAR user credential (not CCP, not service user)
@@ -11,12 +11,18 @@ Purpose
 - Apply direct application permissions to a target group
 - Validate PAS account input using safe-only exact lookup
 
-Notes
-- IdentityApiTenantURL should be the preferred tenant URL if your tenant has one
-  Example: https://yourtenant.my.idaptive.app
-- IdentityTenantURL is used for PAS header/session creation
-- This script skips GetUserInfo and skips Redrock/query entirely
-- If your regular user is challenged for MFA on the Identity API login, the script will prompt for it
+Important behavior
+- NO GetApplication call
+- NO Redrock/query call
+- NO GetUserInfo call
+
+Flow
+1. PAS login as regular user
+2. Safe-only exact PAS account validation
+3. Identity login as regular user
+4. ImportAppFromTemplate
+5. UpdateApplicationDE using returned _RowKey
+6. SetApplicationPermissions using returned _RowKey only
 #>
 
 [CmdletBinding()]
@@ -54,8 +60,8 @@ param(
     [string]$SourceAppExportJson  = '',
 
     # ===== Logging =====
-    [string]$LogPath              = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_From_Json_RegularUser.log',
-    [string]$ReportCsvPath        = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_From_Json_RegularUser_Report.csv',
+    [string]$LogPath              = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_From_Json_RegularUser_NoGetApplication.log',
+    [string]$ReportCsvPath        = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_From_Json_RegularUser_NoGetApplication_Report.csv',
 
     # ===== Advanced =====
     [switch]$WhatIf
@@ -295,13 +301,10 @@ function Get-MechanismPrompt {
     $type   = [string](Get-DirectField -Object $Mechanism -FieldName 'AnswerType')
 
     if ($name -eq 'UP' -or $prompt -match 'Password') {
-        # Reuse the same known password if it exists
         if (-not [string]::IsNullOrWhiteSpace($RegularUserPassword)) {
             return @{
                 Action = 'Answer'
                 Answer = $RegularUserPassword
-                Name   = $name
-                Prompt = $prompt
             }
         }
 
@@ -309,8 +312,6 @@ function Get-MechanismPrompt {
         return @{
             Action = 'Answer'
             Answer = (Convert-SecureStringToPlainText -SecureString $secure)
-            Name   = $name
-            Prompt = $prompt
         }
     }
 
@@ -320,8 +321,6 @@ function Get-MechanismPrompt {
     return @{
         Action = 'Answer'
         Answer = $answer
-        Name   = $name
-        Prompt = $prompt
     }
 }
 
@@ -556,7 +555,7 @@ function Find-VaultAccountInSafeOnly {
     }
 
     if ($matches.Count -lt 1) {
-        throw ("No exact PAS account match was found in Safe '{0}' for identifier '{1}'. The script will not continue with a fuzzy match." -f $SafeName, $AccountIdentifier)
+        throw ("No exact PAS account match was found in Safe '{0}' for identifier '{1}'. The script will not continue with a fuzzy match." -f $SafeName, $AccountName)
     }
 
     if ($matches.Count -gt 1) {
@@ -661,67 +660,6 @@ function Import-AppFromTemplateAdaptive {
     }
 
     throw 'All ImportAppFromTemplate attempts failed.'
-}
-
-function Get-IdentityApplicationDetails {
-    param([Parameter(Mandatory)][string]$AppKey)
-
-    $uri = $IdentityApiTenantURL.TrimEnd('/') + '/SaasManage/GetApplication?_RowKey=' + [uri]::EscapeDataString($AppKey)
-    $resp = Invoke-IdentityApiWithRetry -AbsoluteUris @($uri) -LogicalName 'GetApplication'
-    if (-not $resp.success) { throw ('GetApplication failed: ' + ($resp.Message | Out-String)) }
-    return $resp.Result
-}
-
-function Assert-IdentityWebApp {
-    param(
-        [Parameter(Mandatory)][object]$AppDetails,
-        [Parameter(Mandatory)][string]$Label
-    )
-
-    $appTypeDisplay = [string](Get-DirectField -Object $AppDetails -FieldName 'AppTypeDisplayName')
-    $appType        = [string](Get-DirectField -Object $AppDetails -FieldName 'AppType')
-    $webUPAppType   = [string](Get-DirectField -Object $AppDetails -FieldName 'WebUPAppType')
-    $templateName   = [string](Get-DirectField -Object $AppDetails -FieldName 'TemplateName')
-    $name           = [string](Get-DirectField -Object $AppDetails -FieldName 'Name')
-
-    $isWeb = $false
-    if ($appTypeDisplay -match '^Web') { $isWeb = $true }
-    elseif ($appType -eq 'Web')        { $isWeb = $true }
-    elseif (-not [string]::IsNullOrWhiteSpace($webUPAppType)) { $isWeb = $true }
-
-    if (-not $isWeb) {
-        throw ("{0} is not a Web App. Name='{1}' AppTypeDisplayName='{2}' AppType='{3}' WebUPAppType='{4}' TemplateName='{5}'" -f $Label, $name, $appTypeDisplay, $appType, $webUPAppType, $templateName)
-    }
-
-    Write-Log ("Validated {0} as Web App. Name='{1}' Template='{2}' AppTypeDisplayName='{3}' WebUPAppType='{4}'" -f $Label, $name, $templateName, $appTypeDisplay, $webUPAppType) 'Green'
-    Add-ReportRow -Step ("Validate {0}" -f $Label) -Status 'SUCCESS' -Detail ("Name={0}; Template={1}; AppTypeDisplayName={2}; WebUPAppType={3}" -f $name, $templateName, $appTypeDisplay, $webUPAppType)
-}
-
-function Assert-AppScriptPresent {
-    param(
-        [Parameter(Mandatory)][object]$AppDetails,
-        [Parameter(Mandatory)][string]$ExpectedUrl
-    )
-
-    $scriptText = [string](Get-DirectField -Object $AppDetails -FieldName 'CBEScript')
-    if ([string]::IsNullOrWhiteSpace($scriptText)) {
-        $scriptText = [string](Get-DirectField -Object $AppDetails -FieldName 'UserPassScript')
-    }
-
-    if ([string]::IsNullOrWhiteSpace($scriptText)) {
-        Write-Log 'WARNING: Updated app does not appear to return CBEScript/UserPassScript in GetApplication.' 'Yellow'
-        Add-ReportRow -Step 'Validate Script' -Status 'WARNING' -Detail 'GetApplication did not return CBEScript/UserPassScript.'
-        return
-    }
-
-    if ($scriptText -notmatch [regex]::Escape($ExpectedUrl)) {
-        Write-Log ("WARNING: Updated script does not contain expected applicationUrl '{0}'." -f $ExpectedUrl) 'Yellow'
-        Add-ReportRow -Step 'Validate Script' -Status 'WARNING' -Detail ("Expected applicationUrl {0} not found in returned script." -f $ExpectedUrl)
-        return
-    }
-
-    Write-Log ("Validated Browser Extension script contains expected applicationUrl '{0}'." -f $ExpectedUrl) 'Green'
-    Add-ReportRow -Step 'Validate Script' -Status 'SUCCESS' -Detail ("applicationUrl {0} found in returned script." -f $ExpectedUrl)
 }
 
 function New-AppUpdatePayloadVariants {
@@ -838,135 +776,8 @@ function Update-IdentityApplicationFromConfig {
 }
 
 # ------------------------------------------------------------
-# Permission helpers
+# Blind permission write - no GetApplication
 # ------------------------------------------------------------
-function Find-FirstPropertyValue {
-    param(
-        [Parameter(Mandatory)]$Object,
-        [Parameter(Mandatory)][string[]]$Names,
-        [int]$Depth = 0,
-        [int]$MaxDepth = 8
-    )
-
-    if ($null -eq $Object -or $Depth -gt $MaxDepth) { return $null }
-    if ($Object -is [string] -or $Object -is [ValueType]) { return $null }
-
-    if ($Object -is [System.Collections.IDictionary]) {
-        foreach ($name in $Names) {
-            if ($Object.Contains($name) -and $null -ne $Object[$name]) { return $Object[$name] }
-        }
-        foreach ($key in $Object.Keys) {
-            $v = Find-FirstPropertyValue -Object $Object[$key] -Names $Names -Depth ($Depth + 1) -MaxDepth $MaxDepth
-            if ($null -ne $v) { return $v }
-        }
-        return $null
-    }
-
-    if ($Object -is [System.Collections.IEnumerable] -and -not ($Object -is [string])) {
-        foreach ($item in $Object) {
-            $v = Find-FirstPropertyValue -Object $item -Names $Names -Depth ($Depth + 1) -MaxDepth $MaxDepth
-            if ($null -ne $v) { return $v }
-        }
-        return $null
-    }
-
-    if ($Object.PSObject) {
-        foreach ($name in $Names) {
-            if ($Object.PSObject.Properties.Name -contains $name) {
-                $v = $Object.$name
-                if ($null -ne $v -and -not [string]::IsNullOrWhiteSpace([string]$v)) { return $v }
-            }
-        }
-
-        foreach ($p in $Object.PSObject.Properties) {
-            $v = Find-FirstPropertyValue -Object $p.Value -Names $Names -Depth ($Depth + 1) -MaxDepth $MaxDepth
-            if ($null -ne $v) { return $v }
-        }
-    }
-
-    return $null
-}
-
-function Find-GrantArray {
-    param(
-        [Parameter(Mandatory)]$Object,
-        [int]$Depth = 0,
-        [int]$MaxDepth = 8
-    )
-
-    if ($null -eq $Object -or $Depth -gt $MaxDepth) { return $null }
-    if ($Object -is [string] -or $Object -is [ValueType]) { return $null }
-
-    if ($Object -is [System.Collections.IEnumerable] -and -not ($Object -is [string])) {
-        $arr = @($Object)
-        if ($arr.Count -gt 0) {
-            $first = $arr[0]
-            $props = @()
-            if ($first -is [System.Collections.IDictionary]) {
-                $props = @($first.Keys)
-            } elseif ($first.PSObject) {
-                $props = @($first.PSObject.Properties.Name)
-            }
-
-            if (($props -contains 'Principal') -or ($props -contains 'PrincipalId') -or ($props -contains 'Rights') -or (($props -contains 'PType') -and ($props -contains 'Type'))) {
-                return $arr
-            }
-        }
-
-        foreach ($item in $arr) {
-            $found = Find-GrantArray -Object $item -Depth ($Depth + 1) -MaxDepth $MaxDepth
-            if ($found) { return $found }
-        }
-        return $null
-    }
-
-    if ($Object -is [System.Collections.IDictionary]) {
-        foreach ($key in $Object.Keys) {
-            $found = Find-GrantArray -Object $Object[$key] -Depth ($Depth + 1) -MaxDepth $MaxDepth
-            if ($found) { return $found }
-        }
-        return $null
-    }
-
-    if ($Object.PSObject) {
-        foreach ($p in $Object.PSObject.Properties) {
-            $found = Find-GrantArray -Object $p.Value -Depth ($Depth + 1) -MaxDepth $MaxDepth
-            if ($found) { return $found }
-        }
-    }
-
-    return $null
-}
-
-function Get-AppPermissionState {
-    param([Parameter(Mandatory)][string]$AppKey)
-
-    $details = Get-IdentityApplicationDetails -AppKey $AppKey
-
-    $rowKey = $AppKey
-    $idVal  = $null
-    $pvid   = $null
-
-    $tmpRowKey = Find-FirstPropertyValue -Object $details -Names @('_RowKey','_Rowkey','RowKey')
-    if ($tmpRowKey) { $rowKey = [string]$tmpRowKey }
-
-    $tmpId = Find-FirstPropertyValue -Object $details -Names @('ID','AppID')
-    if ($tmpId) { $idVal = [string]$tmpId }
-
-    $tmpPvid = Find-FirstPropertyValue -Object $details -Names @('PVID','PVId','PermissionVersionId')
-    if ($tmpPvid) { $pvid = [string]$tmpPvid }
-
-    $grants = Find-GrantArray -Object $details
-
-    return [pscustomobject]@{
-        Details = $details
-        RowKey  = $rowKey
-        ID      = $idVal
-        PVID    = $pvid
-        Grants  = $grants
-    }
-}
-
 function New-GrantCandidates {
     param([Parameter(Mandatory)][string]$Rights)
 
@@ -1003,85 +814,31 @@ function New-GrantCandidates {
     return $candidates
 }
 
-function Get-MergedGrantSet {
-    param(
-        [Parameter()][object[]]$ExistingGrants,
-        [Parameter(Mandatory)][object]$NewGrant
-    )
-
-    if (-not $ExistingGrants -or @($ExistingGrants).Count -lt 1) {
-        Write-Log 'No existing grants were discovered. Will try applying only the target group grant.' 'Yellow'
-        Add-ReportRow -Step 'Inspect App Permissions' -Status 'INFO' -Detail 'No existing grants discovered; attempting to set only the target group grant.'
-        return @($NewGrant)
-    }
-
-    $merged = New-Object System.Collections.Generic.List[object]
-    $found = $false
-
-    foreach ($g in @($ExistingGrants)) {
-        $principalId = [string](Get-DirectField -Object $g -FieldName 'PrincipalId')
-        $systemName  = [string](Get-DirectField -Object $g -FieldName 'SystemName')
-        $principal   = [string](Get-DirectField -Object $g -FieldName 'Principal')
-
-        $isTarget = $false
-        if (-not [string]::IsNullOrWhiteSpace($TargetGroupInternalName) -and $principalId -eq $TargetGroupInternalName) { $isTarget = $true }
-        elseif (-not [string]::IsNullOrWhiteSpace($TargetGroupSystemName) -and $systemName -eq $TargetGroupSystemName) { $isTarget = $true }
-        elseif (-not [string]::IsNullOrWhiteSpace($TargetGroupDisplayName) -and $principal -eq $TargetGroupDisplayName) { $isTarget = $true }
-        elseif (-not [string]::IsNullOrWhiteSpace($TargetGroupSystemName) -and $principal -eq $TargetGroupSystemName) { $isTarget = $true }
-
-        if ($isTarget) {
-            $merged.Add($NewGrant) | Out-Null
-            $found = $true
-        } else {
-            $merged.Add($g) | Out-Null
-        }
-    }
-
-    if (-not $found) {
-        $merged.Add($NewGrant) | Out-Null
-    }
-
-    return @($merged)
-}
-
-function New-SetPermissionsBodies {
+function New-SetPermissionsBodiesBlind {
     param(
         [Parameter(Mandatory)][object[]]$Grants,
-        [Parameter(Mandatory)][object]$State
+        [Parameter(Mandatory)][string]$AppRowKey
     )
 
     $bodies = @()
 
     $bodies += [ordered]@{
         Grants = $Grants
-        ID     = $(if ($State.ID) { $State.ID } else { '' })
-        RowKey = $(if ($State.RowKey) { $State.RowKey } else { '' })
-        PVID   = $(if ($State.PVID) { $State.PVID } else { '' })
+        RowKey = $AppRowKey
     }
 
     $bodies += [ordered]@{
         Grants = $Grants
-        RowKey = $(if ($State.RowKey) { $State.RowKey } else { '' })
-        PVID   = $(if ($State.PVID) { $State.PVID } else { '' })
-    }
-
-    $bodies += [ordered]@{
-        Grants = $Grants
-        RowKey = $(if ($State.RowKey) { $State.RowKey } else { '' })
+        RowKey = $AppRowKey
+        ID     = ''
+        PVID   = ''
     }
 
     return $bodies
 }
 
-function Set-ApplicationPermissionsDirectGroup {
+function Set-ApplicationPermissionsDirectGroupBlind {
     param([Parameter(Mandatory)][string]$AppRowKey)
-
-    $state = Get-AppPermissionState -AppKey $AppRowKey
-    $existingGrantCount = 0
-    if ($state.Grants) { $existingGrantCount = @($state.Grants).Count }
-
-    Write-Log ("Discovered app permission metadata. RowKey='{0}' ID='{1}' PVID='{2}' ExistingGrantCount='{3}'" -f $state.RowKey, $state.ID, $state.PVID, $existingGrantCount) 'Gray'
-    Add-ReportRow -Step 'Inspect App Permissions' -Status 'SUCCESS' -Detail ("RowKey={0}; ID={1}; PVID={2}; ExistingGrantCount={3}" -f $state.RowKey, $state.ID, $state.PVID, $existingGrantCount)
 
     $rightsCandidates = @(
         'View,Run,AutoDeploy',
@@ -1093,14 +850,14 @@ function Set-ApplicationPermissionsDirectGroup {
 
     foreach ($rights in $rightsCandidates) {
         foreach ($grant in (New-GrantCandidates -Rights $rights)) {
-            $merged = Get-MergedGrantSet -ExistingGrants @($state.Grants) -NewGrant $grant
-            foreach ($body in (New-SetPermissionsBodies -Grants $merged -State $state)) {
+            $grantArray = @($grant)
+            foreach ($body in (New-SetPermissionsBodiesBlind -Grants $grantArray -AppRowKey $AppRowKey)) {
                 try {
-                    Write-Log ("Trying SetApplicationPermissions with Rights='{0}' Principal='{1}' SystemName='{2}'..." -f $rights, $grant.Principal, $grant.SystemName) 'Gray'
+                    Write-Log ("Trying blind SetApplicationPermissions with Rights='{0}' Principal='{1}' SystemName='{2}'..." -f $rights, $grant.Principal, $grant.SystemName) 'Gray'
                     $resp = Invoke-IdentityApiWithRetry -AbsoluteUris @($uri) -Body $body -LogicalName 'SetApplicationPermissions'
                     if ($resp.success) {
                         Write-Log ("Direct group permission assignment succeeded for group '{0}' using Rights='{1}'." -f $grant.SystemName, $rights) 'Green'
-                        Add-ReportRow -Step 'Set Application Permissions' -Status 'SUCCESS' -Detail ("Group={0}; Rights={1}; RowKey={2}" -f $grant.SystemName, $rights, $state.RowKey)
+                        Add-ReportRow -Step 'Set Application Permissions' -Status 'SUCCESS' -Detail ("Group={0}; Rights={1}; RowKey={2}" -f $grant.SystemName, $rights, $AppRowKey)
                         return
                     }
                 } catch {
@@ -1109,22 +866,20 @@ function Set-ApplicationPermissionsDirectGroup {
                         throw "SetApplicationPermissions returned 401 Unauthorized for the regular user."
                     }
 
-                    Write-Log ("SetApplicationPermissions attempt failed with Rights='{0}' and grant Principal='{1}': {2}" -f $rights, $grant.Principal, $msg) 'Yellow'
+                    Write-Log ("Blind SetApplicationPermissions failed with Rights='{0}' and Principal='{1}': {2}" -f $rights, $grant.Principal, $msg) 'Yellow'
                 }
             }
         }
     }
 
-    throw 'All SetApplicationPermissions attempts failed. Review the target group metadata and tenant-specific Rights value.'
+    throw 'All blind SetApplicationPermissions attempts failed. Review the target group metadata and tenant-specific Rights value.'
 }
 
 # ------------------------------------------------------------
 # MAIN
 # ------------------------------------------------------------
-$exportConfig   = $null
-$newAppKey      = $null
-$createdDetails = $null
-$updatedDetails = $null
+$exportConfig = $null
+$newAppKey    = $null
 
 try {
     if ([string]::IsNullOrWhiteSpace($SourceAppExportJson)) {
@@ -1151,7 +906,7 @@ try {
     Add-ReportRow -Step 'Credential Mode' -Status 'INFO' -Detail ("Regular user login as {0}" -f $script:PasCredential.UserName)
 
     Start-PASSessionFromRegularUser
-    $vaultAccount = Find-VaultAccountInSafeOnly -SafeName $SafeName -AccountIdentifier $AccountName
+    $null = Find-VaultAccountInSafeOnly -SafeName $SafeName -AccountIdentifier $AccountName
 
     Start-IdentityRegularUserSession
     Write-Log "Using regular user Identity login for app-management operations." "Yellow"
@@ -1165,8 +920,6 @@ try {
         Add-ReportRow -Step 'Import App From Template' -Status 'WHATIF' -Detail ("TemplateName={0}; Override={1}" -f $exportConfig.TemplateName, $TemplateIdOverride)
     } else {
         $newAppKey = Import-AppFromTemplateAdaptive -Config $exportConfig -TemplateIdOverride $TemplateIdOverride
-        $createdDetails = Get-IdentityApplicationDetails -AppKey $newAppKey
-        Assert-IdentityWebApp -AppDetails $createdDetails -Label 'Newly Created Application (pre-update)'
     }
 
     if ($WhatIf) {
@@ -1174,20 +927,17 @@ try {
         Add-ReportRow -Step 'Update Application' -Status 'WHATIF' -Detail ("AppKey={0}; NewName={1}" -f $newAppKey, $NewAppName)
     } else {
         Update-IdentityApplicationFromConfig -AppKey $newAppKey -Config $exportConfig -RenameTo $NewAppName -DescriptionToUse $AppDescription
-        $updatedDetails = Get-IdentityApplicationDetails -AppKey $newAppKey
-        Assert-IdentityWebApp -AppDetails $updatedDetails -Label 'Updated Application'
-        Assert-AppScriptPresent -AppDetails $updatedDetails -ExpectedUrl 'https://cna.okta.com/login/default'
     }
 
     if ($WhatIf) {
         Write-Log ("WHATIF: Would add direct app permissions for group '{0}'." -f $(if ($TargetGroupSystemName) { $TargetGroupSystemName } else { $TargetGroupDisplayName })) 'Yellow'
         Add-ReportRow -Step 'Set Application Permissions' -Status 'WHATIF' -Detail ("AppKey={0}; Group={1}" -f $newAppKey, $(if ($TargetGroupSystemName) { $TargetGroupSystemName } else { $TargetGroupDisplayName }))
     } else {
-        Set-ApplicationPermissionsDirectGroup -AppRowKey $newAppKey
+        Set-ApplicationPermissionsDirectGroupBlind -AppRowKey $newAppKey
     }
 
     Write-Log ("Completed create-from-JSON workflow. New app key='{0}'. PAS account '{1}' in Safe '{2}' was validated and recorded in the report." -f $newAppKey, $AccountName, $SafeName) 'Green'
-    Add-ReportRow -Step 'Overall' -Status 'SUCCESS' -Detail ("NewAppKey={0}; Workflow completed." -f $newAppKey)
+    Add-ReportRow -Step 'Overall' -Status 'SUCCESS' -Detail ("NewAppKey={0}; Workflow completed without GetApplication." -f $newAppKey)
 }
 catch {
     Write-Log ("FAILED: {0}" -f $_.Exception.Message) 'Red'
