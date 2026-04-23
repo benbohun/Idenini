@@ -1,28 +1,22 @@
 <#
-CNA_Create_Identity_WebApp_From_Json_RegularUser_NoGetApplication.ps1
+CNA_Create_Identity_WebApp_From_Json_RegularUser_Final.ps1
 
-Purpose
-- Use a REGULAR user credential (not CCP, not service user)
-- Log in to Privilege Cloud / PAS with that regular user
-- Log in to CyberArk Identity app-management APIs with that same regular user
-- Create a new Browser Extension (advanced) style app from exported JSON
-- Update the app with the exported configuration
-- Rename the app
-- Apply direct application permissions to a target group
-- Validate PAS account input using safe-only exact lookup
+Best-preferred flow for your tenant:
+1) Login to PAS as a regular user
+2) Validate the PAS account in the target Safe using exact match only
+3) Login to Identity as the same regular user
+4) Import the app from template
+5) Wait for app propagation
+6) Retry UpdateApplicationDE until the app is ready
+7) Retry SetApplicationPermissions until the app is ready
 
-Important behavior
-- NO GetApplication call
-- NO Redrock/query call
-- NO GetUserInfo call
+This script intentionally does NOT call:
+- GetApplication
+- GetUserInfo
+- Redrock/query
 
-Flow
-1. PAS login as regular user
-2. Safe-only exact PAS account validation
-3. Identity login as regular user
-4. ImportAppFromTemplate
-5. UpdateApplicationDE using returned _RowKey
-6. SetApplicationPermissions using returned _RowKey only
+It validates the PAS account and records it for downstream use,
+but does not fake an undocumented "bind vaulted PAS account into app" admin API.
 #>
 
 [CmdletBinding()]
@@ -30,7 +24,8 @@ param(
     # ===== PAS / Privilege Cloud auth path =====
     [string]$IdentityTenantURL    = 'https://aat4012.id.cyberark.cloud',
 
-    # ===== Identity API path =====
+    # ===== Identity app-management API path =====
+    # Set this to the preferred tenant URL if your tenant uses one.
     [string]$IdentityApiTenantURL = 'https://aat4012.id.cyberark.cloud',
 
     [string]$PCloudSubdomain      = 'cna-prod',
@@ -59,9 +54,15 @@ param(
     # ===== Optional exported app JSON =====
     [string]$SourceAppExportJson  = '',
 
+    # ===== Retry tuning =====
+    [int]$InitialPostCreateDelaySeconds = 180,
+    [int]$UpdateRetryWindowSeconds      = 420,
+    [int]$PermissionRetryWindowSeconds  = 300,
+    [int]$RetryIntervalSeconds          = 20,
+
     # ===== Logging =====
-    [string]$LogPath              = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_From_Json_RegularUser_NoGetApplication.log',
-    [string]$ReportCsvPath        = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_From_Json_RegularUser_NoGetApplication_Report.csv',
+    [string]$LogPath              = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_RegularUser_Final.log',
+    [string]$ReportCsvPath        = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_RegularUser_Final_Report.csv',
 
     # ===== Advanced =====
     [switch]$WhatIf
@@ -113,6 +114,7 @@ function Add-ReportRow {
         [string]$Status,
         [string]$Detail
     )
+
     $script:ReportRows.Add([pscustomobject]@{
         Timestamp = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
         Step      = $Step
@@ -195,6 +197,62 @@ function Get-DefaultSourceExportJson {
 @'
 {"CBEScript":"loginData.applicationUrl = \"https://cna.okta.com/login/default\";\n \nloginData.addField(\"username\", \"input#input28\", LoginUsername + \"@cna.com\");\nloginData.addField(\"password\", \"input[name='credentials.passcode']\", LoginPassword);\n \nloginData.formPattern = \"form\";\nloginData.globalSelectorTimeout = 10000;\n \nloginData.order = [\n  [\"fill\", \"username\"],\n  [\"fill\", \"password\"],\n  [\"click\", \"input[type='submit'][value='Sign in']\"]\n];","Name":"GCP - Okta Prod","Category":"_I18N_AppCategory_Other","DefaultAuthProfileInfo":{"Uuid":"AlwaysAllowed"},"DisplayName":"GCP - Okta Prod","OnPrem":true,"IsSwsEnabled":true,"ShowRegistration":false,"AdminTag":"_I18N_AppCategory_Other","UserNameStrategy":"SetByUser","Description":"_I18N_AppDesc_Generic_BE_Script","FormFillingEnabled":true,"Generic":true,"AppType":"Web","DefaultAuthProfile":"AlwaysAllowed","Icon":"/vfslow/lib/application/icons/GenericBrowserExtension.svg","AuthRules":{"_UniqueKey":"Condition","_Value":[],"Enabled":true,"_Type":"RowSet"},"WebAppType":"UsernamePassword","TemplateName":"GenericBrowserExtensionScript","Notes":"","LocalizationEnabled":false,"WebUPAppType":"BrowserExtensionScript","NotSelfService":true}
 '@
+}
+
+function Should-RetryPostCreate {
+    param([string]$Message)
+
+    if ([string]::IsNullOrWhiteSpace($Message)) { return $false }
+
+    return (
+        $Message -match '\b401\b' -or
+        $Message -match '\b404\b' -or
+        $Message -match '\b409\b' -or
+        $Message -match 'Unauthorized persisted' -or
+        $Message -match 'not found' -or
+        $Message -match 'temporar' -or
+        $Message -match 'conflict'
+    )
+}
+
+function Invoke-EventuallyConsistentStep {
+    param(
+        [Parameter(Mandatory)][scriptblock]$Operation,
+        [Parameter(Mandatory)][string]$OperationName,
+        [Parameter(Mandatory)][int]$MaxWaitSeconds,
+        [int]$InitialDelaySeconds = 0,
+        [int]$IntervalSeconds = 15
+    )
+
+    if ($InitialDelaySeconds -gt 0) {
+        Write-Log ("Waiting {0} second(s) before starting {1}..." -f $InitialDelaySeconds, $OperationName) 'Yellow'
+        Start-Sleep -Seconds $InitialDelaySeconds
+    }
+
+    $deadline = (Get-Date).AddSeconds($MaxWaitSeconds)
+    $attempt = 0
+    $lastMessage = $null
+
+    while ((Get-Date) -lt $deadline) {
+        $attempt++
+        try {
+            Write-Log ("{0} attempt #{1}..." -f $OperationName, $attempt) 'Gray'
+            & $Operation
+            Write-Log ("{0} succeeded on attempt #{1}." -f $OperationName, $attempt) 'Green'
+            return
+        } catch {
+            $lastMessage = $_.Exception.Message
+            if (-not (Should-RetryPostCreate -Message $lastMessage)) {
+                throw
+            }
+
+            $remaining = [int][Math]::Max(0, ($deadline - (Get-Date)).TotalSeconds)
+            Write-Log ("{0} not ready yet on attempt #{1}. Retrying in {2}s. Remaining window: {3}s. Last error: {4}" -f $OperationName, $attempt, $IntervalSeconds, $remaining, $lastMessage) 'Yellow'
+            Start-Sleep -Seconds $IntervalSeconds
+        }
+    }
+
+    throw ("{0} did not succeed within the retry window of {1} seconds. Last error: {2}" -f $OperationName, $MaxWaitSeconds, $lastMessage)
 }
 
 # ------------------------------------------------------------
@@ -555,7 +613,7 @@ function Find-VaultAccountInSafeOnly {
     }
 
     if ($matches.Count -lt 1) {
-        throw ("No exact PAS account match was found in Safe '{0}' for identifier '{1}'. The script will not continue with a fuzzy match." -f $SafeName, $AccountName)
+        throw ("No exact PAS account match was found in Safe '{0}' for identifier '{1}'. The script will not continue with a fuzzy match." -f $SafeName, $AccountIdentifier)
     }
 
     if ($matches.Count -gt 1) {
@@ -737,7 +795,7 @@ function New-AppUpdatePayloadVariants {
     return $variants
 }
 
-function Update-IdentityApplicationFromConfig {
+function Invoke-UpdateApplicationOperation {
     param(
         [Parameter(Mandatory)][string]$AppKey,
         [Parameter(Mandatory)][object]$Config,
@@ -752,25 +810,19 @@ function Update-IdentityApplicationFromConfig {
     foreach ($payload in $payloads) {
         $attempt++
         try {
-            Write-Log ("Trying UpdateApplicationDE payload attempt #{0}..." -f $attempt) 'Gray'
+            Write-Log ("Trying UpdateApplicationDE payload variant #{0}..." -f $attempt) 'Gray'
             $resp = Invoke-IdentityApiWithRetry -AbsoluteUris @($uri) -Body $payload -LogicalName 'UpdateApplicationDE'
             if (-not $resp.success) {
                 throw ('UpdateApplicationDE returned success=false: ' + ($resp.Message | Out-String))
             }
 
-            Write-Log ("UpdateApplicationDE succeeded on attempt #{0}." -f $attempt) 'Green'
-            Add-ReportRow -Step 'Update Application' -Status 'SUCCESS' -Detail ("Attempt={0}; AppKey={1}" -f $attempt, $AppKey)
+            Add-ReportRow -Step 'Update Application' -Status 'SUCCESS' -Detail ("Variant={0}; AppKey={1}" -f $attempt, $AppKey)
             return
         } catch {
-            $msg = $_.Exception.Message
-            if ($msg -match 'Unauthorized persisted for UpdateApplicationDE' -or $msg -match '\(401\).*Unauthorized') {
-                throw "UpdateApplicationDE returned 401 Unauthorized for the regular user. Check effective Application Management rights and IdentityApiTenantURL."
-            }
-
-            Write-Log ("UpdateApplicationDE attempt #{0} failed: {1}" -f $attempt, $msg) 'Yellow'
             if ($attempt -eq $payloads.Count) {
                 throw
             }
+            Write-Log ("UpdateApplicationDE variant #{0} failed: {1}" -f $attempt, $_.Exception.Message) 'Yellow'
         }
     }
 }
@@ -837,7 +889,7 @@ function New-SetPermissionsBodiesBlind {
     return $bodies
 }
 
-function Set-ApplicationPermissionsDirectGroupBlind {
+function Invoke-SetPermissionsOperation {
     param([Parameter(Mandatory)][string]$AppRowKey)
 
     $rightsCandidates = @(
@@ -856,17 +908,11 @@ function Set-ApplicationPermissionsDirectGroupBlind {
                     Write-Log ("Trying blind SetApplicationPermissions with Rights='{0}' Principal='{1}' SystemName='{2}'..." -f $rights, $grant.Principal, $grant.SystemName) 'Gray'
                     $resp = Invoke-IdentityApiWithRetry -AbsoluteUris @($uri) -Body $body -LogicalName 'SetApplicationPermissions'
                     if ($resp.success) {
-                        Write-Log ("Direct group permission assignment succeeded for group '{0}' using Rights='{1}'." -f $grant.SystemName, $rights) 'Green'
                         Add-ReportRow -Step 'Set Application Permissions' -Status 'SUCCESS' -Detail ("Group={0}; Rights={1}; RowKey={2}" -f $grant.SystemName, $rights, $AppRowKey)
                         return
                     }
                 } catch {
-                    $msg = $_.Exception.Message
-                    if ($msg -match 'Unauthorized persisted for SetApplicationPermissions' -or $msg -match '\(401\).*Unauthorized') {
-                        throw "SetApplicationPermissions returned 401 Unauthorized for the regular user."
-                    }
-
-                    Write-Log ("Blind SetApplicationPermissions failed with Rights='{0}' and Principal='{1}': {2}" -f $rights, $grant.Principal, $msg) 'Yellow'
+                    Write-Log ("Blind SetApplicationPermissions failed with Rights='{0}' and Principal='{1}': {2}" -f $rights, $grant.Principal, $_.Exception.Message) 'Yellow'
                 }
             }
         }
@@ -926,14 +972,28 @@ try {
         Write-Log ("WHATIF: Would update new app '{0}' with exported Browser Extension configuration." -f $newAppKey) 'Yellow'
         Add-ReportRow -Step 'Update Application' -Status 'WHATIF' -Detail ("AppKey={0}; NewName={1}" -f $newAppKey, $NewAppName)
     } else {
-        Update-IdentityApplicationFromConfig -AppKey $newAppKey -Config $exportConfig -RenameTo $NewAppName -DescriptionToUse $AppDescription
+        Invoke-EventuallyConsistentStep `
+            -Operation {
+                Invoke-UpdateApplicationOperation -AppKey $newAppKey -Config $exportConfig -RenameTo $NewAppName -DescriptionToUse $AppDescription
+            } `
+            -OperationName 'UpdateApplicationDE' `
+            -MaxWaitSeconds $UpdateRetryWindowSeconds `
+            -InitialDelaySeconds $InitialPostCreateDelaySeconds `
+            -IntervalSeconds $RetryIntervalSeconds
     }
 
     if ($WhatIf) {
         Write-Log ("WHATIF: Would add direct app permissions for group '{0}'." -f $(if ($TargetGroupSystemName) { $TargetGroupSystemName } else { $TargetGroupDisplayName })) 'Yellow'
         Add-ReportRow -Step 'Set Application Permissions' -Status 'WHATIF' -Detail ("AppKey={0}; Group={1}" -f $newAppKey, $(if ($TargetGroupSystemName) { $TargetGroupSystemName } else { $TargetGroupDisplayName }))
     } else {
-        Set-ApplicationPermissionsDirectGroupBlind -AppRowKey $newAppKey
+        Invoke-EventuallyConsistentStep `
+            -Operation {
+                Invoke-SetPermissionsOperation -AppRowKey $newAppKey
+            } `
+            -OperationName 'SetApplicationPermissions' `
+            -MaxWaitSeconds $PermissionRetryWindowSeconds `
+            -InitialDelaySeconds 10 `
+            -IntervalSeconds $RetryIntervalSeconds
     }
 
     Write-Log ("Completed create-from-JSON workflow. New app key='{0}'. PAS account '{1}' in Safe '{2}' was validated and recorded in the report." -f $newAppKey, $AccountName, $SafeName) 'Green'
