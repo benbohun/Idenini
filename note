@@ -1,32 +1,40 @@
 <#
-CNA_Create_And_Update_Identity_WebApp_Reauth.ps1
+CNA_Create_And_Update_Identity_WebApp_Reauth_CCP.ps1
 
 Purpose
-- Prompt for regular CyberArk Identity credential once
+- Prompt once for app Name
+- Attempt to use CCP credential first for CyberArk Identity login
+- Fallback to interactive credential prompt if CCP retrieval fails (or if enabled)
 - Create app from GenericBrowserExtensionScript
-- Re-establish CyberArk Identity session for the update phase
+- Re-establish CyberArk Identity session for update
 - Update the newly created app using the returned _RowKey
-- Apply non-script settings and the Browser Extension (advanced) login workflow
+- Apply non-script settings and Browser Extension advanced script
 - No PAS validation
 - No psPAS dependency
-
-Why this version
-- Your separate scripts worked
-- Same-session create -> update failed with 401 on UpdateApplicationDE
-- This version keeps one credential entry but deliberately performs a fresh Identity login before update
 #>
 
 [CmdletBinding()]
 param(
     [string]$IdentityApiTenantURL      = 'https://aat4012.id.cyberark.cloud',
 
+    # ===== CCP settings (used first) =====
+    [bool]$UseCCPFirst                 = $true,
+    [bool]$FallbackToPromptOnCCPFail   = $true,
+    [string]$CCPAddress                = 'https://vskau1p1231.cna.com',
+    [string]$CCPLocation               = 'AIMWebService',
+    [string]$CCPAppID                  = 'PAMDiscovery',
+    [string]$CCPSafe                   = 'CA_PCloud_Admins',
+    [string]$CCPObject                 = 'cna-prod.cyberark.cloud-cnarestbot',
+    [bool]$CCPWindowsAuth              = $false,
+
+    # ===== Manual fallback credential =====
     [string]$RegularUserName           = '',
     [string]$RegularUserPassword       = '',
 
-    # Create
+    # ===== Create =====
     [string]$TemplateId                = 'GenericBrowserExtensionScript',
 
-    # App settings
+    # ===== App settings =====
     [string]$Name                      = 'g-test-pam1',
     [string]$DisplayName               = 'GCP - Okta Prod',
     [string]$Category                  = '_I18N_AppCategory_Other',
@@ -49,7 +57,7 @@ param(
     [string]$WebUPAppType              = 'BrowserExtensionScript',
     [bool]$NotSelfService              = $true,
 
-    # Advanced Browser Extension workflow
+    # ===== Advanced Browser Extension workflow =====
     [string]$AdvancedScript            = @'
 loginData.applicationUrl = "https://cna.okta.com/login/default";
 loginData.addField("username", "input#input28", LoginUsername + "@cna.com");
@@ -63,15 +71,15 @@ loginData.order = [
 ];
 '@,
 
-    # Timing / retries
+    # ===== Timing / retries =====
     [int]$PreUpdateDelaySeconds        = 15,
     [int]$UpdateRetryWindowSeconds     = 300,
     [int]$RetryIntervalSeconds         = 20,
     [int]$MaxUpdateReauthAttempts      = 2,
 
-    # Logging
-    [string]$LogPath                   = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_And_Update_Reauth.log',
-    [string]$ReportCsvPath             = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_And_Update_Reauth_Report.csv'
+    # ===== Logging =====
+    [string]$LogPath                   = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_And_Update_Reauth_CCP.log',
+    [string]$ReportCsvPath             = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_And_Update_Reauth_CCP_Report.csv'
 )
 
 $script:IdentityAuthToken         = $null
@@ -154,7 +162,54 @@ function Convert-SecureStringToPlainText {
     }
 }
 
-function Get-RegularCredential {
+function Get-CCPUrl {
+    $qp = @(
+        'AppID='  + [uri]::EscapeDataString($CCPAppID)
+        'Safe='   + [uri]::EscapeDataString($CCPSafe)
+        'Object=' + [uri]::EscapeDataString($CCPObject)
+    ) -join '&'
+
+    return ('{0}/{1}/api/Accounts?{2}' -f $CCPAddress.TrimEnd('/'), $CCPLocation.Trim('/'), $qp)
+}
+
+function Try-GetCredentialFromCCP {
+    try {
+        $ccpUrl = Get-CCPUrl
+        Write-Log ("Attempting CCP credential retrieval from: {0}" -f $ccpUrl) 'Cyan'
+
+        $headers = @{ 'Content-Type' = 'application/json' }
+        $resp = Invoke-RestMethod -Uri $ccpUrl -Method GET -Headers $headers -UseDefaultCredentials:$CCPWindowsAuth -ErrorAction Stop
+
+        if (-not $resp -or -not $resp.Content) {
+            throw 'CCP returned empty password content.'
+        }
+
+        $resolvedUser = $null
+        if ($resp.PSObject.Properties.Name -contains 'Username') {
+            $resolvedUser = [string]$resp.Username
+        } elseif ($resp.PSObject.Properties.Name -contains 'UserName') {
+            $resolvedUser = [string]$resp.UserName
+        }
+
+        if ([string]::IsNullOrWhiteSpace($resolvedUser)) {
+            throw 'CCP response did not include Username/UserName.'
+        }
+
+        $secure = ConvertTo-SecureString $resp.Content -AsPlainText -Force
+        $script:RegularCredential = [pscredential]::new($resolvedUser, $secure)
+        $script:RegularUserPlainPassword = $resp.Content
+
+        Write-Log ("CCP credential retrieval succeeded for: {0}" -f $resolvedUser) 'Green'
+        Add-ReportRow -Step 'Credential Source' -Status 'SUCCESS' -Detail ("CCP user {0}" -f $resolvedUser)
+        return $true
+    } catch {
+        Write-Log ("CCP credential retrieval failed: {0}" -f $_.Exception.Message) 'Yellow'
+        Add-ReportRow -Step 'Credential Source' -Status 'FAILED' -Detail ("CCP failed: {0}" -f $_.Exception.Message)
+        return $false
+    }
+}
+
+function Prompt-ForRegularCredential {
     if ([string]::IsNullOrWhiteSpace($RegularUserName)) {
         $script:RegularCredential = Get-Credential -Message 'Enter REGULAR user credential for CyberArk Identity'
         if ($null -eq $script:RegularCredential) {
@@ -173,6 +228,28 @@ function Get-RegularCredential {
     }
 
     $script:RegularCredential = [pscredential]::new($RegularUserName, $secure)
+}
+
+function Get-WorkingCredential {
+    if ($UseCCPFirst) {
+        $ok = Try-GetCredentialFromCCP
+        if ($ok) { return }
+        if (-not $FallbackToPromptOnCCPFail) {
+            throw 'CCP credential retrieval failed and fallback to prompt is disabled.'
+        }
+    }
+
+    Write-Log 'Falling back to interactive/manual credential entry...' 'Yellow'
+    Prompt-ForRegularCredential
+    Add-ReportRow -Step 'Credential Source' -Status 'SUCCESS' -Detail ("Manual user {0}" -f $script:RegularCredential.UserName)
+}
+
+function Get-ResolvedAppName {
+    $entered = Read-Host ("Enter the app Name [{0}]" -f $Name)
+    if ([string]::IsNullOrWhiteSpace($entered)) {
+        return $Name
+    }
+    return $entered.Trim()
 }
 
 function Reset-IdentitySessionState {
@@ -270,7 +347,7 @@ function Start-IdentityRegularUserSession {
 
     $script:IdentityWebSession = New-Object Microsoft.PowerShell.Commands.WebRequestSession
 
-    Write-Log ("Starting interactive CyberArk Identity authentication for regular user '{0}'..." -f $userName) 'Cyan'
+    Write-Log ("Starting interactive CyberArk Identity authentication for user '{0}'..." -f $userName) 'Cyan'
 
     $startBody = @{
         User    = $userName
@@ -441,7 +518,10 @@ function Import-AppFromTemplate {
 }
 
 function New-BaseNonScriptFields {
-    param([Parameter(Mandatory)][string]$ResolvedRowKey)
+    param(
+        [Parameter(Mandatory)][string]$ResolvedRowKey,
+        [Parameter(Mandatory)][string]$ResolvedName
+    )
 
     $authRules = @{
         _UniqueKey = 'Condition'
@@ -456,7 +536,7 @@ function New-BaseNonScriptFields {
 
     return [ordered]@{
         _Rowkey                = $ResolvedRowKey
-        Name                   = $Name
+        Name                   = $ResolvedName
         DisplayName            = $DisplayName
         Category               = $Category
         DefaultAuthProfileInfo = $defaultAuthProfileInfo
@@ -482,9 +562,12 @@ function New-BaseNonScriptFields {
 }
 
 function New-AdvancedScriptPayloadVariants {
-    param([Parameter(Mandatory)][string]$ResolvedRowKey)
+    param(
+        [Parameter(Mandatory)][string]$ResolvedRowKey,
+        [Parameter(Mandatory)][string]$ResolvedName
+    )
 
-    $base = New-BaseNonScriptFields -ResolvedRowKey $ResolvedRowKey
+    $base = New-BaseNonScriptFields -ResolvedRowKey $ResolvedRowKey -ResolvedName $ResolvedName
     $variants = @()
 
     $v1 = [ordered]@{}
@@ -500,7 +583,7 @@ function New-AdvancedScriptPayloadVariants {
 
     $v3 = [ordered]@{
         _Rowkey             = $ResolvedRowKey
-        Name                = $Name
+        Name                = $ResolvedName
         DisplayName         = $DisplayName
         Description         = $Description
         IconUri             = $IconUri
@@ -535,7 +618,7 @@ function New-AdvancedScriptPayloadVariants {
 
     $v7 = [ordered]@{
         _Rowkey     = $ResolvedRowKey
-        Name        = $Name
+        Name        = $ResolvedName
         Description = $Description
         Script      = $AdvancedScript
     }
@@ -543,7 +626,7 @@ function New-AdvancedScriptPayloadVariants {
 
     $v8 = [ordered]@{
         _Rowkey     = $ResolvedRowKey
-        Name        = $Name
+        Name        = $ResolvedName
         Description = $Description
         CBEScript   = $AdvancedScript
     }
@@ -553,10 +636,13 @@ function New-AdvancedScriptPayloadVariants {
 }
 
 function Update-CurrentApplicationWithAdvancedScript {
-    param([Parameter(Mandatory)][string]$ResolvedRowKey)
+    param(
+        [Parameter(Mandatory)][string]$ResolvedRowKey,
+        [Parameter(Mandatory)][string]$ResolvedName
+    )
 
     $uri = $IdentityApiTenantURL.TrimEnd('/') + '/SaasManage/UpdateApplicationDE'
-    $variants = New-AdvancedScriptPayloadVariants -ResolvedRowKey $ResolvedRowKey
+    $variants = New-AdvancedScriptPayloadVariants -ResolvedRowKey $ResolvedRowKey -ResolvedName $ResolvedName
 
     $variantNumber = 0
     foreach ($payload in $variants) {
@@ -612,7 +698,10 @@ function Invoke-EventuallyConsistentStep {
 }
 
 function Invoke-PostCreateUpdatePhase {
-    param([Parameter(Mandatory)][string]$CreatedRowKey)
+    param(
+        [Parameter(Mandatory)][string]$CreatedRowKey,
+        [Parameter(Mandatory)][string]$ResolvedName
+    )
 
     $attempt = 0
     while ($attempt -lt $MaxUpdateReauthAttempts) {
@@ -624,7 +713,7 @@ function Invoke-PostCreateUpdatePhase {
 
             Invoke-EventuallyConsistentStep `
                 -Operation {
-                    Update-CurrentApplicationWithAdvancedScript -ResolvedRowKey $CreatedRowKey
+                    Update-CurrentApplicationWithAdvancedScript -ResolvedRowKey $CreatedRowKey -ResolvedName $ResolvedName
                 } `
                 -OperationName 'Post-Create UpdateApplicationDE' `
                 -MaxWaitSeconds $UpdateRetryWindowSeconds `
@@ -646,19 +735,19 @@ function Invoke-PostCreateUpdatePhase {
 }
 
 $createdAppRowKey = $null
+$resolvedName = $null
 
 try {
     if ([string]::IsNullOrWhiteSpace($TemplateId)) {
         throw 'TemplateId cannot be empty.'
     }
-    if ([string]::IsNullOrWhiteSpace($Name)) {
-        throw 'Name cannot be empty.'
-    }
 
-    Get-RegularCredential
+    Get-WorkingCredential
+    $resolvedName = Get-ResolvedAppName
 
-    Write-Log ("Using regular user credential '{0}' for create + reauth + update flow." -f $script:RegularCredential.UserName) 'Cyan'
-    Add-ReportRow -Step 'Credential Mode' -Status 'INFO' -Detail ("Regular user login as {0}" -f $script:RegularCredential.UserName)
+    Write-Log ("Using credential '{0}' for create + reauth + update flow." -f $script:RegularCredential.UserName) 'Cyan'
+    Write-Log ("Resolved app Name: '{0}'." -f $resolvedName) 'Cyan'
+    Add-ReportRow -Step 'Resolved App Name' -Status 'INFO' -Detail ("Name={0}" -f $resolvedName)
 
     # Phase 1: create
     Start-IdentityRegularUserSession
@@ -668,10 +757,10 @@ try {
     Start-Sleep -Seconds $PreUpdateDelaySeconds
 
     # Phase 2: fresh session update
-    Invoke-PostCreateUpdatePhase -CreatedRowKey $createdAppRowKey
+    Invoke-PostCreateUpdatePhase -CreatedRowKey $createdAppRowKey -ResolvedName $resolvedName
 
     Write-Log ("Create + update completed successfully. Created app row key is '{0}'." -f $createdAppRowKey) 'Green'
-    Add-ReportRow -Step 'Overall' -Status 'SUCCESS' -Detail ("CreatedRowKey={0}; FinalName={1}" -f $createdAppRowKey, $Name)
+    Add-ReportRow -Step 'Overall' -Status 'SUCCESS' -Detail ("CreatedRowKey={0}; FinalName={1}" -f $createdAppRowKey, $resolvedName)
 }
 catch {
     Write-Log ("FAILED: {0}" -f $_.Exception.Message) 'Red'
