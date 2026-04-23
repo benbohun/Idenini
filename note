@@ -1,31 +1,11 @@
 <#
-CNA_Create_Update_AssignPermission_ADResolve.ps1
+CNA_Create_Update_AssignPermission_DSGroupsFirst.ps1
 
-- Prompt for regular CyberArk Identity credential
-- Prompt for app Name
-- Prompt for permission target and type
-- Create app from GenericBrowserExtensionScript
-- Re-auth for update
-- Re-auth again for permission assignment
-- Resolve principal from Identity first
-  * Group: ADGroup first, then DSGroups
-  * User : ADUser first, then DSUsers
-  * Role : Role
-- Call SetApplicationPermissions using the strict schema:
-    {
-      "RowKey": "appkey",
-      "ID": "appkey",
-      "Grants": {
-        "Rights": "View,Run,Automatically Deploy",
-        "Principal": "exact principal text or resolved principal text",
-        "Type": "Group|User|Role",
-        "PrincipalId": "resolved UID",
-        "PType": "Group|User|Role"
-      }
-    }
-
-No CCP
-No PAS validation
+Key change:
+- Resolve Group from DSGroups first using the exact Identity-style name
+- Use DSGroups.InternalName as PrincipalId
+- If InternalName is blank, use Redrock Results.Entities[0].Key
+- Only then fall back to ADGroup lookup by short samAccountName
 #>
 
 [CmdletBinding()]
@@ -82,8 +62,8 @@ loginData.order = [
     [int]$RetryIntervalSeconds         = 20,
     [int]$MaxPhaseReauthAttempts       = 2,
 
-    [string]$LogPath                   = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_Update_AssignPermission_ADResolve.log',
-    [string]$ReportCsvPath             = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_Update_AssignPermission_ADResolve_Report.csv'
+    [string]$LogPath                   = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_Update_AssignPermission_DSGroupsFirst.log',
+    [string]$ReportCsvPath             = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_Update_AssignPermission_DSGroupsFirst_Report.csv'
 )
 
 $script:IdentityAuthToken         = $null
@@ -98,12 +78,9 @@ function Write-Log {
         [Parameter(Mandatory)][string]$Message,
         [ValidateSet('White','Gray','Green','Yellow','Red','Cyan')][string]$Color = 'White'
     )
-
     $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     $line = "$ts - $Message"
-
     try { Write-Host $line -ForegroundColor $Color } catch { Write-Host $line }
-
     try {
         $parent = Split-Path -Path $LogPath -Parent
         if ($parent -and -not (Test-Path $parent)) {
@@ -114,11 +91,7 @@ function Write-Log {
 }
 
 function Add-ReportRow {
-    param(
-        [string]$Step,
-        [string]$Status,
-        [string]$Detail
-    )
+    param([string]$Step,[string]$Status,[string]$Detail)
     $script:ReportRows += [pscustomobject]@{
         Timestamp = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
         Step      = $Step
@@ -134,28 +107,20 @@ function ConvertTo-JsonSafe {
 }
 
 function Get-DirectField {
-    param(
-        [Parameter(Mandatory)]$Object,
-        [Parameter(Mandatory)][string]$FieldName
-    )
-
+    param([Parameter(Mandatory)]$Object,[Parameter(Mandatory)][string]$FieldName)
     if ($null -eq $Object) { return $null }
-
     if ($Object -is [System.Collections.IDictionary]) {
         if ($Object.Contains($FieldName)) { return $Object[$FieldName] }
         return $null
     }
-
     if ($Object.PSObject -and $Object.PSObject.Properties.Name -contains $FieldName) {
         return $Object.$FieldName
     }
-
     return $null
 }
 
 function Convert-SecureStringToPlainText {
     param([Parameter(Mandatory)][SecureString]$SecureString)
-
     $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureString)
     try {
         return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
@@ -174,9 +139,7 @@ function Escape-SqlLiteral {
 function Prompt-ForRegularCredential {
     if ([string]::IsNullOrWhiteSpace($RegularUserName)) {
         $script:RegularCredential = Get-Credential -Message 'Enter REGULAR user credential for CyberArk Identity'
-        if ($null -eq $script:RegularCredential) {
-            throw 'Credential prompt was cancelled.'
-        }
+        if ($null -eq $script:RegularCredential) { throw 'Credential prompt was cancelled.' }
         $script:RegularUserPlainPassword = Convert-SecureStringToPlainText -SecureString $script:RegularCredential.Password
         return
     }
@@ -225,7 +188,6 @@ function Get-ResolvedPermissionPrincipal {
 function Get-ResolvedPermissionType {
     $entered = Read-Host ("Enter permission target type [default: {0}] (Group/User/Role)" -f $PermissionPrincipalType)
     if ([string]::IsNullOrWhiteSpace($entered)) { return $PermissionPrincipalType }
-
     switch -Regex ($entered.Trim()) {
         '^(?i)group$' { return 'Group' }
         '^(?i)user$'  { return 'User'  }
@@ -305,7 +267,6 @@ function Start-IdentityRegularUserSession {
     for ($i = 0; $i -lt 10; $i++) {
         $summary = Get-AuthSummaryValue -Payload $payload
         $authVal = Get-AuthTokenValue -Payload $payload
-
         if ($summary -eq 'LoginSuccess' -or -not [string]::IsNullOrWhiteSpace($authVal)) {
             $script:IdentityAuthToken = $authVal
             $script:IdentityUser      = Get-AuthUserValue -Payload $payload
@@ -401,7 +362,6 @@ function Invoke-IdentityRequestWithRetry {
                 try { $status = [int]$_.Exception.Response.StatusCode.value__ } catch {}
                 $msg = $_.Exception.Message
                 $errors += ("URI={0}; Mode={1}; Status={2}; Error={3}" -f $uri, $mode, $status, $msg)
-
                 if ($status -eq 401) {
                     Write-Log ("401 on {0} via URI '{1}' using auth mode '{2}'. Retrying..." -f $LogicalName, $uri, $mode) 'Yellow'
                     continue
@@ -431,9 +391,9 @@ function Invoke-RedrockQuery {
     return Invoke-IdentityRequestWithRetry -AbsoluteUris @($uri) -Body $body -LogicalName 'RedrockQuery'
 }
 
-function Convert-RedrockResultsToRows {
+function Convert-RedrockResults {
     param([Parameter(Mandatory)]$Response)
-    $rows = @()
+    $items = @()
     $result = Get-DirectField -Object $Response -FieldName 'Result'
     if ($null -eq $result) { return @() }
 
@@ -441,10 +401,18 @@ function Convert-RedrockResultsToRows {
     if ($results -is [System.Collections.IEnumerable] -and -not ($results -is [string])) {
         foreach ($item in $results) {
             $row = Get-DirectField -Object $item -FieldName 'Row'
-            if ($null -ne $row) { $rows += $row }
+            $entities = @(Get-DirectField -Object $item -FieldName 'Entities')
+            $entityKey = $null
+            if ($entities.Count -gt 0) {
+                $entityKey = [string](Get-DirectField -Object $entities[0] -FieldName 'Key')
+            }
+            $items += [pscustomobject]@{
+                Row       = $row
+                EntityKey = $entityKey
+            }
         }
     }
-    return ,$rows
+    return ,$items
 }
 
 function Resolve-IdentityPrincipal {
@@ -455,45 +423,12 @@ function Resolve-IdentityPrincipal {
 
     $escaped = Escape-SqlLiteral -Value $Principal
     $shortName = $Principal
-    if ($Principal -match '@') {
-        $shortName = $Principal.Split('@')[0]
-    }
+    if ($Principal -match '@') { $shortName = $Principal.Split('@')[0] }
     $escapedShort = Escape-SqlLiteral -Value $shortName
 
     switch ($PrincipalType) {
         'Group' {
-            # 1) ADGroup first for AD-backed groups
-            $adQuery = @"
-Select ObjectGUID, Name, SamAccountName, DistinguishedName
-from ADGroup
-WHERE SamAccountName = '$escapedShort' OR Name = '$escapedShort' OR Name = '$escaped'
-ORDER BY SamAccountName COLLATE NOCASE
-"@
-            $adRows = @(Convert-RedrockResultsToRows -Response (Invoke-RedrockQuery -Script $adQuery))
-            if ($adRows.Count -gt 0) {
-                $row = $adRows[0]
-                $principalId = [string]$row.ObjectGUID
-                $principalValue = $Principal
-                if ([string]::IsNullOrWhiteSpace($principalValue)) { $principalValue = [string]$row.SamAccountName }
-                if ([string]::IsNullOrWhiteSpace($principalId)) {
-                    throw ("Resolved AD group for '{0}' is missing ObjectGUID." -f $Principal)
-                }
-
-                $resolved = [pscustomobject]@{
-                    PrincipalType = 'Group'
-                    Input         = $Principal
-                    Principal     = $principalValue
-                    PrincipalId   = $principalId
-                    MatchedFrom   = 'ADGroup'
-                    Name          = [string]$row.Name
-                    SamAccountName= [string]$row.SamAccountName
-                }
-                Write-Log ("Resolved Group principal '{0}' via ADGroup -> Principal='{1}' PrincipalId='{2}'." -f $Principal, $resolved.Principal, $resolved.PrincipalId) 'Green'
-                Add-ReportRow -Step 'Resolve Principal' -Status 'SUCCESS' -Detail (ConvertTo-JsonSafe $resolved)
-                return $resolved
-            }
-
-            # 2) DSGroups fallback
+            # Prefer DSGroups for Identity-style values like group@domain
             $dsQuery = @"
 Select InternalName, SystemName, DisplayName, DirectoryServiceUuid
 from DSGroups
@@ -501,14 +436,18 @@ WHERE SystemName = '$escaped' OR DisplayName = '$escaped' OR InternalName = '$es
    OR SystemName LIKE '%$escaped%' OR DisplayName LIKE '%$escaped%'
 ORDER BY InternalName COLLATE NOCASE
 "@
-            $dsRows = @(Convert-RedrockResultsToRows -Response (Invoke-RedrockQuery -Script $dsQuery))
-            if ($dsRows.Count -gt 0) {
-                $row = $dsRows[0]
-                $principalId = [string]$row.InternalName
-                $principalValue = [string]$row.SystemName
+            $dsItems = @(Convert-RedrockResults -Response (Invoke-RedrockQuery -Script $dsQuery))
+            if ($dsItems.Count -gt 0) {
+                $row = $dsItems[0].Row
+                $entityKey = $dsItems[0].EntityKey
+                $principalId = [string](Get-DirectField -Object $row -FieldName 'InternalName')
+                if ([string]::IsNullOrWhiteSpace($principalId)) { $principalId = $entityKey }
+
+                $principalValue = [string](Get-DirectField -Object $row -FieldName 'SystemName')
                 if ([string]::IsNullOrWhiteSpace($principalValue)) { $principalValue = $Principal }
+
                 if ([string]::IsNullOrWhiteSpace($principalId)) {
-                    throw ("Resolved DSGroups row for '{0}' is missing InternalName." -f $Principal)
+                    throw ("Resolved DSGroups row for '{0}' is missing InternalName and Entity Key." -f $Principal)
                 }
 
                 $resolved = [pscustomobject]@{
@@ -517,61 +456,66 @@ ORDER BY InternalName COLLATE NOCASE
                     Principal     = $principalValue
                     PrincipalId   = $principalId
                     MatchedFrom   = 'DSGroups'
-                    DisplayName   = [string]$row.DisplayName
-                    DirectoryServiceUuid = [string]$row.DirectoryServiceUuid
                 }
                 Write-Log ("Resolved Group principal '{0}' via DSGroups -> Principal='{1}' PrincipalId='{2}'." -f $Principal, $resolved.Principal, $resolved.PrincipalId) 'Green'
                 Add-ReportRow -Step 'Resolve Principal' -Status 'SUCCESS' -Detail (ConvertTo-JsonSafe $resolved)
                 return $resolved
             }
 
-            throw ("No Identity group was found for '{0}' in ADGroup or DSGroups." -f $Principal)
-        }
-
-        'User' {
+            # Fallback to ADGroup by short name
             $adQuery = @"
-Select ObjectGUID, UserPrincipalName, SamAccountName, Mail, Name
-from ADUser
-WHERE UserPrincipalName = '$escaped' OR Mail = '$escaped' OR SamAccountName = '$escapedShort' OR Name = '$escapedShort'
-ORDER BY Name COLLATE NOCASE
+Select ObjectGUID, Name, SamAccountName, DistinguishedName
+from ADGroup
+WHERE SamAccountName = '$escapedShort' OR Name = '$escapedShort' OR Name = '$escaped'
+ORDER BY SamAccountName COLLATE NOCASE
 "@
-            $adRows = @(Convert-RedrockResultsToRows -Response (Invoke-RedrockQuery -Script $adQuery))
-            if ($adRows.Count -gt 0) {
-                $row = $adRows[0]
-                $principalId = [string]$row.ObjectGUID
+            $adItems = @(Convert-RedrockResults -Response (Invoke-RedrockQuery -Script $adQuery))
+            if ($adItems.Count -gt 0) {
+                $row = $adItems[0].Row
+                $entityKey = $adItems[0].EntityKey
+                $principalId = [string](Get-DirectField -Object $row -FieldName 'ObjectGUID')
+                if ([string]::IsNullOrWhiteSpace($principalId)) { $principalId = $entityKey }
+
                 $principalValue = $Principal
-                if ([string]::IsNullOrWhiteSpace($principalValue)) { $principalValue = [string]$row.UserPrincipalName }
                 if ([string]::IsNullOrWhiteSpace($principalId)) {
-                    throw ("Resolved AD user for '{0}' is missing ObjectGUID." -f $Principal)
+                    throw ("Resolved ADGroup row for '{0}' is missing ObjectGUID and Entity Key." -f $Principal)
                 }
 
                 $resolved = [pscustomobject]@{
-                    PrincipalType = 'User'
+                    PrincipalType = 'Group'
                     Input         = $Principal
                     Principal     = $principalValue
                     PrincipalId   = $principalId
-                    MatchedFrom   = 'ADUser'
+                    MatchedFrom   = 'ADGroup'
                 }
-                Write-Log ("Resolved User principal '{0}' via ADUser -> Principal='{1}' PrincipalId='{2}'." -f $Principal, $resolved.Principal, $resolved.PrincipalId) 'Green'
+                Write-Log ("Resolved Group principal '{0}' via ADGroup -> Principal='{1}' PrincipalId='{2}'." -f $Principal, $resolved.Principal, $resolved.PrincipalId) 'Green'
                 Add-ReportRow -Step 'Resolve Principal' -Status 'SUCCESS' -Detail (ConvertTo-JsonSafe $resolved)
                 return $resolved
             }
 
+            throw ("No Identity group was found for '{0}' in DSGroups or ADGroup." -f $Principal)
+        }
+
+        'User' {
             $dsQuery = @"
-Select InternalName, SystemName, DisplayName, DirectoryServiceUuid
+Select InternalName, SystemName, DisplayName, DirectoryServiceUuid, Email
 from DSUsers
-WHERE SystemName = '$escaped' OR DisplayName = '$escaped' OR InternalName = '$escaped'
-   OR SystemName LIKE '%$escaped%' OR DisplayName LIKE '%$escaped%'
+WHERE SystemName = '$escaped' OR DisplayName = '$escaped' OR InternalName = '$escaped' OR Email = '$escaped'
+   OR SystemName LIKE '%$escaped%' OR DisplayName LIKE '%$escaped%' OR Email LIKE '%$escaped%'
 ORDER BY InternalName COLLATE NOCASE
 "@
-            $dsRows = @(Convert-RedrockResultsToRows -Response (Invoke-RedrockQuery -Script $dsQuery))
-            if ($dsRows.Count -gt 0) {
-                $row = $dsRows[0]
-                $principalId = [string]$row.InternalName
-                $principalValue = [string]$row.SystemName
+            $dsItems = @(Convert-RedrockResults -Response (Invoke-RedrockQuery -Script $dsQuery))
+            if ($dsItems.Count -gt 0) {
+                $row = $dsItems[0].Row
+                $entityKey = $dsItems[0].EntityKey
+                $principalId = [string](Get-DirectField -Object $row -FieldName 'InternalName')
+                if ([string]::IsNullOrWhiteSpace($principalId)) { $principalId = $entityKey }
+
+                $principalValue = [string](Get-DirectField -Object $row -FieldName 'SystemName')
                 if ([string]::IsNullOrWhiteSpace($principalValue)) { $principalValue = $Principal }
+
                 if ([string]::IsNullOrWhiteSpace($principalId)) {
-                    throw ("Resolved DS user for '{0}' is missing InternalName." -f $Principal)
+                    throw ("Resolved DSUsers row for '{0}' is missing InternalName and Entity Key." -f $Principal)
                 }
 
                 $resolved = [pscustomobject]@{
@@ -586,7 +530,37 @@ ORDER BY InternalName COLLATE NOCASE
                 return $resolved
             }
 
-            throw ("No Identity user was found for '{0}' in ADUser or DSUsers." -f $Principal)
+            $adQuery = @"
+Select ObjectGUID, UserPrincipalName, SamAccountName, Mail, Name
+from ADUser
+WHERE UserPrincipalName = '$escaped' OR Mail = '$escaped' OR SamAccountName = '$escapedShort' OR Name = '$escapedShort'
+ORDER BY Name COLLATE NOCASE
+"@
+            $adItems = @(Convert-RedrockResults -Response (Invoke-RedrockQuery -Script $adQuery))
+            if ($adItems.Count -gt 0) {
+                $row = $adItems[0].Row
+                $entityKey = $adItems[0].EntityKey
+                $principalId = [string](Get-DirectField -Object $row -FieldName 'ObjectGUID')
+                if ([string]::IsNullOrWhiteSpace($principalId)) { $principalId = $entityKey }
+
+                $principalValue = $Principal
+                if ([string]::IsNullOrWhiteSpace($principalId)) {
+                    throw ("Resolved ADUser row for '{0}' is missing ObjectGUID and Entity Key." -f $Principal)
+                }
+
+                $resolved = [pscustomobject]@{
+                    PrincipalType = 'User'
+                    Input         = $Principal
+                    Principal     = $principalValue
+                    PrincipalId   = $principalId
+                    MatchedFrom   = 'ADUser'
+                }
+                Write-Log ("Resolved User principal '{0}' via ADUser -> Principal='{1}' PrincipalId='{2}'." -f $Principal, $resolved.Principal, $resolved.PrincipalId) 'Green'
+                Add-ReportRow -Step 'Resolve Principal' -Status 'SUCCESS' -Detail (ConvertTo-JsonSafe $resolved)
+                return $resolved
+            }
+
+            throw ("No Identity user was found for '{0}' in DSUsers or ADUser." -f $Principal)
         }
 
         'Role' {
@@ -596,14 +570,12 @@ from Role
 WHERE Name = '$escaped' OR ID = '$escaped' OR Name LIKE '%$escaped%'
 ORDER BY Name COLLATE NOCASE
 "@
-            $rows = @(Convert-RedrockResultsToRows -Response (Invoke-RedrockQuery -Script $query))
-            if ($rows.Count -lt 1) {
-                throw ("No Identity role was found for '{0}'." -f $Principal)
-            }
+            $items = @(Convert-RedrockResults -Response (Invoke-RedrockQuery -Script $query))
+            if ($items.Count -lt 1) { throw ("No Identity role was found for '{0}'." -f $Principal) }
 
-            $row = $rows[0]
-            $principalId = [string]$row.ID
-            $principalValue = [string]$row.Name
+            $row = $items[0].Row
+            $principalId = [string](Get-DirectField -Object $row -FieldName 'ID')
+            $principalValue = [string](Get-DirectField -Object $row -FieldName 'Name')
             if ([string]::IsNullOrWhiteSpace($principalId) -or [string]::IsNullOrWhiteSpace($principalValue)) {
                 throw ("Resolved role for '{0}' is missing ID or Name." -f $Principal)
             }
@@ -624,21 +596,16 @@ ORDER BY Name COLLATE NOCASE
 
 function Import-AppFromTemplate {
     param([Parameter(Mandatory)][string]$ResolvedTemplateId)
-
     $uri = $IdentityApiTenantURL.TrimEnd('/') + '/SaasManage/ImportAppFromTemplate'
     $body = @{ ID = @($ResolvedTemplateId) }
-
     $resp = Invoke-IdentityRequestWithRetry -AbsoluteUris @($uri) -Body $body -LogicalName 'ImportAppFromTemplate'
-    if (-not $resp.success) {
-        throw ('ImportAppFromTemplate returned success=false: ' + ($resp.Message | Out-String))
-    }
 
+    if (-not $resp.success) { throw ('ImportAppFromTemplate returned success=false: ' + ($resp.Message | Out-String)) }
     $resultItems = @($resp.Result)
     if ($resultItems.Count -lt 1) { throw 'ImportAppFromTemplate returned no result items.' }
 
     $first = $resultItems[0]
-    $created = Get-DirectField -Object $first -FieldName 'success'
-    if ($created -ne $true) {
+    if ((Get-DirectField -Object $first -FieldName 'success') -ne $true) {
         $idVal = [string](Get-DirectField -Object $first -FieldName 'ID')
         $msg = [string](Get-DirectField -Object $first -FieldName 'Message')
         throw ("ImportAppFromTemplate result item failed. ID={0}; Message={1}" -f $idVal, $msg)
@@ -654,11 +621,7 @@ function Import-AppFromTemplate {
 }
 
 function New-BaseNonScriptFields {
-    param(
-        [Parameter(Mandatory)][string]$ResolvedRowKey,
-        [Parameter(Mandatory)][string]$ResolvedName
-    )
-
+    param([Parameter(Mandatory)][string]$ResolvedRowKey,[Parameter(Mandatory)][string]$ResolvedName)
     $authRules = @{ _UniqueKey = 'Condition'; _Value = @(); Enabled = $true; _Type = 'RowSet' }
     $defaultAuthProfileInfo = @{ Uuid = $DefaultAuthProfileUuid }
 
@@ -690,11 +653,7 @@ function New-BaseNonScriptFields {
 }
 
 function New-AdvancedScriptPayloadVariants {
-    param(
-        [Parameter(Mandatory)][string]$ResolvedRowKey,
-        [Parameter(Mandatory)][string]$ResolvedName
-    )
-
+    param([Parameter(Mandatory)][string]$ResolvedRowKey,[Parameter(Mandatory)][string]$ResolvedName)
     $base = New-BaseNonScriptFields -ResolvedRowKey $ResolvedRowKey -ResolvedName $ResolvedName
     $variants = @()
 
@@ -707,46 +666,16 @@ function New-AdvancedScriptPayloadVariants {
     foreach ($k in $v1.Keys) { if ($k -eq '_Rowkey') { $v2['_RowKey'] = $v1[$k] } else { $v2[$k] = $v1[$k] } }
     $variants += ,$v2
 
-    $v3 = [ordered]@{
-        _Rowkey             = $ResolvedRowKey
-        Name                = $ResolvedName
-        DisplayName         = $DisplayName
-        Description         = $Description
-        IconUri             = $IconUri
-        IsSwsEnabled        = $IsSwsEnabled
-        UserNameStrategy    = $UserNameStrategy
-        FormFillingEnabled  = $FormFillingEnabled
-        AppType             = $AppType
-        WebAppType          = $WebAppType
-        WebUPAppType        = $WebUPAppType
-        TemplateName        = $TemplateName
-        DefaultAuthProfile  = $DefaultAuthProfile
-        Script              = $AdvancedScript
-    }
+    $v3 = [ordered]@{}
+    foreach ($k in $base.Keys) { $v3[$k] = $base[$k] }
+    $v3['CBEScript'] = $AdvancedScript
     $variants += ,$v3
-
-    $v4 = [ordered]@{}
-    foreach ($k in $v3.Keys) { if ($k -eq '_Rowkey') { $v4['_RowKey'] = $v3[$k] } else { $v4[$k] = $v3[$k] } }
-    $variants += ,$v4
-
-    $v5 = [ordered]@{}
-    foreach ($k in $base.Keys) { $v5[$k] = $base[$k] }
-    $v5['CBEScript'] = $AdvancedScript
-    $variants += ,$v5
-
-    $v6 = [ordered]@{}
-    foreach ($k in $v5.Keys) { if ($k -eq '_Rowkey') { $v6['_RowKey'] = $v5[$k] } else { $v6[$k] = $v5[$k] } }
-    $variants += ,$v6
 
     return $variants
 }
 
 function Update-CurrentApplicationWithAdvancedScript {
-    param(
-        [Parameter(Mandatory)][string]$ResolvedRowKey,
-        [Parameter(Mandatory)][string]$ResolvedName
-    )
-
+    param([Parameter(Mandatory)][string]$ResolvedRowKey,[Parameter(Mandatory)][string]$ResolvedName)
     $uri = $IdentityApiTenantURL.TrimEnd('/') + '/SaasManage/UpdateApplicationDE'
     $variants = New-AdvancedScriptPayloadVariants -ResolvedRowKey $ResolvedRowKey -ResolvedName $ResolvedName
 
@@ -756,13 +685,10 @@ function Update-CurrentApplicationWithAdvancedScript {
         try {
             Write-Log ("Trying UpdateApplicationDE advanced-script payload variant #{0}..." -f $variantNumber) 'Gray'
             $resp = Invoke-IdentityRequestWithRetry -AbsoluteUris @($uri) -Body $payload -LogicalName 'UpdateApplicationDE'
-
-            $success = Get-DirectField -Object $resp -FieldName 'success'
-            if ($success -ne $true) {
+            if ((Get-DirectField -Object $resp -FieldName 'success') -ne $true) {
                 $msg = [string](Get-DirectField -Object $resp -FieldName 'Message')
                 throw ("UpdateApplicationDE returned success=false. Message={0}" -f $msg)
             }
-
             Write-Log ("UpdateApplicationDE succeeded on advanced-script payload variant #{0}." -f $variantNumber) 'Green'
             Add-ReportRow -Step 'Update Application' -Status 'SUCCESS' -Detail ("RowKey={0}; Variant={1}" -f $ResolvedRowKey, $variantNumber)
             return
@@ -770,20 +696,15 @@ function Update-CurrentApplicationWithAdvancedScript {
             Write-Log ("Advanced-script payload variant #{0} failed: {1}" -f $variantNumber, $_.Exception.Message) 'Yellow'
         }
     }
-
     throw 'All UpdateApplicationDE advanced-script payload variants failed.'
 }
 
 function New-SetPermissionBodies {
-    param(
-        [Parameter(Mandatory)][string]$ResolvedRowKey,
-        [Parameter(Mandatory)]$ResolvedPrincipal
-    )
+    param([Parameter(Mandatory)][string]$ResolvedRowKey,[Parameter(Mandatory)]$ResolvedPrincipal)
 
     $rightsVariants = @(
         'View,Run,Automatically Deploy',
-        'View,Run,AutomaticallyDeploy',
-        'Run,Automatically Deploy'
+        'View,Run,AutomaticallyDeploy'
     )
 
     $bodies = @()
@@ -813,11 +734,7 @@ function New-SetPermissionBodies {
 }
 
 function Set-ApplicationPermissionsResolved {
-    param(
-        [Parameter(Mandatory)][string]$ResolvedRowKey,
-        [Parameter(Mandatory)]$ResolvedPrincipal
-    )
-
+    param([Parameter(Mandatory)][string]$ResolvedRowKey,[Parameter(Mandatory)]$ResolvedPrincipal)
     $uri = $IdentityApiTenantURL.TrimEnd('/') + '/SaasManage/SetApplicationPermissions'
     $bodies = New-SetPermissionBodies -ResolvedRowKey $ResolvedRowKey -ResolvedPrincipal $ResolvedPrincipal
 
@@ -827,13 +744,11 @@ function Set-ApplicationPermissionsResolved {
         try {
             Write-Log ("Trying SetApplicationPermissions payload variant #{0}..." -f $variantNumber) 'Gray'
             $resp = Invoke-IdentityRequestWithRetry -AbsoluteUris @($uri) -Body $body -LogicalName 'SetApplicationPermissions'
-
             $success = Get-DirectField -Object $resp -FieldName 'success'
             if ($success -eq $false) {
                 $msg = [string](Get-DirectField -Object $resp -FieldName 'Message')
                 throw ("SetApplicationPermissions returned success=false. Message={0}" -f $msg)
             }
-
             Write-Log ("SetApplicationPermissions succeeded on payload variant #{0}." -f $variantNumber) 'Green'
             Add-ReportRow -Step 'Assign Permissions' -Status 'SUCCESS' -Detail ("RowKey={0}; Principal={1}; PrincipalId={2}; Type={3}; Variant={4}" -f $ResolvedRowKey, $ResolvedPrincipal.Principal, $ResolvedPrincipal.PrincipalId, $ResolvedPrincipal.PrincipalType, $variantNumber)
             return
@@ -841,18 +756,11 @@ function Set-ApplicationPermissionsResolved {
             Write-Log ("SetApplicationPermissions payload variant #{0} failed: {1}" -f $variantNumber, $_.Exception.Message) 'Yellow'
         }
     }
-
     throw 'All SetApplicationPermissions payload variants failed.'
 }
 
 function Invoke-EventuallyConsistentStep {
-    param(
-        [Parameter(Mandatory)][scriptblock]$Operation,
-        [Parameter(Mandatory)][string]$OperationName,
-        [Parameter(Mandatory)][int]$MaxWaitSeconds,
-        [int]$IntervalSeconds = 15
-    )
-
+    param([Parameter(Mandatory)][scriptblock]$Operation,[Parameter(Mandatory)][string]$OperationName,[Parameter(Mandatory)][int]$MaxWaitSeconds,[int]$IntervalSeconds = 15)
     $deadline = (Get-Date).AddSeconds($MaxWaitSeconds)
     $attempt = 0
     $lastMessage = $null
@@ -881,11 +789,7 @@ function Invoke-CreatePhase {
 }
 
 function Invoke-UpdatePhase {
-    param(
-        [Parameter(Mandatory)][string]$CreatedRowKey,
-        [Parameter(Mandatory)][string]$ResolvedName
-    )
-
+    param([Parameter(Mandatory)][string]$CreatedRowKey,[Parameter(Mandatory)][string]$ResolvedName)
     $attempt = 0
     while ($attempt -lt $MaxPhaseReauthAttempts) {
         $attempt++
@@ -893,15 +797,9 @@ function Invoke-UpdatePhase {
             Write-Log ("Starting update phase with fresh Identity session (attempt {0}/{1})..." -f $attempt, $MaxPhaseReauthAttempts) 'Cyan'
             Reset-IdentitySessionState
             Start-IdentityRegularUserSession
-
-            Invoke-EventuallyConsistentStep `
-                -Operation {
-                    Update-CurrentApplicationWithAdvancedScript -ResolvedRowKey $CreatedRowKey -ResolvedName $ResolvedName
-                } `
-                -OperationName 'UpdateApplicationDE' `
-                -MaxWaitSeconds $UpdateRetryWindowSeconds `
-                -IntervalSeconds $RetryIntervalSeconds
-
+            Invoke-EventuallyConsistentStep -Operation {
+                Update-CurrentApplicationWithAdvancedScript -ResolvedRowKey $CreatedRowKey -ResolvedName $ResolvedName
+            } -OperationName 'UpdateApplicationDE' -MaxWaitSeconds $UpdateRetryWindowSeconds -IntervalSeconds $RetryIntervalSeconds
             return
         } catch {
             $msg = $_.Exception.Message
@@ -913,12 +811,7 @@ function Invoke-UpdatePhase {
 }
 
 function Invoke-PermissionPhase {
-    param(
-        [Parameter(Mandatory)][string]$CreatedRowKey,
-        [Parameter(Mandatory)][string]$ResolvedPrincipalText,
-        [Parameter(Mandatory)][string]$ResolvedPrincipalType
-    )
-
+    param([Parameter(Mandatory)][string]$CreatedRowKey,[Parameter(Mandatory)][string]$ResolvedPrincipalText,[Parameter(Mandatory)][string]$ResolvedPrincipalType)
     $attempt = 0
     while ($attempt -lt $MaxPhaseReauthAttempts) {
         $attempt++
@@ -929,14 +822,9 @@ function Invoke-PermissionPhase {
 
             $resolvedAgain = Resolve-IdentityPrincipal -Principal $ResolvedPrincipalText -PrincipalType $ResolvedPrincipalType
 
-            Invoke-EventuallyConsistentStep `
-                -Operation {
-                    Set-ApplicationPermissionsResolved -ResolvedRowKey $CreatedRowKey -ResolvedPrincipal $resolvedAgain
-                } `
-                -OperationName 'SetApplicationPermissions' `
-                -MaxWaitSeconds $PermissionRetryWindowSeconds `
-                -IntervalSeconds $RetryIntervalSeconds
-
+            Invoke-EventuallyConsistentStep -Operation {
+                Set-ApplicationPermissionsResolved -ResolvedRowKey $CreatedRowKey -ResolvedPrincipal $resolvedAgain
+            } -OperationName 'SetApplicationPermissions' -MaxWaitSeconds $PermissionRetryWindowSeconds -IntervalSeconds $RetryIntervalSeconds
             return
         } catch {
             $msg = $_.Exception.Message
