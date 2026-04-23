@@ -1,16 +1,20 @@
 <#
-CNA_Lookup_Identity_App_By_Key.ps1
+CNA_Lookup_Clone_And_Rename_Identity_App.ps1
 
-Purpose
-- Authenticate to CyberArk Identity as a regular user
-- Query the Application table through /Redrock/query
-- Verify whether a specific app key exists
-- Export the exact matching app and a broader nearby app listing for troubleshooting
+What this script does
+1) Login to CyberArk Identity as a regular user
+2) Query the Application table via /Redrock/query to confirm the source app exists
+3) Export the exact match and a broader app listing for troubleshooting
+4) Attempt clone only AFTER the source app is confirmed
+5) Rename the cloned app with UpdateApplicationDE
 
-Why this script
-- Redrock/query is the documented read-only query interface
-- Application table is the documented source for application metadata
-- This avoids guessing undocumented clone endpoints
+Important
+- The lookup portion is fully documented by CyberArk.
+- The clone operation is known to exist, but the exact route/body were not exposed
+  in the public pages I could verify, so CloneApiPath is parameterized and the script
+  also tries the two legacy guesses you already tested.
+- If you later capture the exact clone route from your tenant or Postman, place it in
+  -CloneApiPath and rerun.
 #>
 
 [CmdletBinding()]
@@ -21,12 +25,21 @@ param(
     [string]$RegularUserPassword  = '',
 
     [string]$SourceAppKey         = '31946715-3381-489a-8fd1-4903eb8cce4b',
+    [string]$NewAppName           = 'g-test-pam1',
+    [string]$AppDescription       = 'Cloned and renamed via CyberArk Identity API',
 
-    [int]$PageSize                = 200,
+    # Optional exact clone path if you capture it from Postman/browser network
+    # Example format: '/SaasManage/<ExactClonePath>'
+    [string]$CloneApiPath         = '',
 
-    [string]$LogPath              = 'E:\Installation Media\Script\OnboardScript\data\Identity_App_Lookup.log',
+    [int]$PageSize                = 500,
+    [int]$RenameRetryWindowSeconds = 300,
+    [int]$RetryIntervalSeconds     = 20,
+
+    [string]$LogPath              = 'E:\Installation Media\Script\OnboardScript\data\Identity_Lookup_Clone_Rename.log',
     [string]$ExactCsvPath         = 'E:\Installation Media\Script\OnboardScript\data\Identity_App_Lookup_Exact.csv',
-    [string]$NearbyCsvPath        = 'E:\Installation Media\Script\OnboardScript\data\Identity_App_Lookup_Nearby.csv'
+    [string]$NearbyCsvPath        = 'E:\Installation Media\Script\OnboardScript\data\Identity_App_Lookup_Nearby.csv',
+    [string]$ReportCsvPath        = 'E:\Installation Media\Script\OnboardScript\data\Identity_Lookup_Clone_Rename_Report.csv'
 )
 
 $script:IdentityAuthToken         = $null
@@ -34,6 +47,7 @@ $script:IdentityUser              = $null
 $script:IdentityWebSession        = $null
 $script:PasCredential             = $null
 $script:RegularUserPlainPassword  = $null
+$script:ReportRows                = @()
 
 function Write-Log {
     param(
@@ -54,10 +68,29 @@ function Write-Log {
     } catch {}
 }
 
+function Add-ReportRow {
+    param(
+        [string]$Step,
+        [string]$Status,
+        [string]$Detail
+    )
+    $script:ReportRows += [pscustomobject]@{
+        Timestamp = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+        Step      = $Step
+        Status    = $Status
+        Detail    = $Detail
+    }
+}
+
 function ConvertTo-JsonSafe {
     param([Parameter()][object]$Object)
     if ($null -eq $Object) { return $null }
     return ($Object | ConvertTo-Json -Depth 80)
+}
+
+function Get-HttpStatusCode {
+    param([Parameter(Mandatory)]$Exception)
+    try { return [int]$Exception.Response.StatusCode.value__ } catch { return $null }
 }
 
 function Get-DirectField {
@@ -112,6 +145,56 @@ function Get-RegularCredential {
     }
 
     $script:PasCredential = [pscredential]::new($RegularUserName, $secure)
+}
+
+function Should-Retry {
+    param([string]$Message)
+
+    if ([string]::IsNullOrWhiteSpace($Message)) { return $false }
+
+    return (
+        $Message -match '\b401\b' -or
+        $Message -match '\b404\b' -or
+        $Message -match '\b409\b' -or
+        $Message -match 'Unauthorized persisted' -or
+        $Message -match 'not found' -or
+        $Message -match 'temporar' -or
+        $Message -match 'conflict'
+    )
+}
+
+function Invoke-EventuallyConsistentStep {
+    param(
+        [Parameter(Mandatory)][scriptblock]$Operation,
+        [Parameter(Mandatory)][string]$OperationName,
+        [Parameter(Mandatory)][int]$MaxWaitSeconds,
+        [int]$IntervalSeconds = 15
+    )
+
+    $deadline = (Get-Date).AddSeconds($MaxWaitSeconds)
+    $attempt = 0
+    $lastMessage = $null
+
+    while ((Get-Date) -lt $deadline) {
+        $attempt++
+        try {
+            Write-Log ("{0} attempt #{1}..." -f $OperationName, $attempt) 'Gray'
+            $result = & $Operation
+            Write-Log ("{0} succeeded on attempt #{1}." -f $OperationName, $attempt) 'Green'
+            return $result
+        } catch {
+            $lastMessage = $_.Exception.Message
+            if (-not (Should-Retry -Message $lastMessage)) {
+                throw
+            }
+
+            $remaining = [int][Math]::Max(0, ($deadline - (Get-Date)).TotalSeconds)
+            Write-Log ("{0} not ready yet on attempt #{1}. Retrying in {2}s. Remaining window: {3}s. Last error: {4}" -f $OperationName, $attempt, $IntervalSeconds, $remaining, $lastMessage) 'Yellow'
+            Start-Sleep -Seconds $IntervalSeconds
+        }
+    }
+
+    throw ("{0} did not succeed within {1} seconds. Last error: {2}" -f $OperationName, $MaxWaitSeconds, $lastMessage)
 }
 
 function Get-AuthPayload {
@@ -224,6 +307,7 @@ function Start-IdentityRegularUserSession {
             try { $cookieCount = $script:IdentityWebSession.Cookies.GetCookies($tenantUrl).Count } catch {}
 
             Write-Log ("Identity API authentication succeeded as '{0}'. CookieCount={1}" -f $script:IdentityUser, $cookieCount) 'Green'
+            Add-ReportRow -Step 'Identity Login' -Status 'SUCCESS' -Detail ("Authenticated as {0}" -f $script:IdentityUser)
             return
         }
 
@@ -295,7 +379,7 @@ function Convert-RedrockResultsToRows {
     return ,$rows
 }
 
-function Invoke-ApplicationLookup {
+function Lookup-ApplicationByKey {
     param([Parameter(Mandatory)][string]$AppKey)
 
     $uri = $IdentityApiTenantURL.TrimEnd('/') + '/Redrock/query'
@@ -334,39 +418,217 @@ function Invoke-ApplicationLookup {
     }
 }
 
-try {
-    if ([string]::IsNullOrWhiteSpace($SourceAppKey)) {
-        throw 'SourceAppKey cannot be empty.'
+function Parse-CloneResponseRowKey {
+    param([Parameter(Mandatory)]$Response)
+
+    $result = Get-DirectField -Object $Response -FieldName 'Result'
+    if ($null -ne $result) {
+        if ($result -is [System.Collections.IEnumerable] -and -not ($result -is [string])) {
+            foreach ($item in $result) {
+                $rk = [string](Get-DirectField -Object $item -FieldName '_RowKey')
+                if ([string]::IsNullOrWhiteSpace($rk)) { $rk = [string](Get-DirectField -Object $item -FieldName '_Rowkey') }
+                if (-not [string]::IsNullOrWhiteSpace($rk)) { return $rk }
+            }
+        } else {
+            $rk = [string](Get-DirectField -Object $result -FieldName '_RowKey')
+            if ([string]::IsNullOrWhiteSpace($rk)) { $rk = [string](Get-DirectField -Object $result -FieldName '_Rowkey') }
+            if (-not [string]::IsNullOrWhiteSpace($rk)) { return $rk }
+        }
     }
+
+    $rk2 = [string](Get-DirectField -Object $Response -FieldName '_RowKey')
+    if ([string]::IsNullOrWhiteSpace($rk2)) { $rk2 = [string](Get-DirectField -Object $Response -FieldName '_Rowkey') }
+    return $rk2
+}
+
+function Get-CloneCandidateUris {
+    $uris = @()
+
+    if (-not [string]::IsNullOrWhiteSpace($CloneApiPath)) {
+        if ($CloneApiPath.StartsWith('http')) {
+            $uris += $CloneApiPath
+        } else {
+            $uris += ($IdentityApiTenantURL.TrimEnd('/') + $CloneApiPath)
+        }
+    }
+
+    # Previously tried guesses kept as fallbacks
+    $uris += ($IdentityApiTenantURL.TrimEnd('/') + '/SaasManage/CloneApplication')
+    $uris += ($IdentityApiTenantURL.TrimEnd('/') + '/SaasManage/CloneExistingApplication')
+
+    return ,($uris | Select-Object -Unique)
+}
+
+function Clone-AppFromExisting {
+    param([Parameter(Mandatory)][string]$SourceKey)
+
+    $candidateUris = Get-CloneCandidateUris
+
+    $payloads = @(
+        @{ _RowKey        = $SourceKey },
+        @{ _Rowkey        = $SourceKey },
+        @{ ID             = $SourceKey },
+        @{ appkey         = $SourceKey },
+        @{ Application    = $SourceKey },
+        @{ ApplicationKey = $SourceKey }
+    )
+
+    foreach ($uri in $candidateUris) {
+        foreach ($payload in $payloads) {
+            try {
+                Write-Log ("Trying clone using URI '{0}' and payload keys [{1}]..." -f $uri, (($payload.Keys) -join ',')) 'Gray'
+                $resp = Invoke-IdentityRequest -AbsoluteUri $uri -Body $payload
+
+                $success = Get-DirectField -Object $resp -FieldName 'success'
+                if ($success -ne $true) {
+                    $msg = [string](Get-DirectField -Object $resp -FieldName 'Message')
+                    throw ("Clone call returned success=false. Message={0}" -f $msg)
+                }
+
+                $rowKey = Parse-CloneResponseRowKey -Response $resp
+                if ([string]::IsNullOrWhiteSpace($rowKey)) {
+                    throw 'Clone call succeeded but did not return a new _RowKey.'
+                }
+
+                Write-Log ("Cloned source application '{0}'. New cloned app _RowKey='{1}'." -f $SourceKey, $rowKey) 'Green'
+                Add-ReportRow -Step 'Clone Application' -Status 'SUCCESS' -Detail ("SourceAppKey={0}; NewRowKey={1}; Uri={2}; PayloadKeys={3}" -f $SourceKey, $rowKey, $uri, (($payload.Keys) -join ','))
+                return $rowKey
+            } catch {
+                Write-Log ("Clone attempt failed on URI '{0}' with payload keys [{1}]: {2}" -f $uri, (($payload.Keys) -join ','), $_.Exception.Message) 'Yellow'
+            }
+        }
+    }
+
+    throw 'All clone endpoint/payload variants failed after source app lookup succeeded.'
+}
+
+function New-RenamePayloadVariants {
+    param(
+        [Parameter(Mandatory)][string]$RowKey,
+        [Parameter(Mandatory)][string]$NewName,
+        [Parameter(Mandatory)][string]$Description
+    )
+
+    return @(
+        [ordered]@{
+            _Rowkey     = $RowKey
+            Name        = $NewName
+            Description = $Description
+        },
+        [ordered]@{
+            _RowKey     = $RowKey
+            Name        = $NewName
+            Description = $Description
+        },
+        [ordered]@{
+            _Rowkey     = $RowKey
+            Name        = $NewName
+            DisplayName = $NewName
+            Description = $Description
+        },
+        [ordered]@{
+            _RowKey     = $RowKey
+            Name        = $NewName
+            DisplayName = $NewName
+            Description = $Description
+        }
+    )
+}
+
+function Rename-ClonedApplication {
+    param(
+        [Parameter(Mandatory)][string]$RowKey,
+        [Parameter(Mandatory)][string]$NewName,
+        [Parameter(Mandatory)][string]$Description
+    )
+
+    $uri = $IdentityApiTenantURL.TrimEnd('/') + '/SaasManage/UpdateApplicationDE'
+    $variants = New-RenamePayloadVariants -RowKey $RowKey -NewName $NewName -Description $Description
+
+    foreach ($payload in $variants) {
+        try {
+            Write-Log ("Trying rename with UpdateApplicationDE payload keys [{0}]..." -f (($payload.Keys) -join ',')) 'Gray'
+            $resp = Invoke-IdentityRequest -AbsoluteUri $uri -Body $payload
+            $success = Get-DirectField -Object $resp -FieldName 'success'
+            if ($success -ne $true) {
+                $msg = [string](Get-DirectField -Object $resp -FieldName 'Message')
+                throw ("UpdateApplicationDE returned success=false. Message={0}" -f $msg)
+            }
+
+            Write-Log ("Rename succeeded for cloned app '{0}' -> '{1}'." -f $RowKey, $NewName) 'Green'
+            Add-ReportRow -Step 'Rename Cloned Application' -Status 'SUCCESS' -Detail ("RowKey={0}; NewName={1}; PayloadKeys={2}" -f $RowKey, $NewName, (($payload.Keys) -join ','))
+            return
+        } catch {
+            Write-Log ("Rename payload failed [{0}]: {1}" -f (($payload.Keys) -join ','), $_.Exception.Message) 'Yellow'
+        }
+    }
+
+    throw 'All direct UpdateApplicationDE rename payloads failed.'
+}
+
+$clonedRowKey = $null
+$lookup = $null
+
+try {
+    if ([string]::IsNullOrWhiteSpace($SourceAppKey)) { throw 'SourceAppKey cannot be empty.' }
+    if ([string]::IsNullOrWhiteSpace($NewAppName))   { throw 'NewAppName cannot be empty.' }
 
     Get-RegularCredential
     Start-IdentityRegularUserSession
 
-    Write-Log ("Looking up source app key '{0}'..." -f $SourceAppKey) 'Cyan'
-    $lookup = Invoke-ApplicationLookup -AppKey $SourceAppKey
+    Write-Log ("Looking up source app key '{0}' before clone..." -f $SourceAppKey) 'Cyan'
+    $lookup = Lookup-ApplicationByKey -AppKey $SourceAppKey
 
-    $exactRows = @($lookup.Exact)
+    $exactRows  = @($lookup.Exact)
     $nearbyRows = @($lookup.Nearby)
-
-    if ($exactRows.Count -gt 0) {
-        Write-Log ("Found {0} exact matching app(s) for ID '{1}'." -f $exactRows.Count, $SourceAppKey) 'Green'
-        $exactRows | Export-Csv -Path $ExactCsvPath -NoTypeInformation -Force
-        Write-Log ("Exact-match export written to: {0}" -f $ExactCsvPath) 'Green'
-
-        foreach ($row in $exactRows) {
-            Write-Log ("Match -> ID='{0}' Name='{1}' DisplayName='{2}' TemplateName='{3}' AppType='{4}' WebAppType='{5}'" -f $row.ID, $row.Name, $row.DisplayName, $row.TemplateName, $row.AppType, $row.WebAppType) 'Green'
-        }
-    } else {
-        Write-Log ("No exact Application row found for ID '{0}'." -f $SourceAppKey) 'Yellow'
-    }
 
     if ($nearbyRows.Count -gt 0) {
         $nearbyRows | Export-Csv -Path $NearbyCsvPath -NoTypeInformation -Force
         Write-Log ("Broader app listing export written to: {0}" -f $NearbyCsvPath) 'Green'
-    } else {
-        Write-Log "No broader Application rows were returned." 'Yellow'
     }
+
+    if ($exactRows.Count -lt 1) {
+        throw ("Source app key '{0}' was not found in the Application table. Clone will not be attempted." -f $SourceAppKey)
+    }
+
+    $exactRows | Export-Csv -Path $ExactCsvPath -NoTypeInformation -Force
+    Write-Log ("Exact-match export written to: {0}" -f $ExactCsvPath) 'Green'
+
+    foreach ($row in $exactRows) {
+        Write-Log ("Found source app -> ID='{0}' Name='{1}' DisplayName='{2}' TemplateName='{3}' AppType='{4}' WebAppType='{5}'" -f $row.ID, $row.Name, $row.DisplayName, $row.TemplateName, $row.AppType, $row.WebAppType) 'Green'
+    }
+
+    Add-ReportRow -Step 'Lookup Source App' -Status 'SUCCESS' -Detail ("SourceAppKey={0}; ExactMatches={1}" -f $SourceAppKey, $exactRows.Count)
+
+    $clonedRowKey = Clone-AppFromExisting -SourceKey $SourceAppKey
+
+    Invoke-EventuallyConsistentStep `
+        -Operation {
+            Rename-ClonedApplication -RowKey $clonedRowKey -NewName $NewAppName -Description $AppDescription
+        } `
+        -OperationName 'Rename Cloned Application' `
+        -MaxWaitSeconds $RenameRetryWindowSeconds `
+        -IntervalSeconds $RetryIntervalSeconds
+
+    Write-Log ("Lookup + clone + rename completed successfully. New app row key is '{0}'." -f $clonedRowKey) 'Green'
+    Add-ReportRow -Step 'Overall' -Status 'SUCCESS' -Detail ("SourceAppKey={0}; NewRowKey={1}; NewAppName={2}" -f $SourceAppKey, $clonedRowKey, $NewAppName)
 }
 catch {
     Write-Log ("FAILED: {0}" -f $_.Exception.Message) 'Red'
+    Add-ReportRow -Step 'Overall' -Status 'FAILED' -Detail $_.Exception.Message
+}
+finally {
+    try {
+        $reportDir = Split-Path -Path $ReportCsvPath -Parent
+        if ($reportDir -and -not (Test-Path $reportDir)) {
+            New-Item -Path $reportDir -ItemType Directory -Force | Out-Null
+        }
+
+        if ($script:ReportRows.Count -gt 0) {
+            $script:ReportRows | Export-Csv -Path $ReportCsvPath -NoTypeInformation -Force
+            Write-Log ("Report exported: {0}" -f $ReportCsvPath) 'Green'
+        }
+    } catch {
+        Write-Log ("Could not export report CSV: {0}" -f $_.Exception.Message) 'Yellow'
+    }
 }
