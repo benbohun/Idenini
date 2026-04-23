@@ -1,17 +1,17 @@
 <#
-CNA_Update_Current_Identity_App_NoScript.ps1
+CNA_Update_Current_Identity_App_AdvancedScript.ps1
 
 Purpose
-- Post-create updater for an existing CyberArk Identity app
-- Updates NON-SCRIPT properties only
-- Does NOT call GetApplication
-- Does NOT send CBEScript or Script/UserPassScript
-- Uses direct UpdateApplicationDE with payload fallbacks
+- Update the current existing app row key
+- Apply non-script app settings
+- Apply the Browser Extension (advanced) login workflow script
+- Does NOT use PAS
+- Uses the same regular CyberArk Identity admin user authentication pattern
 
-Expected use
-1) Run your baseline create script
-2) Copy the returned _RowKey
-3) Run this script and provide that row key
+How it works
+- Tries UpdateApplicationDE with Script first
+- If that does not update the Advanced tab, falls back to CBEScript
+- Keeps retry logic and logs which payload variant succeeded
 #>
 
 [CmdletBinding()]
@@ -21,10 +21,10 @@ param(
     [string]$RegularUserName      = '',
     [string]$RegularUserPassword  = '',
 
-    # Existing created app row key
-    [string]$AppRowKey            = '',
+    # Existing app row key from successful create
+    [string]$AppRowKey            = '5531d686-9e50-492e-a3cc-8476f5d965d5',
 
-    # Settings you want on the created app
+    # App settings
     [string]$Name                 = 'g-test-pam1',
     [string]$DisplayName          = 'GCP - Okta Prod',
     [string]$Category             = '_I18N_AppCategory_Other',
@@ -47,11 +47,25 @@ param(
     [string]$WebUPAppType         = 'BrowserExtensionScript',
     [bool]$NotSelfService         = $true,
 
+    # Advanced Browser Extension workflow
+    [string]$AdvancedScript       = @'
+loginData.applicationUrl = "https://cna.okta.com/login/default";
+loginData.addField("username", "input#input28", LoginUsername + "@cna.com");
+loginData.addField("password", "input[name='credentials.passcode']", LoginPassword);
+loginData.formPattern = "form";
+loginData.globalSelectorTimeout = 10000;
+loginData.order = [
+  ["fill", "username"],
+  ["fill", "password"],
+  ["click", "input[type='submit'][value='Sign in']"]
+];
+'@,
+
     [int]$RetryWindowSeconds      = 300,
     [int]$RetryIntervalSeconds    = 20,
 
-    [string]$LogPath              = 'E:\Installation Media\Script\OnboardScript\data\Identity_Update_Current_App_NoScript.log',
-    [string]$ReportCsvPath        = 'E:\Installation Media\Script\OnboardScript\data\Identity_Update_Current_App_NoScript_Report.csv'
+    [string]$LogPath              = 'E:\Installation Media\Script\OnboardScript\data\Identity_Update_Current_App_AdvancedScript.log',
+    [string]$ReportCsvPath        = 'E:\Installation Media\Script\OnboardScript\data\Identity_Update_Current_App_AdvancedScript_Report.csv'
 )
 
 $script:IdentityAuthToken         = $null
@@ -98,7 +112,7 @@ function Add-ReportRow {
 function ConvertTo-JsonSafe {
     param([Parameter()][object]$Object)
     if ($null -eq $Object) { return $null }
-    return ($Object | ConvertTo-Json -Depth 80)
+    return ($Object | ConvertTo-Json -Depth 100)
 }
 
 function Get-DirectField {
@@ -375,20 +389,7 @@ function Invoke-IdentityRequestWithRetry {
     throw ("Unauthorized persisted for {0}. Details: {1}" -f $LogicalName, ($errors -join ' || '))
 }
 
-function Get-AppRowKeyInteractive {
-    if (-not [string]::IsNullOrWhiteSpace($AppRowKey)) {
-        return $AppRowKey
-    }
-
-    $rk = Read-Host 'Enter the existing app _RowKey from the successful create run'
-    if ([string]::IsNullOrWhiteSpace($rk)) {
-        throw 'AppRowKey cannot be empty.'
-    }
-
-    return $rk.Trim()
-}
-
-function New-UpdatePayloadVariants {
+function New-BaseNonScriptFields {
     param([Parameter(Mandatory)][string]$ResolvedRowKey)
 
     $authRules = @{
@@ -402,8 +403,7 @@ function New-UpdatePayloadVariants {
         Uuid = $DefaultAuthProfileUuid
     }
 
-    # Broad best-effort payload, excluding all script fields
-    $v1 = [ordered]@{
+    return [ordered]@{
         _Rowkey                = $ResolvedRowKey
         Name                   = $Name
         DisplayName            = $DisplayName
@@ -428,14 +428,28 @@ function New-UpdatePayloadVariants {
         WebUPAppType           = $WebUPAppType
         NotSelfService         = $NotSelfService
     }
+}
 
-    # Same with alternate rowkey casing
+function New-AdvancedScriptPayloadVariants {
+    param([Parameter(Mandatory)][string]$ResolvedRowKey)
+
+    $base = New-BaseNonScriptFields -ResolvedRowKey $ResolvedRowKey
+    $variants = @()
+
+    # Variant 1: documented-style Script + broad settings
+    $v1 = [ordered]@{}
+    foreach ($k in $base.Keys) { $v1[$k] = $base[$k] }
+    $v1['Script'] = $AdvancedScript
+    $variants += ,$v1
+
+    # Variant 2: same with alternate rowkey casing
     $v2 = [ordered]@{}
     foreach ($k in $v1.Keys) {
         if ($k -eq '_Rowkey') { $v2['_RowKey'] = $v1[$k] } else { $v2[$k] = $v1[$k] }
     }
+    $variants += ,$v2
 
-    # Narrower payload focused on likely-safe non-script fields
+    # Variant 3: Script with narrower app properties
     $v3 = [ordered]@{
         _Rowkey             = $ResolvedRowKey
         Name                = $Name
@@ -450,42 +464,62 @@ function New-UpdatePayloadVariants {
         WebUPAppType        = $WebUPAppType
         TemplateName        = $TemplateName
         DefaultAuthProfile  = $DefaultAuthProfile
-        DefaultAuthProfileInfo = $defaultAuthProfileInfo
-        OnPrem              = $OnPrem
-        Generic             = $Generic
-        NotSelfService      = $NotSelfService
+        Script              = $AdvancedScript
     }
+    $variants += ,$v3
 
-    # Minimal documented-style payload
-    $v4 = [ordered]@{
+    # Variant 4: same but _RowKey
+    $v4 = [ordered]@{}
+    foreach ($k in $v3.Keys) {
+        if ($k -eq '_Rowkey') { $v4['_RowKey'] = $v3[$k] } else { $v4[$k] = $v3[$k] }
+    }
+    $variants += ,$v4
+
+    # Variant 5: fallback inferred from tenant export schema
+    $v5 = [ordered]@{}
+    foreach ($k in $base.Keys) { $v5[$k] = $base[$k] }
+    $v5['CBEScript'] = $AdvancedScript
+    $variants += ,$v5
+
+    # Variant 6: fallback inferred with alternate rowkey casing
+    $v6 = [ordered]@{}
+    foreach ($k in $v5.Keys) {
+        if ($k -eq '_Rowkey') { $v6['_RowKey'] = $v5[$k] } else { $v6[$k] = $v5[$k] }
+    }
+    $variants += ,$v6
+
+    # Variant 7: script-only minimal
+    $v7 = [ordered]@{
         _Rowkey     = $ResolvedRowKey
         Name        = $Name
         Description = $Description
-        IconUri     = $IconUri
+        Script      = $AdvancedScript
     }
+    $variants += ,$v7
 
-    # Minimal documented-style with alternate rowkey casing
-    $v5 = [ordered]@{
-        _RowKey     = $ResolvedRowKey
+    # Variant 8: cbe-only minimal fallback
+    $v8 = [ordered]@{
+        _Rowkey     = $ResolvedRowKey
         Name        = $Name
         Description = $Description
-        IconUri     = $IconUri
+        CBEScript   = $AdvancedScript
     }
+    $variants += ,$v8
 
-    return @($v1, $v2, $v3, $v4, $v5)
+    return $variants
 }
 
-function Update-CurrentApplicationNoScript {
+function Update-CurrentApplicationWithAdvancedScript {
     param([Parameter(Mandatory)][string]$ResolvedRowKey)
 
     $uri = $IdentityApiTenantURL.TrimEnd('/') + '/SaasManage/UpdateApplicationDE'
-    $variants = New-UpdatePayloadVariants -ResolvedRowKey $ResolvedRowKey
+    $variants = New-AdvancedScriptPayloadVariants -ResolvedRowKey $ResolvedRowKey
 
     $variantNumber = 0
     foreach ($payload in $variants) {
         $variantNumber++
         try {
-            Write-Log ("Trying UpdateApplicationDE payload variant #{0}..." -f $variantNumber) 'Gray'
+            Write-Log ("Trying UpdateApplicationDE advanced-script payload variant #{0}..." -f $variantNumber) 'Gray'
             $resp = Invoke-IdentityRequestWithRetry -AbsoluteUris @($uri) -Body $payload -LogicalName 'UpdateApplicationDE'
 
             $success = Get-DirectField -Object $resp -FieldName 'success'
@@ -494,15 +528,15 @@ function Update-CurrentApplicationNoScript {
                 throw ("UpdateApplicationDE returned success=false. Message={0}" -f $msg)
             }
 
-            Write-Log ("UpdateApplicationDE succeeded on payload variant #{0}." -f $variantNumber) 'Green'
-            Add-ReportRow -Step 'Update Application' -Status 'SUCCESS' -Detail ("RowKey={0}; Variant={1}" -f $ResolvedRowKey, $variantNumber)
+            Write-Log ("UpdateApplicationDE succeeded on advanced-script payload variant #{0}." -f $variantNumber) 'Green'
+            Add-ReportRow -Step 'Update Advanced Script' -Status 'SUCCESS' -Detail ("RowKey={0}; Variant={1}" -f $ResolvedRowKey, $variantNumber)
             return
         } catch {
-            Write-Log ("UpdateApplicationDE variant #{0} failed: {1}" -f $variantNumber, $_.Exception.Message) 'Yellow'
+            Write-Log ("Advanced-script payload variant #{0} failed: {1}" -f $variantNumber, $_.Exception.Message) 'Yellow'
         }
     }
 
-    throw 'All UpdateApplicationDE non-script payload variants failed.'
+    throw 'All UpdateApplicationDE advanced-script payload variants failed.'
 }
 
 function Invoke-EventuallyConsistentStep {
@@ -534,29 +568,30 @@ function Invoke-EventuallyConsistentStep {
     throw ("{0} did not succeed within {1} seconds. Last error: {2}" -f $OperationName, $MaxWaitSeconds, $lastMessage)
 }
 
-$resolvedRowKey = $null
-
 try {
+    if ([string]::IsNullOrWhiteSpace($AppRowKey)) {
+        throw 'AppRowKey cannot be empty.'
+    }
+
     Get-RegularCredential
-    $resolvedRowKey = Get-AppRowKeyInteractive
 
     Write-Log ("Using regular user credential '{0}' for Identity update." -f $script:RegularCredential.UserName) 'Cyan'
-    Write-Log ("Target app row key: '{0}'." -f $resolvedRowKey) 'Cyan'
+    Write-Log ("Target app row key: '{0}'." -f $AppRowKey) 'Cyan'
     Add-ReportRow -Step 'Credential Mode' -Status 'INFO' -Detail ("Regular user login as {0}" -f $script:RegularCredential.UserName)
-    Add-ReportRow -Step 'Target App' -Status 'INFO' -Detail ("RowKey={0}" -f $resolvedRowKey)
+    Add-ReportRow -Step 'Target App' -Status 'INFO' -Detail ("RowKey={0}" -f $AppRowKey)
 
     Start-IdentityRegularUserSession
 
     Invoke-EventuallyConsistentStep `
         -Operation {
-            Update-CurrentApplicationNoScript -ResolvedRowKey $resolvedRowKey
+            Update-CurrentApplicationWithAdvancedScript -ResolvedRowKey $AppRowKey
         } `
-        -OperationName 'Update Current Application (No Script)' `
+        -OperationName 'Update Current Application With Advanced Script' `
         -MaxWaitSeconds $RetryWindowSeconds `
         -IntervalSeconds $RetryIntervalSeconds
 
-    Write-Log ("Post-create non-script update completed successfully for row key '{0}'." -f $resolvedRowKey) 'Green'
-    Add-ReportRow -Step 'Overall' -Status 'SUCCESS' -Detail ("RowKey={0}; Name={1}" -f $resolvedRowKey, $Name)
+    Write-Log ("Advanced-script update completed successfully for row key '{0}'." -f $AppRowKey) 'Green'
+    Add-ReportRow -Step 'Overall' -Status 'SUCCESS' -Detail ("RowKey={0}; Name={1}" -f $AppRowKey, $Name)
 }
 catch {
     Write-Log ("FAILED: {0}" -f $_.Exception.Message) 'Red'
