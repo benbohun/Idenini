@@ -1,19 +1,22 @@
 <#
-CNA_Create_Identity_WebApp_From_Json_NonServiceUser.ps1
+CNA_Create_Identity_WebApp_From_Json_RegularUser.ps1
 
 Purpose
-- Use CCP/service-user only for PAS lookup
-- Use an interactive NON-SERVICE Identity admin user for Identity app-management APIs
+- Use a REGULAR user credential (not CCP, not service user)
+- Log in to Privilege Cloud / PAS with that regular user
+- Log in to CyberArk Identity app-management APIs with that same regular user
 - Create a new Browser Extension (advanced) style app from exported JSON
 - Update the app with the exported configuration
 - Rename the app
 - Apply direct application permissions to a target group
+- Validate PAS account input using safe-only exact lookup
 
 Notes
-- IdentityApiTenantURL should be your preferred tenant URL if available, for example:
-    https://yourtenant.my.idaptive.app
-- Supports password and simple text/OTP challenge prompts for Identity auth.
-- Skips GetUserInfo and skips Redrock/query entirely.
+- IdentityApiTenantURL should be the preferred tenant URL if your tenant has one
+  Example: https://yourtenant.my.idaptive.app
+- IdentityTenantURL is used for PAS header/session creation
+- This script skips GetUserInfo and skips Redrock/query entirely
+- If your regular user is challenged for MFA on the Identity API login, the script will prompt for it
 #>
 
 [CmdletBinding()]
@@ -27,16 +30,9 @@ param(
     [string]$PCloudSubdomain      = 'cna-prod',
     [string]$PrivilegeCloudURL    = 'https://cna-prod.privilegecloud.cyberark.cloud',
 
-    # ===== CCP settings (for PAS only) =====
-    [string]$CCPAddress           = 'https://vskau1p1231.cna.com',
-    [string]$CCPLocation          = 'AIMWebService',
-    [string]$CCPAppID             = 'PAMDiscovery',
-    [string]$CCPSafe              = 'CA_PCloud_Admins',
-    [string]$CCPObject            = 'cna-prod.cyberark.cloud-cnarestbot',
-    [bool]$CCPWindowsAuth         = $false,
-
-    # ===== Interactive Identity admin login =====
-    [string]$IdentityAdminUserName = '',
+    # ===== Regular user login =====
+    [string]$RegularUserName      = '',
+    [string]$RegularUserPassword  = '',
 
     # ===== New app settings =====
     [string]$SourceAppName        = 'GCP - Okta Prod',
@@ -58,8 +54,8 @@ param(
     [string]$SourceAppExportJson  = '',
 
     # ===== Logging =====
-    [string]$LogPath              = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_From_Json_NonServiceUser.log',
-    [string]$ReportCsvPath        = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_From_Json_NonServiceUser_Report.csv',
+    [string]$LogPath              = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_From_Json_RegularUser.log',
+    [string]$ReportCsvPath        = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_From_Json_RegularUser_Report.csv',
 
     # ===== Advanced =====
     [switch]$WhatIf
@@ -171,6 +167,24 @@ function Convert-SecureStringToPlainText {
     }
 }
 
+function Get-RegularCredential {
+    if ([string]::IsNullOrWhiteSpace($RegularUserName)) {
+        $script:PasCredential = Get-Credential -Message 'Enter REGULAR user credential for PAS and Identity app-management APIs'
+        if ($null -eq $script:PasCredential) {
+            throw 'Credential prompt was cancelled.'
+        }
+        return
+    }
+
+    if ([string]::IsNullOrWhiteSpace($RegularUserPassword)) {
+        $secure = Read-Host "Enter password for $RegularUserName" -AsSecureString
+    } else {
+        $secure = ConvertTo-SecureString $RegularUserPassword -AsPlainText -Force
+    }
+
+    $script:PasCredential = [pscredential]::new($RegularUserName, $secure)
+}
+
 function Get-DefaultSourceExportJson {
 @'
 {"CBEScript":"loginData.applicationUrl = \"https://cna.okta.com/login/default\";\n \nloginData.addField(\"username\", \"input#input28\", LoginUsername + \"@cna.com\");\nloginData.addField(\"password\", \"input[name='credentials.passcode']\", LoginPassword);\n \nloginData.formPattern = \"form\";\nloginData.globalSelectorTimeout = 10000;\n \nloginData.order = [\n  [\"fill\", \"username\"],\n  [\"fill\", \"password\"],\n  [\"click\", \"input[type='submit'][value='Sign in']\"]\n];","Name":"GCP - Okta Prod","Category":"_I18N_AppCategory_Other","DefaultAuthProfileInfo":{"Uuid":"AlwaysAllowed"},"DisplayName":"GCP - Okta Prod","OnPrem":true,"IsSwsEnabled":true,"ShowRegistration":false,"AdminTag":"_I18N_AppCategory_Other","UserNameStrategy":"SetByUser","Description":"_I18N_AppDesc_Generic_BE_Script","FormFillingEnabled":true,"Generic":true,"AppType":"Web","DefaultAuthProfile":"AlwaysAllowed","Icon":"/vfslow/lib/application/icons/GenericBrowserExtension.svg","AuthRules":{"_UniqueKey":"Condition","_Value":[],"Enabled":true,"_Type":"RowSet"},"WebAppType":"UsernamePassword","TemplateName":"GenericBrowserExtensionScript","Notes":"","LocalizationEnabled":false,"WebUPAppType":"BrowserExtensionScript","NotSelfService":true}
@@ -192,62 +206,39 @@ try {
 }
 
 # ------------------------------------------------------------
-# PAS auth from CCP
+# PAS login using regular user
 # ------------------------------------------------------------
-function Start-PASSessionFromCCP {
-    param([Parameter(Mandatory)][string]$ObjectName)
-
-    $headers = @{ 'Content-Type' = 'application/json' }
-    $ccpUrl  = "$CCPAddress/$CCPLocation/api/Accounts?AppID=$CCPAppID&Safe=$CCPSafe&Object=$ObjectName"
-
-    Write-Log ("Retrieving CyberArk API credentials from CCP using Object='{0}'..." -f $ObjectName) 'Cyan'
-    Write-Log ("CCP URL: {0}" -f $ccpUrl) 'Gray'
-
-    $resp = Invoke-RestMethod -Uri $ccpUrl -Method GET -Headers $headers -UseDefaultCredentials:$CCPWindowsAuth -ErrorAction Stop
-    if (-not $resp -or -not $resp.Content) {
-        throw 'Empty CCP response.'
+function Start-PASSessionFromRegularUser {
+    if ($null -eq $script:PasCredential) {
+        throw 'Regular user credential is not initialized.'
     }
-
-    $resolvedUser = $null
-    if ($resp.PSObject.Properties.Name -contains 'Username') {
-        $resolvedUser = [string]$resp.Username
-    } elseif ($resp.PSObject.Properties.Name -contains 'UserName') {
-        $resolvedUser = [string]$resp.UserName
-    }
-
-    if ([string]::IsNullOrWhiteSpace($resolvedUser)) {
-        throw 'CCP returned password but no Username/UserName field.'
-    }
-
-    $secure = ConvertTo-SecureString $resp.Content -AsPlainText -Force
-    $script:PasCredential = [PSCredential]::new($resolvedUser, $secure)
-
-    Write-Log ("Successfully retrieved credentials for PAS service user: {0}" -f $resolvedUser) 'Green'
-    Add-ReportRow -Step 'CCP Retrieve' -Status 'SUCCESS' -Detail ("User {0}" -f $resolvedUser)
 
     $normalizedTenant = Get-NormalizedIdentityTenant -TenantUrl $IdentityTenantURL
 
-    Write-Log 'Requesting PAS session via psPAS Identity header...' 'Cyan'
-    $header = Get-IdentityHeader `
-        -IdentityTenantURL $normalizedTenant `
-        -psPASFormat `
-        -PCloudSubdomain $PCloudSubdomain `
-        -UPCreds $script:PasCredential
+    try {
+        Write-Log ("Attempting PAS login as regular user '{0}'..." -f $script:PasCredential.UserName) 'Cyan'
 
-    Use-PASSession $header | Out-Null
+        $header = Get-IdentityHeader `
+            -IdentityTenantURL $normalizedTenant `
+            -psPASFormat `
+            -PCloudSubdomain $PCloudSubdomain `
+            -UPCreds $script:PasCredential
 
-    if (-not (Get-PASSession)) {
-        throw 'psPAS session not established.'
+        Use-PASSession $header | Out-Null
+
+        if (-not (Get-PASSession)) {
+            throw 'psPAS session not established.'
+        }
+
+        Write-Log ("PAS session established ({0})." -f $script:PasCredential.UserName) 'Green'
+        Add-ReportRow -Step 'PAS Session' -Status 'SUCCESS' -Detail ("Authenticated as {0}" -f $script:PasCredential.UserName)
+    } catch {
+        throw ("PAS login failed for regular user '{0}': {1}" -f $script:PasCredential.UserName, $_.Exception.Message)
     }
-
-    Write-Log ("PAS session established ({0})." -f $script:PasCredential.UserName) 'Green'
-    Add-ReportRow -Step 'PAS Session' -Status 'SUCCESS' -Detail ("Authenticated as {0}" -f $script:PasCredential.UserName)
-
-    return $resp
 }
 
 # ------------------------------------------------------------
-# Interactive Identity authentication (non-service user)
+# Interactive Identity authentication (same regular user)
 # ------------------------------------------------------------
 function Get-AuthPayload {
     param([Parameter(Mandatory)]$Response)
@@ -304,7 +295,17 @@ function Get-MechanismPrompt {
     $type   = [string](Get-DirectField -Object $Mechanism -FieldName 'AnswerType')
 
     if ($name -eq 'UP' -or $prompt -match 'Password') {
-        $secure = Read-Host "Enter password for the Identity admin account" -AsSecureString
+        # Reuse the same known password if it exists
+        if (-not [string]::IsNullOrWhiteSpace($RegularUserPassword)) {
+            return @{
+                Action = 'Answer'
+                Answer = $RegularUserPassword
+                Name   = $name
+                Prompt = $prompt
+            }
+        }
+
+        $secure = Read-Host "Enter password for the regular Identity admin account" -AsSecureString
         return @{
             Action = 'Answer'
             Answer = (Convert-SecureStringToPlainText -SecureString $secure)
@@ -324,19 +325,13 @@ function Get-MechanismPrompt {
     }
 }
 
-function Start-IdentityInteractiveSession {
-    param(
-        [Parameter(Mandatory)][string]$TenantUrl,
-        [string]$UserName
-    )
-
-    if ([string]::IsNullOrWhiteSpace($UserName)) {
-        $UserName = Read-Host 'Enter the NON-SERVICE Identity admin username'
+function Start-IdentityRegularUserSession {
+    if ($null -eq $script:PasCredential) {
+        throw 'Regular user credential is not initialized.'
     }
 
-    if ([string]::IsNullOrWhiteSpace($UserName)) {
-        throw 'Identity admin username cannot be empty.'
-    }
+    $TenantUrl = $IdentityApiTenantURL
+    $UserName  = $script:PasCredential.UserName
 
     $baseHeaders = @{
         'X-IDAP-NATIVE-CLIENT' = 'true'
@@ -349,7 +344,7 @@ function Start-IdentityInteractiveSession {
 
     $script:IdentityWebSession = New-Object Microsoft.PowerShell.Commands.WebRequestSession
 
-    Write-Log ("Starting interactive CyberArk Identity authentication for '{0}'..." -f $UserName) 'Cyan'
+    Write-Log ("Starting interactive CyberArk Identity authentication for regular user '{0}'..." -f $UserName) 'Cyan'
 
     $startBody = @{
         User    = $UserName
@@ -658,7 +653,7 @@ function Import-AppFromTemplateAdaptive {
         } catch {
             $msg = $_.Exception.Message
             if ($msg -match 'Unauthorized persisted for ImportAppFromTemplate' -or $msg -match '\(401\).*Unauthorized') {
-                throw "ImportAppFromTemplate returned 401 Unauthorized for the interactive admin account. Check the account's effective Application Management rights and the IdentityApiTenantURL value."
+                throw "ImportAppFromTemplate returned 401 Unauthorized for the regular user. Check effective Application Management rights and the IdentityApiTenantURL value."
             }
 
             Write-Log ("ImportAppFromTemplate failed for template '{0}': {1}" -f $templateId, $msg) 'Yellow'
@@ -831,7 +826,7 @@ function Update-IdentityApplicationFromConfig {
         } catch {
             $msg = $_.Exception.Message
             if ($msg -match 'Unauthorized persisted for UpdateApplicationDE' -or $msg -match '\(401\).*Unauthorized') {
-                throw "UpdateApplicationDE returned 401 Unauthorized for the interactive admin account. Check effective Application Management rights and IdentityApiTenantURL."
+                throw "UpdateApplicationDE returned 401 Unauthorized for the regular user. Check effective Application Management rights and IdentityApiTenantURL."
             }
 
             Write-Log ("UpdateApplicationDE attempt #{0} failed: {1}" -f $attempt, $msg) 'Yellow'
@@ -944,11 +939,11 @@ function Find-GrantArray {
 }
 
 function Get-AppPermissionState {
-    param([Parameter(Mandatory)][string]$AppRowKey)
+    param([Parameter(Mandatory)][string]$AppKey)
 
-    $details = Get-IdentityApplicationDetails -AppKey $AppRowKey
+    $details = Get-IdentityApplicationDetails -AppKey $AppKey
 
-    $rowKey = $AppRowKey
+    $rowKey = $AppKey
     $idVal  = $null
     $pvid   = $null
 
@@ -1082,41 +1077,6 @@ function Set-ApplicationPermissionsDirectGroup {
     param([Parameter(Mandatory)][string]$AppRowKey)
 
     $state = Get-AppPermissionState -AppKey $AppRowKey
-}
-
-function Get-AppPermissionState {
-    param([Parameter(Mandatory)][string]$AppKey)
-
-    $details = Get-IdentityApplicationDetails -AppKey $AppKey
-
-    $rowKey = $AppKey
-    $idVal  = $null
-    $pvid   = $null
-
-    $tmpRowKey = Find-FirstPropertyValue -Object $details -Names @('_RowKey','_Rowkey','RowKey')
-    if ($tmpRowKey) { $rowKey = [string]$tmpRowKey }
-
-    $tmpId = Find-FirstPropertyValue -Object $details -Names @('ID','AppID')
-    if ($tmpId) { $idVal = [string]$tmpId }
-
-    $tmpPvid = Find-FirstPropertyValue -Object $details -Names @('PVID','PVId','PermissionVersionId')
-    if ($tmpPvid) { $pvid = [string]$tmpPvid }
-
-    $grants = Find-GrantArray -Object $details
-
-    return [pscustomobject]@{
-        Details = $details
-        RowKey  = $rowKey
-        ID      = $idVal
-        PVID    = $pvid
-        Grants  = $grants
-    }
-}
-
-function Set-ApplicationPermissionsDirectGroup {
-    param([Parameter(Mandatory)][string]$AppRowKey)
-
-    $state = Get-AppPermissionState -AppKey $AppRowKey
     $existingGrantCount = 0
     if ($state.Grants) { $existingGrantCount = @($state.Grants).Count }
 
@@ -1146,7 +1106,7 @@ function Set-ApplicationPermissionsDirectGroup {
                 } catch {
                     $msg = $_.Exception.Message
                     if ($msg -match 'Unauthorized persisted for SetApplicationPermissions' -or $msg -match '\(401\).*Unauthorized') {
-                        throw "SetApplicationPermissions returned 401 Unauthorized for the interactive admin account."
+                        throw "SetApplicationPermissions returned 401 Unauthorized for the regular user."
                     }
 
                     Write-Log ("SetApplicationPermissions attempt failed with Rights='{0}' and grant Principal='{1}': {2}" -f $rights, $grant.Principal, $msg) 'Yellow'
@@ -1161,7 +1121,6 @@ function Set-ApplicationPermissionsDirectGroup {
 # ------------------------------------------------------------
 # MAIN
 # ------------------------------------------------------------
-$response       = $null
 $exportConfig   = $null
 $newAppKey      = $null
 $createdDetails = $null
@@ -1187,12 +1146,16 @@ try {
         throw 'AccountName cannot be empty.'
     }
 
-    $response = Start-PASSessionFromCCP -ObjectName $CCPObject
+    Get-RegularCredential
+    Write-Log ("Using regular user credential '{0}' for both PAS and Identity login." -f $script:PasCredential.UserName) 'Cyan'
+    Add-ReportRow -Step 'Credential Mode' -Status 'INFO' -Detail ("Regular user login as {0}" -f $script:PasCredential.UserName)
+
+    Start-PASSessionFromRegularUser
     $vaultAccount = Find-VaultAccountInSafeOnly -SafeName $SafeName -AccountIdentifier $AccountName
 
-    Start-IdentityInteractiveSession -TenantUrl $IdentityApiTenantURL -UserName $IdentityAdminUserName
-    Write-Log "Using interactive non-service Identity admin login for app-management operations." "Yellow"
-    Add-ReportRow -Step 'Identity Login Mode' -Status 'INFO' -Detail 'Interactive non-service admin login'
+    Start-IdentityRegularUserSession
+    Write-Log "Using regular user Identity login for app-management operations." "Yellow"
+    Add-ReportRow -Step 'Identity Login Mode' -Status 'INFO' -Detail 'Regular user login'
 
     Write-Log ("Using exported config Name='{0}', TemplateName='{1}', AppType='{2}', WebUPAppType='{3}', IsSwsEnabled='{4}'." -f $exportConfig.Name, $exportConfig.TemplateName, $exportConfig.AppType, $exportConfig.WebUPAppType, $exportConfig.IsSwsEnabled) 'Cyan'
     Add-ReportRow -Step 'Input Summary' -Status 'INFO' -Detail ("SourceAppName={0}; ExportedTemplateName={1}; NewAppName={2}; GroupDisplayName={3}; GroupSystemName={4}; GroupInternalName={5}; GroupDirectoryServiceUuid={6}; SafeName={7}; AccountName={8}; IdentityApiTenantURL={9}" -f $SourceAppName, $exportConfig.TemplateName, $NewAppName, $TargetGroupDisplayName, $TargetGroupSystemName, $TargetGroupInternalName, $TargetGroupDirectoryServiceUuid, $SafeName, $AccountName, $IdentityApiTenantURL)
