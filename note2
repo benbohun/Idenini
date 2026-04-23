@@ -1,41 +1,3 @@
-Based on the logon pattern
-Use this to logon
-Develop a script to move disabled AD account in CyberArk to "WIN_Removed" platform and "Accounts to be deleted" Safe
-Am trying to build this into a schedule task to be run manually
-The AD lookup for disabled account also below
-
-
-# Import Active Directory module
-Import-Module ActiveDirectory
-
-# Define search base OU
-$SearchBase = "OU=End Users,DC=alliantcreditunion,DC=com"
-
-# Define export path
-$ExportPath = "I:\Script\Disabled User"
-$ExportFile = "$ExportPath\DisabledAdminAccount.csv"
-
-# Create directory if it does not exist
-if (!(Test-Path $ExportPath)) {
-    New-Item -ItemType Directory -Path $ExportPath -Force
-}
-
-# Get disabled users starting with A_
-Get-ADUser `
-    -SearchBase $SearchBase `
-    -Filter { Enabled -eq $false -and SamAccountName -like "A_*" } `
-    -Properties SamAccountName, Name, DistinguishedName, Enabled |
-Select-Object `
-    SamAccountName,
-    Name,
-    DistinguishedName |
-Export-Csv `
-    -Path $ExportFile `
-    -NoTypeInformation
-
-Write-Host "Disabled admin accounts exported to $ExportFile"
-
-
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
     # ===== Identity / Privilege Cloud =====
@@ -47,78 +9,68 @@ param(
     [string]$CCPLocation         = "AIMWebService",
     [string]$CCPAppID            = "ACURestAPI",
     [string]$CCPSafe             = "ACU-VAULT-API",
-    #[string]$CCPObject           = "application-cyb_p_builtinadmin-alliantcredit.cyberark.cloud",
-    [string]$CCPObject          = "Application-CyberArkVaultRestAPI-alliantcredit.cyberark.cloud",
-
+    [string]$CCPObject           = "Application-CyberArkVaultRestAPI-alliantcredit.cyberark.cloud",
     [bool]  $CCPWindowsAuth      = $false,
 
-    # ===== CSV input =====
-    [string]$CsvPath             = "I:\Script\IDENTITY Script New\csv\SafesToUpdate.csv",
+    # ===== AD lookup =====
+    [string]$SearchBase          = "OU=End Users,DC=alliantcreditunion,DC=com",
+    [string]$SamAccountPattern   = "A_*",
 
-    # ===== Status export =====
-    [string]$StatusCsvPath       = "I:\Script\IDENTITY Script New\csv\safeupdatestatus.csv",
+    # ===== Target CyberArk state =====
+    [string]$TargetSafeName      = "Accounts to be deleted",
+    [string]$TargetPlatformID    = "WIN_Removed",
+    [bool]  $DisableAutoManagement = $true,
+    [string]$ManualManagementReason = "Disabled in Active Directory and moved by CyberArk cleanup automation.",
 
-    # ===== Default retention if CSV row does not provide one =====
-    [ValidateRange(1,3650)]
-    [int]$TargetRetentionDays    = 60,
+    # ===== Search tuning =====
+    [ValidateRange(1,5000)]
+    [int]$AccountSearchLimit     = 1000,
 
-    # ===== Safe member enforcement =====
-    [string]$ServiceIdentityUser = "acurestapi_local@alliantcreditunion.admin",
-    [string]$SafeMemberSearchIn  = "Vault",
-    [ValidateSet("User","Group","Role")]
-    [string]$SafeMemberType      = "User",
-
-    # ===== Logging =====
-    [string]$LogFilePath         = "I:\Script\IDENTITY Script New\logs\UpdateRetention_SelectedSafes.txt"
+    # ===== Export / Logging =====
+    [string]$ExportRoot          = "I:\Script\Disabled User"
 )
 
-# --- Full Safe permissions for the enforced service identity member ---
-$FullPermPAS = [PSCustomObject]@{
-    UseAccounts                            = $true
-    RetrieveAccounts                       = $true
-    ListAccounts                           = $true
-    AddAccounts                            = $true
-    UpdateAccountContent                   = $true
-    UpdateAccountProperties                = $true
-    InitiateCPMAccountManagementOperations = $true
-    SpecifyNextAccountContent              = $true
-    RenameAccounts                         = $true
-    DeleteAccounts                         = $true
-    UnlockAccounts                         = $true
-    ManageSafe                             = $true
-    ManageSafeMembers                      = $true
-    BackupSafe                             = $true
-    ViewAuditLog                           = $true
-    ViewSafeMembers                        = $true
-    AccessWithoutConfirmation              = $true
-    CreateFolders                          = $true
-    DeleteFolders                          = $true
-    MoveAccountsAndFolders                 = $true
-    requestsAuthorizationLevel1            = $true
-    requestsAuthorizationLevel2            = $false
-}
-
-# --- Modules & TLS ---
-Import-Module psPAS -ErrorAction Stop
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+# ==============================
+# Environment / module setup
+# ==============================
 $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
+Import-Module ActiveDirectory -ErrorAction Stop
+Import-Module psPAS -ErrorAction Stop
+
+# ==============================
+# Paths
+# ==============================
+$TimeStamp        = Get-Date -Format "yyyyMMdd_HHmmss"
+$DisabledUsersCsv = Join-Path $ExportRoot "DisabledAdminAccount.csv"
+$StatusCsvPath    = Join-Path $ExportRoot ("DisabledAdminAccount_MoveStatus_{0}.csv" -f $TimeStamp)
+$LogFilePath      = Join-Path $ExportRoot ("DisabledAdminAccount_Move_{0}.log" -f $TimeStamp)
+
+# ==============================
+# Console helpers
+# ==============================
 function Write-Err {
     param([string]$Message)
     Write-Host "❌ $Message" -ForegroundColor Red
 }
-
+function Write-WarnLine {
+    param([string]$Message)
+    Write-Host "⚠️  $Message" -ForegroundColor Yellow
+}
 function Write-Info {
     param([string]$Message)
     Write-Host "ℹ️  $Message" -ForegroundColor Cyan
 }
-
 function Write-Ok {
     param([string]$Message)
     Write-Host "✅ $Message" -ForegroundColor Green
 }
 
+# ==============================
+# Utility helpers
+# ==============================
 function Ensure-Directory {
     param([Parameter(Mandatory)][string]$Path)
     if (-not [string]::IsNullOrWhiteSpace($Path) -and -not (Test-Path -LiteralPath $Path)) {
@@ -157,36 +109,69 @@ function Get-PropValueCI {
         [Parameter(Mandatory)][string]$PropName
     )
     if ($null -eq $Object) { return $null }
-    $p = $Object.PSObject.Properties | Where-Object { $_.Name -ieq $PropName } | Select-Object -First 1
-    if ($p) { return $p.Value }
+
+    $prop = $Object.PSObject.Properties | Where-Object { $_.Name -ieq $PropName } | Select-Object -First 1
+    if ($prop) { return $prop.Value }
     return $null
 }
 
-function Get-RowValueCI {
+function Convert-ToObjectArray {
+    param($InputObject)
+
+    if ($null -eq $InputObject) { return @() }
+
+    if ($InputObject -is [System.Array]) {
+        return $InputObject
+    }
+
+    $valueProp = $InputObject.PSObject.Properties | Where-Object { $_.Name -eq 'value' } | Select-Object -First 1
+    if ($valueProp -and $null -ne $valueProp.Value) {
+        return @($valueProp.Value)
+    }
+
+    return @($InputObject)
+}
+
+function Test-UsernameMatch {
     param(
-        [Parameter(Mandatory)]$Row,
-        [Parameter(Mandatory)][string[]]$CandidateNames
+        [string]$UserName,
+        [string]$SamAccountName
     )
 
-    foreach ($name in $CandidateNames) {
-        $prop = $Row.PSObject.Properties | Where-Object { $_.Name -ieq $name } | Select-Object -First 1
-        if ($prop) {
-            return $prop.Value
-        }
+    if ([string]::IsNullOrWhiteSpace($UserName) -or [string]::IsNullOrWhiteSpace($SamAccountName)) {
+        return $false
     }
-    return $null
+
+    $escaped = [regex]::Escape($SamAccountName)
+
+    if ($UserName -ieq $SamAccountName) { return $true }
+    if ($UserName -imatch ("^(?:[^\\/@]+[\\/@])?{0}$" -f $escaped)) { return $true }
+    if ($UserName -imatch ("^{0}@[^@]+$" -f $escaped)) { return $true }
+
+    return $false
 }
 
-function Convert-ObjectToHashtable {
-    param([Parameter(Mandatory)]$InputObject)
+function Test-AccountNameMatch {
+    param(
+        [string]$AccountName,
+        [string]$SamAccountName
+    )
 
-    $hash = @{}
-    foreach ($prop in $InputObject.PSObject.Properties) {
-        $hash[$prop.Name] = $prop.Value
+    if ([string]::IsNullOrWhiteSpace($AccountName) -or [string]::IsNullOrWhiteSpace($SamAccountName)) {
+        return $false
     }
-    return $hash
+
+    $escaped = [regex]::Escape($SamAccountName)
+
+    if ($AccountName -ieq $SamAccountName) { return $true }
+    if ($AccountName -imatch ("(^|[-]){0}$" -f $escaped)) { return $true }
+
+    return $false
 }
 
+# ==============================
+# CCP / PAS authentication
+# ==============================
 function Get-ServiceUserCredentialFromCCP {
     [CmdletBinding()]
     param(
@@ -201,16 +186,16 @@ function Get-ServiceUserCredentialFromCCP {
     $base = $CCPAddress.TrimEnd('/')
     $loc  = $Location.Trim('/')
 
-    $url  = "{0}/{1}/api/Accounts?AppID={2}&Safe={3}&Object={4}" -f $base, $loc, $AppID, $Safe, $Object
+    $url = "{0}/{1}/api/Accounts?AppID={2}&Safe={3}&Object={4}" -f $base, $loc, $AppID, $Safe, $Object
 
-    Write-LogLine "Retrieving Service User credential from CCP: $url" "INFO"
+    Write-LogLine "Retrieving service credential from CCP: $url" "INFO"
     Write-Info "Retrieving service credential from CCP..."
 
     $headers = @{ "Content-Type" = "application/json" }
     $resp = Invoke-RestMethod -Uri $url -Method GET -Headers $headers -UseDefaultCredentials:$WindowsAuth -ErrorAction Stop
 
     if (-not $resp.UserName -or -not $resp.Content) {
-        throw "CCP response missing UserName/Content."
+        throw "CCP response missing UserName and/or Content."
     }
 
     Write-LogLine "CCP returned service user: $($resp.UserName)" "SUCCESS"
@@ -231,8 +216,8 @@ function Connect-PCloudWithServiceUser {
     $tenantHost = Get-HostFromUrl $IdentityTenantURL
     $subdomain  = Get-PCloudSubdomainFromUrl $PrivilegeCloudURL
 
-    Write-LogLine "Attempting login (Primary): New-PASSession (ServiceUser)..." "INFO"
-    Write-Info "Attempting Privilege Cloud login using primary authentication method..."
+    Write-LogLine "Attempting login (Primary): New-PASSession -ServiceUser" "INFO"
+    Write-Info "Attempting Privilege Cloud login using primary method..."
 
     try {
         New-PASSession `
@@ -243,7 +228,7 @@ function Connect-PCloudWithServiceUser {
             -ErrorAction Stop | Out-Null
 
         $sess = Get-PASSession
-        if (-not $sess) { throw "Get-PASSession returned null after New-PASSession." }
+        if (-not $sess) { throw "Get-PASSession returned null after primary login." }
 
         Write-LogLine "Authenticated (Primary) to $PrivilegeCloudURL as $($ServiceCred.UserName)" "SUCCESS"
         Write-Ok "Privilege Cloud login successful (Primary) as: $($ServiceCred.UserName)"
@@ -251,11 +236,11 @@ function Connect-PCloudWithServiceUser {
     }
     catch {
         Write-LogLine "Primary login failed: $($_.Exception.Message)" "WARN"
-        Write-Info "Primary login failed. Attempting fallback authentication..."
+        Write-WarnLine "Primary login failed. Attempting fallback..."
 
         $cmd = Get-Command Get-IdentityHeader -ErrorAction SilentlyContinue
         if (-not $cmd) {
-            throw "Fallback login not available (Get-IdentityHeader not found). Primary login failed."
+            throw "Fallback login not available because Get-IdentityHeader was not found."
         }
 
         $header = Get-IdentityHeader `
@@ -267,30 +252,379 @@ function Connect-PCloudWithServiceUser {
         Use-PASSession $header
 
         $sess2 = Get-PASSession
-        if (-not $sess2) { throw "Get-PASSession returned null after Use-PASSession." }
+        if (-not $sess2) { throw "Get-PASSession returned null after fallback login." }
 
         Write-LogLine "Authenticated (Fallback) to $PrivilegeCloudURL as $($ServiceCred.UserName)" "SUCCESS"
         Write-Ok "Privilege Cloud login successful (Fallback) as: $($ServiceCred.UserName)"
-        return
     }
 }
 
-function Import-SafeTargetsFromCsv {
+# ==============================
+# AD discovery
+# ==============================
+function Get-DisabledADAdminUsers {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][int]$DefaultRetentionDays
+        [Parameter(Mandatory)][string]$SearchBase,
+        [Parameter(Mandatory)][string]$SamAccountPattern,
+        [Parameter(Mandatory)][string]$ExportFile
     )
 
-    if (-not (Test-Path -LiteralPath $Path)) {
-        throw "CSV file not found: $Path"
-    }
+    Write-Info "Querying AD for disabled admin accounts..."
+    Write-LogLine "Querying AD. SearchBase='$SearchBase'; SamAccountPattern='$SamAccountPattern'" "INFO"
 
-    $rows = Import-Csv -LiteralPath $Path
-    if (-not $rows -or $rows.Count -eq 0) {
-        throw "CSV file is empty: $Path"
-    }
+    $users = Get-ADUser `
+        -SearchBase $SearchBase `
+        -Filter { Enabled -eq $false -and SamAccountName -like $SamAccountPattern } `
+        -Properties SamAccountName, Name, DistinguishedName, Enabled |
+    Select-Object SamAccountName, Name, DistinguishedName
 
-    $targets = New-Object System.Collections.Generic.List[object]
+    $users = @($users)
+
+    $users | Export-Csv -Path $ExportFile -NoTypeInformation
+    Write-LogLine "Exported disabled AD users to $ExportFile. Count=$($users.Count)" "SUCCESS"
+    Write-Ok "Disabled AD admin accounts exported to: $ExportFile"
+
+    return $users
+}
+
+# ==============================
+# CyberArk account lookup
+# ==============================
+function Find-PASAccountsForDisabledUser {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$SamAccountName,
+        [Parameter(Mandatory)][int]$Limit
+    )
+
+    Write-LogLine "Searching CyberArk accounts for disabled AD user '$SamAccountName'" "INFO"
+
+    $raw = Get-PASAccount -search $SamAccountName -limit $Limit
+    $accounts = Convert-ToObjectArray $raw
+
+    $matches = New-Object System.Collections.Generic.List[object]
     $seen    = @{}
-    $rowNum = 1
+
+    foreach ($acct in $accounts) {
+        if ($null -eq $acct) { continue }
+
+        $id       = Get-PropValueCI -Object $acct -PropName 'id'
+        $userName = Get-PropValueCI -Object $acct -PropName 'userName'
+        $name     = Get-PropValueCI -Object $acct -PropName 'name'
+
+        if ([string]::IsNullOrWhiteSpace($id)) { continue }
+        if ($seen.ContainsKey($id)) { continue }
+
+        $userMatch = Test-UsernameMatch -UserName $userName -SamAccountName $SamAccountName
+        $nameMatch = Test-AccountNameMatch -AccountName $name -SamAccountName $SamAccountName
+
+        if ($userMatch -or $nameMatch) {
+            $seen[$id] = $true
+            [void]$matches.Add($acct)
+        }
+    }
+
+    Write-LogLine "Found $($matches.Count) matching CyberArk account(s) for '$SamAccountName'" "INFO"
+    return @($matches)
+}
+
+# ==============================
+# CyberArk account update
+# ==============================
+function Update-DisabledPASAccount {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [Parameter(Mandatory)]$Account,
+        [Parameter(Mandatory)][string]$TargetSafeName,
+        [Parameter(Mandatory)][string]$TargetPlatformID,
+        [Parameter(Mandatory)][bool]$DisableAutoManagement,
+        [Parameter(Mandatory)][string]$ManualManagementReason
+    )
+
+    $id              = Get-PropValueCI -Object $Account -PropName 'id'
+    $name            = Get-PropValueCI -Object $Account -PropName 'name'
+    $userName        = Get-PropValueCI -Object $Account -PropName 'userName'
+    $address         = Get-PropValueCI -Object $Account -PropName 'address'
+    $currentSafe     = Get-PropValueCI -Object $Account -PropName 'safeName'
+    $currentPlatform = Get-PropValueCI -Object $Account -PropName 'platformId'
+
+    $currentAutoMgmt = $null
+    $currentReason   = $null
+    if ($null -ne $Account.secretManagement) {
+        $currentAutoMgmt = $Account.secretManagement.automaticManagementEnabled
+        $currentReason   = $Account.secretManagement.manualManagementReason
+    }
+
+    $display = "{0} | {1} | {2}" -f $id, $name, $userName
+
+    $plannedOps = New-Object System.Collections.Generic.List[string]
+
+    if ($currentSafe -ne $TargetSafeName) {
+        [void]$plannedOps.Add("safeName: '$currentSafe' -> '$TargetSafeName'")
+    }
+    if ($currentPlatform -ne $TargetPlatformID) {
+        [void]$plannedOps.Add("platformId: '$currentPlatform' -> '$TargetPlatformID'")
+    }
+    if ($DisableAutoManagement -and $currentAutoMgmt -ne $false) {
+        [void]$plannedOps.Add("automaticManagementEnabled: '$currentAutoMgmt' -> 'False'")
+    }
+    if ($DisableAutoManagement -and $currentReason -ne $ManualManagementReason) {
+        [void]$plannedOps.Add("manualManagementReason updated")
+    }
+
+    if ($plannedOps.Count -eq 0) {
+        return [pscustomobject]@{
+            Status  = "AlreadyCompliant"
+            Message = "No changes required."
+        }
+    }
+
+    $actionText = $plannedOps -join "; "
+
+    if ($PSCmdlet.ShouldProcess($display, $actionText)) {
+        if ($currentSafe -ne $TargetSafeName) {
+            Set-PASAccount -AccountID $id -op replace -path "/safeName" -value $TargetSafeName
+        }
+
+        if ($currentPlatform -ne $TargetPlatformID) {
+            Set-PASAccount -AccountID $id -op replace -path "/platformId" -value $TargetPlatformID
+        }
+
+        if ($DisableAutoManagement -and $currentAutoMgmt -ne $false) {
+            Set-PASAccount -AccountID $id -op replace -path "/secretManagement/automaticManagementEnabled" -value $false
+        }
+
+        if ($DisableAutoManagement -and $currentReason -ne $ManualManagementReason) {
+            Set-PASAccount -AccountID $id -op replace -path "/secretManagement/manualManagementReason" -value $ManualManagementReason
+        }
+
+        return [pscustomobject]@{
+            Status  = "Updated"
+            Message = $actionText
+        }
+    }
+    else {
+        return [pscustomobject]@{
+            Status  = "WhatIf"
+            Message = $actionText
+        }
+    }
+}
+
+# ==============================
+# Main
+# ==============================
+Ensure-Directory -Path $ExportRoot
+"" | Set-Content -Path $LogFilePath
+
+Write-Info "Disabled AD -> CyberArk move script starting..."
+Write-LogLine "Script started." "INFO"
+Write-LogLine "TargetSafeName='$TargetSafeName'; TargetPlatformID='$TargetPlatformID'; DisableAutoManagement='$DisableAutoManagement'" "INFO"
+
+$results = New-Object System.Collections.Generic.List[object]
+
+try {
+    # Validate target safe access early
+    try {
+        $null = Get-PASSafe -SafeName $TargetSafeName -ErrorAction Stop
+        Write-Ok "Validated target safe access: $TargetSafeName"
+        Write-LogLine "Validated target safe access: $TargetSafeName" "SUCCESS"
+    }
+    catch {
+        throw "Target safe '$TargetSafeName' was not found or is not accessible by the service user."
+    }
+
+    # Optional platform existence validation if command exists
+    $getPlatformCmd = Get-Command Get-PASPlatform -ErrorAction SilentlyContinue
+    if ($getPlatformCmd) {
+        try {
+            $null = Get-PASPlatform -PlatformID $TargetPlatformID -ErrorAction Stop
+            Write-Ok "Validated target platform: $TargetPlatformID"
+            Write-LogLine "Validated target platform: $TargetPlatformID" "SUCCESS"
+        }
+        catch {
+            Write-WarnLine "Could not validate target platform '$TargetPlatformID' via Get-PASPlatform. Continuing."
+            Write-LogLine "Platform validation warning for '$TargetPlatformID': $($_.Exception.Message)" "WARN"
+        }
+    }
+
+    # AD export
+    $disabledUsers = Get-DisabledADAdminUsers `
+        -SearchBase $SearchBase `
+        -SamAccountPattern $SamAccountPattern `
+        -ExportFile $DisabledUsersCsv
+
+    if (-not $disabledUsers -or $disabledUsers.Count -eq 0) {
+        Write-WarnLine "No disabled AD admin accounts found."
+        Write-LogLine "No disabled AD accounts found. Exiting." "WARN"
+        @() | Export-Csv -Path $StatusCsvPath -NoTypeInformation
+        Write-Ok "Empty status report exported to: $StatusCsvPath"
+        return
+    }
+
+    Write-Info ("Found {0} disabled AD account(s)." -f $disabledUsers.Count)
+
+    # Authenticate to CyberArk
+    $serviceCred = Get-ServiceUserCredentialFromCCP `
+        -CCPAddress  $CCPAddress `
+        -Location    $CCPLocation `
+        -AppID       $CCPAppID `
+        -Safe        $CCPSafe `
+        -Object      $CCPObject `
+        -WindowsAuth $CCPWindowsAuth
+
+    Connect-PCloudWithServiceUser `
+        -IdentityTenantURL $IdentityTenantURL `
+        -PrivilegeCloudURL $PrivilegeCloudURL `
+        -ServiceCred       $serviceCred
+
+    # Re-validate target safe after logon
+    try {
+        $null = Get-PASSafe -SafeName $TargetSafeName -ErrorAction Stop
+    }
+    catch {
+        throw "After authentication, target safe '$TargetSafeName' was not accessible."
+    }
+
+    $i = 0
+    foreach ($user in $disabledUsers) {
+        $i++
+        $sam  = $user.SamAccountName
+        $name = $user.Name
+        $dn   = $user.DistinguishedName
+
+        Write-Info ("[{0}/{1}] Processing disabled AD user: {2}" -f $i, $disabledUsers.Count, $sam)
+        Write-LogLine "Processing disabled AD user '$sam'" "INFO"
+
+        try {
+            $matches = Find-PASAccountsForDisabledUser -SamAccountName $sam -Limit $AccountSearchLimit
+
+            if (-not $matches -or $matches.Count -eq 0) {
+                $msg = "No matching CyberArk accounts found."
+                Write-WarnLine "$sam -> $msg"
+                Write-LogLine "$sam -> $msg" "WARN"
+
+                [void]$results.Add([pscustomobject]@{
+                    ADSamAccountName   = $sam
+                    ADName             = $name
+                    ADDistinguishedName= $dn
+                    AccountID          = $null
+                    AccountName        = $null
+                    AccountUserName    = $null
+                    Address            = $null
+                    SourceSafe         = $null
+                    SourcePlatformID   = $null
+                    TargetSafe         = $TargetSafeName
+                    TargetPlatformID   = $TargetPlatformID
+                    Status             = "NoMatch"
+                    Message            = $msg
+                })
+                continue
+            }
+
+            foreach ($acct in $matches) {
+                $acctId       = Get-PropValueCI -Object $acct -PropName 'id'
+                $acctName     = Get-PropValueCI -Object $acct -PropName 'name'
+                $acctUserName = Get-PropValueCI -Object $acct -PropName 'userName'
+                $acctAddress  = Get-PropValueCI -Object $acct -PropName 'address'
+                $acctSafe     = Get-PropValueCI -Object $acct -PropName 'safeName'
+                $acctPlatform = Get-PropValueCI -Object $acct -PropName 'platformId'
+
+                $reason = "{0} Disabled AD account detected: {1}." -f $ManualManagementReason.TrimEnd('.'), $sam
+
+                $update = Update-DisabledPASAccount `
+                    -Account $acct `
+                    -TargetSafeName $TargetSafeName `
+                    -TargetPlatformID $TargetPlatformID `
+                    -DisableAutoManagement $DisableAutoManagement `
+                    -ManualManagementReason $reason `
+                    -WhatIf:$WhatIfPreference
+
+                if ($update.Status -eq 'Updated') {
+                    Write-Ok ("{0} -> moved to safe '{1}' and platform '{2}'." -f $acctId, $TargetSafeName, $TargetPlatformID)
+                    Write-LogLine "$acctId updated successfully. $($update.Message)" "SUCCESS"
+                }
+                elseif ($update.Status -eq 'WhatIf') {
+                    Write-Info ("{0} -> WhatIf only. {1}" -f $acctId, $update.Message)
+                    Write-LogLine "$acctId WhatIf: $($update.Message)" "INFO"
+                }
+                else {
+                    Write-Info ("{0} -> {1}" -f $acctId, $update.Message)
+                    Write-LogLine "$acctId no change required." "INFO"
+                }
+
+                [void]$results.Add([pscustomobject]@{
+                    ADSamAccountName    = $sam
+                    ADName              = $name
+                    ADDistinguishedName = $dn
+                    AccountID           = $acctId
+                    AccountName         = $acctName
+                    AccountUserName     = $acctUserName
+                    Address             = $acctAddress
+                    SourceSafe          = $acctSafe
+                    SourcePlatformID    = $acctPlatform
+                    TargetSafe          = $TargetSafeName
+                    TargetPlatformID    = $TargetPlatformID
+                    Status              = $update.Status
+                    Message             = $update.Message
+                })
+            }
+        }
+        catch {
+            $err = $_.Exception.Message
+            Write-Err ("{0} -> Failed: {1}" -f $sam, $err)
+            Write-LogLine "$sam failed: $err" "ERROR"
+
+            [void]$results.Add([pscustomobject]@{
+                ADSamAccountName    = $sam
+                ADName              = $name
+                ADDistinguishedName = $dn
+                AccountID           = $null
+                AccountName         = $null
+                AccountUserName     = $null
+                Address             = $null
+                SourceSafe          = $null
+                SourcePlatformID    = $null
+                TargetSafe          = $TargetSafeName
+                TargetPlatformID    = $TargetPlatformID
+                Status              = "Failed"
+                Message             = $err
+            })
+        }
+    }
+}
+catch {
+    $fatal = $_.Exception.Message
+    Write-Err "Fatal error: $fatal"
+    Write-LogLine "Fatal error: $fatal" "ERROR"
+    throw
+}
+finally {
+    try {
+        if ($results.Count -gt 0) {
+            $results | Export-Csv -Path $StatusCsvPath -NoTypeInformation
+        }
+        else {
+            @() | Export-Csv -Path $StatusCsvPath -NoTypeInformation
+        }
+
+        Write-Ok "Status report exported to: $StatusCsvPath"
+        Write-LogLine "Status report exported to: $StatusCsvPath" "SUCCESS"
+    }
+    catch {
+        Write-Err "Failed to export status CSV: $($_.Exception.Message)"
+        Write-LogLine "Failed to export status CSV: $($_.Exception.Message)" "ERROR"
+    }
+
+    try {
+        Close-PASSession | Out-Null
+        Write-LogLine "PAS session closed." "INFO"
+    }
+    catch {
+        Write-LogLine "Close-PASSession skipped or failed: $($_.Exception.Message)" "WARN"
+    }
+
+    Write-Info "Completed."
+    Write-LogLine "Script completed." "INFO"
+}
