@@ -1,5 +1,5 @@
 <#
-CNA_Create_Update_AssignPermission_ResolvedPrincipal.ps1
+CNA_Create_Update_AssignPermission_StrictSchema.ps1
 
 Purpose
 - Prompt for regular CyberArk Identity credential
@@ -9,7 +9,18 @@ Purpose
 - Re-auth for update
 - Re-auth again for permission assignment
 - Resolve principal from Identity first (DSGroups / DSUsers / Role)
-- Call SetApplicationPermissions with resolved metadata
+- Call SetApplicationPermissions using the strict schema:
+    {
+      "RowKey": "...",
+      "ID": "...",
+      "Grants": {
+        "Rights": "...",
+        "Principal": "...",
+        "Type": "...",
+        "PrincipalId": "...",
+        "PType": "..."
+      }
+    }
 - No CCP
 - No PAS validation
 - No psPAS dependency
@@ -76,8 +87,8 @@ loginData.order = [
     [int]$MaxPhaseReauthAttempts       = 2,
 
     # Logging
-    [string]$LogPath                   = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_Update_AssignPermission_ResolvedPrincipal.log',
-    [string]$ReportCsvPath             = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_Update_AssignPermission_ResolvedPrincipal_Report.csv'
+    [string]$LogPath                   = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_Update_AssignPermission_StrictSchema.log',
+    [string]$ReportCsvPath             = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_Update_AssignPermission_StrictSchema_Report.csv'
 )
 
 $script:IdentityAuthToken         = $null
@@ -195,15 +206,27 @@ function Get-ResolvedAppName {
 }
 
 function Get-ResolvedPermissionPrincipal {
-    if (-not [string]::IsNullOrWhiteSpace($PermissionPrincipal)) {
-        return $PermissionPrincipal.Trim()
-    }
+    while ($true) {
+        $entered = if (-not [string]::IsNullOrWhiteSpace($PermissionPrincipal)) {
+            $PermissionPrincipal.Trim()
+        } else {
+            (Read-Host 'Enter the permission target to add (user/group/role name exactly as it appears in Identity)').Trim()
+        }
 
-    $entered = Read-Host 'Enter the permission target to add (user/group/role name as it appears in Identity)'
-    if ([string]::IsNullOrWhiteSpace($entered)) {
-        throw 'Permission target cannot be empty.'
+        if ([string]::IsNullOrWhiteSpace($entered)) {
+            Write-Log 'Permission target cannot be empty.' 'Yellow'
+            $PermissionPrincipal = ''
+            continue
+        }
+
+        if ($entered -match '^(?i)(group|user|role)$') {
+            Write-Log ("'{0}' looks like a type, not the actual principal name. Enter the real Identity group/user/role value." -f $entered) 'Yellow'
+            $PermissionPrincipal = ''
+            continue
+        }
+
+        return $entered
     }
-    return $entered.Trim()
 }
 
 function Get-ResolvedPermissionType {
@@ -455,8 +478,10 @@ function Invoke-RedrockQuery {
         Script = $Script
         Args   = @{
             PageNumber = 1
-            PageSize   = 25
-            Limit      = 25
+            PageSize   = 50
+            Limit      = 50
+            SortBy     = ''
+            direction  = $false
             Caching    = -1
         }
     }
@@ -494,31 +519,61 @@ function Resolve-IdentityPrincipal {
 
     switch ($PrincipalType) {
         'Group' {
-            $query = @"
+            $queryExact = @"
 Select InternalName, SystemName, DisplayName, DirectoryServiceUuid, ServiceType, ServiceInstance
 from DSGroups
 WHERE SystemName = '$escaped' OR DisplayName = '$escaped' OR InternalName = '$escaped'
-ORDER BY DisplayName COLLATE NOCASE
+ORDER BY InternalName COLLATE NOCASE
 "@
-            $rows = @(Convert-RedrockResultsToRows -Response (Invoke-RedrockQuery -Script $query))
+            $rows = @(Convert-RedrockResultsToRows -Response (Invoke-RedrockQuery -Script $queryExact))
+
+            if ($rows.Count -lt 1) {
+                $queryLike = @"
+Select InternalName, SystemName, DisplayName, DirectoryServiceUuid, ServiceType, ServiceInstance
+from DSGroups
+WHERE SystemName LIKE '%$escaped%' OR DisplayName LIKE '%$escaped%'
+ORDER BY InternalName COLLATE NOCASE
+"@
+                $rows = @(Convert-RedrockResultsToRows -Response (Invoke-RedrockQuery -Script $queryLike))
+            }
         }
         'User' {
-            $query = @"
+            $queryExact = @"
 Select InternalName, SystemName, DisplayName, DirectoryServiceUuid, ServiceType, ServiceInstance, Email
 from DSUsers
 WHERE SystemName = '$escaped' OR DisplayName = '$escaped' OR InternalName = '$escaped' OR Email = '$escaped'
-ORDER BY DisplayName COLLATE NOCASE
+ORDER BY InternalName COLLATE NOCASE
 "@
-            $rows = @(Convert-RedrockResultsToRows -Response (Invoke-RedrockQuery -Script $query))
+            $rows = @(Convert-RedrockResultsToRows -Response (Invoke-RedrockQuery -Script $queryExact))
+
+            if ($rows.Count -lt 1) {
+                $queryLike = @"
+Select InternalName, SystemName, DisplayName, DirectoryServiceUuid, ServiceType, ServiceInstance, Email
+from DSUsers
+WHERE SystemName LIKE '%$escaped%' OR DisplayName LIKE '%$escaped%' OR Email LIKE '%$escaped%'
+ORDER BY InternalName COLLATE NOCASE
+"@
+                $rows = @(Convert-RedrockResultsToRows -Response (Invoke-RedrockQuery -Script $queryLike))
+            }
         }
         'Role' {
-            $query = @"
+            $queryExact = @"
 Select ID, Name, RoleType
 from Role
 WHERE Name = '$escaped' OR ID = '$escaped'
 ORDER BY Name COLLATE NOCASE
 "@
-            $rows = @(Convert-RedrockResultsToRows -Response (Invoke-RedrockQuery -Script $query))
+            $rows = @(Convert-RedrockResultsToRows -Response (Invoke-RedrockQuery -Script $queryExact))
+
+            if ($rows.Count -lt 1) {
+                $queryLike = @"
+Select ID, Name, RoleType
+from Role
+WHERE Name LIKE '%$escaped%'
+ORDER BY Name COLLATE NOCASE
+"@
+                $rows = @(Convert-RedrockResultsToRows -Response (Invoke-RedrockQuery -Script $queryLike))
+            }
         }
     }
 
@@ -530,51 +585,56 @@ ORDER BY Name COLLATE NOCASE
 
     switch ($PrincipalType) {
         'Group' {
+            $internal = [string]$best.InternalName
+            $system   = [string]$best.SystemName
+            if ([string]::IsNullOrWhiteSpace($internal) -or [string]::IsNullOrWhiteSpace($system)) {
+                throw ("Resolved group for '{0}' is missing InternalName or SystemName." -f $Principal)
+            }
+
             $resolved = [pscustomobject]@{
-                PrincipalType       = 'Group'
-                Input               = $Principal
-                DisplayName         = [string]$best.DisplayName
-                SystemName          = [string]$best.SystemName
-                InternalName        = [string]$best.InternalName
-                DirectoryServiceUuid= [string]$best.DirectoryServiceUuid
-                ServiceType         = [string]$best.ServiceType
-                ServiceInstance     = [string]$best.ServiceInstance
-                RoleType            = $null
-                RoleId              = $null
+                PrincipalType        = 'Group'
+                Input                = $Principal
+                DisplayName          = [string]$best.DisplayName
+                SystemName           = $system
+                InternalName         = $internal
+                DirectoryServiceUuid = [string]$best.DirectoryServiceUuid
             }
         }
         'User' {
+            $internal = [string]$best.InternalName
+            $system   = [string]$best.SystemName
+            if ([string]::IsNullOrWhiteSpace($internal) -or [string]::IsNullOrWhiteSpace($system)) {
+                throw ("Resolved user for '{0}' is missing InternalName or SystemName." -f $Principal)
+            }
+
             $resolved = [pscustomobject]@{
-                PrincipalType       = 'User'
-                Input               = $Principal
-                DisplayName         = [string]$best.DisplayName
-                SystemName          = [string]$best.SystemName
-                InternalName        = [string]$best.InternalName
-                DirectoryServiceUuid= [string]$best.DirectoryServiceUuid
-                ServiceType         = [string]$best.ServiceType
-                ServiceInstance     = [string]$best.ServiceInstance
-                Email               = [string]$best.Email
-                RoleType            = $null
-                RoleId              = $null
+                PrincipalType        = 'User'
+                Input                = $Principal
+                DisplayName          = [string]$best.DisplayName
+                SystemName           = $system
+                InternalName         = $internal
+                DirectoryServiceUuid = [string]$best.DirectoryServiceUuid
             }
         }
         'Role' {
+            $roleId = [string]$best.ID
+            $name = [string]$best.Name
+            if ([string]::IsNullOrWhiteSpace($roleId) -or [string]::IsNullOrWhiteSpace($name)) {
+                throw ("Resolved role for '{0}' is missing ID or Name." -f $Principal)
+            }
+
             $resolved = [pscustomobject]@{
-                PrincipalType       = 'Role'
-                Input               = $Principal
-                DisplayName         = [string]$best.Name
-                SystemName          = [string]$best.Name
-                InternalName        = $null
-                DirectoryServiceUuid= $null
-                ServiceType         = $null
-                ServiceInstance     = $null
-                RoleType            = [string]$best.RoleType
-                RoleId              = [string]$best.ID
+                PrincipalType        = 'Role'
+                Input                = $Principal
+                DisplayName          = $name
+                SystemName           = $name
+                InternalName         = $roleId
+                DirectoryServiceUuid = $null
             }
         }
     }
 
-    Write-Log ("Resolved {0} principal '{1}' -> DisplayName='{2}' SystemName='{3}' Internal/ID='{4}'." -f $resolved.PrincipalType, $resolved.Input, $resolved.DisplayName, $resolved.SystemName, ($(if ($resolved.PrincipalType -eq 'Role') {$resolved.RoleId} else {$resolved.InternalName}))) 'Green'
+    Write-Log ("Resolved {0} principal '{1}' -> Principal='{2}' PrincipalId='{3}'." -f $resolved.PrincipalType, $resolved.Input, $resolved.SystemName, $resolved.InternalName) 'Green'
     Add-ReportRow -Step 'Resolve Principal' -Status 'SUCCESS' -Detail (ConvertTo-JsonSafe $resolved)
     return $resolved
 }
@@ -768,71 +828,67 @@ function Update-CurrentApplicationWithAdvancedScript {
     throw 'All UpdateApplicationDE advanced-script payload variants failed.'
 }
 
-function New-GrantPayloadVariants {
+function New-SetPermissionBodies {
     param(
         [Parameter(Mandatory)][string]$ResolvedRowKey,
         [Parameter(Mandatory)]$ResolvedPrincipal
     )
 
-    $rightsArrays = @(
-        @('View','Run','Automatically Deploy'),
-        @('Run','Automatically Deploy')
+    $bodies = @()
+    $principalId = $ResolvedPrincipal.InternalName
+    $principalName = $ResolvedPrincipal.SystemName
+    $ptype = $ResolvedPrincipal.PrincipalType
+
+    $rightsVariants = @(
+        'View,Run,Automatically Deploy',
+        'View,Run,AutomaticallyDeploy',
+        'Run,Automatically Deploy'
     )
 
-    $variants = @()
-
-    foreach ($rightsArr in $rightsArrays) {
-        $rightsString = ($rightsArr -join ',')
-
-        if ($ResolvedPrincipal.PrincipalType -eq 'Group' -or $ResolvedPrincipal.PrincipalType -eq 'User') {
-            $grant1 = [ordered]@{
-                Principal            = $ResolvedPrincipal.SystemName
-                PrincipalType        = $ResolvedPrincipal.PrincipalType
-                Type                 = $ResolvedPrincipal.PrincipalType
-                PType                = $ResolvedPrincipal.PrincipalType
-                DisplayName          = $ResolvedPrincipal.DisplayName
-                SystemName           = $ResolvedPrincipal.SystemName
-                InternalName         = $ResolvedPrincipal.InternalName
-                PrincipalId          = $ResolvedPrincipal.InternalName
-                DirectoryServiceUuid = $ResolvedPrincipal.DirectoryServiceUuid
-                Rights               = $rightsString
-                Permissions          = $rightsArr
+    foreach ($rights in $rightsVariants) {
+        # Exact schema: Grants as single object
+        $bodies += ,([ordered]@{
+            RowKey = $ResolvedRowKey
+            ID     = $ResolvedRowKey
+            Grants = [ordered]@{
+                Rights      = $rights
+                Principal   = $principalName
+                Type        = $ptype
+                PrincipalId = $principalId
+                PType       = $ptype
             }
-            $variants += ,([ordered]@{ RowKey = $ResolvedRowKey; Grants = @($grant1) })
-            $variants += ,([ordered]@{ _Rowkey = $ResolvedRowKey; Grants = @($grant1) })
-            $variants += ,([ordered]@{ _RowKey = $ResolvedRowKey; Grants = @($grant1) })
+        })
 
-            $grant2 = [ordered]@{
-                Name                 = $ResolvedPrincipal.SystemName
-                PrincipalType        = $ResolvedPrincipal.PrincipalType
-                InternalName         = $ResolvedPrincipal.InternalName
-                DirectoryServiceUuid = $ResolvedPrincipal.DirectoryServiceUuid
-                Rights               = $rightsString
-            }
-            $variants += ,([ordered]@{ RowKey = $ResolvedRowKey; Grants = @($grant2) })
-            $variants += ,([ordered]@{ _Rowkey = $ResolvedRowKey; Grants = @($grant2) })
-        }
+        # Same with Grants as array fallback
+        $bodies += ,([ordered]@{
+            RowKey = $ResolvedRowKey
+            ID     = $ResolvedRowKey
+            Grants = @([ordered]@{
+                Rights      = $rights
+                Principal   = $principalName
+                Type        = $ptype
+                PrincipalId = $principalId
+                PType       = $ptype
+            })
+        })
 
-        if ($ResolvedPrincipal.PrincipalType -eq 'Role') {
-            $grant3 = [ordered]@{
-                Principal     = $ResolvedPrincipal.SystemName
-                PrincipalType = 'Role'
-                Type          = 'Role'
-                PType         = 'Role'
-                Name          = $ResolvedPrincipal.SystemName
-                ID            = $ResolvedPrincipal.RoleId
-                Role          = $ResolvedPrincipal.RoleId
-                RoleType      = $ResolvedPrincipal.RoleType
-                Rights        = $rightsString
-                Permissions   = $rightsArr
-            }
-            $variants += ,([ordered]@{ RowKey = $ResolvedRowKey; Grants = @($grant3) })
-            $variants += ,([ordered]@{ _Rowkey = $ResolvedRowKey; Grants = @($grant3) })
-            $variants += ,([ordered]@{ _RowKey = $ResolvedRowKey; Grants = @($grant3) })
+        # DisplayName fallback for Principal
+        if (-not [string]::IsNullOrWhiteSpace($ResolvedPrincipal.DisplayName)) {
+            $bodies += ,([ordered]@{
+                RowKey = $ResolvedRowKey
+                ID     = $ResolvedRowKey
+                Grants = [ordered]@{
+                    Rights      = $rights
+                    Principal   = $ResolvedPrincipal.DisplayName
+                    Type        = $ptype
+                    PrincipalId = $principalId
+                    PType       = $ptype
+                }
+            })
         }
     }
 
-    return $variants
+    return $bodies
 }
 
 function Set-ApplicationPermissionsResolved {
@@ -842,10 +898,10 @@ function Set-ApplicationPermissionsResolved {
     )
 
     $uri = $IdentityApiTenantURL.TrimEnd('/') + '/SaasManage/SetApplicationPermissions'
-    $variants = New-GrantPayloadVariants -ResolvedRowKey $ResolvedRowKey -ResolvedPrincipal $ResolvedPrincipal
+    $bodies = New-SetPermissionBodies -ResolvedRowKey $ResolvedRowKey -ResolvedPrincipal $ResolvedPrincipal
 
     $variantNumber = 0
-    foreach ($body in $variants) {
+    foreach ($body in $bodies) {
         $variantNumber++
         try {
             Write-Log ("Trying SetApplicationPermissions payload variant #{0}..." -f $variantNumber) 'Gray'
@@ -858,7 +914,7 @@ function Set-ApplicationPermissionsResolved {
             }
 
             Write-Log ("SetApplicationPermissions succeeded on payload variant #{0}." -f $variantNumber) 'Green'
-            Add-ReportRow -Step 'Assign Permissions' -Status 'SUCCESS' -Detail ("RowKey={0}; Principal={1}; Type={2}; Variant={3}" -f $ResolvedRowKey, $ResolvedPrincipal.SystemName, $ResolvedPrincipal.PrincipalType, $variantNumber)
+            Add-ReportRow -Step 'Assign Permissions' -Status 'SUCCESS' -Detail ("RowKey={0}; Principal={1}; PrincipalId={2}; Type={3}; Variant={4}" -f $ResolvedRowKey, $ResolvedPrincipal.SystemName, $ResolvedPrincipal.InternalName, $ResolvedPrincipal.PrincipalType, $variantNumber)
             return
         } catch {
             Write-Log ("SetApplicationPermissions payload variant #{0} failed: {1}" -f $variantNumber, $_.Exception.Message) 'Yellow'
@@ -939,7 +995,8 @@ function Invoke-UpdatePhase {
 function Invoke-PermissionPhase {
     param(
         [Parameter(Mandatory)][string]$CreatedRowKey,
-        [Parameter(Mandatory)]$ResolvedPrincipal
+        [Parameter(Mandatory)][string]$ResolvedPrincipalText,
+        [Parameter(Mandatory)][string]$ResolvedPrincipalType
     )
 
     $attempt = 0
@@ -950,8 +1007,7 @@ function Invoke-PermissionPhase {
             Reset-IdentitySessionState
             Start-IdentityRegularUserSession
 
-            # Re-resolve inside the fresh session to ensure current object data
-            $resolvedAgain = Resolve-IdentityPrincipal -Principal $ResolvedPrincipal.Input -PrincipalType $ResolvedPrincipal.PrincipalType
+            $resolvedAgain = Resolve-IdentityPrincipal -Principal $ResolvedPrincipalText -PrincipalType $ResolvedPrincipalType
 
             Invoke-EventuallyConsistentStep `
                 -Operation {
@@ -975,7 +1031,6 @@ $createdAppRowKey = $null
 $resolvedName = $null
 $resolvedPrincipalText = $null
 $resolvedPrincipalType = $null
-$resolvedPrincipalObject = $null
 
 try {
     if ([string]::IsNullOrWhiteSpace($TemplateId)) {
@@ -1003,16 +1058,11 @@ try {
     # Phase 2: update
     Invoke-UpdatePhase -CreatedRowKey $createdAppRowKey -ResolvedName $resolvedName
 
-    # Resolve principal before permission phase
-    Reset-IdentitySessionState
-    Start-IdentityRegularUserSession
-    $resolvedPrincipalObject = Resolve-IdentityPrincipal -Principal $resolvedPrincipalText -PrincipalType $resolvedPrincipalType
-
     # Phase 3: permission
-    Invoke-PermissionPhase -CreatedRowKey $createdAppRowKey -ResolvedPrincipal $resolvedPrincipalObject
+    Invoke-PermissionPhase -CreatedRowKey $createdAppRowKey -ResolvedPrincipalText $resolvedPrincipalText -ResolvedPrincipalType $resolvedPrincipalType
 
     Write-Log ("Create + update + permission completed successfully. Created app row key is '{0}'." -f $createdAppRowKey) 'Green'
-    Add-ReportRow -Step 'Overall' -Status 'SUCCESS' -Detail ("CreatedRowKey={0}; FinalName={1}; Principal={2}; Type={3}" -f $createdAppRowKey, $resolvedName, $resolvedPrincipalObject.SystemName, $resolvedPrincipalObject.PrincipalType)
+    Add-ReportRow -Step 'Overall' -Status 'SUCCESS' -Detail ("CreatedRowKey={0}; FinalName={1}; Principal={2}; Type={3}" -f $createdAppRowKey, $resolvedName, $resolvedPrincipalText, $resolvedPrincipalType)
 }
 catch {
     Write-Log ("FAILED: {0}" -f $_.Exception.Message) 'Red'
