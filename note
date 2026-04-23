@@ -1,18 +1,19 @@
 <#
-CNA_Create_And_Update_Identity_WebApp_SingleLogin.ps1
+CNA_Create_And_Update_Identity_WebApp_Reauth.ps1
 
 Purpose
-- Single CyberArk Identity login only
-- Create a new app directly from GenericBrowserExtensionScript
-- Immediately update the newly created app using the returned _RowKey
-- Apply both non-script settings and the Browser Extension (advanced) login workflow
+- Prompt for regular CyberArk Identity credential once
+- Create app from GenericBrowserExtensionScript
+- Re-establish CyberArk Identity session for the update phase
+- Update the newly created app using the returned _RowKey
+- Apply non-script settings and the Browser Extension (advanced) login workflow
 - No PAS validation
 - No psPAS dependency
 
-Notes
-- Uses ImportAppFromTemplate for creation
-- Uses UpdateApplicationDE for post-create update
-- Tries Script first for Advanced-tab persistence, then falls back to CBEScript
+Why this version
+- Your separate scripts worked
+- Same-session create -> update failed with 401 on UpdateApplicationDE
+- This version keeps one credential entry but deliberately performs a fresh Identity login before update
 #>
 
 [CmdletBinding()]
@@ -62,11 +63,15 @@ loginData.order = [
 ];
 '@,
 
+    # Timing / retries
+    [int]$PreUpdateDelaySeconds        = 15,
     [int]$UpdateRetryWindowSeconds     = 300,
     [int]$RetryIntervalSeconds         = 20,
+    [int]$MaxUpdateReauthAttempts      = 2,
 
-    [string]$LogPath                   = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_And_Update_SingleLogin.log',
-    [string]$ReportCsvPath             = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_And_Update_SingleLogin_Report.csv'
+    # Logging
+    [string]$LogPath                   = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_And_Update_Reauth.log',
+    [string]$ReportCsvPath             = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_And_Update_Reauth_Report.csv'
 )
 
 $script:IdentityAuthToken         = $null
@@ -168,6 +173,12 @@ function Get-RegularCredential {
     }
 
     $script:RegularCredential = [pscredential]::new($RegularUserName, $secure)
+}
+
+function Reset-IdentitySessionState {
+    $script:IdentityAuthToken  = $null
+    $script:IdentityUser       = $null
+    $script:IdentityWebSession = $null
 }
 
 function Get-AuthPayload {
@@ -600,6 +611,40 @@ function Invoke-EventuallyConsistentStep {
     throw ("{0} did not succeed within {1} seconds. Last error: {2}" -f $OperationName, $MaxWaitSeconds, $lastMessage)
 }
 
+function Invoke-PostCreateUpdatePhase {
+    param([Parameter(Mandatory)][string]$CreatedRowKey)
+
+    $attempt = 0
+    while ($attempt -lt $MaxUpdateReauthAttempts) {
+        $attempt++
+        try {
+            Write-Log ("Starting post-create update phase with fresh Identity session (attempt {0}/{1})..." -f $attempt, $MaxUpdateReauthAttempts) 'Cyan'
+            Reset-IdentitySessionState
+            Start-IdentityRegularUserSession
+
+            Invoke-EventuallyConsistentStep `
+                -Operation {
+                    Update-CurrentApplicationWithAdvancedScript -ResolvedRowKey $CreatedRowKey
+                } `
+                -OperationName 'Post-Create UpdateApplicationDE' `
+                -MaxWaitSeconds $UpdateRetryWindowSeconds `
+                -IntervalSeconds $RetryIntervalSeconds
+
+            return
+        } catch {
+            $msg = $_.Exception.Message
+            Write-Log ("Post-create update phase attempt {0} failed: {1}" -f $attempt, $msg) 'Yellow'
+
+            if ($attempt -ge $MaxUpdateReauthAttempts) {
+                throw
+            }
+
+            Write-Log "Re-establishing Identity session and retrying update phase..." 'Yellow'
+            Start-Sleep -Seconds $RetryIntervalSeconds
+        }
+    }
+}
+
 $createdAppRowKey = $null
 
 try {
@@ -612,20 +657,18 @@ try {
 
     Get-RegularCredential
 
-    Write-Log ("Using regular user credential '{0}' for single create+update flow." -f $script:RegularCredential.UserName) 'Cyan'
+    Write-Log ("Using regular user credential '{0}' for create + reauth + update flow." -f $script:RegularCredential.UserName) 'Cyan'
     Add-ReportRow -Step 'Credential Mode' -Status 'INFO' -Detail ("Regular user login as {0}" -f $script:RegularCredential.UserName)
 
+    # Phase 1: create
     Start-IdentityRegularUserSession
-
     $createdAppRowKey = Import-AppFromTemplate -ResolvedTemplateId $TemplateId
 
-    Invoke-EventuallyConsistentStep `
-        -Operation {
-            Update-CurrentApplicationWithAdvancedScript -ResolvedRowKey $createdAppRowKey
-        } `
-        -OperationName 'Post-Create UpdateApplicationDE' `
-        -MaxWaitSeconds $UpdateRetryWindowSeconds `
-        -IntervalSeconds $RetryIntervalSeconds
+    Write-Log ("Waiting {0} second(s) before starting fresh-session update phase..." -f $PreUpdateDelaySeconds) 'Yellow'
+    Start-Sleep -Seconds $PreUpdateDelaySeconds
+
+    # Phase 2: fresh session update
+    Invoke-PostCreateUpdatePhase -CreatedRowKey $createdAppRowKey
 
     Write-Log ("Create + update completed successfully. Created app row key is '{0}'." -f $createdAppRowKey) 'Green'
     Add-ReportRow -Step 'Overall' -Status 'SUCCESS' -Detail ("CreatedRowKey={0}; FinalName={1}" -f $createdAppRowKey, $Name)
