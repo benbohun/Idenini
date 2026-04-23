@@ -1,16 +1,15 @@
 <#
-CNA_Create_Update_And_AssignPermission_Reauth_PromptOnly.ps1
+CNA_Create_Update_AssignPermission_ResolvedPrincipal.ps1
 
 Purpose
-- Use normal interactive CyberArk Identity authentication only
+- Prompt for regular CyberArk Identity credential
 - Prompt for app Name
-- Prompt for permission target and type (Group/User/Role)
+- Prompt for permission target and type
 - Create app from GenericBrowserExtensionScript
-- Wait after create
-- Re-establish CyberArk Identity session for update
-- Update the newly created app using the returned _RowKey
-- Apply non-script settings and Browser Extension advanced script
-- Add prompted principal to app permissions with Run + Automatically Deploy
+- Re-auth for update
+- Re-auth again for permission assignment
+- Resolve principal from Identity first (DSGroups / DSUsers / Role)
+- Call SetApplicationPermissions with resolved metadata
 - No CCP
 - No PAS validation
 - No psPAS dependency
@@ -69,20 +68,16 @@ loginData.order = [
     [ValidateSet('Group','User','Role')]
     [string]$PermissionPrincipalType   = 'Group',
 
-    # Optional advanced permission fields if your tenant needs them
-    [string]$PermissionPrincipalId     = '',
-    [string]$PermissionDirectoryServiceUuid = '',
-
     # Timing / retries
     [int]$PreUpdateDelaySeconds        = 15,
     [int]$UpdateRetryWindowSeconds     = 300,
     [int]$PermissionRetryWindowSeconds = 180,
     [int]$RetryIntervalSeconds         = 20,
-    [int]$MaxUpdateReauthAttempts      = 2,
+    [int]$MaxPhaseReauthAttempts       = 2,
 
     # Logging
-    [string]$LogPath                   = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_Update_AssignPermission.log',
-    [string]$ReportCsvPath             = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_Update_AssignPermission_Report.csv'
+    [string]$LogPath                   = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_Update_AssignPermission_ResolvedPrincipal.log',
+    [string]$ReportCsvPath             = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_Update_AssignPermission_ResolvedPrincipal_Report.csv'
 )
 
 $script:IdentityAuthToken         = $null
@@ -163,6 +158,11 @@ function Convert-SecureStringToPlainText {
             [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
         }
     }
+}
+
+function Escape-SqlLiteral {
+    param([Parameter(Mandatory)][string]$Value)
+    return ($Value -replace "'", "''")
 }
 
 function Prompt-ForRegularCredential {
@@ -447,6 +447,138 @@ function Invoke-IdentityRequestWithRetry {
     throw ("Unauthorized persisted for {0}. Details: {1}" -f $LogicalName, ($errors -join ' || '))
 }
 
+function Invoke-RedrockQuery {
+    param([Parameter(Mandatory)][string]$Script)
+
+    $uri = $IdentityApiTenantURL.TrimEnd('/') + '/Redrock/query'
+    $body = @{
+        Script = $Script
+        Args   = @{
+            PageNumber = 1
+            PageSize   = 25
+            Limit      = 25
+            Caching    = -1
+        }
+    }
+
+    return Invoke-IdentityRequestWithRetry -AbsoluteUris @($uri) -Body $body -LogicalName 'RedrockQuery'
+}
+
+function Convert-RedrockResultsToRows {
+    param([Parameter(Mandatory)]$Response)
+
+    $rows = @()
+    $result = Get-DirectField -Object $Response -FieldName 'Result'
+    if ($null -eq $result) { return @() }
+
+    $results = Get-DirectField -Object $result -FieldName 'Results'
+    if ($results -is [System.Collections.IEnumerable] -and -not ($results -is [string])) {
+        foreach ($item in $results) {
+            $row = Get-DirectField -Object $item -FieldName 'Row'
+            if ($null -ne $row) {
+                $rows += $row
+            }
+        }
+    }
+    return ,$rows
+}
+
+function Resolve-IdentityPrincipal {
+    param(
+        [Parameter(Mandatory)][string]$Principal,
+        [Parameter(Mandatory)][ValidateSet('Group','User','Role')][string]$PrincipalType
+    )
+
+    $escaped = Escape-SqlLiteral -Value $Principal
+    $rows = @()
+
+    switch ($PrincipalType) {
+        'Group' {
+            $query = @"
+Select InternalName, SystemName, DisplayName, DirectoryServiceUuid, ServiceType, ServiceInstance
+from DSGroups
+WHERE SystemName = '$escaped' OR DisplayName = '$escaped' OR InternalName = '$escaped'
+ORDER BY DisplayName COLLATE NOCASE
+"@
+            $rows = @(Convert-RedrockResultsToRows -Response (Invoke-RedrockQuery -Script $query))
+        }
+        'User' {
+            $query = @"
+Select InternalName, SystemName, DisplayName, DirectoryServiceUuid, ServiceType, ServiceInstance, Email
+from DSUsers
+WHERE SystemName = '$escaped' OR DisplayName = '$escaped' OR InternalName = '$escaped' OR Email = '$escaped'
+ORDER BY DisplayName COLLATE NOCASE
+"@
+            $rows = @(Convert-RedrockResultsToRows -Response (Invoke-RedrockQuery -Script $query))
+        }
+        'Role' {
+            $query = @"
+Select ID, Name, RoleType
+from Role
+WHERE Name = '$escaped' OR ID = '$escaped'
+ORDER BY Name COLLATE NOCASE
+"@
+            $rows = @(Convert-RedrockResultsToRows -Response (Invoke-RedrockQuery -Script $query))
+        }
+    }
+
+    if ($rows.Count -lt 1) {
+        throw ("No Identity {0} was found for '{1}'." -f $PrincipalType, $Principal)
+    }
+
+    $best = $rows[0]
+
+    switch ($PrincipalType) {
+        'Group' {
+            $resolved = [pscustomobject]@{
+                PrincipalType       = 'Group'
+                Input               = $Principal
+                DisplayName         = [string]$best.DisplayName
+                SystemName          = [string]$best.SystemName
+                InternalName        = [string]$best.InternalName
+                DirectoryServiceUuid= [string]$best.DirectoryServiceUuid
+                ServiceType         = [string]$best.ServiceType
+                ServiceInstance     = [string]$best.ServiceInstance
+                RoleType            = $null
+                RoleId              = $null
+            }
+        }
+        'User' {
+            $resolved = [pscustomobject]@{
+                PrincipalType       = 'User'
+                Input               = $Principal
+                DisplayName         = [string]$best.DisplayName
+                SystemName          = [string]$best.SystemName
+                InternalName        = [string]$best.InternalName
+                DirectoryServiceUuid= [string]$best.DirectoryServiceUuid
+                ServiceType         = [string]$best.ServiceType
+                ServiceInstance     = [string]$best.ServiceInstance
+                Email               = [string]$best.Email
+                RoleType            = $null
+                RoleId              = $null
+            }
+        }
+        'Role' {
+            $resolved = [pscustomobject]@{
+                PrincipalType       = 'Role'
+                Input               = $Principal
+                DisplayName         = [string]$best.Name
+                SystemName          = [string]$best.Name
+                InternalName        = $null
+                DirectoryServiceUuid= $null
+                ServiceType         = $null
+                ServiceInstance     = $null
+                RoleType            = [string]$best.RoleType
+                RoleId              = [string]$best.ID
+            }
+        }
+    }
+
+    Write-Log ("Resolved {0} principal '{1}' -> DisplayName='{2}' SystemName='{3}' Internal/ID='{4}'." -f $resolved.PrincipalType, $resolved.Input, $resolved.DisplayName, $resolved.SystemName, ($(if ($resolved.PrincipalType -eq 'Role') {$resolved.RoleId} else {$resolved.InternalName}))) 'Green'
+    Add-ReportRow -Step 'Resolve Principal' -Status 'SUCCESS' -Detail (ConvertTo-JsonSafe $resolved)
+    return $resolved
+}
+
 function Import-AppFromTemplate {
     param([Parameter(Mandatory)][string]$ResolvedTemplateId)
 
@@ -636,102 +768,84 @@ function Update-CurrentApplicationWithAdvancedScript {
     throw 'All UpdateApplicationDE advanced-script payload variants failed.'
 }
 
-function New-PermissionGrantVariants {
-    param(
-        [Parameter(Mandatory)][string]$ResolvedPrincipal,
-        [Parameter(Mandatory)][string]$ResolvedPrincipalType
-    )
-
-    $rightsCandidates = @(
-        'View,Run,Automatically Deploy',
-        'View,Run,AutoDeploy',
-        'Run,Automatically Deploy',
-        'Run,AutoDeploy'
-    )
-
-    $grantVariants = @()
-
-    foreach ($rights in $rightsCandidates) {
-        $g1 = [ordered]@{
-            Principal  = $ResolvedPrincipal
-            PType      = $ResolvedPrincipalType
-            SystemName = $ResolvedPrincipal
-            Type       = $ResolvedPrincipalType
-            Rights     = $rights
-        }
-        if (-not [string]::IsNullOrWhiteSpace($PermissionPrincipalId)) {
-            $g1['PrincipalId'] = $PermissionPrincipalId
-        }
-        if (-not [string]::IsNullOrWhiteSpace($PermissionDirectoryServiceUuid)) {
-            $g1['DirectoryServiceUuid'] = $PermissionDirectoryServiceUuid
-        }
-        $grantVariants += ,$g1
-
-        $g2 = [ordered]@{
-            Principal = $ResolvedPrincipal
-            PType     = $ResolvedPrincipalType
-            Rights    = $rights
-        }
-        $grantVariants += ,$g2
-
-        $g3 = [ordered]@{
-            Principal = $ResolvedPrincipal
-            Type      = $ResolvedPrincipalType
-            Rights    = $rights
-        }
-        $grantVariants += ,$g3
-
-        $g4 = [ordered]@{
-            SystemName = $ResolvedPrincipal
-            Type       = $ResolvedPrincipalType
-            Rights     = $rights
-        }
-        $grantVariants += ,$g4
-    }
-
-    return $grantVariants
-}
-
-function New-SetPermissionBodies {
+function New-GrantPayloadVariants {
     param(
         [Parameter(Mandatory)][string]$ResolvedRowKey,
-        [Parameter(Mandatory)][array]$GrantVariants
+        [Parameter(Mandatory)]$ResolvedPrincipal
     )
 
-    $bodies = @()
-    foreach ($grant in $GrantVariants) {
-        $bodies += ,([ordered]@{
-            RowKey = $ResolvedRowKey
-            Grants = @($grant)
-        })
+    $rightsArrays = @(
+        @('View','Run','Automatically Deploy'),
+        @('Run','Automatically Deploy')
+    )
 
-        $bodies += ,([ordered]@{
-            _Rowkey = $ResolvedRowKey
-            Grants  = @($grant)
-        })
+    $variants = @()
 
-        $bodies += ,([ordered]@{
-            _RowKey = $ResolvedRowKey
-            Grants  = @($grant)
-        })
+    foreach ($rightsArr in $rightsArrays) {
+        $rightsString = ($rightsArr -join ',')
+
+        if ($ResolvedPrincipal.PrincipalType -eq 'Group' -or $ResolvedPrincipal.PrincipalType -eq 'User') {
+            $grant1 = [ordered]@{
+                Principal            = $ResolvedPrincipal.SystemName
+                PrincipalType        = $ResolvedPrincipal.PrincipalType
+                Type                 = $ResolvedPrincipal.PrincipalType
+                PType                = $ResolvedPrincipal.PrincipalType
+                DisplayName          = $ResolvedPrincipal.DisplayName
+                SystemName           = $ResolvedPrincipal.SystemName
+                InternalName         = $ResolvedPrincipal.InternalName
+                PrincipalId          = $ResolvedPrincipal.InternalName
+                DirectoryServiceUuid = $ResolvedPrincipal.DirectoryServiceUuid
+                Rights               = $rightsString
+                Permissions          = $rightsArr
+            }
+            $variants += ,([ordered]@{ RowKey = $ResolvedRowKey; Grants = @($grant1) })
+            $variants += ,([ordered]@{ _Rowkey = $ResolvedRowKey; Grants = @($grant1) })
+            $variants += ,([ordered]@{ _RowKey = $ResolvedRowKey; Grants = @($grant1) })
+
+            $grant2 = [ordered]@{
+                Name                 = $ResolvedPrincipal.SystemName
+                PrincipalType        = $ResolvedPrincipal.PrincipalType
+                InternalName         = $ResolvedPrincipal.InternalName
+                DirectoryServiceUuid = $ResolvedPrincipal.DirectoryServiceUuid
+                Rights               = $rightsString
+            }
+            $variants += ,([ordered]@{ RowKey = $ResolvedRowKey; Grants = @($grant2) })
+            $variants += ,([ordered]@{ _Rowkey = $ResolvedRowKey; Grants = @($grant2) })
+        }
+
+        if ($ResolvedPrincipal.PrincipalType -eq 'Role') {
+            $grant3 = [ordered]@{
+                Principal     = $ResolvedPrincipal.SystemName
+                PrincipalType = 'Role'
+                Type          = 'Role'
+                PType         = 'Role'
+                Name          = $ResolvedPrincipal.SystemName
+                ID            = $ResolvedPrincipal.RoleId
+                Role          = $ResolvedPrincipal.RoleId
+                RoleType      = $ResolvedPrincipal.RoleType
+                Rights        = $rightsString
+                Permissions   = $rightsArr
+            }
+            $variants += ,([ordered]@{ RowKey = $ResolvedRowKey; Grants = @($grant3) })
+            $variants += ,([ordered]@{ _Rowkey = $ResolvedRowKey; Grants = @($grant3) })
+            $variants += ,([ordered]@{ _RowKey = $ResolvedRowKey; Grants = @($grant3) })
+        }
     }
 
-    return $bodies
+    return $variants
 }
 
-function Set-ApplicationPermissions {
+function Set-ApplicationPermissionsResolved {
     param(
         [Parameter(Mandatory)][string]$ResolvedRowKey,
-        [Parameter(Mandatory)][string]$ResolvedPrincipal,
-        [Parameter(Mandatory)][string]$ResolvedPrincipalType
+        [Parameter(Mandatory)]$ResolvedPrincipal
     )
 
     $uri = $IdentityApiTenantURL.TrimEnd('/') + '/SaasManage/SetApplicationPermissions'
-    $grantVariants = New-PermissionGrantVariants -ResolvedPrincipal $ResolvedPrincipal -ResolvedPrincipalType $ResolvedPrincipalType
-    $bodies = New-SetPermissionBodies -ResolvedRowKey $ResolvedRowKey -GrantVariants $grantVariants
+    $variants = New-GrantPayloadVariants -ResolvedRowKey $ResolvedRowKey -ResolvedPrincipal $ResolvedPrincipal
 
     $variantNumber = 0
-    foreach ($body in $bodies) {
+    foreach ($body in $variants) {
         $variantNumber++
         try {
             Write-Log ("Trying SetApplicationPermissions payload variant #{0}..." -f $variantNumber) 'Gray'
@@ -744,7 +858,7 @@ function Set-ApplicationPermissions {
             }
 
             Write-Log ("SetApplicationPermissions succeeded on payload variant #{0}." -f $variantNumber) 'Green'
-            Add-ReportRow -Step 'Assign Permissions' -Status 'SUCCESS' -Detail ("RowKey={0}; Principal={1}; Type={2}; Variant={3}" -f $ResolvedRowKey, $ResolvedPrincipal, $ResolvedPrincipalType, $variantNumber)
+            Add-ReportRow -Step 'Assign Permissions' -Status 'SUCCESS' -Detail ("RowKey={0}; Principal={1}; Type={2}; Variant={3}" -f $ResolvedRowKey, $ResolvedPrincipal.SystemName, $ResolvedPrincipal.PrincipalType, $variantNumber)
             return
         } catch {
             Write-Log ("SetApplicationPermissions payload variant #{0} failed: {1}" -f $variantNumber, $_.Exception.Message) 'Yellow'
@@ -783,19 +897,24 @@ function Invoke-EventuallyConsistentStep {
     throw ("{0} did not succeed within {1} seconds. Last error: {2}" -f $OperationName, $MaxWaitSeconds, $lastMessage)
 }
 
-function Invoke-PostCreatePhase {
+function Invoke-CreatePhase {
+    param([Parameter(Mandatory)][string]$ResolvedTemplateId)
+
+    Start-IdentityRegularUserSession
+    return (Import-AppFromTemplate -ResolvedTemplateId $ResolvedTemplateId)
+}
+
+function Invoke-UpdatePhase {
     param(
         [Parameter(Mandatory)][string]$CreatedRowKey,
-        [Parameter(Mandatory)][string]$ResolvedName,
-        [Parameter(Mandatory)][string]$ResolvedPrincipal,
-        [Parameter(Mandatory)][string]$ResolvedPrincipalType
+        [Parameter(Mandatory)][string]$ResolvedName
     )
 
     $attempt = 0
-    while ($attempt -lt $MaxUpdateReauthAttempts) {
+    while ($attempt -lt $MaxPhaseReauthAttempts) {
         $attempt++
         try {
-            Write-Log ("Starting post-create phase with fresh Identity session (attempt {0}/{1})..." -f $attempt, $MaxUpdateReauthAttempts) 'Cyan'
+            Write-Log ("Starting update phase with fresh Identity session (attempt {0}/{1})..." -f $attempt, $MaxPhaseReauthAttempts) 'Cyan'
             Reset-IdentitySessionState
             Start-IdentityRegularUserSession
 
@@ -803,28 +922,50 @@ function Invoke-PostCreatePhase {
                 -Operation {
                     Update-CurrentApplicationWithAdvancedScript -ResolvedRowKey $CreatedRowKey -ResolvedName $ResolvedName
                 } `
-                -OperationName 'Post-Create UpdateApplicationDE' `
+                -OperationName 'UpdateApplicationDE' `
                 -MaxWaitSeconds $UpdateRetryWindowSeconds `
                 -IntervalSeconds $RetryIntervalSeconds
 
+            return
+        } catch {
+            $msg = $_.Exception.Message
+            Write-Log ("Update phase attempt {0} failed: {1}" -f $attempt, $msg) 'Yellow'
+            if ($attempt -ge $MaxPhaseReauthAttempts) { throw }
+            Start-Sleep -Seconds $RetryIntervalSeconds
+        }
+    }
+}
+
+function Invoke-PermissionPhase {
+    param(
+        [Parameter(Mandatory)][string]$CreatedRowKey,
+        [Parameter(Mandatory)]$ResolvedPrincipal
+    )
+
+    $attempt = 0
+    while ($attempt -lt $MaxPhaseReauthAttempts) {
+        $attempt++
+        try {
+            Write-Log ("Starting permission phase with fresh Identity session (attempt {0}/{1})..." -f $attempt, $MaxPhaseReauthAttempts) 'Cyan'
+            Reset-IdentitySessionState
+            Start-IdentityRegularUserSession
+
+            # Re-resolve inside the fresh session to ensure current object data
+            $resolvedAgain = Resolve-IdentityPrincipal -Principal $ResolvedPrincipal.Input -PrincipalType $ResolvedPrincipal.PrincipalType
+
             Invoke-EventuallyConsistentStep `
                 -Operation {
-                    Set-ApplicationPermissions -ResolvedRowKey $CreatedRowKey -ResolvedPrincipal $ResolvedPrincipal -ResolvedPrincipalType $ResolvedPrincipalType
+                    Set-ApplicationPermissionsResolved -ResolvedRowKey $CreatedRowKey -ResolvedPrincipal $resolvedAgain
                 } `
-                -OperationName 'Post-Create SetApplicationPermissions' `
+                -OperationName 'SetApplicationPermissions' `
                 -MaxWaitSeconds $PermissionRetryWindowSeconds `
                 -IntervalSeconds $RetryIntervalSeconds
 
             return
         } catch {
             $msg = $_.Exception.Message
-            Write-Log ("Post-create phase attempt {0} failed: {1}" -f $attempt, $msg) 'Yellow'
-
-            if ($attempt -ge $MaxUpdateReauthAttempts) {
-                throw
-            }
-
-            Write-Log "Re-establishing Identity session and retrying post-create phase..." 'Yellow'
+            Write-Log ("Permission phase attempt {0} failed: {1}" -f $attempt, $msg) 'Yellow'
+            if ($attempt -ge $MaxPhaseReauthAttempts) { throw }
             Start-Sleep -Seconds $RetryIntervalSeconds
         }
     }
@@ -832,8 +973,9 @@ function Invoke-PostCreatePhase {
 
 $createdAppRowKey = $null
 $resolvedName = $null
-$resolvedPrincipal = $null
+$resolvedPrincipalText = $null
 $resolvedPrincipalType = $null
+$resolvedPrincipalObject = $null
 
 try {
     if ([string]::IsNullOrWhiteSpace($TemplateId)) {
@@ -842,28 +984,35 @@ try {
 
     Prompt-ForRegularCredential
     $resolvedName = Get-ResolvedAppName
-    $resolvedPrincipal = Get-ResolvedPermissionPrincipal
+    $resolvedPrincipalText = Get-ResolvedPermissionPrincipal
     $resolvedPrincipalType = Get-ResolvedPermissionType
 
-    Write-Log ("Using credential '{0}' for create + reauth + update + permission flow." -f $script:RegularCredential.UserName) 'Cyan'
+    Write-Log ("Using credential '{0}' for create + update + permission flow." -f $script:RegularCredential.UserName) 'Cyan'
     Write-Log ("Resolved app Name: '{0}'." -f $resolvedName) 'Cyan'
-    Write-Log ("Resolved permission target: '{0}' ({1})." -f $resolvedPrincipal, $resolvedPrincipalType) 'Cyan'
+    Write-Log ("Resolved permission target text: '{0}' ({1})." -f $resolvedPrincipalText, $resolvedPrincipalType) 'Cyan'
     Add-ReportRow -Step 'Credential Source' -Status 'SUCCESS' -Detail ("Manual user {0}" -f $script:RegularCredential.UserName)
     Add-ReportRow -Step 'Resolved App Name' -Status 'INFO' -Detail ("Name={0}" -f $resolvedName)
-    Add-ReportRow -Step 'Resolved Permission Target' -Status 'INFO' -Detail ("Principal={0}; Type={1}" -f $resolvedPrincipal, $resolvedPrincipalType)
+    Add-ReportRow -Step 'Resolved Permission Target' -Status 'INFO' -Detail ("Principal={0}; Type={1}" -f $resolvedPrincipalText, $resolvedPrincipalType)
 
     # Phase 1: create
-    Start-IdentityRegularUserSession
-    $createdAppRowKey = Import-AppFromTemplate -ResolvedTemplateId $TemplateId
+    $createdAppRowKey = Invoke-CreatePhase -ResolvedTemplateId $TemplateId
 
-    Write-Log ("Waiting {0} second(s) before starting fresh-session post-create phase..." -f $PreUpdateDelaySeconds) 'Yellow'
+    Write-Log ("Waiting {0} second(s) before starting update phase..." -f $PreUpdateDelaySeconds) 'Yellow'
     Start-Sleep -Seconds $PreUpdateDelaySeconds
 
-    # Phase 2: fresh session update + permission
-    Invoke-PostCreatePhase -CreatedRowKey $createdAppRowKey -ResolvedName $resolvedName -ResolvedPrincipal $resolvedPrincipal -ResolvedPrincipalType $resolvedPrincipalType
+    # Phase 2: update
+    Invoke-UpdatePhase -CreatedRowKey $createdAppRowKey -ResolvedName $resolvedName
+
+    # Resolve principal before permission phase
+    Reset-IdentitySessionState
+    Start-IdentityRegularUserSession
+    $resolvedPrincipalObject = Resolve-IdentityPrincipal -Principal $resolvedPrincipalText -PrincipalType $resolvedPrincipalType
+
+    # Phase 3: permission
+    Invoke-PermissionPhase -CreatedRowKey $createdAppRowKey -ResolvedPrincipal $resolvedPrincipalObject
 
     Write-Log ("Create + update + permission completed successfully. Created app row key is '{0}'." -f $createdAppRowKey) 'Green'
-    Add-ReportRow -Step 'Overall' -Status 'SUCCESS' -Detail ("CreatedRowKey={0}; FinalName={1}; Principal={2}; Type={3}" -f $createdAppRowKey, $resolvedName, $resolvedPrincipal, $resolvedPrincipalType)
+    Add-ReportRow -Step 'Overall' -Status 'SUCCESS' -Detail ("CreatedRowKey={0}; FinalName={1}; Principal={2}; Type={3}" -f $createdAppRowKey, $resolvedName, $resolvedPrincipalObject.SystemName, $resolvedPrincipalObject.PrincipalType)
 }
 catch {
     Write-Log ("FAILED: {0}" -f $_.Exception.Message) 'Red'
