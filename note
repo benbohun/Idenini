@@ -1,5 +1,5 @@
 <#
-CNA_Create_Update_AssignPermission_UIDLookup_SetPermsFixed.ps1
+CNA_Create_Update_AssignPermission_NoRights_UserGroup.ps1
 
 Purpose
 - Prompt for regular CyberArk Identity credential
@@ -22,7 +22,7 @@ Key Fix
           "Principal": "CAG1896@cna.com",
           "PrincipalId": "7ab1280d-da3d-45b5-bdc4-0090d057e386",
           "PType": "User",
-          "Rights": "Run,Automatically Deploy"
+          "Rights": ""
         }
       ]
     }
@@ -77,10 +77,14 @@ loginData.order = [
 '@,
 
     [string]$PermissionPrincipal       = '',
-    [ValidateSet('User')]
+    [ValidateSet('User','Group')]
     [string]$PermissionPrincipalType   = 'User',
 
-    [string]$PermissionRights          = 'Run,Automatically Deploy',
+    # Intentionally blank to test adding a principal with no rights.
+    # The script will try two permission payload variants:
+    #   1) Grant object without the Rights property
+    #   2) Grant object with Rights = empty string
+    [string]$PermissionRights          = '',
 
     # Use this to create/update the application only and completely skip SetApplicationPermissions.
     [switch]$SkipPermissionAssignment,
@@ -93,8 +97,8 @@ loginData.order = [
     [int]$RetryIntervalSeconds         = 20,
     [int]$MaxPhaseReauthAttempts       = 2,
 
-    [string]$LogPath                   = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_Update_AssignPermission_UIDLookup_SetPermsFixed.log',
-    [string]$ReportCsvPath             = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_Update_AssignPermission_UIDLookup_SetPermsFixed_Report.csv'
+    [string]$LogPath                   = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_Update_AssignPermission_NoRights_UserGroup.log',
+    [string]$ReportCsvPath             = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_Update_AssignPermission_NoRights_UserGroup_Report.csv'
 )
 
 $script:IdentityAuthToken         = $null
@@ -203,28 +207,71 @@ function Get-ResolvedAppName {
     return $entered.Trim()
 }
 
+function Get-ResolvedPermissionType {
+    if (-not [string]::IsNullOrWhiteSpace($PermissionPrincipal) -and -not [string]::IsNullOrWhiteSpace($PermissionPrincipalType)) {
+        return $PermissionPrincipalType
+    }
+
+    while ($true) {
+        Write-Host ''
+        Write-Host 'Select permission target type:' -ForegroundColor Cyan
+        Write-Host '  1. User   - Example: CAG1896, CAG1896a, or CAG1896a@cna.com'
+        Write-Host '  2. Group  - Example: CA_PCloud_Admins or CA_PCloud_Admins@cna.com'
+        Write-Host ''
+
+        $entered = Read-Host ("Enter selection [default: {0}] (1/2 or User/Group)" -f $PermissionPrincipalType)
+
+        if ([string]::IsNullOrWhiteSpace($entered)) {
+            return $PermissionPrincipalType
+        }
+
+        switch -Regex ($entered.Trim()) {
+            '^(?i)(1|user|u)$'  { return 'User'  }
+            '^(?i)(2|group|g)$' { return 'Group' }
+            default {
+                Write-Log 'Invalid selection. Choose 1/2 or User/Group.' 'Yellow'
+            }
+        }
+    }
+}
+
 function Get-ResolvedPermissionPrincipal {
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('User','Group')]
+        [string]$ResolvedPrincipalType
+    )
+
     while ($true) {
         if (-not [string]::IsNullOrWhiteSpace($PermissionPrincipal)) {
             $entered = $PermissionPrincipal.Trim()
         } else {
-            $entered = (Read-Host 'Enter the USER login or UPN. Example: CAG1896, CAG1896a, or CAG1896a@cna.com').Trim()
+            if ($ResolvedPrincipalType -eq 'User') {
+                $entered = (Read-Host 'Enter the USER login or UPN. Example: CAG1896, CAG1896a, or CAG1896a@cna.com').Trim()
+            } else {
+                $entered = (Read-Host 'Enter the GROUP name. Example: CA_PCloud_Admins or CA_PCloud_Admins@cna.com').Trim()
+            }
         }
 
         if ([string]::IsNullOrWhiteSpace($entered)) {
-            Write-Log 'User target cannot be empty.' 'Yellow'
+            Write-Log ("{0} target cannot be empty." -f $ResolvedPrincipalType) 'Yellow'
             $PermissionPrincipal = ''
             continue
         }
 
         if ($entered -match '^(?i)(group|user|role)$') {
-            Write-Log ("'{0}' looks like a type, not the actual user value. Enter the real target name." -f $entered) 'Yellow'
+            Write-Log ("'{0}' looks like a type, not the actual {1} value. Enter the real target name." -f $entered, $ResolvedPrincipalType) 'Yellow'
             $PermissionPrincipal = ''
             continue
         }
 
-        if ($entered -notmatch '@' -and -not [string]::IsNullOrWhiteSpace($DefaultUserSuffix)) {
+        if ($ResolvedPrincipalType -eq 'User' -and $entered -notmatch '@' -and -not [string]::IsNullOrWhiteSpace($DefaultUserSuffix)) {
             Write-Log ("User value does not contain a suffix. Lookup will try both '{0}' and '{1}'." -f $entered, ($entered + $DefaultUserSuffix)) 'Yellow'
+        }
+
+        if ($ResolvedPrincipalType -eq 'Group' -and $entered -match '@') {
+            $shortGroup = ($entered -split '@')[0]
+            Write-Log ("Group value contains a domain suffix. Lookup will try both '{0}' and '{1}'." -f $entered, $shortGroup) 'Yellow'
         }
 
         return $entered
@@ -714,6 +761,193 @@ function Resolve-IdentityUserUid {
     throw ("No usable Identity user UID could be resolved for '{0}' without Redrock. Tried candidate(s): {1}" -f $UserIdentifier, $tried)
 }
 
+
+function Get-GroupLookupCandidates {
+    param([Parameter(Mandatory)][string]$GroupIdentifier)
+
+    $candidateList = New-Object System.Collections.Generic.List[string]
+    $clean = $GroupIdentifier.Trim()
+
+    if (-not [string]::IsNullOrWhiteSpace($clean)) {
+        $candidateList.Add($clean)
+    }
+
+    if ($clean -match '@') {
+        $short = ($clean -split '@')[0]
+        if (-not [string]::IsNullOrWhiteSpace($short)) {
+            $candidateList.Add($short)
+        }
+    }
+
+    return @($candidateList | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+}
+
+function New-ResolvedGroupObject {
+    param(
+        [Parameter(Mandatory)][string]$InputValue,
+        [Parameter(Mandatory)][string]$MatchedInput,
+        [Parameter(Mandatory)][string]$Principal,
+        [Parameter(Mandatory)][string]$PrincipalId,
+        [Parameter(Mandatory)][string]$MatchedFrom
+    )
+
+    return [pscustomobject]@{
+        PrincipalType = 'Group'
+        Input         = $InputValue
+        MatchedInput  = $MatchedInput
+        Principal     = $Principal
+        PrincipalId   = $PrincipalId
+        MatchedFrom   = $MatchedFrom
+    }
+}
+
+function Resolve-IdentityGroupUidByDirectoryServiceQuery {
+    param([Parameter(Mandatory)][string]$GroupIdentifier)
+
+    $uri = $IdentityApiTenantURL.TrimEnd('/') + '/UserMgmt/DirectoryServiceQuery'
+    $candidates = @(Get-GroupLookupCandidates -GroupIdentifier $GroupIdentifier)
+
+    foreach ($candidate in $candidates) {
+        $filters = @(
+            @{ Name = 'SystemName';   Filter = @{ SystemName   = @{ _like = $candidate } } },
+            @{ Name = 'DisplayName';  Filter = @{ DisplayName  = @{ _like = $candidate } } },
+            @{ Name = 'InternalName'; Filter = @{ InternalName = @{ _like = $candidate } } }
+        )
+
+        foreach ($filterDef in $filters) {
+            try {
+                Write-Log ("Resolving Identity group via UserMgmt/DirectoryServiceQuery. Candidate='{0}', Filter='{1}'..." -f $candidate, $filterDef.Name) 'Gray'
+
+                $groupFilterJson = $filterDef.Filter | ConvertTo-Json -Depth 20 -Compress
+
+                $bodyVariants = @(
+                    @{
+                        group             = $groupFilterJson
+                        user              = '{}'
+                        roles             = '{}'
+                        directoryServices = @()
+                        Args              = @{
+                            PageNumber = 1
+                            PageSize   = 50
+                            Limit      = 50
+                            SortBy     = ''
+                            direction  = $false
+                            Caching    = -1
+                        }
+                    },
+                    @{
+                        group = $groupFilterJson
+                    }
+                )
+
+                foreach ($body in $bodyVariants) {
+                    $resp = Invoke-IdentityRequestWithRetry -AbsoluteUris @($uri) -Body $body -LogicalName 'DirectoryServiceQuery'
+
+                    $rows = @(Get-DirectoryServiceQueryRows -Response $resp)
+
+                    if ($rows.Count -lt 1) {
+                        Write-Log ("DirectoryServiceQuery returned no group rows for candidate '{0}' using filter '{1}'." -f $candidate, $filterDef.Name) 'Yellow'
+                        continue
+                    }
+
+                    $candidateLower = $candidate.ToLowerInvariant()
+
+                    $bestRows = foreach ($row in $rows) {
+                        $systemName   = [string](Get-DirectField -Object $row -FieldName 'SystemName')
+                        $displayName  = [string](Get-DirectField -Object $row -FieldName 'DisplayName')
+                        $internalName = [string](Get-DirectField -Object $row -FieldName 'InternalName')
+
+                        $score = 0
+
+                        if (-not [string]::IsNullOrWhiteSpace($systemName) -and $systemName.ToLowerInvariant() -eq $candidateLower) { $score += 100 }
+                        if (-not [string]::IsNullOrWhiteSpace($displayName) -and $displayName.ToLowerInvariant() -eq $candidateLower) { $score += 95 }
+                        if (-not [string]::IsNullOrWhiteSpace($internalName) -and $internalName.ToLowerInvariant() -eq $candidateLower) { $score += 90 }
+                        if (-not [string]::IsNullOrWhiteSpace($systemName) -and $systemName.ToLowerInvariant().Contains($candidateLower)) { $score += 50 }
+                        if (-not [string]::IsNullOrWhiteSpace($displayName) -and $displayName.ToLowerInvariant().Contains($candidateLower)) { $score += 45 }
+                        if (-not [string]::IsNullOrWhiteSpace($internalName) -and $internalName.ToLowerInvariant().Contains($candidateLower)) { $score += 40 }
+
+                        [pscustomobject]@{
+                            Row   = $row
+                            Score = $score
+                        }
+                    }
+
+                    $best = $bestRows | Sort-Object Score -Descending | Select-Object -First 1
+
+                    if ($null -eq $best -or $best.Score -le 0) {
+                        Write-Log ("DirectoryServiceQuery returned group rows for '{0}', but no strong match was identified." -f $candidate) 'Yellow'
+                        continue
+                    }
+
+                    $bestRow = $best.Row
+
+                    $principalId = [string](Get-DirectField -Object $bestRow -FieldName 'InternalName')
+                    if ([string]::IsNullOrWhiteSpace($principalId)) {
+                        $principalId = [string](Get-DirectField -Object $bestRow -FieldName 'Uuid')
+                    }
+                    if ([string]::IsNullOrWhiteSpace($principalId)) {
+                        $principalId = [string](Get-DirectField -Object $bestRow -FieldName 'DirectoryServiceUuid')
+                    }
+
+                    if ([string]::IsNullOrWhiteSpace($principalId)) {
+                        Write-Log ("DirectoryServiceQuery best group row did not include InternalName/Uuid for '{0}'." -f $candidate) 'Yellow'
+                        continue
+                    }
+
+                    $principalValue = [string](Get-DirectField -Object $bestRow -FieldName 'SystemName')
+                    if ([string]::IsNullOrWhiteSpace($principalValue)) { $principalValue = [string](Get-DirectField -Object $bestRow -FieldName 'DisplayName') }
+                    if ([string]::IsNullOrWhiteSpace($principalValue)) { $principalValue = $candidate }
+
+                    $resolved = New-ResolvedGroupObject `
+                        -InputValue $GroupIdentifier `
+                        -MatchedInput $candidate `
+                        -Principal $principalValue `
+                        -PrincipalId $principalId `
+                        -MatchedFrom 'UserMgmt/DirectoryServiceQuery'
+
+                    Write-Log ("Resolved Identity group without Redrock -> Principal='{0}' PrincipalId='{1}' MatchedInput='{2}'." -f $resolved.Principal, $resolved.PrincipalId, $resolved.MatchedInput) 'Green'
+                    Add-ReportRow -Step 'Resolve Group Principal' -Status 'SUCCESS' -Detail (ConvertTo-JsonSafe $resolved)
+
+                    return $resolved
+                }
+            } catch {
+                Write-Log ("DirectoryServiceQuery group lookup failed for candidate '{0}' filter '{1}': {2}" -f $candidate, $filterDef.Name, $_.Exception.Message) 'Yellow'
+            }
+        }
+    }
+
+    return $null
+}
+
+function Resolve-IdentityGroupUid {
+    param([Parameter(Mandatory)][string]$GroupIdentifier)
+
+    Write-Log ("Starting non-Redrock Identity group UID resolution for '{0}'." -f $GroupIdentifier) 'Cyan'
+
+    $resolved = Resolve-IdentityGroupUidByDirectoryServiceQuery -GroupIdentifier $GroupIdentifier
+
+    if ($null -ne $resolved) {
+        return $resolved
+    }
+
+    $tried = @(Get-GroupLookupCandidates -GroupIdentifier $GroupIdentifier) -join ', '
+    throw ("No usable Identity group UID could be resolved for '{0}' without Redrock. Tried candidate(s): {1}" -f $GroupIdentifier, $tried)
+}
+
+function Resolve-IdentityPrincipal {
+    param(
+        [Parameter(Mandatory)][string]$Principal,
+        [Parameter(Mandatory)]
+        [ValidateSet('User','Group')]
+        [string]$PrincipalType
+    )
+
+    switch ($PrincipalType) {
+        'User'  { return (Resolve-IdentityUserUid -UserIdentifier $Principal) }
+        'Group' { return (Resolve-IdentityGroupUid -GroupIdentifier $Principal) }
+    }
+}
+
 function Import-AppFromTemplate {
     param([Parameter(Mandatory)][string]$ResolvedTemplateId)
 
@@ -853,32 +1087,66 @@ function Update-CurrentApplicationWithAdvancedScript {
     throw 'All UpdateApplicationDE advanced-script payload variants failed.'
 }
 
-function New-SetPermissionBody {
+function New-SetPermissionBodies {
     param(
         [Parameter(Mandatory)][string]$ResolvedRowKey,
         [Parameter(Mandatory)]$ResolvedPrincipal
     )
 
-    # Correct /SaasManage/SetApplicationPermissions body:
+    # Test mode for /SaasManage/SetApplicationPermissions:
     # - ID, RowKey, and PVID are all the Application RowKey/AppId.
     # - Grants is an ARRAY.
     # - Each Grant uses PType, not Type.
-    # - PrincipalId is the UID/UUID resolved from UserMgmt.
-    $grant = [ordered]@{
+    # - PrincipalId is the UID/UUID/InternalName resolved from UserMgmt/DirectoryServiceQuery.
+    # - By default PermissionRights is blank. The script will first omit Rights completely,
+    #   then try Rights = "" as a second payload variant.
+
+    $bodies = @()
+
+    $grantNoRights = [ordered]@{
         Principal   = $ResolvedPrincipal.Principal
         PrincipalId = $ResolvedPrincipal.PrincipalId
         PType       = $ResolvedPrincipal.PrincipalType
-        Rights      = $PermissionRights
     }
 
-    $body = [ordered]@{
-        ID     = $ResolvedRowKey
-        RowKey = $ResolvedRowKey
-        PVID   = $ResolvedRowKey
-        Grants = @($grant)
+    if ([string]::IsNullOrWhiteSpace($PermissionRights)) {
+        $bodies += ,([ordered]@{
+            ID     = $ResolvedRowKey
+            RowKey = $ResolvedRowKey
+            PVID   = $ResolvedRowKey
+            Grants = @($grantNoRights)
+        })
+
+        $grantEmptyRights = [ordered]@{
+            Principal   = $ResolvedPrincipal.Principal
+            PrincipalId = $ResolvedPrincipal.PrincipalId
+            PType       = $ResolvedPrincipal.PrincipalType
+            Rights      = ''
+        }
+
+        $bodies += ,([ordered]@{
+            ID     = $ResolvedRowKey
+            RowKey = $ResolvedRowKey
+            PVID   = $ResolvedRowKey
+            Grants = @($grantEmptyRights)
+        })
+    } else {
+        $grantWithRights = [ordered]@{
+            Principal   = $ResolvedPrincipal.Principal
+            PrincipalId = $ResolvedPrincipal.PrincipalId
+            PType       = $ResolvedPrincipal.PrincipalType
+            Rights      = $PermissionRights
+        }
+
+        $bodies += ,([ordered]@{
+            ID     = $ResolvedRowKey
+            RowKey = $ResolvedRowKey
+            PVID   = $ResolvedRowKey
+            Grants = @($grantWithRights)
+        })
     }
 
-    return $body
+    return ,$bodies
 }
 
 function Set-ApplicationPermissionsResolved {
@@ -888,38 +1156,48 @@ function Set-ApplicationPermissionsResolved {
     )
 
     $uri = $IdentityApiTenantURL.TrimEnd('/') + '/SaasManage/SetApplicationPermissions'
-    $body = New-SetPermissionBody -ResolvedRowKey $ResolvedRowKey -ResolvedPrincipal $ResolvedPrincipal
+    $bodies = @(New-SetPermissionBodies -ResolvedRowKey $ResolvedRowKey -ResolvedPrincipal $ResolvedPrincipal)
 
-    Write-Log 'SetApplicationPermissions corrected payload preview:' 'Cyan'
-    Write-Log (ConvertTo-JsonSafe $body) 'Gray'
+    $variantNumber = 0
+    $lastError = $null
 
-    try {
-        $resp = Invoke-IdentityRequestWithRetry `
-            -AbsoluteUris @($uri) `
-            -Body $body `
-            -LogicalName 'SetApplicationPermissions' `
-            -AuthModes @('BearerCookie')
+    foreach ($body in $bodies) {
+        $variantNumber++
 
-        $success = Get-DirectField -Object $resp -FieldName 'success'
+        Write-Log ("SetApplicationPermissions no-rights payload variant #{0} preview:" -f $variantNumber) 'Cyan'
+        Write-Log (ConvertTo-JsonSafe $body) 'Gray'
 
-        if ($success -eq $false) {
-            $msg = [string](Get-DirectField -Object $resp -FieldName 'Message')
-            throw ("SetApplicationPermissions returned success=false. Message={0}" -f $msg)
+        try {
+            $resp = Invoke-IdentityRequestWithRetry `
+                -AbsoluteUris @($uri) `
+                -Body $body `
+                -LogicalName 'SetApplicationPermissions' `
+                -AuthModes @('BearerCookie')
+
+            $success = Get-DirectField -Object $resp -FieldName 'success'
+
+            if ($success -eq $false) {
+                $msg = [string](Get-DirectField -Object $resp -FieldName 'Message')
+                throw ("SetApplicationPermissions returned success=false. Message={0}" -f $msg)
+            }
+
+            Write-Log ("SetApplicationPermissions succeeded with no-rights payload variant #{0}." -f $variantNumber) 'Green'
+
+            $rightsDetail = if ([string]::IsNullOrWhiteSpace($PermissionRights)) { 'No Rights / Rights omitted or blank test' } else { $PermissionRights }
+
+            Add-ReportRow -Step 'Assign Permissions' -Status 'SUCCESS' -Detail ("RowKey={0}; Principal={1}; PrincipalId={2}; PType={3}; Rights={4}; Variant={5}" -f $ResolvedRowKey, $ResolvedPrincipal.Principal, $ResolvedPrincipal.PrincipalId, $ResolvedPrincipal.PrincipalType, $rightsDetail, $variantNumber)
+
+            return
+        } catch {
+            $lastError = $_.Exception.Message
+            Write-Log ("SetApplicationPermissions no-rights payload variant #{0} failed: {1}" -f $variantNumber, $lastError) 'Yellow'
         }
-
-        Write-Log 'SetApplicationPermissions succeeded with corrected payload.' 'Green'
-
-        Add-ReportRow -Step 'Assign Permissions' -Status 'SUCCESS' -Detail ("RowKey={0}; Principal={1}; PrincipalId={2}; PType={3}; Rights={4}" -f $ResolvedRowKey, $ResolvedPrincipal.Principal, $ResolvedPrincipal.PrincipalId, $ResolvedPrincipal.PrincipalType, $PermissionRights)
-
-        return
-    } catch {
-        $msg = $_.Exception.Message
-
-        Write-Log ("SetApplicationPermissions failed after corrected payload. {0}" -f $msg) 'Red'
-        Write-Log 'If this is still HTTP 401, validate that the authenticating user is a System Administrator or has Grant permission on this application/resource.' 'Yellow'
-
-        throw
     }
+
+    Write-Log 'SetApplicationPermissions failed after all no-rights payload variants.' 'Red'
+    Write-Log 'If this still returns HTTP 401, the issue is likely not the Rights value. It may be an endpoint-specific API authorization/session requirement.' 'Yellow'
+
+    throw $lastError
 }
 
 function Invoke-EventuallyConsistentStep {
@@ -997,7 +1275,10 @@ function Invoke-UpdatePhase {
 function Invoke-PermissionPhase {
     param(
         [Parameter(Mandatory)][string]$CreatedRowKey,
-        [Parameter(Mandatory)][string]$ResolvedPrincipalText
+        [Parameter(Mandatory)][string]$ResolvedPrincipalText,
+        [Parameter(Mandatory)]
+        [ValidateSet('User','Group')]
+        [string]$ResolvedPrincipalType
     )
 
     $attempt = 0
@@ -1011,7 +1292,7 @@ function Invoke-PermissionPhase {
             Reset-IdentitySessionState
             Start-IdentityRegularUserSession
 
-            $resolvedAgain = Resolve-IdentityUserUid -UserIdentifier $ResolvedPrincipalText
+            $resolvedAgain = Resolve-IdentityPrincipal -Principal $ResolvedPrincipalText -PrincipalType $ResolvedPrincipalType
 
             Invoke-EventuallyConsistentStep -Operation {
                 Set-ApplicationPermissionsResolved -ResolvedRowKey $CreatedRowKey -ResolvedPrincipal $resolvedAgain
@@ -1032,6 +1313,7 @@ function Invoke-PermissionPhase {
 $createdAppRowKey = $null
 $resolvedName = $null
 $resolvedPrincipalText = $null
+$resolvedPrincipalType = $null
 
 try {
     if ([string]::IsNullOrWhiteSpace($TemplateId)) { throw 'TemplateId cannot be empty.' }
@@ -1041,12 +1323,14 @@ try {
     $resolvedName = Get-ResolvedAppName
 
     if (-not $SkipPermissionAssignment) {
-        $resolvedPrincipalText = Get-ResolvedPermissionPrincipal
+        $resolvedPrincipalType = Get-ResolvedPermissionType
+        $resolvedPrincipalText = Get-ResolvedPermissionPrincipal -ResolvedPrincipalType $resolvedPrincipalType
     } else {
+        $resolvedPrincipalType = ''
         $resolvedPrincipalText = ''
     }
 
-    $flowLabel = if ($SkipPermissionAssignment) { 'create + update only flow; permission assignment skipped' } else { 'create + update + permission flow' }
+    $flowLabel = if ($SkipPermissionAssignment) { 'create + update only flow; permission assignment skipped' } else { 'create + update + no-rights permission test flow' }
 
     Write-Log ("Using credential '{0}' for {1}." -f $script:RegularCredential.UserName, $flowLabel) 'Cyan'
     Write-Log ("Resolved app Name: '{0}'." -f $resolvedName) 'Cyan'
@@ -1055,22 +1339,24 @@ try {
     Add-ReportRow -Step 'Resolved App Name' -Status 'INFO' -Detail ("Name={0}" -f $resolvedName)
 
     if (-not $SkipPermissionAssignment) {
-        Write-Log ("Resolved permission target type: 'User'.") 'Cyan'
+        Write-Log ("Resolved permission target type: '{0}'." -f $resolvedPrincipalType) 'Cyan'
         Write-Log ("Resolved permission target text: '{0}'." -f $resolvedPrincipalText) 'Cyan'
-        Add-ReportRow -Step 'Resolved Permission Target' -Status 'INFO' -Detail ("Principal={0}; Type=User; Rights={1}" -f $resolvedPrincipalText, $PermissionRights)
 
-        Write-Log 'Running preflight Identity user UID lookup before creating the app...' 'Cyan'
+        $rightsLabel = if ([string]::IsNullOrWhiteSpace($PermissionRights)) { 'NO RIGHTS TEST' } else { $PermissionRights }
+        Add-ReportRow -Step 'Resolved Permission Target' -Status 'INFO' -Detail ("Principal={0}; Type={1}; Rights={2}" -f $resolvedPrincipalText, $resolvedPrincipalType, $rightsLabel)
+
+        Write-Log ("Running preflight Identity {0} UID lookup before creating the app..." -f $resolvedPrincipalType) 'Cyan'
 
         Reset-IdentitySessionState
         Start-IdentityRegularUserSession
 
-        $preflightPrincipal = Resolve-IdentityUserUid -UserIdentifier $resolvedPrincipalText
+        $preflightPrincipal = Resolve-IdentityPrincipal -Principal $resolvedPrincipalText -PrincipalType $resolvedPrincipalType
 
-        Write-Log ("Preflight principal lookup succeeded. Principal='{0}', PrincipalId='{1}'." -f $preflightPrincipal.Principal, $preflightPrincipal.PrincipalId) 'Green'
+        Write-Log ("Preflight principal lookup succeeded. Principal='{0}', PrincipalId='{1}', Type='{2}'." -f $preflightPrincipal.Principal, $preflightPrincipal.PrincipalId, $preflightPrincipal.PrincipalType) 'Green'
 
         Reset-IdentitySessionState
     } else {
-        Write-Log 'SkipPermissionAssignment enabled. No user lookup and no SetApplicationPermissions call will be performed.' 'Yellow'
+        Write-Log 'SkipPermissionAssignment enabled. No user/group lookup and no SetApplicationPermissions call will be performed.' 'Yellow'
         Add-ReportRow -Step 'Permission Assignment' -Status 'SKIPPED' -Detail 'SkipPermissionAssignment enabled before app creation.'
     }
 
@@ -1082,9 +1368,12 @@ try {
     Invoke-UpdatePhase -CreatedRowKey $createdAppRowKey -ResolvedName $resolvedName
 
     if (-not $SkipPermissionAssignment) {
-        Invoke-PermissionPhase -CreatedRowKey $createdAppRowKey -ResolvedPrincipalText $resolvedPrincipalText
-        Write-Log ("Create + update + permission completed successfully. Created app row key is '{0}'." -f $createdAppRowKey) 'Green'
-        Add-ReportRow -Step 'Overall' -Status 'SUCCESS' -Detail ("CreatedRowKey={0}; FinalName={1}; Principal={2}; Type=User; Rights={3}" -f $createdAppRowKey, $resolvedName, $resolvedPrincipalText, $PermissionRights)
+        Invoke-PermissionPhase -CreatedRowKey $createdAppRowKey -ResolvedPrincipalText $resolvedPrincipalText -ResolvedPrincipalType $resolvedPrincipalType
+
+        Write-Log ("Create + update + no-rights permission test completed successfully. Created app row key is '{0}'." -f $createdAppRowKey) 'Green'
+
+        $rightsLabel = if ([string]::IsNullOrWhiteSpace($PermissionRights)) { 'NO RIGHTS TEST' } else { $PermissionRights }
+        Add-ReportRow -Step 'Overall' -Status 'SUCCESS' -Detail ("CreatedRowKey={0}; FinalName={1}; Principal={2}; Type={3}; Rights={4}" -f $createdAppRowKey, $resolvedName, $resolvedPrincipalText, $resolvedPrincipalType, $rightsLabel)
     } else {
         Write-Log ("Create + update completed successfully with permission assignment skipped. Created app row key is '{0}'." -f $createdAppRowKey) 'Green'
         Add-ReportRow -Step 'Overall' -Status 'SUCCESS' -Detail ("CreatedRowKey={0}; FinalName={1}; PermissionAssignment=Skipped" -f $createdAppRowKey, $resolvedName)
