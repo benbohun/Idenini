@@ -4,29 +4,18 @@ CNA_Create_Update_AssignPermission_UIDLookup_Final.ps1
 Purpose
 - Prompt for regular CyberArk Identity credential
 - Prompt for app Name
-- Prompt for permission target TYPE first: Group/User/Role
-- Prompt for permission target VALUE based on selected type
-- Preflight validate the principal before creating the application
+- Prompt for permission target type
+- Resolve Identity USER UID without Redrock:
+    * Primary: /UserMgmt/GetUserAttributes
+    * Fallback: /UserMgmt/DirectoryServiceQuery
 - Create app from GenericBrowserExtensionScript
-- Re-auth for update
-- Re-auth for permission assignment
-- Resolve Identity UID first:
-    * User  -> /UserMgmt/GetUserAttributes
-    * Group -> Redrock query on DSGroups
-    * Role  -> Redrock query on Role
+- Update app advanced script
+- Assign application permission using SaasManage/SetApplicationPermissions
 
-Key Fixes
-- PermissionPrincipalType no longer silently defaults to Group.
-- Default is now Select, forcing the user to choose the target type interactively.
-- Prevents entering "user" or "group" as the target value by mistake.
-- For Group lookup:
-    * Tries original input
-    * If input contains @domain, also tries the short name before @
-    * Searches SystemName, DisplayName, and InternalName
-    * Tries scoped DirectoryServiceFilter first
-    * Falls back to global DSGroups lookup if scoped lookup fails
-    * Performs a broader LIKE search as a final fallback
-- Principal is resolved before app creation to avoid creating apps that later fail permission assignment.
+Important
+- User UID lookup does NOT use Redrock.
+- Redrock is not used for resolving Identity users.
+- For this workflow, User is now the default permission principal type.
 #>
 
 [CmdletBinding()]
@@ -75,15 +64,9 @@ loginData.order = [
 
     [string]$PermissionPrincipal       = '',
 
-    # IMPORTANT:
-    # Default is now Select, not Group.
-    # This prevents the script from treating a user as a group when the operator forgets to change the type.
-    [ValidateSet('Select','Group','User','Role')]
-    [string]$PermissionPrincipalType   = 'Select',
-
-    # Optional scoping for DSGroups lookup.
-    # If scoped lookup fails, script will automatically retry globally.
-    [string]$DirectoryServiceFilter    = 'AdProxy_cnaroot.com',
+    # User is now the default because your current issue is Identity USER UID lookup.
+    [ValidateSet('User','Group','Role')]
+    [string]$PermissionPrincipalType   = 'User',
 
     # Optional fallback for short usernames.
     [string]$DefaultUserSuffix         = '@cna.com',
@@ -186,14 +169,6 @@ function Convert-SecureStringToPlainText {
     }
 }
 
-function Escape-SqlLiteral {
-    param(
-        [Parameter(Mandatory)][string]$Value
-    )
-
-    return ($Value -replace "'", "''")
-}
-
 function ConvertTo-JsonSafe {
     param(
         [Parameter()][object]$Object
@@ -240,43 +215,29 @@ function Get-ResolvedAppName {
 }
 
 function Get-ResolvedPermissionType {
-    if ($PermissionPrincipalType -ne 'Select') {
+    if (-not [string]::IsNullOrWhiteSpace($PermissionPrincipal)) {
         return $PermissionPrincipalType
     }
 
-    while ($true) {
-        Write-Host ''
-        Write-Host 'Select permission target type:' -ForegroundColor Cyan
-        Write-Host '  1. Group  - Example: CA_PCloud_Admins or CA_PCloud_Admins@cna.com'
-        Write-Host '  2. User   - Example: CAG1896, CAG1896a, or CAG1896a@cna.com'
-        Write-Host '  3. Role   - Example: CyberArk Identity role name'
-        Write-Host ''
+    Write-Host ''
+    Write-Host 'Select permission target type:' -ForegroundColor Cyan
+    Write-Host '  1. User   - Example: CAG1896, CAG1896a, or CAG1896a@cna.com'
+    Write-Host '  2. Group  - Only use if you are assigning a group'
+    Write-Host '  3. Role   - Only use if you are assigning an Identity role'
+    Write-Host ''
 
-        $entered = Read-Host 'Enter selection (1/2/3 or Group/User/Role)'
+    $entered = Read-Host ("Enter selection [default: {0}] (1/2/3 or User/Group/Role)" -f $PermissionPrincipalType)
 
-        if ([string]::IsNullOrWhiteSpace($entered)) {
-            Write-Log 'Permission target type cannot be empty. Choose Group, User, or Role.' 'Yellow'
-            continue
-        }
+    if ([string]::IsNullOrWhiteSpace($entered)) {
+        return $PermissionPrincipalType
+    }
 
-        $normalized = $entered.Trim().ToLowerInvariant()
-
-        switch ($normalized) {
-            '1'     { return 'Group' }
-            'g'     { return 'Group' }
-            'group' { return 'Group' }
-
-            '2'    { return 'User' }
-            'u'    { return 'User' }
-            'user' { return 'User' }
-
-            '3'    { return 'Role' }
-            'r'    { return 'Role' }
-            'role' { return 'Role' }
-
-            default {
-                Write-Log 'Invalid selection. Choose 1/2/3 or Group/User/Role.' 'Yellow'
-            }
+    switch -Regex ($entered.Trim()) {
+        '^(?i)(1|user|u)$'  { return 'User'  }
+        '^(?i)(2|group|g)$' { return 'Group' }
+        '^(?i)(3|role|r)$'  { return 'Role'  }
+        default {
+            throw 'Permission target type must be User, Group, or Role.'
         }
     }
 }
@@ -284,7 +245,7 @@ function Get-ResolvedPermissionType {
 function Get-ResolvedPermissionPrincipal {
     param(
         [Parameter(Mandatory)]
-        [ValidateSet('Group','User','Role')]
+        [ValidateSet('User','Group','Role')]
         [string]$ResolvedPrincipalType
     )
 
@@ -293,12 +254,12 @@ function Get-ResolvedPermissionPrincipal {
             $entered = $PermissionPrincipal.Trim()
         } else {
             switch ($ResolvedPrincipalType) {
-                'Group' {
-                    $entered = (Read-Host 'Enter the GROUP name. Example: CA_PCloud_Admins or CA_PCloud_Admins@cna.com').Trim()
-                }
-
                 'User' {
                     $entered = (Read-Host 'Enter the USER login or UPN. Example: CAG1896, CAG1896a, or CAG1896a@cna.com').Trim()
+                }
+
+                'Group' {
+                    $entered = (Read-Host 'Enter the GROUP name exactly as it appears in Identity').Trim()
                 }
 
                 'Role' {
@@ -317,11 +278,6 @@ function Get-ResolvedPermissionPrincipal {
             Write-Log ("'{0}' looks like a type, not the actual {1} value. Enter the real target name." -f $entered, $ResolvedPrincipalType) 'Yellow'
             $PermissionPrincipal = ''
             continue
-        }
-
-        if ($ResolvedPrincipalType -eq 'Group' -and $entered -match '@') {
-            $shortGroup = ($entered -split '@')[0]
-            Write-Log ("Group value contains a domain suffix. Lookup will try both '{0}' and '{1}'." -f $entered, $shortGroup) 'Yellow'
         }
 
         if ($ResolvedPrincipalType -eq 'User' -and $entered -notmatch '@' -and -not [string]::IsNullOrWhiteSpace($DefaultUserSuffix)) {
@@ -368,6 +324,18 @@ function Get-AuthTokenValue {
 function Get-AuthUserValue {
     param([Parameter(Mandatory)]$Payload)
     return [string](Get-DirectField -Object $Payload -FieldName 'User')
+}
+
+function Get-AuthUserIdValue {
+    param([Parameter(Mandatory)]$Payload)
+
+    $userId = [string](Get-DirectField -Object $Payload -FieldName 'UserId')
+
+    if ([string]::IsNullOrWhiteSpace($userId)) {
+        $userId = [string](Get-DirectField -Object $Payload -FieldName 'Id')
+    }
+
+    return $userId
 }
 
 function Get-FirstMechanism {
@@ -427,7 +395,7 @@ function Start-IdentityRegularUserSession {
         throw 'Regular user credential is not initialized.'
     }
 
-    $tenantUrl = $IdentityApiTenantURL
+    $tenantUrl = $IdentityApiTenantURL.TrimEnd('/')
     $userName  = $script:RegularCredential.UserName
 
     $baseHeaders = @{
@@ -436,8 +404,8 @@ function Start-IdentityRegularUserSession {
         'Accept'               = 'application/json'
     }
 
-    $startUri = ($tenantUrl.TrimEnd('/') + '/Security/StartAuthentication')
-    $advUri   = ($tenantUrl.TrimEnd('/') + '/Security/AdvanceAuthentication')
+    $startUri = ($tenantUrl + '/Security/StartAuthentication')
+    $advUri   = ($tenantUrl + '/Security/AdvanceAuthentication')
 
     $script:IdentityWebSession = New-Object Microsoft.PowerShell.Commands.WebRequestSession
 
@@ -466,13 +434,20 @@ function Start-IdentityRegularUserSession {
             $script:IdentityAuthToken = $authVal
             $script:IdentityUser      = Get-AuthUserValue -Payload $payload
 
+            $loginUserId = Get-AuthUserIdValue -Payload $payload
+
             $cookieCount = 0
             try {
                 $cookieCount = $script:IdentityWebSession.Cookies.GetCookies($tenantUrl).Count
             } catch {}
 
             Write-Log ("Identity API authentication succeeded as '{0}'. CookieCount={1}" -f $script:IdentityUser, $cookieCount) 'Green'
-            Add-ReportRow -Step 'Identity Login' -Status 'SUCCESS' -Detail ("Authenticated as {0}; CookieCount={1}" -f $script:IdentityUser, $cookieCount)
+
+            if (-not [string]::IsNullOrWhiteSpace($loginUserId)) {
+                Write-Log ("Authenticated session user UUID/UserId: {0}" -f $loginUserId) 'Gray'
+            }
+
+            Add-ReportRow -Step 'Identity Login' -Status 'SUCCESS' -Detail ("Authenticated as {0}; CookieCount={1}; UserId={2}" -f $script:IdentityUser, $cookieCount, $loginUserId)
             return
         }
 
@@ -601,34 +576,152 @@ function Invoke-IdentityRequestWithRetry {
     throw ("Unauthorized persisted for {0}. Details: {1}" -f $LogicalName, ($errors -join ' || '))
 }
 
-function Invoke-RedrockQuery {
+function Get-UserLookupCandidates {
     param(
-        [Parameter(Mandatory)][string]$Script
+        [Parameter(Mandatory)][string]$UserIdentifier
     )
 
-    $uri = $IdentityApiTenantURL.TrimEnd('/') + '/Redrock/query'
+    $candidateList = New-Object System.Collections.Generic.List[string]
 
-    $body = @{
-        Script = $Script
-        Args   = @{
-            PageNumber = 1
-            PageSize   = 50
-            Limit      = 50
-            SortBy     = ''
-            direction  = $false
-            Caching    = -1
+    $clean = $UserIdentifier.Trim()
+
+    if (-not [string]::IsNullOrWhiteSpace($clean)) {
+        $candidateList.Add($clean)
+    }
+
+    if ($clean -notmatch '@' -and -not [string]::IsNullOrWhiteSpace($DefaultUserSuffix)) {
+        $candidateList.Add($clean + $DefaultUserSuffix)
+    }
+
+    if ($clean -match '@') {
+        $short = ($clean -split '@')[0]
+
+        if (-not [string]::IsNullOrWhiteSpace($short)) {
+            $candidateList.Add($short)
         }
     }
 
-    return Invoke-IdentityRequestWithRetry -AbsoluteUris @($uri) -Body $body -LogicalName 'RedrockQuery'
+    return @($candidateList | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
 }
 
-function Get-RedrockItems {
+function New-ResolvedUserObject {
     param(
-        [Parameter(Mandatory)]$Response
+        [Parameter(Mandatory)][string]$InputValue,
+        [Parameter(Mandatory)][string]$MatchedInput,
+        [Parameter(Mandatory)][string]$Principal,
+        [Parameter(Mandatory)][string]$PrincipalId,
+        [Parameter(Mandatory)][string]$MatchedFrom
     )
 
-    $items = @()
+    return [pscustomobject]@{
+        PrincipalType = 'User'
+        Input         = $InputValue
+        MatchedInput  = $MatchedInput
+        Principal     = $Principal
+        PrincipalId   = $PrincipalId
+        MatchedFrom   = $MatchedFrom
+    }
+}
+
+function Get-PrincipalValueFromUserResult {
+    param(
+        [Parameter(Mandatory)]$Result,
+        [Parameter(Mandatory)][string]$Fallback
+    )
+
+    $principalValue = [string](Get-DirectField -Object $Result -FieldName 'UserPrincipalName')
+
+    if ([string]::IsNullOrWhiteSpace($principalValue)) {
+        $principalValue = [string](Get-DirectField -Object $Result -FieldName 'LoginName')
+    }
+
+    if ([string]::IsNullOrWhiteSpace($principalValue)) {
+        $principalValue = [string](Get-DirectField -Object $Result -FieldName 'EmailAddress')
+    }
+
+    if ([string]::IsNullOrWhiteSpace($principalValue)) {
+        $principalValue = [string](Get-DirectField -Object $Result -FieldName 'CanonicalName')
+    }
+
+    if ([string]::IsNullOrWhiteSpace($principalValue)) {
+        $principalValue = $Fallback
+    }
+
+    return $principalValue
+}
+
+function Resolve-IdentityUserUidByGetUserAttributes {
+    param(
+        [Parameter(Mandatory)][string]$UserIdentifier
+    )
+
+    $uri = $IdentityApiTenantURL.TrimEnd('/') + '/UserMgmt/GetUserAttributes'
+    $candidates = @(Get-UserLookupCandidates -UserIdentifier $UserIdentifier)
+
+    foreach ($candidate in $candidates) {
+        try {
+            Write-Log ("Resolving Identity user via UserMgmt/GetUserAttributes. Candidate='{0}'..." -f $candidate) 'Gray'
+
+            $body = @{
+                ID = $candidate
+            }
+
+            $resp = Invoke-IdentityRequestWithRetry -AbsoluteUris @($uri) -Body $body -LogicalName 'GetUserAttributes'
+
+            $success = Get-DirectField -Object $resp -FieldName 'success'
+
+            if ($success -eq $false) {
+                $msg = [string](Get-DirectField -Object $resp -FieldName 'Message')
+                Write-Log ("GetUserAttributes returned success=false for '{0}'. Message={1}" -f $candidate, $msg) 'Yellow'
+                continue
+            }
+
+            $result = Get-DirectField -Object $resp -FieldName 'Result'
+
+            if ($null -eq $result) {
+                Write-Log ("GetUserAttributes returned no Result for '{0}'." -f $candidate) 'Yellow'
+                continue
+            }
+
+            $principalId = [string](Get-DirectField -Object $result -FieldName 'Uuid')
+
+            if ([string]::IsNullOrWhiteSpace($principalId)) {
+                $principalId = [string](Get-DirectField -Object $result -FieldName 'Id')
+            }
+
+            if ([string]::IsNullOrWhiteSpace($principalId)) {
+                $principalId = [string](Get-DirectField -Object $result -FieldName 'UserId')
+            }
+
+            $principalValue = Get-PrincipalValueFromUserResult -Result $result -Fallback $candidate
+
+            if (-not [string]::IsNullOrWhiteSpace($principalId)) {
+                $resolved = New-ResolvedUserObject `
+                    -InputValue $UserIdentifier `
+                    -MatchedInput $candidate `
+                    -Principal $principalValue `
+                    -PrincipalId $principalId `
+                    -MatchedFrom 'UserMgmt/GetUserAttributes'
+
+                Write-Log ("Resolved Identity user without Redrock -> Principal='{0}' PrincipalId='{1}' MatchedInput='{2}'." -f $resolved.Principal, $resolved.PrincipalId, $resolved.MatchedInput) 'Green'
+                Add-ReportRow -Step 'Resolve User Principal' -Status 'SUCCESS' -Detail (ConvertTo-JsonSafe $resolved)
+
+                return $resolved
+            }
+
+            Write-Log ("GetUserAttributes did not return Uuid/Id/UserId for '{0}'." -f $candidate) 'Yellow'
+        } catch {
+            Write-Log ("GetUserAttributes lookup failed for '{0}': {1}" -f $candidate, $_.Exception.Message) 'Yellow'
+        }
+    }
+
+    return $null
+}
+
+function Get-DirectoryServiceQueryRows {
+    param(
+        [Parameter(Mandatory)][object]$Response
+    )
 
     $result = Get-DirectField -Object $Response -FieldName 'Result'
 
@@ -642,108 +735,146 @@ function Get-RedrockItems {
         return @()
     }
 
-    foreach ($item in @($results)) {
-        if ($null -eq $item) {
-            continue
-        }
+    $rows = @()
 
+    foreach ($item in @($results)) {
         $row = Get-DirectField -Object $item -FieldName 'Row'
 
-        $entities = @(Get-DirectField -Object $item -FieldName 'Entities')
-
-        $entityKey = $null
-
-        if ($entities.Count -gt 0 -and $null -ne $entities[0]) {
-            $entityKey = [string](Get-DirectField -Object $entities[0] -FieldName 'Key')
-        }
-
-        $items += [pscustomobject]@{
-            Row       = $row
-            EntityKey = $entityKey
+        if ($null -ne $row) {
+            $rows += $row
         }
     }
 
-    return ,$items
+    return ,$rows
 }
 
-function Get-GroupLookupCandidates {
+function Resolve-IdentityUserUidByDirectoryServiceQuery {
     param(
-        [Parameter(Mandatory)][string]$GroupInput
+        [Parameter(Mandatory)][string]$UserIdentifier
     )
 
-    $candidateList = New-Object System.Collections.Generic.List[string]
+    $uri = $IdentityApiTenantURL.TrimEnd('/') + '/UserMgmt/DirectoryServiceQuery'
+    $candidates = @(Get-UserLookupCandidates -UserIdentifier $UserIdentifier)
 
-    $clean = $GroupInput.Trim()
+    foreach ($candidate in $candidates) {
+        $candidateEscapedForJson = $candidate
 
-    if (-not [string]::IsNullOrWhiteSpace($clean)) {
-        $candidateList.Add($clean)
-    }
+        $filters = @(
+            @{ Name = 'SystemName'; Filter = @{ SystemName = @{ _like = $candidateEscapedForJson } } },
+            @{ Name = 'Email';      Filter = @{ Email      = @{ _like = $candidateEscapedForJson } } },
+            @{ Name = 'DisplayName';Filter = @{ DisplayName= @{ _like = $candidateEscapedForJson } } }
+        )
 
-    if ($clean -match '@') {
-        $shortName = ($clean -split '@')[0]
+        foreach ($filterDef in $filters) {
+            try {
+                Write-Log ("Resolving Identity user via UserMgmt/DirectoryServiceQuery. Candidate='{0}', Filter='{1}'..." -f $candidate, $filterDef.Name) 'Gray'
 
-        if (-not [string]::IsNullOrWhiteSpace($shortName)) {
-            $candidateList.Add($shortName)
+                $userFilterJson = $filterDef.Filter | ConvertTo-Json -Depth 20 -Compress
+
+                $body = @{
+                    user = $userFilterJson
+                }
+
+                $resp = Invoke-IdentityRequestWithRetry -AbsoluteUris @($uri) -Body $body -LogicalName 'DirectoryServiceQuery'
+
+                $rows = @(Get-DirectoryServiceQueryRows -Response $resp)
+
+                if ($rows.Count -lt 1) {
+                    Write-Log ("DirectoryServiceQuery returned no rows for candidate '{0}' using filter '{1}'." -f $candidate, $filterDef.Name) 'Yellow'
+                    continue
+                }
+
+                $candidateLower = $candidate.ToLowerInvariant()
+
+                $bestRows = foreach ($row in $rows) {
+                    $systemName  = [string](Get-DirectField -Object $row -FieldName 'SystemName')
+                    $email       = [string](Get-DirectField -Object $row -FieldName 'EMail')
+                    if ([string]::IsNullOrWhiteSpace($email)) {
+                        $email = [string](Get-DirectField -Object $row -FieldName 'Email')
+                    }
+                    $displayName = [string](Get-DirectField -Object $row -FieldName 'DisplayName')
+                    $internal    = [string](Get-DirectField -Object $row -FieldName 'InternalName')
+
+                    $score = 0
+
+                    if (-not [string]::IsNullOrWhiteSpace($systemName) -and $systemName.ToLowerInvariant() -eq $candidateLower) {
+                        $score += 100
+                    }
+
+                    if (-not [string]::IsNullOrWhiteSpace($email) -and $email.ToLowerInvariant() -eq $candidateLower) {
+                        $score += 95
+                    }
+
+                    if (-not [string]::IsNullOrWhiteSpace($displayName) -and $displayName.ToLowerInvariant() -eq $candidateLower) {
+                        $score += 80
+                    }
+
+                    if (-not [string]::IsNullOrWhiteSpace($systemName) -and $systemName.ToLowerInvariant().StartsWith($candidateLower)) {
+                        $score += 50
+                    }
+
+                    if (-not [string]::IsNullOrWhiteSpace($email) -and $email.ToLowerInvariant().StartsWith($candidateLower)) {
+                        $score += 45
+                    }
+
+                    [pscustomobject]@{
+                        Row   = $row
+                        Score = $score
+                    }
+                }
+
+                $best = $bestRows | Sort-Object Score -Descending | Select-Object -First 1
+
+                if ($null -eq $best -or $best.Score -le 0) {
+                    Write-Log ("DirectoryServiceQuery returned rows for '{0}', but no strong match was identified." -f $candidate) 'Yellow'
+                    continue
+                }
+
+                $bestRow = $best.Row
+
+                $principalId = [string](Get-DirectField -Object $bestRow -FieldName 'InternalName')
+
+                if ([string]::IsNullOrWhiteSpace($principalId)) {
+                    Write-Log ("DirectoryServiceQuery best row did not include InternalName for '{0}'." -f $candidate) 'Yellow'
+                    continue
+                }
+
+                $principalValue = [string](Get-DirectField -Object $bestRow -FieldName 'SystemName')
+
+                if ([string]::IsNullOrWhiteSpace($principalValue)) {
+                    $principalValue = [string](Get-DirectField -Object $bestRow -FieldName 'EMail')
+                }
+
+                if ([string]::IsNullOrWhiteSpace($principalValue)) {
+                    $principalValue = [string](Get-DirectField -Object $bestRow -FieldName 'Email')
+                }
+
+                if ([string]::IsNullOrWhiteSpace($principalValue)) {
+                    $principalValue = [string](Get-DirectField -Object $bestRow -FieldName 'DisplayName')
+                }
+
+                if ([string]::IsNullOrWhiteSpace($principalValue)) {
+                    $principalValue = $candidate
+                }
+
+                $resolved = New-ResolvedUserObject `
+                    -InputValue $UserIdentifier `
+                    -MatchedInput $candidate `
+                    -Principal $principalValue `
+                    -PrincipalId $principalId `
+                    -MatchedFrom 'UserMgmt/DirectoryServiceQuery'
+
+                Write-Log ("Resolved Identity user without Redrock -> Principal='{0}' PrincipalId='{1}' MatchedInput='{2}'." -f $resolved.Principal, $resolved.PrincipalId, $resolved.MatchedInput) 'Green'
+                Add-ReportRow -Step 'Resolve User Principal' -Status 'SUCCESS' -Detail (ConvertTo-JsonSafe $resolved)
+
+                return $resolved
+            } catch {
+                Write-Log ("DirectoryServiceQuery lookup failed for candidate '{0}' filter '{1}': {2}" -f $candidate, $filterDef.Name, $_.Exception.Message) 'Yellow'
+            }
         }
     }
 
-    return @($candidateList | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
-}
-
-function Select-BestGroupMatch {
-    param(
-        [Parameter(Mandatory)]$Items,
-        [Parameter(Mandatory)][string]$Candidate
-    )
-
-    $candidateLower = $Candidate.ToLowerInvariant()
-
-    $scored = foreach ($item in @($Items)) {
-        if ($null -eq $item.Row) {
-            continue
-        }
-
-        $row = $item.Row
-
-        $systemName   = [string](Get-DirectField -Object $row -FieldName 'SystemName')
-        $displayName  = [string](Get-DirectField -Object $row -FieldName 'DisplayName')
-        $internalName = [string](Get-DirectField -Object $row -FieldName 'InternalName')
-
-        $score = 0
-
-        if (-not [string]::IsNullOrWhiteSpace($systemName) -and $systemName.ToLowerInvariant() -eq $candidateLower) {
-            $score += 100
-        }
-
-        if (-not [string]::IsNullOrWhiteSpace($displayName) -and $displayName.ToLowerInvariant() -eq $candidateLower) {
-            $score += 90
-        }
-
-        if (-not [string]::IsNullOrWhiteSpace($internalName) -and $internalName.ToLowerInvariant() -eq $candidateLower) {
-            $score += 80
-        }
-
-        if (-not [string]::IsNullOrWhiteSpace($systemName) -and $systemName.ToLowerInvariant().Contains($candidateLower)) {
-            $score += 40
-        }
-
-        if (-not [string]::IsNullOrWhiteSpace($displayName) -and $displayName.ToLowerInvariant().Contains($candidateLower)) {
-            $score += 30
-        }
-
-        [pscustomobject]@{
-            Item  = $item
-            Score = $score
-        }
-    }
-
-    $best = $scored | Sort-Object Score -Descending | Select-Object -First 1
-
-    if ($null -eq $best -or $best.Score -le 0) {
-        return $null
-    }
-
-    return $best.Item
+    return $null
 }
 
 function Resolve-IdentityUserUid {
@@ -751,255 +882,32 @@ function Resolve-IdentityUserUid {
         [Parameter(Mandatory)][string]$UserIdentifier
     )
 
-    $candidateList = New-Object System.Collections.Generic.List[string]
+    Write-Log ("Starting non-Redrock Identity user UID resolution for '{0}'." -f $UserIdentifier) 'Cyan'
 
-    $candidateList.Add($UserIdentifier)
+    $resolved = Resolve-IdentityUserUidByGetUserAttributes -UserIdentifier $UserIdentifier
 
-    if ($UserIdentifier -notmatch '@' -and -not [string]::IsNullOrWhiteSpace($DefaultUserSuffix)) {
-        $candidateList.Add($UserIdentifier + $DefaultUserSuffix)
+    if ($null -ne $resolved) {
+        return $resolved
     }
 
-    $candidates = $candidateList | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique
+    Write-Log 'Primary user lookup did not resolve a UID. Trying DirectoryServiceQuery fallback without Redrock...' 'Yellow'
 
-    foreach ($candidate in $candidates) {
-        $uri = $IdentityApiTenantURL.TrimEnd('/') + '/UserMgmt/GetUserAttributes'
-        $body = @{
-            ID = $candidate
-        }
+    $resolved = Resolve-IdentityUserUidByDirectoryServiceQuery -UserIdentifier $UserIdentifier
 
-        try {
-            $resp = Invoke-IdentityRequestWithRetry -AbsoluteUris @($uri) -Body $body -LogicalName 'GetUserAttributes'
-
-            $result = Get-DirectField -Object $resp -FieldName 'Result'
-
-            if ($null -eq $result) {
-                continue
-            }
-
-            $principalId = [string](Get-DirectField -Object $result -FieldName 'Uuid')
-
-            $principalValue = [string](Get-DirectField -Object $result -FieldName 'UserPrincipalName')
-
-            if ([string]::IsNullOrWhiteSpace($principalValue)) {
-                $principalValue = [string](Get-DirectField -Object $result -FieldName 'LoginName')
-            }
-
-            if ([string]::IsNullOrWhiteSpace($principalValue)) {
-                $principalValue = [string](Get-DirectField -Object $result -FieldName 'EmailAddress')
-            }
-
-            if ([string]::IsNullOrWhiteSpace($principalValue)) {
-                $principalValue = $candidate
-            }
-
-            if (-not [string]::IsNullOrWhiteSpace($principalId)) {
-                $resolved = [pscustomobject]@{
-                    PrincipalType = 'User'
-                    Input         = $UserIdentifier
-                    MatchedInput  = $candidate
-                    Principal     = $principalValue
-                    PrincipalId   = $principalId
-                    MatchedFrom   = 'GetUserAttributes'
-                }
-
-                Write-Log ("Resolved User principal '{0}' using candidate '{1}' -> Principal='{2}' PrincipalId='{3}'." -f $UserIdentifier, $candidate, $resolved.Principal, $resolved.PrincipalId) 'Green'
-                Add-ReportRow -Step 'Resolve Principal' -Status 'SUCCESS' -Detail (ConvertTo-JsonSafe $resolved)
-
-                return $resolved
-            }
-        } catch {
-            Write-Log ("GetUserAttributes lookup failed for '{0}': {1}" -f $candidate, $_.Exception.Message) 'Yellow'
-        }
+    if ($null -ne $resolved) {
+        return $resolved
     }
 
-    throw ("No usable user UID could be resolved for '{0}'. Tried candidate(s): {1}" -f $UserIdentifier, ($candidates -join ', '))
-}
+    $tried = @(Get-UserLookupCandidates -UserIdentifier $UserIdentifier) -join ', '
 
-function Resolve-IdentityGroupUid {
-    param(
-        [Parameter(Mandatory)][string]$GroupSystemName
-    )
-
-    $candidates = @(Get-GroupLookupCandidates -GroupInput $GroupSystemName)
-
-    foreach ($candidate in $candidates) {
-        $escaped = Escape-SqlLiteral -Value $candidate
-
-        $exactWhere = @"
-(
-    SystemName = '$escaped'
-    OR DisplayName = '$escaped'
-    OR InternalName = '$escaped'
-)
-"@
-
-        $likeWhere = @"
-(
-    SystemName LIKE '%$escaped%'
-    OR DisplayName LIKE '%$escaped%'
-    OR InternalName LIKE '%$escaped%'
-)
-"@
-
-        $queries = @()
-
-        if (-not [string]::IsNullOrWhiteSpace($DirectoryServiceFilter)) {
-            $escSvc = Escape-SqlLiteral -Value $DirectoryServiceFilter
-
-            $queries += [pscustomobject]@{
-                Description = "Exact scoped lookup"
-                Query       = @"
-Select InternalName, SystemName, DisplayName, DirectoryServiceUuid, ServiceInstance
-from DSGroups
-WHERE $exactWhere
-AND ServiceInstance = '$escSvc'
-"@
-            }
-        }
-
-        $queries += [pscustomobject]@{
-            Description = "Exact global lookup"
-            Query       = @"
-Select InternalName, SystemName, DisplayName, DirectoryServiceUuid, ServiceInstance
-from DSGroups
-WHERE $exactWhere
-"@
-        }
-
-        if (-not [string]::IsNullOrWhiteSpace($DirectoryServiceFilter)) {
-            $escSvc = Escape-SqlLiteral -Value $DirectoryServiceFilter
-
-            $queries += [pscustomobject]@{
-                Description = "LIKE scoped lookup"
-                Query       = @"
-Select InternalName, SystemName, DisplayName, DirectoryServiceUuid, ServiceInstance
-from DSGroups
-WHERE $likeWhere
-AND ServiceInstance = '$escSvc'
-"@
-            }
-        }
-
-        $queries += [pscustomobject]@{
-            Description = "LIKE global lookup"
-            Query       = @"
-Select InternalName, SystemName, DisplayName, DirectoryServiceUuid, ServiceInstance
-from DSGroups
-WHERE $likeWhere
-"@
-        }
-
-        foreach ($queryDef in $queries) {
-            Write-Log ("Looking up Group candidate '{0}' in DSGroups using {1}..." -f $candidate, $queryDef.Description) 'Gray'
-
-            $resp = Invoke-RedrockQuery -Script $queryDef.Query
-            $items = @(Get-RedrockItems -Response $resp)
-
-            if ($items.Count -lt 1) {
-                Write-Log ("No DSGroups match found for candidate '{0}' using {1}." -f $candidate, $queryDef.Description) 'Yellow'
-                continue
-            }
-
-            $bestItem = Select-BestGroupMatch -Items $items -Candidate $candidate
-
-            if ($null -eq $bestItem -or $null -eq $bestItem.Row) {
-                Write-Log ("DSGroups returned rows for '{0}', but none were strong matches." -f $candidate) 'Yellow'
-                continue
-            }
-
-            $row = $bestItem.Row
-
-            $principalId = [string](Get-DirectField -Object $row -FieldName 'InternalName')
-
-            if ([string]::IsNullOrWhiteSpace($principalId)) {
-                $principalId = $bestItem.EntityKey
-            }
-
-            $principalValue = [string](Get-DirectField -Object $row -FieldName 'SystemName')
-
-            if ([string]::IsNullOrWhiteSpace($principalValue)) {
-                $principalValue = [string](Get-DirectField -Object $row -FieldName 'DisplayName')
-            }
-
-            if ([string]::IsNullOrWhiteSpace($principalValue)) {
-                $principalValue = $candidate
-            }
-
-            $serviceInstance = [string](Get-DirectField -Object $row -FieldName 'ServiceInstance')
-
-            if ([string]::IsNullOrWhiteSpace($principalId)) {
-                Write-Log ("DSGroups matched '{0}' but returned no InternalName or Entity Key. Continuing..." -f $candidate) 'Yellow'
-                continue
-            }
-
-            $resolved = [pscustomobject]@{
-                PrincipalType   = 'Group'
-                Input           = $GroupSystemName
-                MatchedInput    = $candidate
-                Principal       = $principalValue
-                PrincipalId     = $principalId
-                ServiceInstance = $serviceInstance
-                MatchedFrom     = 'DSGroups'
-            }
-
-            Write-Log ("Resolved Group principal '{0}' using candidate '{1}' -> Principal='{2}' PrincipalId='{3}' ServiceInstance='{4}'." -f $GroupSystemName, $candidate, $resolved.Principal, $resolved.PrincipalId, $serviceInstance) 'Green'
-            Add-ReportRow -Step 'Resolve Principal' -Status 'SUCCESS' -Detail (ConvertTo-JsonSafe $resolved)
-
-            return $resolved
-        }
-    }
-
-    throw ("No DSGroups row found for group '{0}'. Tried candidate(s): {1}" -f $GroupSystemName, ($candidates -join ', '))
-}
-
-function Resolve-IdentityRoleUid {
-    param(
-        [Parameter(Mandatory)][string]$RoleName
-    )
-
-    $escaped = Escape-SqlLiteral -Value $RoleName
-
-    $query = @"
-Select ID, Name, RoleType
-from Role
-WHERE Name = '$escaped' OR ID = '$escaped'
-"@
-
-    $resp = Invoke-RedrockQuery -Script $query
-    $items = @(Get-RedrockItems -Response $resp)
-
-    if ($items.Count -lt 1 -or $null -eq $items[0].Row) {
-        throw ("No role found for '{0}'." -f $RoleName)
-    }
-
-    $row = $items[0].Row
-
-    $principalId = [string](Get-DirectField -Object $row -FieldName 'ID')
-    $principalValue = [string](Get-DirectField -Object $row -FieldName 'Name')
-
-    if ([string]::IsNullOrWhiteSpace($principalId) -or [string]::IsNullOrWhiteSpace($principalValue)) {
-        throw ("Role lookup returned no usable ID/Name for '{0}'." -f $RoleName)
-    }
-
-    $resolved = [pscustomobject]@{
-        PrincipalType = 'Role'
-        Input         = $RoleName
-        Principal     = $principalValue
-        PrincipalId   = $principalId
-        MatchedFrom   = 'Role'
-    }
-
-    Write-Log ("Resolved Role principal '{0}' -> Principal='{1}' PrincipalId='{2}'." -f $RoleName, $resolved.Principal, $resolved.PrincipalId) 'Green'
-    Add-ReportRow -Step 'Resolve Principal' -Status 'SUCCESS' -Detail (ConvertTo-JsonSafe $resolved)
-
-    return $resolved
+    throw ("No usable Identity user UID could be resolved for '{0}' without Redrock. Tried candidate(s): {1}" -f $UserIdentifier, $tried)
 }
 
 function Resolve-IdentityPrincipal {
     param(
         [Parameter(Mandatory)][string]$Principal,
         [Parameter(Mandatory)]
-        [ValidateSet('Group','User','Role')]
+        [ValidateSet('User','Group','Role')]
         [string]$PrincipalType
     )
 
@@ -1009,11 +917,11 @@ function Resolve-IdentityPrincipal {
         }
 
         'Group' {
-            return (Resolve-IdentityGroupUid -GroupSystemName $Principal)
+            throw 'Group lookup is intentionally disabled in this version because this script is now using non-Redrock UserMgmt lookup for Identity users. Select User or provide a separate group resolver.'
         }
 
         'Role' {
-            return (Resolve-IdentityRoleUid -RoleName $Principal)
+            throw 'Role lookup is intentionally disabled in this version because this script is now using non-Redrock UserMgmt lookup for Identity users. Select User or provide a separate role resolver.'
         }
     }
 }
@@ -1291,20 +1199,10 @@ function Invoke-EventuallyConsistentStep {
 
 function Invoke-CreatePhase {
     param(
-        [Parameter(Mandatory)][string]$ResolvedTemplateId,
-        [Parameter(Mandatory)][string]$ResolvedPrincipalText,
-        [Parameter(Mandatory)]
-        [ValidateSet('Group','User','Role')]
-        [string]$ResolvedPrincipalType
+        [Parameter(Mandatory)][string]$ResolvedTemplateId
     )
 
     Start-IdentityRegularUserSession
-
-    Write-Log 'Running preflight principal validation before creating the application...' 'Cyan'
-
-    $null = Resolve-IdentityPrincipal -Principal $ResolvedPrincipalText -PrincipalType $ResolvedPrincipalType
-
-    Write-Log 'Preflight principal validation succeeded. Proceeding with app creation.' 'Green'
 
     return (Import-AppFromTemplate -ResolvedTemplateId $ResolvedTemplateId)
 }
@@ -1350,7 +1248,7 @@ function Invoke-PermissionPhase {
         [Parameter(Mandatory)][string]$CreatedRowKey,
         [Parameter(Mandatory)][string]$ResolvedPrincipalText,
         [Parameter(Mandatory)]
-        [ValidateSet('Group','User','Role')]
+        [ValidateSet('User','Group','Role')]
         [string]$ResolvedPrincipalType
     )
 
@@ -1400,10 +1298,6 @@ try {
 
     $resolvedName = Get-ResolvedAppName
 
-    # New corrected pattern:
-    # 1. Ask permission target type first.
-    # 2. Then ask for actual target value.
-    # 3. Validate principal before creating the application.
     $resolvedPrincipalType = Get-ResolvedPermissionType
     $resolvedPrincipalText = Get-ResolvedPermissionPrincipal -ResolvedPrincipalType $resolvedPrincipalType
 
@@ -1416,10 +1310,18 @@ try {
     Add-ReportRow -Step 'Resolved App Name' -Status 'INFO' -Detail ("Name={0}" -f $resolvedName)
     Add-ReportRow -Step 'Resolved Permission Target' -Status 'INFO' -Detail ("Principal={0}; Type={1}" -f $resolvedPrincipalText, $resolvedPrincipalType)
 
-    $createdAppRowKey = Invoke-CreatePhase `
-        -ResolvedTemplateId $TemplateId `
-        -ResolvedPrincipalText $resolvedPrincipalText `
-        -ResolvedPrincipalType $resolvedPrincipalType
+    Write-Log 'Running preflight Identity user UID lookup before creating the app...' 'Cyan'
+
+    Reset-IdentitySessionState
+    Start-IdentityRegularUserSession
+
+    $preflightPrincipal = Resolve-IdentityPrincipal -Principal $resolvedPrincipalText -PrincipalType $resolvedPrincipalType
+
+    Write-Log ("Preflight principal lookup succeeded. Principal='{0}', PrincipalId='{1}'." -f $preflightPrincipal.Principal, $preflightPrincipal.PrincipalId) 'Green'
+
+    Reset-IdentitySessionState
+
+    $createdAppRowKey = Invoke-CreatePhase -ResolvedTemplateId $TemplateId
 
     Write-Log ("Waiting {0} second(s) before starting update phase..." -f $PreUpdateDelaySeconds) 'Yellow'
     Start-Sleep -Seconds $PreUpdateDelaySeconds
