@@ -1,17 +1,15 @@
 <#
-CNA_Create_Update_AssignPermission_DSGroupsScoped.ps1
+CNA_Create_Update_AssignPermission_UIDLookup.ps1
 
-Changes from prior version
-- Group resolution now uses DSGroups FIRST with exact, scoped lookups
-- Optional directory service filter added (default: AdProxy_cnaroot.com)
-- Redrock parsing hardened against null Row / null Entities
-- PrincipalId resolution order:
-    1) DSGroups.InternalName
-    2) DSGroups.Entities[0].Key
-    3) ADGroup.ObjectGUID
-    4) ADGroup.Entities[0].Key
-- Query strategy is exact-first, then fallback
-- Performance improved by avoiding broad LIKE until necessary
+Purpose
+- Prompt for regular CyberArk Identity credential
+- Prompt for app Name
+- Prompt for permission target and type
+- Create app from GenericBrowserExtensionScript
+- Re-auth for update
+- Re-auth for permission assignment
+- Resolve Identity UID for the group/user/role first
+- Use strict SetApplicationPermissions schema
 #>
 
 [CmdletBinding()]
@@ -62,7 +60,7 @@ loginData.order = [
     [ValidateSet('Group','User','Role')]
     [string]$PermissionPrincipalType   = 'Group',
 
-    # Scope lookups to known source when possible
+    # Scope exact group lookup when known
     [string]$DirectoryServiceFilter    = 'AdProxy_cnaroot.com',
 
     [int]$PreUpdateDelaySeconds        = 15,
@@ -71,8 +69,8 @@ loginData.order = [
     [int]$RetryIntervalSeconds         = 20,
     [int]$MaxPhaseReauthAttempts       = 2,
 
-    [string]$LogPath                   = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_Update_AssignPermission_DSGroupsScoped.log',
-    [string]$ReportCsvPath             = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_Update_AssignPermission_DSGroupsScoped_Report.csv'
+    [string]$LogPath                   = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_Update_AssignPermission_UIDLookup.log',
+    [string]$ReportCsvPath             = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_Update_AssignPermission_UIDLookup_Report.csv'
 )
 
 $script:IdentityAuthToken         = $null
@@ -90,6 +88,7 @@ function Write-Log {
     $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     $line = "$ts - $Message"
     try { Write-Host $line -ForegroundColor $Color } catch { Write-Host $line }
+
     try {
         $parent = Split-Path -Path $LogPath -Parent
         if ($parent -and -not (Test-Path $parent)) {
@@ -107,12 +106,6 @@ function Add-ReportRow {
         Status    = $Status
         Detail    = $Detail
     }
-}
-
-function ConvertTo-JsonSafe {
-    param([Parameter()][object]$Object)
-    if ($null -eq $Object) { return $null }
-    return ($Object | ConvertTo-Json -Depth 100)
 }
 
 function Get-DirectField {
@@ -143,6 +136,12 @@ function Convert-SecureStringToPlainText {
 function Escape-SqlLiteral {
     param([Parameter(Mandatory)][string]$Value)
     return ($Value -replace "'", "''")
+}
+
+function ConvertTo-JsonSafe {
+    param([Parameter()][object]$Object)
+    if ($null -eq $Object) { return $null }
+    return ($Object | ConvertTo-Json -Depth 100)
 }
 
 function Prompt-ForRegularCredential {
@@ -339,9 +338,7 @@ function Invoke-IdentityRequestRaw {
         ErrorAction = 'Stop'
     }
 
-    if ($null -ne $Body) {
-        $invokeParams['Body'] = ($Body | ConvertTo-Json -Depth 100)
-    }
+    if ($null -ne $Body) { $invokeParams['Body'] = ($Body | ConvertTo-Json -Depth 100) }
 
     if (($AuthMode -eq 'BearerCookie' -or $AuthMode -eq 'CookieOnly') -and $null -ne $script:IdentityWebSession) {
         $invokeParams['WebSession'] = $script:IdentityWebSession
@@ -430,201 +427,97 @@ function Get-RedrockItems {
     return ,$items
 }
 
-function New-DSGroupsQueries {
-    param([Parameter(Mandatory)][string]$Principal,[string]$ServiceInstance)
-
-    $escaped = Escape-SqlLiteral -Value $Principal
-    $short = $Principal
-    if ($Principal -match '@') { $short = $Principal.Split('@')[0] }
-    $escapedShort = Escape-SqlLiteral -Value $short
-
-    $scope = ''
-    if (-not [string]::IsNullOrWhiteSpace($ServiceInstance)) {
-        $escSvc = Escape-SqlLiteral -Value $ServiceInstance
-        $scope = " AND ServiceInstance = '$escSvc'"
-    }
-
-    @(
-@"
-Select InternalName, SystemName, DisplayName, DirectoryServiceUuid, ServiceInstance
-from DSGroups
-WHERE SystemName = '$escaped'$scope
-ORDER BY InternalName COLLATE NOCASE
-"@,
-@"
-Select InternalName, SystemName, DisplayName, DirectoryServiceUuid, ServiceInstance
-from DSGroups
-WHERE DisplayName = '$escaped'$scope
-ORDER BY InternalName COLLATE NOCASE
-"@,
-@"
-Select InternalName, SystemName, DisplayName, DirectoryServiceUuid, ServiceInstance
-from DSGroups
-WHERE SystemName = '$escapedShort'$scope
-ORDER BY InternalName COLLATE NOCASE
-"@,
-@"
-Select InternalName, SystemName, DisplayName, DirectoryServiceUuid, ServiceInstance
-from DSGroups
-WHERE DisplayName = '$escapedShort'$scope
-ORDER BY InternalName COLLATE NOCASE
-"@
-    )
-}
-
-function New-ADGroupQueries {
-    param([Parameter(Mandatory)][string]$Principal)
-    $short = $Principal
-    if ($Principal -match '@') { $short = $Principal.Split('@')[0] }
-    $escapedShort = Escape-SqlLiteral -Value $short
-    $escaped = Escape-SqlLiteral -Value $Principal
-
-    @(
-@"
-Select ObjectGUID, Name, SamAccountName, DistinguishedName
-from ADGroup
-WHERE SamAccountName = '$escapedShort'
-ORDER BY SamAccountName COLLATE NOCASE
-"@,
-@"
-Select ObjectGUID, Name, SamAccountName, DistinguishedName
-from ADGroup
-WHERE Name = '$escapedShort' OR Name = '$escaped'
-ORDER BY Name COLLATE NOCASE
-"@
-    )
-}
-
 function Resolve-IdentityPrincipal {
     param(
         [Parameter(Mandatory)][string]$Principal,
         [Parameter(Mandatory)][ValidateSet('Group','User','Role')][string]$PrincipalType
     )
 
-    switch ($PrincipalType) {
-        'Group' {
-            foreach ($q in (New-DSGroupsQueries -Principal $Principal -ServiceInstance $DirectoryServiceFilter)) {
-                $items = @(Get-RedrockItems -Response (Invoke-RedrockQuery -Script $q))
-                if ($items.Count -gt 0 -and $null -ne $items[0].Row) {
-                    $row = $items[0].Row
-                    $principalId = [string](Get-DirectField -Object $row -FieldName 'InternalName')
-                    if ([string]::IsNullOrWhiteSpace($principalId)) { $principalId = $items[0].EntityKey }
-
-                    $principalValue = [string](Get-DirectField -Object $row -FieldName 'SystemName')
-                    if ([string]::IsNullOrWhiteSpace($principalValue)) { $principalValue = $Principal }
-
-                    if (-not [string]::IsNullOrWhiteSpace($principalId)) {
-                        $resolved = [pscustomobject]@{
-                            PrincipalType = 'Group'
-                            Input         = $Principal
-                            Principal     = $principalValue
-                            PrincipalId   = $principalId
-                            MatchedFrom   = 'DSGroups'
-                        }
-                        Write-Log ("Resolved Group principal '{0}' via DSGroups -> Principal='{1}' PrincipalId='{2}'." -f $Principal, $resolved.Principal, $resolved.PrincipalId) 'Green'
-                        Add-ReportRow -Step 'Resolve Principal' -Status 'SUCCESS' -Detail (ConvertTo-JsonSafe $resolved)
-                        return $resolved
-                    }
-                }
-            }
-
-            foreach ($q in (New-ADGroupQueries -Principal $Principal)) {
-                $items = @(Get-RedrockItems -Response (Invoke-RedrockQuery -Script $q))
-                if ($items.Count -gt 0 -and $null -ne $items[0].Row) {
-                    $row = $items[0].Row
-                    $principalId = [string](Get-DirectField -Object $row -FieldName 'ObjectGUID')
-                    if ([string]::IsNullOrWhiteSpace($principalId)) { $principalId = $items[0].EntityKey }
-
-                    if (-not [string]::IsNullOrWhiteSpace($principalId)) {
-                        $resolved = [pscustomobject]@{
-                            PrincipalType = 'Group'
-                            Input         = $Principal
-                            Principal     = $Principal
-                            PrincipalId   = $principalId
-                            MatchedFrom   = 'ADGroup'
-                        }
-                        Write-Log ("Resolved Group principal '{0}' via ADGroup -> Principal='{1}' PrincipalId='{2}'." -f $Principal, $resolved.Principal, $resolved.PrincipalId) 'Green'
-                        Add-ReportRow -Step 'Resolve Principal' -Status 'SUCCESS' -Detail (ConvertTo-JsonSafe $resolved)
-                        return $resolved
-                    }
-                }
-            }
-
-            throw ("No usable principal ID could be resolved for group '{0}' from DSGroups or ADGroup." -f $Principal)
+    if ($PrincipalType -eq 'Group') {
+        $escaped = Escape-SqlLiteral -Value $Principal
+        $scope = ''
+        if (-not [string]::IsNullOrWhiteSpace($DirectoryServiceFilter)) {
+            $escSvc = Escape-SqlLiteral -Value $DirectoryServiceFilter
+            $scope = " AND ServiceInstance = '$escSvc'"
         }
 
-        'User' {
-            $escaped = Escape-SqlLiteral -Value $Principal
-            $short = $Principal
-            if ($Principal -match '@') { $short = $Principal.Split('@')[0] }
-            $escapedShort = Escape-SqlLiteral -Value $short
+        $query = @"
+Select InternalName, SystemName, DisplayName, DirectoryServiceUuid, ServiceInstance
+from DSGroups
+WHERE SystemName = '$escaped'$scope
+"@
 
-            $queries = @(
-@"
+        $items = @(Get-RedrockItems -Response (Invoke-RedrockQuery -Script $query))
+        if ($items.Count -gt 0 -and $null -ne $items[0].Row) {
+            $row = $items[0].Row
+            $principalId = [string](Get-DirectField -Object $row -FieldName 'InternalName')
+            if ([string]::IsNullOrWhiteSpace($principalId)) { $principalId = $items[0].EntityKey }
+
+            $principalValue = [string](Get-DirectField -Object $row -FieldName 'SystemName')
+            if ([string]::IsNullOrWhiteSpace($principalValue)) { $principalValue = $Principal }
+
+            if (-not [string]::IsNullOrWhiteSpace($principalId)) {
+                $resolved = [pscustomobject]@{
+                    PrincipalType = 'Group'
+                    Input         = $Principal
+                    Principal     = $principalValue
+                    PrincipalId   = $principalId
+                    MatchedFrom   = 'DSGroups'
+                }
+                Write-Log ("Resolved Group principal '{0}' via DSGroups -> Principal='{1}' PrincipalId='{2}'." -f $Principal, $resolved.Principal, $resolved.PrincipalId) 'Green'
+                Add-ReportRow -Step 'Resolve Principal' -Status 'SUCCESS' -Detail (ConvertTo-JsonSafe $resolved)
+                return $resolved
+            }
+        }
+
+        throw ("No usable DSGroups UID could be resolved for group '{0}'." -f $Principal)
+    }
+
+    if ($PrincipalType -eq 'User') {
+        $escaped = Escape-SqlLiteral -Value $Principal
+        $query = @"
 Select InternalName, SystemName, DisplayName, DirectoryServiceUuid, Email
 from DSUsers
 WHERE SystemName = '$escaped' OR Email = '$escaped'
-ORDER BY InternalName COLLATE NOCASE
-"@,
-@"
-Select ObjectGUID, UserPrincipalName, SamAccountName, Mail, Name
-from ADUser
-WHERE UserPrincipalName = '$escaped' OR Mail = '$escaped' OR SamAccountName = '$escapedShort'
-ORDER BY Name COLLATE NOCASE
 "@
-            )
+        $items = @(Get-RedrockItems -Response (Invoke-RedrockQuery -Script $query))
+        if ($items.Count -gt 0 -and $null -ne $items[0].Row) {
+            $row = $items[0].Row
+            $principalId = [string](Get-DirectField -Object $row -FieldName 'InternalName')
+            if ([string]::IsNullOrWhiteSpace($principalId)) { $principalId = $items[0].EntityKey }
+            $principalValue = [string](Get-DirectField -Object $row -FieldName 'SystemName')
+            if ([string]::IsNullOrWhiteSpace($principalValue)) { $principalValue = $Principal }
 
-            foreach ($q in $queries) {
-                $items = @(Get-RedrockItems -Response (Invoke-RedrockQuery -Script $q))
-                if ($items.Count -gt 0 -and $null -ne $items[0].Row) {
-                    $row = $items[0].Row
-                    $principalId = [string](Get-DirectField -Object $row -FieldName 'InternalName')
-                    if ([string]::IsNullOrWhiteSpace($principalId)) { $principalId = [string](Get-DirectField -Object $row -FieldName 'ObjectGUID') }
-                    if ([string]::IsNullOrWhiteSpace($principalId)) { $principalId = $items[0].EntityKey }
-
-                    $principalValue = [string](Get-DirectField -Object $row -FieldName 'SystemName')
-                    if ([string]::IsNullOrWhiteSpace($principalValue)) { $principalValue = [string](Get-DirectField -Object $row -FieldName 'UserPrincipalName') }
-                    if ([string]::IsNullOrWhiteSpace($principalValue)) { $principalValue = $Principal }
-
-                    if (-not [string]::IsNullOrWhiteSpace($principalId)) {
-                        $resolved = [pscustomobject]@{
-                            PrincipalType = 'User'
-                            Input         = $Principal
-                            Principal     = $principalValue
-                            PrincipalId   = $principalId
-                            MatchedFrom   = 'DSUsers/ADUser'
-                        }
-                        Write-Log ("Resolved User principal '{0}' -> Principal='{1}' PrincipalId='{2}'." -f $Principal, $resolved.Principal, $resolved.PrincipalId) 'Green'
-                        Add-ReportRow -Step 'Resolve Principal' -Status 'SUCCESS' -Detail (ConvertTo-JsonSafe $resolved)
-                        return $resolved
-                    }
+            if (-not [string]::IsNullOrWhiteSpace($principalId)) {
+                $resolved = [pscustomobject]@{
+                    PrincipalType = 'User'
+                    Input         = $Principal
+                    Principal     = $principalValue
+                    PrincipalId   = $principalId
+                    MatchedFrom   = 'DSUsers'
                 }
+                Write-Log ("Resolved User principal '{0}' via DSUsers -> Principal='{1}' PrincipalId='{2}'." -f $Principal, $resolved.Principal, $resolved.PrincipalId) 'Green'
+                Add-ReportRow -Step 'Resolve Principal' -Status 'SUCCESS' -Detail (ConvertTo-JsonSafe $resolved)
+                return $resolved
             }
-
-            throw ("No usable principal ID could be resolved for user '{0}'." -f $Principal)
         }
 
-        'Role' {
-            $escaped = Escape-SqlLiteral -Value $Principal
-            $query = @"
+        throw ("No usable DSUsers UID could be resolved for user '{0}'." -f $Principal)
+    }
+
+    $escaped = Escape-SqlLiteral -Value $Principal
+    $query = @"
 Select ID, Name, RoleType
 from Role
 WHERE Name = '$escaped' OR ID = '$escaped'
-ORDER BY Name COLLATE NOCASE
 "@
-            $items = @(Get-RedrockItems -Response (Invoke-RedrockQuery -Script $query))
-            if ($items.Count -lt 1 -or $null -eq $items[0].Row) {
-                throw ("No Identity role was found for '{0}'." -f $Principal)
-            }
+    $items = @(Get-RedrockItems -Response (Invoke-RedrockQuery -Script $query))
+    if ($items.Count -gt 0 -and $null -ne $items[0].Row) {
+        $row = $items[0].Row
+        $principalId = [string](Get-DirectField -Object $row -FieldName 'ID')
+        $principalValue = [string](Get-DirectField -Object $row -FieldName 'Name')
 
-            $row = $items[0].Row
-            $principalId = [string](Get-DirectField -Object $row -FieldName 'ID')
-            $principalValue = [string](Get-DirectField -Object $row -FieldName 'Name')
-
-            if ([string]::IsNullOrWhiteSpace($principalId) -or [string]::IsNullOrWhiteSpace($principalValue)) {
-                throw ("Resolved role for '{0}' is missing ID or Name." -f $Principal)
-            }
-
+        if (-not [string]::IsNullOrWhiteSpace($principalId) -and -not [string]::IsNullOrWhiteSpace($principalValue)) {
             $resolved = [pscustomobject]@{
                 PrincipalType = 'Role'
                 Input         = $Principal
@@ -637,6 +530,8 @@ ORDER BY Name COLLATE NOCASE
             return $resolved
         }
     }
+
+    throw ("No usable role UID could be resolved for '{0}'." -f $Principal)
 }
 
 function Import-AppFromTemplate {
