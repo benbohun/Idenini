@@ -1,26 +1,26 @@
 <#
-CNA_Create_And_Update_Identity_WebApp_Reauth_AppNameDescMapping.ps1
+CNA_Create_And_Update_Identity_WebApp_Reauth_AppNameDescMapping_10Sec_PromptDefault.ps1
 
 Purpose
 - Prompt for regular CyberArk Identity credential once.
 - Prompt for Name of App to be created.
 - Create app from GenericBrowserExtensionScript.
-- Wait 5 seconds, then re-establish a fresh CyberArk Identity session for update.
+- Wait 10 seconds, then re-establish a fresh CyberArk Identity session for update.
 - Update the newly created app using the returned _RowKey.
 - Dynamically set app description to:
     This GCP Application is managed by Service Account ("<Name of App>")
 - Apply the Browser Extension (advanced) login workflow.
-- Best-effort Account Mapping:
-    1. Try to set Account Mapping to "All users share one name" using UserNameStrategy = Fixed.
-    2. If that fails, fall back to "Prompt for user name" using UserNameStrategy = SetByUser.
+- Account Mapping:
+    - Default: leave as "Prompt for user name" using UserNameStrategy = SetByUser.
+    - Optional: try "All users share one name" only when -TryAllUsersShareOneName:$true is explicitly used.
 
 Notes
 - CyberArk publicly documents the Account Mapping UI options, but the exact UpdateApplicationDE field for
   "All users share one name" is not fully exposed in the public API documentation.
 - This script therefore tries the best-known Identity application model first:
     UserNameStrategy = Fixed
-  with a shared username value.
-- If that fails, it safely falls back to:
+  with a shared username value, but this is disabled by default because the public API does not clearly document the UI field.
+- Default safe mode uses:
     UserNameStrategy = SetByUser
 #>
 
@@ -48,7 +48,7 @@ param(
     [string]$AdminTag                  = '_I18N_AppCategory_Other',
 
     # Account Mapping settings
-    [bool]$TryAllUsersShareOneName     = $true,
+    [bool]$TryAllUsersShareOneName     = $false,
     [string]$PromptUserNameStrategy    = 'SetByUser',
     [string]$AllUsersShareOneNameStrategy = 'Fixed',
     [string]$SharedUserName            = '',
@@ -79,14 +79,14 @@ loginData.order = [
 '@,
 
     # Timing / retries
-    [int]$PreUpdateDelaySeconds        = 5,
+    [int]$PreUpdateDelaySeconds        = 10,
     [int]$UpdateRetryWindowSeconds     = 300,
-    [int]$RetryIntervalSeconds         = 5,
+    [int]$RetryIntervalSeconds         = 10,
     [int]$MaxUpdateReauthAttempts      = 2,
 
     # Logging
-    [string]$LogPath                   = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_And_Update_Reauth_AppNameDescMapping.log',
-    [string]$ReportCsvPath             = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_And_Update_Reauth_AppNameDescMapping_Report.csv'
+    [string]$LogPath                   = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_And_Update_Reauth_AppNameDescMapping_10Sec_PromptDefault.log',
+    [string]$ReportCsvPath             = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_And_Update_Reauth_AppNameDescMapping_10Sec_PromptDefault_Report.csv'
 )
 
 $script:IdentityAuthToken         = $null
@@ -223,9 +223,9 @@ function Get-ResolvedAppConfiguration {
     Write-Log ("Resolved app Description: '{0}'." -f $script:ResolvedDescription) 'Cyan'
 
     if ($TryAllUsersShareOneName) {
-        Write-Log ("Account Mapping best-effort mode: Try 'All users share one name' first using shared username '{0}', then fallback to 'Prompt for user name'." -f $script:ResolvedSharedUserName) 'Yellow'
+        Write-Log ("Account Mapping optional mode enabled: Try 'All users share one name' using shared username '{0}'." -f $script:ResolvedSharedUserName) 'Yellow'
     } else {
-        Write-Log 'Account Mapping mode: Prompt for user name only.' 'Yellow'
+        Write-Log 'Account Mapping mode: Prompt for user name only. This is the default safe API mode.' 'Yellow'
     }
 
     Add-ReportRow -Step 'Resolved App Config' -Status 'INFO' -Detail ("Name={0}; DisplayName={1}; Description={2}; SharedUserName={3}; TryAllUsersShareOneName={4}" -f $script:ResolvedAppName, $script:ResolvedDisplayName, $script:ResolvedDescription, $script:ResolvedSharedUserName, $TryAllUsersShareOneName)
@@ -623,31 +623,9 @@ function Invoke-UpdateApplicationPayload {
 function Update-CurrentApplicationWithAdvancedScript {
     param([Parameter(Mandatory)][string]$ResolvedRowKey)
 
-    $variantNumber = 0
-
-    if ($TryAllUsersShareOneName) {
-        $sharedVariants = @(New-SharedAccountMappingPayloadVariants -ResolvedRowKey $ResolvedRowKey)
-
-        foreach ($payload in $sharedVariants) {
-            $variantNumber++
-            try {
-                Write-Log ("Trying UpdateApplicationDE shared-account-mapping payload variant #{0}..." -f $variantNumber) 'Gray'
-                $null = Invoke-UpdateApplicationPayload -Payload $payload -LogicalName 'UpdateApplicationDE'
-
-                $script:ResolvedUserNameStrategy = $AllUsersShareOneNameStrategy
-                $script:ResolvedMappingMode = 'All users share one name - best effort'
-
-                Write-Log ("UpdateApplicationDE succeeded using shared-account-mapping payload variant #{0}. UserNameStrategy='{1}' SharedUserName='{2}'." -f $variantNumber, $AllUsersShareOneNameStrategy, $script:ResolvedSharedUserName) 'Green'
-                Add-ReportRow -Step 'Update Application' -Status 'SUCCESS' -Detail ("RowKey={0}; Variant={1}; MappingMode=AllUsersShareOneName-BestEffort; UserNameStrategy={2}; SharedUserName={3}" -f $ResolvedRowKey, $variantNumber, $AllUsersShareOneNameStrategy, $script:ResolvedSharedUserName)
-                return
-            } catch {
-                Write-Log ("Shared-account-mapping payload variant #{0} failed: {1}" -f $variantNumber, $_.Exception.Message) 'Yellow'
-            }
-        }
-
-        Write-Log 'All shared-account-mapping variants failed. Falling back to Prompt for user name.' 'Yellow'
-    }
-
+    # Default safe path:
+    # Use Prompt for user name first. This is the known stable payload shape for UpdateApplicationDE.
+    # The previous shared-account-mapping attempt returned success=false and then caused subsequent 401s.
     $promptVariants = @(New-PromptForUserNamePayloadVariants -ResolvedRowKey $ResolvedRowKey)
     $promptVariantNumber = 0
 
@@ -662,9 +640,40 @@ function Update-CurrentApplicationWithAdvancedScript {
 
             Write-Log ("UpdateApplicationDE succeeded using Prompt-for-user-name payload variant #{0}. UserNameStrategy='{1}'." -f $promptVariantNumber, $PromptUserNameStrategy) 'Green'
             Add-ReportRow -Step 'Update Application' -Status 'SUCCESS' -Detail ("RowKey={0}; Variant={1}; MappingMode=PromptForUserName; UserNameStrategy={2}" -f $ResolvedRowKey, $promptVariantNumber, $PromptUserNameStrategy)
+
             return
         } catch {
             Write-Log ("Prompt-for-user-name payload variant #{0} failed: {1}" -f $promptVariantNumber, $_.Exception.Message) 'Yellow'
+        }
+    }
+
+    if (-not $TryAllUsersShareOneName) {
+        throw 'Prompt-for-user-name UpdateApplicationDE failed, and TryAllUsersShareOneName is disabled.'
+    }
+
+    # Optional experimental path only:
+    # Re-authenticate before trying shared-account mapping so a failed prompt attempt does not reuse a bad session.
+    Write-Log "Prompt-for-user-name variants failed. TryAllUsersShareOneName is enabled, so re-authenticating before shared-account-mapping test..." 'Yellow'
+    Reset-IdentitySessionState
+    Start-IdentityRegularUserSession
+
+    $variantNumber = 0
+    $sharedVariants = @(New-SharedAccountMappingPayloadVariants -ResolvedRowKey $ResolvedRowKey)
+
+    foreach ($payload in $sharedVariants) {
+        $variantNumber++
+        try {
+            Write-Log ("Trying UpdateApplicationDE shared-account-mapping payload variant #{0}..." -f $variantNumber) 'Gray'
+            $null = Invoke-UpdateApplicationPayload -Payload $payload -LogicalName 'UpdateApplicationDE'
+
+            $script:ResolvedUserNameStrategy = $AllUsersShareOneNameStrategy
+            $script:ResolvedMappingMode = 'All users share one name - best effort'
+
+            Write-Log ("UpdateApplicationDE succeeded using shared-account-mapping payload variant #{0}. UserNameStrategy='{1}' SharedUserName='{2}'." -f $variantNumber, $AllUsersShareOneNameStrategy, $script:ResolvedSharedUserName) 'Green'
+            Add-ReportRow -Step 'Update Application' -Status 'SUCCESS' -Detail ("RowKey={0}; Variant={1}; MappingMode=AllUsersShareOneName-BestEffort; UserNameStrategy={2}; SharedUserName={3}" -f $ResolvedRowKey, $variantNumber, $AllUsersShareOneNameStrategy, $script:ResolvedSharedUserName)
+            return
+        } catch {
+            Write-Log ("Shared-account-mapping payload variant #{0} failed: {1}" -f $variantNumber, $_.Exception.Message) 'Yellow'
         }
     }
 
