@@ -1,28 +1,27 @@
-
-Update the script with the below requirement
-1. Prompt for Name of App to be created
-2. Change fresh session time to 5 seconds
-3. Update App Description to This GCP Application is managed by Service Account ("Name of App")
-4. See if you can update Application account Mapping to "All users share one name" else leave as "Prompt for User Name"
-
-
-
 <#
-CNA_Create_And_Update_Identity_WebApp_Reauth.ps1
+CNA_Create_And_Update_Identity_WebApp_Reauth_AppNameDescMapping.ps1
 
 Purpose
-- Prompt for regular CyberArk Identity credential once
-- Create app from GenericBrowserExtensionScript
-- Re-establish CyberArk Identity session for the update phase
-- Update the newly created app using the returned _RowKey
-- Apply non-script settings and the Browser Extension (advanced) login workflow
-- No PAS validation
-- No psPAS dependency
+- Prompt for regular CyberArk Identity credential once.
+- Prompt for Name of App to be created.
+- Create app from GenericBrowserExtensionScript.
+- Wait 5 seconds, then re-establish a fresh CyberArk Identity session for update.
+- Update the newly created app using the returned _RowKey.
+- Dynamically set app description to:
+    This GCP Application is managed by Service Account ("<Name of App>")
+- Apply the Browser Extension (advanced) login workflow.
+- Best-effort Account Mapping:
+    1. Try to set Account Mapping to "All users share one name" using UserNameStrategy = Fixed.
+    2. If that fails, fall back to "Prompt for user name" using UserNameStrategy = SetByUser.
 
-Why this version
-- Your separate scripts worked
-- Same-session create -> update failed with 401 on UpdateApplicationDE
-- This version keeps one credential entry but deliberately performs a fresh Identity login before update
+Notes
+- CyberArk publicly documents the Account Mapping UI options, but the exact UpdateApplicationDE field for
+  "All users share one name" is not fully exposed in the public API documentation.
+- This script therefore tries the best-known Identity application model first:
+    UserNameStrategy = Fixed
+  with a shared username value.
+- If that fails, it safely falls back to:
+    UserNameStrategy = SetByUser
 #>
 
 [CmdletBinding()]
@@ -38,6 +37,8 @@ param(
     # App settings
     [string]$Name                      = 'g-test-pam1',
     [string]$DisplayName               = 'GCP - Okta Prod',
+    [switch]$KeepConfiguredDisplayName,
+
     [string]$Category                  = '_I18N_AppCategory_Other',
     [string]$DefaultAuthProfile        = 'AlwaysAllowed',
     [string]$DefaultAuthProfileUuid    = 'AlwaysAllowed',
@@ -45,11 +46,16 @@ param(
     [bool]$IsSwsEnabled                = $true,
     [bool]$ShowRegistration            = $false,
     [string]$AdminTag                  = '_I18N_AppCategory_Other',
-    [string]$UserNameStrategy          = 'SetByUser',
+
+    # Account Mapping settings
+    [bool]$TryAllUsersShareOneName     = $true,
+    [string]$PromptUserNameStrategy    = 'SetByUser',
+    [string]$AllUsersShareOneNameStrategy = 'Fixed',
+    [string]$SharedUserName            = '',
+
     [bool]$FormFillingEnabled          = $true,
     [bool]$Generic                     = $true,
     [string]$AppType                   = 'Web',
-    [string]$Description               = '_I18N_AppDesc_Generic_BE_Script',
     [string]$IconUri                   = '/vfslow/lib/application/icons/GenericBrowserExtension.svg',
     [string]$WebAppType                = 'UsernamePassword',
     [string]$TemplateName              = 'GenericBrowserExtensionScript',
@@ -73,14 +79,14 @@ loginData.order = [
 '@,
 
     # Timing / retries
-    [int]$PreUpdateDelaySeconds        = 15,
+    [int]$PreUpdateDelaySeconds        = 5,
     [int]$UpdateRetryWindowSeconds     = 300,
-    [int]$RetryIntervalSeconds         = 20,
+    [int]$RetryIntervalSeconds         = 5,
     [int]$MaxUpdateReauthAttempts      = 2,
 
     # Logging
-    [string]$LogPath                   = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_And_Update_Reauth.log',
-    [string]$ReportCsvPath             = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_And_Update_Reauth_Report.csv'
+    [string]$LogPath                   = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_And_Update_Reauth_AppNameDescMapping.log',
+    [string]$ReportCsvPath             = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_And_Update_Reauth_AppNameDescMapping_Report.csv'
 )
 
 $script:IdentityAuthToken         = $null
@@ -89,6 +95,13 @@ $script:IdentityWebSession        = $null
 $script:RegularCredential         = $null
 $script:RegularUserPlainPassword  = $null
 $script:ReportRows                = @()
+
+$script:ResolvedAppName           = $null
+$script:ResolvedDisplayName       = $null
+$script:ResolvedDescription       = $null
+$script:ResolvedSharedUserName    = $null
+$script:ResolvedUserNameStrategy  = $null
+$script:ResolvedMappingMode       = $null
 
 function Write-Log {
     param(
@@ -111,11 +124,7 @@ function Write-Log {
 }
 
 function Add-ReportRow {
-    param(
-        [string]$Step,
-        [string]$Status,
-        [string]$Detail
-    )
+    param([string]$Step,[string]$Status,[string]$Detail)
     $script:ReportRows += [pscustomobject]@{
         Timestamp = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
         Step      = $Step
@@ -166,9 +175,7 @@ function Convert-SecureStringToPlainText {
 function Get-RegularCredential {
     if ([string]::IsNullOrWhiteSpace($RegularUserName)) {
         $script:RegularCredential = Get-Credential -Message 'Enter REGULAR user credential for CyberArk Identity'
-        if ($null -eq $script:RegularCredential) {
-            throw 'Credential prompt was cancelled.'
-        }
+        if ($null -eq $script:RegularCredential) { throw 'Credential prompt was cancelled.' }
         $script:RegularUserPlainPassword = Convert-SecureStringToPlainText -SecureString $script:RegularCredential.Password
         return
     }
@@ -182,6 +189,46 @@ function Get-RegularCredential {
     }
 
     $script:RegularCredential = [pscredential]::new($RegularUserName, $secure)
+}
+
+function Get-ResolvedAppConfiguration {
+    $enteredName = Read-Host ("Enter the Name of App to be created [{0}]" -f $Name)
+
+    if ([string]::IsNullOrWhiteSpace($enteredName)) {
+        $script:ResolvedAppName = $Name.Trim()
+    } else {
+        $script:ResolvedAppName = $enteredName.Trim()
+    }
+
+    if ([string]::IsNullOrWhiteSpace($script:ResolvedAppName)) {
+        throw 'Name of App cannot be empty.'
+    }
+
+    if ($KeepConfiguredDisplayName) {
+        $script:ResolvedDisplayName = $DisplayName
+    } else {
+        $script:ResolvedDisplayName = $script:ResolvedAppName
+    }
+
+    $script:ResolvedDescription = ('This GCP Application is managed by Service Account ("{0}")' -f $script:ResolvedAppName)
+
+    if ([string]::IsNullOrWhiteSpace($SharedUserName)) {
+        $script:ResolvedSharedUserName = $script:ResolvedAppName
+    } else {
+        $script:ResolvedSharedUserName = $SharedUserName.Trim()
+    }
+
+    Write-Log ("Resolved app Name: '{0}'." -f $script:ResolvedAppName) 'Cyan'
+    Write-Log ("Resolved app DisplayName: '{0}'." -f $script:ResolvedDisplayName) 'Cyan'
+    Write-Log ("Resolved app Description: '{0}'." -f $script:ResolvedDescription) 'Cyan'
+
+    if ($TryAllUsersShareOneName) {
+        Write-Log ("Account Mapping best-effort mode: Try 'All users share one name' first using shared username '{0}', then fallback to 'Prompt for user name'." -f $script:ResolvedSharedUserName) 'Yellow'
+    } else {
+        Write-Log 'Account Mapping mode: Prompt for user name only.' 'Yellow'
+    }
+
+    Add-ReportRow -Step 'Resolved App Config' -Status 'INFO' -Detail ("Name={0}; DisplayName={1}; Description={2}; SharedUserName={3}; TryAllUsersShareOneName={4}" -f $script:ResolvedAppName, $script:ResolvedDisplayName, $script:ResolvedDescription, $script:ResolvedSharedUserName, $TryAllUsersShareOneName)
 }
 
 function Reset-IdentitySessionState {
@@ -200,25 +247,10 @@ function Get-AuthPayload {
     return $Response
 }
 
-function Get-AuthSummaryValue {
-    param([Parameter(Mandatory)]$Payload)
-    return [string](Get-DirectField -Object $Payload -FieldName 'Summary')
-}
-
-function Get-AuthSessionId {
-    param([Parameter(Mandatory)]$Payload)
-    return [string](Get-DirectField -Object $Payload -FieldName 'SessionId')
-}
-
-function Get-AuthTokenValue {
-    param([Parameter(Mandatory)]$Payload)
-    return [string](Get-DirectField -Object $Payload -FieldName 'Auth')
-}
-
-function Get-AuthUserValue {
-    param([Parameter(Mandatory)]$Payload)
-    return [string](Get-DirectField -Object $Payload -FieldName 'User')
-}
+function Get-AuthSummaryValue { param([Parameter(Mandatory)]$Payload) return [string](Get-DirectField -Object $Payload -FieldName 'Summary') }
+function Get-AuthSessionId   { param([Parameter(Mandatory)]$Payload) return [string](Get-DirectField -Object $Payload -FieldName 'SessionId') }
+function Get-AuthTokenValue  { param([Parameter(Mandatory)]$Payload) return [string](Get-DirectField -Object $Payload -FieldName 'Auth') }
+function Get-AuthUserValue   { param([Parameter(Mandatory)]$Payload) return [string](Get-DirectField -Object $Payload -FieldName 'User') }
 
 function Get-FirstMechanism {
     param([Parameter(Mandatory)]$Payload)
@@ -228,9 +260,7 @@ function Get-FirstMechanism {
         $mechs = @(Get-DirectField -Object $challenge -FieldName 'Mechanisms')
         foreach ($mech in $mechs) {
             $mechId = [string](Get-DirectField -Object $mech -FieldName 'MechanismId')
-            if (-not [string]::IsNullOrWhiteSpace($mechId)) {
-                return $mech
-            }
+            if (-not [string]::IsNullOrWhiteSpace($mechId)) { return $mech }
         }
     }
 
@@ -245,25 +275,17 @@ function Get-MechanismPrompt {
     $type   = [string](Get-DirectField -Object $Mechanism -FieldName 'AnswerType')
 
     if ($name -eq 'UP' -or $prompt -match 'Password') {
-        return @{
-            Action = 'Answer'
-            Answer = $script:RegularUserPlainPassword
-        }
+        return @{ Action = 'Answer'; Answer = $script:RegularUserPlainPassword }
     }
 
     $display = if (-not [string]::IsNullOrWhiteSpace($prompt)) { $prompt } else { $name }
     $answer = Read-Host ("Enter response for challenge [{0}] {1}" -f $type, $display)
 
-    return @{
-        Action = 'Answer'
-        Answer = $answer
-    }
+    return @{ Action = 'Answer'; Answer = $answer }
 }
 
 function Start-IdentityRegularUserSession {
-    if ($null -eq $script:RegularCredential) {
-        throw 'Regular user credential is not initialized.'
-    }
+    if ($null -eq $script:RegularCredential) { throw 'Regular user credential is not initialized.' }
 
     $tenantUrl = $IdentityApiTenantURL
     $userName  = $script:RegularCredential.UserName
@@ -281,10 +303,7 @@ function Start-IdentityRegularUserSession {
 
     Write-Log ("Starting interactive CyberArk Identity authentication for regular user '{0}'..." -f $userName) 'Cyan'
 
-    $startBody = @{
-        User    = $userName
-        Version = '1.0'
-    }
+    $startBody = @{ User = $userName; Version = '1.0' }
 
     $startResp = Invoke-RestMethod -Method POST -Uri $startUri -Headers $baseHeaders -WebSession $script:IdentityWebSession -ContentType 'application/json' -Body (ConvertTo-JsonSafe $startBody) -ErrorAction Stop
     $payload = Get-AuthPayload -Response $startResp
@@ -306,14 +325,10 @@ function Start-IdentityRegularUserSession {
         }
 
         $sessionId = Get-AuthSessionId -Payload $payload
-        if ([string]::IsNullOrWhiteSpace($sessionId)) {
-            throw 'Authentication package did not include SessionId.'
-        }
+        if ([string]::IsNullOrWhiteSpace($sessionId)) { throw 'Authentication package did not include SessionId.' }
 
         $mechanism = Get-FirstMechanism -Payload $payload
-        if ($null -eq $mechanism) {
-            throw 'No supported authentication mechanism was returned.'
-        }
+        if ($null -eq $mechanism) { throw 'No supported authentication mechanism was returned.' }
 
         $mechId = [string](Get-DirectField -Object $mechanism -FieldName 'MechanismId')
         $name   = [string](Get-DirectField -Object $mechanism -FieldName 'Name')
@@ -351,9 +366,7 @@ function Invoke-IdentityRequestRaw {
     }
 
     if ($AuthMode -eq 'BearerCookie' -or $AuthMode -eq 'BearerOnly') {
-        if ([string]::IsNullOrWhiteSpace($script:IdentityAuthToken)) {
-            throw 'Identity auth token is not initialized.'
-        }
+        if ([string]::IsNullOrWhiteSpace($script:IdentityAuthToken)) { throw 'Identity auth token is not initialized.' }
         $headers['Authorization'] = ("Bearer {0}" -f $script:IdentityAuthToken)
     }
 
@@ -418,14 +431,10 @@ function Import-AppFromTemplate {
     $body = @{ ID = @($ResolvedTemplateId) }
 
     $resp = Invoke-IdentityRequestWithRetry -AbsoluteUris @($uri) -Body $body -LogicalName 'ImportAppFromTemplate'
-    if (-not $resp.success) {
-        throw ('ImportAppFromTemplate returned success=false: ' + ($resp.Message | Out-String))
-    }
+    if (-not $resp.success) { throw ('ImportAppFromTemplate returned success=false: ' + ($resp.Message | Out-String)) }
 
     $resultItems = @($resp.Result)
-    if ($resultItems.Count -lt 1) {
-        throw 'ImportAppFromTemplate returned no result items.'
-    }
+    if ($resultItems.Count -lt 1) { throw 'ImportAppFromTemplate returned no result items.' }
 
     $first = $resultItems[0]
     $created = Get-DirectField -Object $first -FieldName 'success'
@@ -436,13 +445,8 @@ function Import-AppFromTemplate {
     }
 
     $rowKey = [string](Get-DirectField -Object $first -FieldName '_RowKey')
-    if ([string]::IsNullOrWhiteSpace($rowKey)) {
-        $rowKey = [string](Get-DirectField -Object $first -FieldName '_Rowkey')
-    }
-
-    if ([string]::IsNullOrWhiteSpace($rowKey)) {
-        throw 'ImportAppFromTemplate did not return _RowKey.'
-    }
+    if ([string]::IsNullOrWhiteSpace($rowKey)) { $rowKey = [string](Get-DirectField -Object $first -FieldName '_Rowkey') }
+    if ([string]::IsNullOrWhiteSpace($rowKey)) { throw 'ImportAppFromTemplate did not return _RowKey.' }
 
     Write-Log ("Imported new application from template '{0}'. New _RowKey='{1}'." -f $ResolvedTemplateId, $rowKey) 'Green'
     Add-ReportRow -Step 'Create Application' -Status 'SUCCESS' -Detail ("TemplateID={0}; RowKey={1}" -f $ResolvedTemplateId, $rowKey)
@@ -450,31 +454,27 @@ function Import-AppFromTemplate {
 }
 
 function New-BaseNonScriptFields {
-    param([Parameter(Mandatory)][string]$ResolvedRowKey)
+    param(
+        [Parameter(Mandatory)][string]$ResolvedRowKey,
+        [Parameter(Mandatory)][string]$UserNameStrategyValue,
+        [Parameter()][string]$MappingMode = 'PromptForUserName'
+    )
 
-    $authRules = @{
-        _UniqueKey = 'Condition'
-        _Value     = @()
-        Enabled    = $true
-        _Type      = 'RowSet'
-    }
+    $authRules = @{ _UniqueKey = 'Condition'; _Value = @(); Enabled = $true; _Type = 'RowSet' }
+    $defaultAuthProfileInfo = @{ Uuid = $DefaultAuthProfileUuid }
 
-    $defaultAuthProfileInfo = @{
-        Uuid = $DefaultAuthProfileUuid
-    }
-
-    return [ordered]@{
+    $base = [ordered]@{
         _Rowkey                = $ResolvedRowKey
-        Name                   = $Name
-        DisplayName            = $DisplayName
+        Name                   = $script:ResolvedAppName
+        DisplayName            = $script:ResolvedDisplayName
         Category               = $Category
         DefaultAuthProfileInfo = $defaultAuthProfileInfo
         OnPrem                 = $OnPrem
         IsSwsEnabled           = $IsSwsEnabled
         ShowRegistration       = $ShowRegistration
         AdminTag               = $AdminTag
-        UserNameStrategy       = $UserNameStrategy
-        Description            = $Description
+        UserNameStrategy       = $UserNameStrategyValue
+        Description            = $script:ResolvedDescription
         FormFillingEnabled     = $FormFillingEnabled
         Generic                = $Generic
         AppType                = $AppType
@@ -488,33 +488,106 @@ function New-BaseNonScriptFields {
         WebUPAppType           = $WebUPAppType
         NotSelfService         = $NotSelfService
     }
+
+    if ($MappingMode -eq 'AllUsersShareOneName') {
+        $base['UserName'] = $script:ResolvedSharedUserName
+    }
+
+    return $base
 }
 
-function New-AdvancedScriptPayloadVariants {
+function Convert-RowKeyVariant {
+    param([Parameter(Mandatory)][ordered]$Payload)
+
+    $clone = [ordered]@{}
+    foreach ($k in $Payload.Keys) {
+        if ($k -eq '_Rowkey') { $clone['_RowKey'] = $Payload[$k] } else { $clone[$k] = $Payload[$k] }
+    }
+    return $clone
+}
+
+function New-SharedAccountMappingPayloadVariants {
     param([Parameter(Mandatory)][string]$ResolvedRowKey)
 
-    $base = New-BaseNonScriptFields -ResolvedRowKey $ResolvedRowKey
+    $variants = @()
+    if (-not $TryAllUsersShareOneName) { return @() }
+
+    $baseShared = New-BaseNonScriptFields -ResolvedRowKey $ResolvedRowKey -UserNameStrategyValue $AllUsersShareOneNameStrategy -MappingMode 'AllUsersShareOneName'
+
+    $v1 = [ordered]@{}
+    foreach ($k in $baseShared.Keys) { $v1[$k] = $baseShared[$k] }
+    $v1['Script'] = $AdvancedScript
+    $variants += ,$v1
+    $variants += ,(Convert-RowKeyVariant -Payload $v1)
+
+    $v2 = [ordered]@{}
+    foreach ($k in $baseShared.Keys) { $v2[$k] = $baseShared[$k] }
+    $v2['CBEScript'] = $AdvancedScript
+    $variants += ,$v2
+    $variants += ,(Convert-RowKeyVariant -Payload $v2)
+
+    $alternateUserNameFields = @('LoginUserName','SharedUserName','FixedUserName','ApplicationUserName','AppUserName')
+
+    foreach ($fieldName in $alternateUserNameFields) {
+        $payload = [ordered]@{}
+        foreach ($k in $baseShared.Keys) {
+            if ($k -ne 'UserName') { $payload[$k] = $baseShared[$k] }
+        }
+        $payload[$fieldName] = $script:ResolvedSharedUserName
+        $payload['Script'] = $AdvancedScript
+        $variants += ,$payload
+        $variants += ,(Convert-RowKeyVariant -Payload $payload)
+    }
+
+    $vMinimal = [ordered]@{
+        _Rowkey             = $ResolvedRowKey
+        Name                = $script:ResolvedAppName
+        DisplayName         = $script:ResolvedDisplayName
+        Description         = $script:ResolvedDescription
+        IconUri             = $IconUri
+        IsSwsEnabled        = $IsSwsEnabled
+        UserNameStrategy    = $AllUsersShareOneNameStrategy
+        UserName            = $script:ResolvedSharedUserName
+        FormFillingEnabled  = $FormFillingEnabled
+        AppType             = $AppType
+        WebAppType          = $WebAppType
+        WebUPAppType        = $WebUPAppType
+        TemplateName        = $TemplateName
+        DefaultAuthProfile  = $DefaultAuthProfile
+        Script              = $AdvancedScript
+    }
+    $variants += ,$vMinimal
+    $variants += ,(Convert-RowKeyVariant -Payload $vMinimal)
+
+    return ,$variants
+}
+
+function New-PromptForUserNamePayloadVariants {
+    param([Parameter(Mandatory)][string]$ResolvedRowKey)
+
+    $basePrompt = New-BaseNonScriptFields -ResolvedRowKey $ResolvedRowKey -UserNameStrategyValue $PromptUserNameStrategy -MappingMode 'PromptForUserName'
     $variants = @()
 
     $v1 = [ordered]@{}
-    foreach ($k in $base.Keys) { $v1[$k] = $base[$k] }
+    foreach ($k in $basePrompt.Keys) { $v1[$k] = $basePrompt[$k] }
     $v1['Script'] = $AdvancedScript
     $variants += ,$v1
+    $variants += ,(Convert-RowKeyVariant -Payload $v1)
 
     $v2 = [ordered]@{}
-    foreach ($k in $v1.Keys) {
-        if ($k -eq '_Rowkey') { $v2['_RowKey'] = $v1[$k] } else { $v2[$k] = $v1[$k] }
-    }
+    foreach ($k in $basePrompt.Keys) { $v2[$k] = $basePrompt[$k] }
+    $v2['CBEScript'] = $AdvancedScript
     $variants += ,$v2
+    $variants += ,(Convert-RowKeyVariant -Payload $v2)
 
     $v3 = [ordered]@{
         _Rowkey             = $ResolvedRowKey
-        Name                = $Name
-        DisplayName         = $DisplayName
-        Description         = $Description
+        Name                = $script:ResolvedAppName
+        DisplayName         = $script:ResolvedDisplayName
+        Description         = $script:ResolvedDescription
         IconUri             = $IconUri
         IsSwsEnabled        = $IsSwsEnabled
-        UserNameStrategy    = $UserNameStrategy
+        UserNameStrategy    = $PromptUserNameStrategy
         FormFillingEnabled  = $FormFillingEnabled
         AppType             = $AppType
         WebAppType          = $WebAppType
@@ -524,71 +597,78 @@ function New-AdvancedScriptPayloadVariants {
         Script              = $AdvancedScript
     }
     $variants += ,$v3
+    $variants += ,(Convert-RowKeyVariant -Payload $v3)
 
-    $v4 = [ordered]@{}
-    foreach ($k in $v3.Keys) {
-        if ($k -eq '_Rowkey') { $v4['_RowKey'] = $v3[$k] } else { $v4[$k] = $v3[$k] }
+    return ,$variants
+}
+
+function Invoke-UpdateApplicationPayload {
+    param(
+        [Parameter(Mandatory)][ordered]$Payload,
+        [Parameter(Mandatory)][string]$LogicalName
+    )
+
+    $uri = $IdentityApiTenantURL.TrimEnd('/') + '/SaasManage/UpdateApplicationDE'
+    $resp = Invoke-IdentityRequestWithRetry -AbsoluteUris @($uri) -Body $Payload -LogicalName $LogicalName
+
+    $success = Get-DirectField -Object $resp -FieldName 'success'
+    if ($success -ne $true) {
+        $msg = [string](Get-DirectField -Object $resp -FieldName 'Message')
+        throw ("UpdateApplicationDE returned success=false. Message={0}" -f $msg)
     }
-    $variants += ,$v4
 
-    $v5 = [ordered]@{}
-    foreach ($k in $base.Keys) { $v5[$k] = $base[$k] }
-    $v5['CBEScript'] = $AdvancedScript
-    $variants += ,$v5
-
-    $v6 = [ordered]@{}
-    foreach ($k in $v5.Keys) {
-        if ($k -eq '_Rowkey') { $v6['_RowKey'] = $v5[$k] } else { $v6[$k] = $v5[$k] }
-    }
-    $variants += ,$v6
-
-    $v7 = [ordered]@{
-        _Rowkey     = $ResolvedRowKey
-        Name        = $Name
-        Description = $Description
-        Script      = $AdvancedScript
-    }
-    $variants += ,$v7
-
-    $v8 = [ordered]@{
-        _Rowkey     = $ResolvedRowKey
-        Name        = $Name
-        Description = $Description
-        CBEScript   = $AdvancedScript
-    }
-    $variants += ,$v8
-
-    return $variants
+    return $resp
 }
 
 function Update-CurrentApplicationWithAdvancedScript {
     param([Parameter(Mandatory)][string]$ResolvedRowKey)
 
-    $uri = $IdentityApiTenantURL.TrimEnd('/') + '/SaasManage/UpdateApplicationDE'
-    $variants = New-AdvancedScriptPayloadVariants -ResolvedRowKey $ResolvedRowKey
-
     $variantNumber = 0
-    foreach ($payload in $variants) {
-        $variantNumber++
-        try {
-            Write-Log ("Trying UpdateApplicationDE advanced-script payload variant #{0}..." -f $variantNumber) 'Gray'
-            $resp = Invoke-IdentityRequestWithRetry -AbsoluteUris @($uri) -Body $payload -LogicalName 'UpdateApplicationDE'
 
-            $success = Get-DirectField -Object $resp -FieldName 'success'
-            if ($success -ne $true) {
-                $msg = [string](Get-DirectField -Object $resp -FieldName 'Message')
-                throw ("UpdateApplicationDE returned success=false. Message={0}" -f $msg)
+    if ($TryAllUsersShareOneName) {
+        $sharedVariants = @(New-SharedAccountMappingPayloadVariants -ResolvedRowKey $ResolvedRowKey)
+
+        foreach ($payload in $sharedVariants) {
+            $variantNumber++
+            try {
+                Write-Log ("Trying UpdateApplicationDE shared-account-mapping payload variant #{0}..." -f $variantNumber) 'Gray'
+                $null = Invoke-UpdateApplicationPayload -Payload $payload -LogicalName 'UpdateApplicationDE'
+
+                $script:ResolvedUserNameStrategy = $AllUsersShareOneNameStrategy
+                $script:ResolvedMappingMode = 'All users share one name - best effort'
+
+                Write-Log ("UpdateApplicationDE succeeded using shared-account-mapping payload variant #{0}. UserNameStrategy='{1}' SharedUserName='{2}'." -f $variantNumber, $AllUsersShareOneNameStrategy, $script:ResolvedSharedUserName) 'Green'
+                Add-ReportRow -Step 'Update Application' -Status 'SUCCESS' -Detail ("RowKey={0}; Variant={1}; MappingMode=AllUsersShareOneName-BestEffort; UserNameStrategy={2}; SharedUserName={3}" -f $ResolvedRowKey, $variantNumber, $AllUsersShareOneNameStrategy, $script:ResolvedSharedUserName)
+                return
+            } catch {
+                Write-Log ("Shared-account-mapping payload variant #{0} failed: {1}" -f $variantNumber, $_.Exception.Message) 'Yellow'
             }
+        }
 
-            Write-Log ("UpdateApplicationDE succeeded on advanced-script payload variant #{0}." -f $variantNumber) 'Green'
-            Add-ReportRow -Step 'Update Application' -Status 'SUCCESS' -Detail ("RowKey={0}; Variant={1}" -f $ResolvedRowKey, $variantNumber)
+        Write-Log 'All shared-account-mapping variants failed. Falling back to Prompt for user name.' 'Yellow'
+    }
+
+    $promptVariants = @(New-PromptForUserNamePayloadVariants -ResolvedRowKey $ResolvedRowKey)
+    $promptVariantNumber = 0
+
+    foreach ($payload in $promptVariants) {
+        $promptVariantNumber++
+        try {
+            Write-Log ("Trying UpdateApplicationDE Prompt-for-user-name payload variant #{0}..." -f $promptVariantNumber) 'Gray'
+            $null = Invoke-UpdateApplicationPayload -Payload $payload -LogicalName 'UpdateApplicationDE'
+
+            $script:ResolvedUserNameStrategy = $PromptUserNameStrategy
+            $script:ResolvedMappingMode = 'Prompt for user name'
+
+            Write-Log ("UpdateApplicationDE succeeded using Prompt-for-user-name payload variant #{0}. UserNameStrategy='{1}'." -f $promptVariantNumber, $PromptUserNameStrategy) 'Green'
+            Add-ReportRow -Step 'Update Application' -Status 'SUCCESS' -Detail ("RowKey={0}; Variant={1}; MappingMode=PromptForUserName; UserNameStrategy={2}" -f $ResolvedRowKey, $promptVariantNumber, $PromptUserNameStrategy)
             return
         } catch {
-            Write-Log ("Advanced-script payload variant #{0} failed: {1}" -f $variantNumber, $_.Exception.Message) 'Yellow'
+            Write-Log ("Prompt-for-user-name payload variant #{0} failed: {1}" -f $promptVariantNumber, $_.Exception.Message) 'Yellow'
         }
     }
 
-    throw 'All UpdateApplicationDE advanced-script payload variants failed.'
+    throw 'All UpdateApplicationDE payload variants failed.'
 }
 
 function Invoke-EventuallyConsistentStep {
@@ -596,7 +676,7 @@ function Invoke-EventuallyConsistentStep {
         [Parameter(Mandatory)][scriptblock]$Operation,
         [Parameter(Mandatory)][string]$OperationName,
         [Parameter(Mandatory)][int]$MaxWaitSeconds,
-        [int]$IntervalSeconds = 15
+        [int]$IntervalSeconds = 5
     )
 
     $deadline = (Get-Date).AddSeconds($MaxWaitSeconds)
@@ -632,9 +712,7 @@ function Invoke-PostCreateUpdatePhase {
             Start-IdentityRegularUserSession
 
             Invoke-EventuallyConsistentStep `
-                -Operation {
-                    Update-CurrentApplicationWithAdvancedScript -ResolvedRowKey $CreatedRowKey
-                } `
+                -Operation { Update-CurrentApplicationWithAdvancedScript -ResolvedRowKey $CreatedRowKey } `
                 -OperationName 'Post-Create UpdateApplicationDE' `
                 -MaxWaitSeconds $UpdateRetryWindowSeconds `
                 -IntervalSeconds $RetryIntervalSeconds
@@ -644,11 +722,9 @@ function Invoke-PostCreateUpdatePhase {
             $msg = $_.Exception.Message
             Write-Log ("Post-create update phase attempt {0} failed: {1}" -f $attempt, $msg) 'Yellow'
 
-            if ($attempt -ge $MaxUpdateReauthAttempts) {
-                throw
-            }
+            if ($attempt -ge $MaxUpdateReauthAttempts) { throw }
 
-            Write-Log "Re-establishing Identity session and retrying update phase..." 'Yellow'
+            Write-Log 'Re-establishing Identity session and retrying update phase...' 'Yellow'
             Start-Sleep -Seconds $RetryIntervalSeconds
         }
     }
@@ -657,14 +733,10 @@ function Invoke-PostCreateUpdatePhase {
 $createdAppRowKey = $null
 
 try {
-    if ([string]::IsNullOrWhiteSpace($TemplateId)) {
-        throw 'TemplateId cannot be empty.'
-    }
-    if ([string]::IsNullOrWhiteSpace($Name)) {
-        throw 'Name cannot be empty.'
-    }
+    if ([string]::IsNullOrWhiteSpace($TemplateId)) { throw 'TemplateId cannot be empty.' }
 
     Get-RegularCredential
+    Get-ResolvedAppConfiguration
 
     Write-Log ("Using regular user credential '{0}' for create + reauth + update flow." -f $script:RegularCredential.UserName) 'Cyan'
     Add-ReportRow -Step 'Credential Mode' -Status 'INFO' -Detail ("Regular user login as {0}" -f $script:RegularCredential.UserName)
@@ -680,7 +752,9 @@ try {
     Invoke-PostCreateUpdatePhase -CreatedRowKey $createdAppRowKey
 
     Write-Log ("Create + update completed successfully. Created app row key is '{0}'." -f $createdAppRowKey) 'Green'
-    Add-ReportRow -Step 'Overall' -Status 'SUCCESS' -Detail ("CreatedRowKey={0}; FinalName={1}" -f $createdAppRowKey, $Name)
+    Write-Log ("Final app Name='{0}', Description='{1}', MappingMode='{2}', UserNameStrategy='{3}'." -f $script:ResolvedAppName, $script:ResolvedDescription, $script:ResolvedMappingMode, $script:ResolvedUserNameStrategy) 'Green'
+
+    Add-ReportRow -Step 'Overall' -Status 'SUCCESS' -Detail ("CreatedRowKey={0}; FinalName={1}; Description={2}; MappingMode={3}; UserNameStrategy={4}" -f $createdAppRowKey, $script:ResolvedAppName, $script:ResolvedDescription, $script:ResolvedMappingMode, $script:ResolvedUserNameStrategy)
 }
 catch {
     Write-Log ("FAILED: {0}" -f $_.Exception.Message) 'Red'
