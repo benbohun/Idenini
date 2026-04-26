@@ -1,35 +1,28 @@
+
+Update the script with the below requirement
+1. Prompt for Name of App to be created
+2. Change fresh session time to 5 seconds
+3. Update App Description to This GCP Application is managed by Service Account ("Name of App")
+4. See if you can update Application account Mapping to "All users share one name" else leave as "Prompt for User Name"
+
+
+
 <#
-CNA_Create_Update_AssignPermission_NoRights_UserGroup.ps1
+CNA_Create_And_Update_Identity_WebApp_Reauth.ps1
 
 Purpose
-- Prompt for regular CyberArk Identity credential
-- Prompt for app Name
-- Resolve Identity USER UID without Redrock:
-    * Primary: /UserMgmt/GetUserAttributes
-    * Fallback: /UserMgmt/DirectoryServiceQuery
+- Prompt for regular CyberArk Identity credential once
 - Create app from GenericBrowserExtensionScript
-- Update app advanced script
-- Assign application permission using /SaasManage/SetApplicationPermissions
+- Re-establish CyberArk Identity session for the update phase
+- Update the newly created app using the returned _RowKey
+- Apply non-script settings and the Browser Extension (advanced) login workflow
+- No PAS validation
+- No psPAS dependency
 
-Key Fix
-- SetApplicationPermissions payload now uses the documented/observed shape:
-    {
-      "ID": "ApplicationRowKey",
-      "RowKey": "ApplicationRowKey",
-      "PVID": "ApplicationRowKey",
-      "Grants": [
-        {
-          "Principal": "CAG1896@cna.com",
-          "PrincipalId": "7ab1280d-da3d-45b5-bdc4-0090d057e386",
-          "PType": "User",
-          "Rights": ""
-        }
-      ]
-    }
-
-Notes
-- No Redrock is used to resolve the Identity user UID.
-- If SetApplicationPermissions still returns 401 with this corrected payload, the authenticated user most likely lacks System Administrator / Grant permission on the app/resource.
+Why this version
+- Your separate scripts worked
+- Same-session create -> update failed with 401 on UpdateApplicationDE
+- This version keeps one credential entry but deliberately performs a fresh Identity login before update
 #>
 
 [CmdletBinding()]
@@ -39,8 +32,10 @@ param(
     [string]$RegularUserName           = '',
     [string]$RegularUserPassword       = '',
 
+    # Create
     [string]$TemplateId                = 'GenericBrowserExtensionScript',
 
+    # App settings
     [string]$Name                      = 'g-test-pam1',
     [string]$DisplayName               = 'GCP - Okta Prod',
     [string]$Category                  = '_I18N_AppCategory_Other',
@@ -63,6 +58,7 @@ param(
     [string]$WebUPAppType              = 'BrowserExtensionScript',
     [bool]$NotSelfService              = $true,
 
+    # Advanced Browser Extension workflow
     [string]$AdvancedScript            = @'
 loginData.applicationUrl = "https://cna.okta.com/login/default";
 loginData.addField("username", "input#input28", LoginUsername + "@cna.com");
@@ -76,29 +72,15 @@ loginData.order = [
 ];
 '@,
 
-    [string]$PermissionPrincipal       = '',
-    [ValidateSet('User','Group')]
-    [string]$PermissionPrincipalType   = 'User',
-
-    # Intentionally blank to test adding a principal with no rights.
-    # The script will try two permission payload variants:
-    #   1) Grant object without the Rights property
-    #   2) Grant object with Rights = empty string
-    [string]$PermissionRights          = '',
-
-    # Use this to create/update the application only and completely skip SetApplicationPermissions.
-    [switch]$SkipPermissionAssignment,
-
-    [string]$DefaultUserSuffix         = '@cna.com',
-
+    # Timing / retries
     [int]$PreUpdateDelaySeconds        = 15,
     [int]$UpdateRetryWindowSeconds     = 300,
-    [int]$PermissionRetryWindowSeconds = 180,
     [int]$RetryIntervalSeconds         = 20,
-    [int]$MaxPhaseReauthAttempts       = 2,
+    [int]$MaxUpdateReauthAttempts      = 2,
 
-    [string]$LogPath                   = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_Update_AssignPermission_NoRights_UserGroup.log',
-    [string]$ReportCsvPath             = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_Update_AssignPermission_NoRights_UserGroup_Report.csv'
+    # Logging
+    [string]$LogPath                   = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_And_Update_Reauth.log',
+    [string]$ReportCsvPath             = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_And_Update_Reauth_Report.csv'
 )
 
 $script:IdentityAuthToken         = $null
@@ -129,14 +111,23 @@ function Write-Log {
 }
 
 function Add-ReportRow {
-    param([string]$Step,[string]$Status,[string]$Detail)
-
+    param(
+        [string]$Step,
+        [string]$Status,
+        [string]$Detail
+    )
     $script:ReportRows += [pscustomobject]@{
         Timestamp = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
         Step      = $Step
         Status    = $Status
         Detail    = $Detail
     }
+}
+
+function ConvertTo-JsonSafe {
+    param([Parameter()][object]$Object)
+    if ($null -eq $Object) { return $null }
+    return ($Object | ConvertTo-Json -Depth 100)
 }
 
 function Get-DirectField {
@@ -163,7 +154,6 @@ function Convert-SecureStringToPlainText {
     param([Parameter(Mandatory)][SecureString]$SecureString)
 
     $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureString)
-
     try {
         return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
     } finally {
@@ -173,19 +163,12 @@ function Convert-SecureStringToPlainText {
     }
 }
 
-function ConvertTo-JsonSafe {
-    param([Parameter()][object]$Object)
-
-    if ($null -eq $Object) { return $null }
-
-    return ($Object | ConvertTo-Json -Depth 100)
-}
-
-function Prompt-ForRegularCredential {
+function Get-RegularCredential {
     if ([string]::IsNullOrWhiteSpace($RegularUserName)) {
         $script:RegularCredential = Get-Credential -Message 'Enter REGULAR user credential for CyberArk Identity'
-        if ($null -eq $script:RegularCredential) { throw 'Credential prompt was cancelled.' }
-
+        if ($null -eq $script:RegularCredential) {
+            throw 'Credential prompt was cancelled.'
+        }
         $script:RegularUserPlainPassword = Convert-SecureStringToPlainText -SecureString $script:RegularCredential.Password
         return
     }
@@ -199,83 +182,6 @@ function Prompt-ForRegularCredential {
     }
 
     $script:RegularCredential = [pscredential]::new($RegularUserName, $secure)
-}
-
-function Get-ResolvedAppName {
-    $entered = Read-Host ("Enter the app Name [{0}]" -f $Name)
-    if ([string]::IsNullOrWhiteSpace($entered)) { return $Name }
-    return $entered.Trim()
-}
-
-function Get-ResolvedPermissionType {
-    if (-not [string]::IsNullOrWhiteSpace($PermissionPrincipal) -and -not [string]::IsNullOrWhiteSpace($PermissionPrincipalType)) {
-        return $PermissionPrincipalType
-    }
-
-    while ($true) {
-        Write-Host ''
-        Write-Host 'Select permission target type:' -ForegroundColor Cyan
-        Write-Host '  1. User   - Example: CAG1896, CAG1896a, or CAG1896a@cna.com'
-        Write-Host '  2. Group  - Example: CA_PCloud_Admins or CA_PCloud_Admins@cna.com'
-        Write-Host ''
-
-        $entered = Read-Host ("Enter selection [default: {0}] (1/2 or User/Group)" -f $PermissionPrincipalType)
-
-        if ([string]::IsNullOrWhiteSpace($entered)) {
-            return $PermissionPrincipalType
-        }
-
-        switch -Regex ($entered.Trim()) {
-            '^(?i)(1|user|u)$'  { return 'User'  }
-            '^(?i)(2|group|g)$' { return 'Group' }
-            default {
-                Write-Log 'Invalid selection. Choose 1/2 or User/Group.' 'Yellow'
-            }
-        }
-    }
-}
-
-function Get-ResolvedPermissionPrincipal {
-    param(
-        [Parameter(Mandatory)]
-        [ValidateSet('User','Group')]
-        [string]$ResolvedPrincipalType
-    )
-
-    while ($true) {
-        if (-not [string]::IsNullOrWhiteSpace($PermissionPrincipal)) {
-            $entered = $PermissionPrincipal.Trim()
-        } else {
-            if ($ResolvedPrincipalType -eq 'User') {
-                $entered = (Read-Host 'Enter the USER login or UPN. Example: CAG1896, CAG1896a, or CAG1896a@cna.com').Trim()
-            } else {
-                $entered = (Read-Host 'Enter the GROUP name. Example: CA_PCloud_Admins or CA_PCloud_Admins@cna.com').Trim()
-            }
-        }
-
-        if ([string]::IsNullOrWhiteSpace($entered)) {
-            Write-Log ("{0} target cannot be empty." -f $ResolvedPrincipalType) 'Yellow'
-            $PermissionPrincipal = ''
-            continue
-        }
-
-        if ($entered -match '^(?i)(group|user|role)$') {
-            Write-Log ("'{0}' looks like a type, not the actual {1} value. Enter the real target name." -f $entered, $ResolvedPrincipalType) 'Yellow'
-            $PermissionPrincipal = ''
-            continue
-        }
-
-        if ($ResolvedPrincipalType -eq 'User' -and $entered -notmatch '@' -and -not [string]::IsNullOrWhiteSpace($DefaultUserSuffix)) {
-            Write-Log ("User value does not contain a suffix. Lookup will try both '{0}' and '{1}'." -f $entered, ($entered + $DefaultUserSuffix)) 'Yellow'
-        }
-
-        if ($ResolvedPrincipalType -eq 'Group' -and $entered -match '@') {
-            $shortGroup = ($entered -split '@')[0]
-            Write-Log ("Group value contains a domain suffix. Lookup will try both '{0}' and '{1}'." -f $entered, $shortGroup) 'Yellow'
-        }
-
-        return $entered
-    }
 }
 
 function Reset-IdentitySessionState {
@@ -294,31 +200,37 @@ function Get-AuthPayload {
     return $Response
 }
 
-function Get-AuthSummaryValue { param([Parameter(Mandatory)]$Payload) return [string](Get-DirectField -Object $Payload -FieldName 'Summary') }
-function Get-AuthSessionId   { param([Parameter(Mandatory)]$Payload) return [string](Get-DirectField -Object $Payload -FieldName 'SessionId') }
-function Get-AuthTokenValue  { param([Parameter(Mandatory)]$Payload) return [string](Get-DirectField -Object $Payload -FieldName 'Auth') }
-function Get-AuthUserValue   { param([Parameter(Mandatory)]$Payload) return [string](Get-DirectField -Object $Payload -FieldName 'User') }
-
-function Get-AuthUserIdValue {
+function Get-AuthSummaryValue {
     param([Parameter(Mandatory)]$Payload)
+    return [string](Get-DirectField -Object $Payload -FieldName 'Summary')
+}
 
-    $userId = [string](Get-DirectField -Object $Payload -FieldName 'UserId')
-    if ([string]::IsNullOrWhiteSpace($userId)) { $userId = [string](Get-DirectField -Object $Payload -FieldName 'Id') }
+function Get-AuthSessionId {
+    param([Parameter(Mandatory)]$Payload)
+    return [string](Get-DirectField -Object $Payload -FieldName 'SessionId')
+}
 
-    return $userId
+function Get-AuthTokenValue {
+    param([Parameter(Mandatory)]$Payload)
+    return [string](Get-DirectField -Object $Payload -FieldName 'Auth')
+}
+
+function Get-AuthUserValue {
+    param([Parameter(Mandatory)]$Payload)
+    return [string](Get-DirectField -Object $Payload -FieldName 'User')
 }
 
 function Get-FirstMechanism {
     param([Parameter(Mandatory)]$Payload)
 
     $challenges = @(Get-DirectField -Object $Payload -FieldName 'Challenges')
-
     foreach ($challenge in $challenges) {
         $mechs = @(Get-DirectField -Object $challenge -FieldName 'Mechanisms')
-
         foreach ($mech in $mechs) {
             $mechId = [string](Get-DirectField -Object $mech -FieldName 'MechanismId')
-            if (-not [string]::IsNullOrWhiteSpace($mechId)) { return $mech }
+            if (-not [string]::IsNullOrWhiteSpace($mechId)) {
+                return $mech
+            }
         }
     }
 
@@ -333,19 +245,27 @@ function Get-MechanismPrompt {
     $type   = [string](Get-DirectField -Object $Mechanism -FieldName 'AnswerType')
 
     if ($name -eq 'UP' -or $prompt -match 'Password') {
-        return @{ Action = 'Answer'; Answer = $script:RegularUserPlainPassword }
+        return @{
+            Action = 'Answer'
+            Answer = $script:RegularUserPlainPassword
+        }
     }
 
     $display = if (-not [string]::IsNullOrWhiteSpace($prompt)) { $prompt } else { $name }
     $answer = Read-Host ("Enter response for challenge [{0}] {1}" -f $type, $display)
 
-    return @{ Action = 'Answer'; Answer = $answer }
+    return @{
+        Action = 'Answer'
+        Answer = $answer
+    }
 }
 
 function Start-IdentityRegularUserSession {
-    if ($null -eq $script:RegularCredential) { throw 'Regular user credential is not initialized.' }
+    if ($null -eq $script:RegularCredential) {
+        throw 'Regular user credential is not initialized.'
+    }
 
-    $tenantUrl = $IdentityApiTenantURL.TrimEnd('/')
+    $tenantUrl = $IdentityApiTenantURL
     $userName  = $script:RegularCredential.UserName
 
     $baseHeaders = @{
@@ -354,26 +274,19 @@ function Start-IdentityRegularUserSession {
         'Accept'               = 'application/json'
     }
 
-    $startUri = ($tenantUrl + '/Security/StartAuthentication')
-    $advUri   = ($tenantUrl + '/Security/AdvanceAuthentication')
+    $startUri = ($tenantUrl.TrimEnd('/') + '/Security/StartAuthentication')
+    $advUri   = ($tenantUrl.TrimEnd('/') + '/Security/AdvanceAuthentication')
 
     $script:IdentityWebSession = New-Object Microsoft.PowerShell.Commands.WebRequestSession
 
-    Write-Log ("Starting interactive CyberArk Identity authentication for user '{0}'..." -f $userName) 'Cyan'
+    Write-Log ("Starting interactive CyberArk Identity authentication for regular user '{0}'..." -f $userName) 'Cyan'
 
     $startBody = @{
         User    = $userName
         Version = '1.0'
     }
 
-    $startResp = Invoke-RestMethod -Method POST `
-                                   -Uri $startUri `
-                                   -Headers $baseHeaders `
-                                   -WebSession $script:IdentityWebSession `
-                                   -ContentType 'application/json' `
-                                   -Body ($startBody | ConvertTo-Json -Depth 20) `
-                                   -ErrorAction Stop
-
+    $startResp = Invoke-RestMethod -Method POST -Uri $startUri -Headers $baseHeaders -WebSession $script:IdentityWebSession -ContentType 'application/json' -Body (ConvertTo-JsonSafe $startBody) -ErrorAction Stop
     $payload = Get-AuthPayload -Response $startResp
 
     for ($i = 0; $i -lt 10; $i++) {
@@ -384,26 +297,23 @@ function Start-IdentityRegularUserSession {
             $script:IdentityAuthToken = $authVal
             $script:IdentityUser      = Get-AuthUserValue -Payload $payload
 
-            $loginUserId = Get-AuthUserIdValue -Payload $payload
-
             $cookieCount = 0
             try { $cookieCount = $script:IdentityWebSession.Cookies.GetCookies($tenantUrl).Count } catch {}
 
             Write-Log ("Identity API authentication succeeded as '{0}'. CookieCount={1}" -f $script:IdentityUser, $cookieCount) 'Green'
-
-            if (-not [string]::IsNullOrWhiteSpace($loginUserId)) {
-                Write-Log ("Authenticated session user UUID/UserId: {0}" -f $loginUserId) 'Gray'
-            }
-
-            Add-ReportRow -Step 'Identity Login' -Status 'SUCCESS' -Detail ("Authenticated as {0}; CookieCount={1}; UserId={2}" -f $script:IdentityUser, $cookieCount, $loginUserId)
+            Add-ReportRow -Step 'Identity Login' -Status 'SUCCESS' -Detail ("Authenticated as {0}; CookieCount={1}" -f $script:IdentityUser, $cookieCount)
             return
         }
 
         $sessionId = Get-AuthSessionId -Payload $payload
-        if ([string]::IsNullOrWhiteSpace($sessionId)) { throw 'Authentication package did not include SessionId.' }
+        if ([string]::IsNullOrWhiteSpace($sessionId)) {
+            throw 'Authentication package did not include SessionId.'
+        }
 
         $mechanism = Get-FirstMechanism -Payload $payload
-        if ($null -eq $mechanism) { throw 'No supported authentication mechanism was returned.' }
+        if ($null -eq $mechanism) {
+            throw 'No supported authentication mechanism was returned.'
+        }
 
         $mechId = [string](Get-DirectField -Object $mechanism -FieldName 'MechanismId')
         $name   = [string](Get-DirectField -Object $mechanism -FieldName 'Name')
@@ -420,14 +330,7 @@ function Start-IdentityRegularUserSession {
             Answer      = $response.Answer
         }
 
-        $advResp = Invoke-RestMethod -Method POST `
-                                     -Uri $advUri `
-                                     -Headers $baseHeaders `
-                                     -WebSession $script:IdentityWebSession `
-                                     -ContentType 'application/json' `
-                                     -Body ($advBody | ConvertTo-Json -Depth 20) `
-                                     -ErrorAction Stop
-
+        $advResp = Invoke-RestMethod -Method POST -Uri $advUri -Headers $baseHeaders -WebSession $script:IdentityWebSession -ContentType 'application/json' -Body (ConvertTo-JsonSafe $advBody) -ErrorAction Stop
         $payload = Get-AuthPayload -Response $advResp
     }
 
@@ -438,8 +341,7 @@ function Invoke-IdentityRequestRaw {
     param(
         [Parameter(Mandatory)][string]$AbsoluteUri,
         [Parameter()][object]$Body,
-        [ValidateSet('BearerCookie','CookieOnly','BearerOnly')]
-        [string]$AuthMode = 'BearerCookie'
+        [ValidateSet('BearerCookie','CookieOnly','BearerOnly')][string]$AuthMode = 'BearerCookie'
     )
 
     $headers = @{
@@ -449,7 +351,9 @@ function Invoke-IdentityRequestRaw {
     }
 
     if ($AuthMode -eq 'BearerCookie' -or $AuthMode -eq 'BearerOnly') {
-        if ([string]::IsNullOrWhiteSpace($script:IdentityAuthToken)) { throw 'Identity auth token is not initialized.' }
+        if ([string]::IsNullOrWhiteSpace($script:IdentityAuthToken)) {
+            throw 'Identity auth token is not initialized.'
+        }
         $headers['Authorization'] = ("Bearer {0}" -f $script:IdentityAuthToken)
     }
 
@@ -461,7 +365,8 @@ function Invoke-IdentityRequestRaw {
         ErrorAction = 'Stop'
     }
 
-    if ($null -ne $Body) { $invokeParams['Body'] = ($Body | ConvertTo-Json -Depth 100) }
+    $json = ConvertTo-JsonSafe -Object $Body
+    if ($null -ne $json) { $invokeParams['Body'] = $json }
 
     if (($AuthMode -eq 'BearerCookie' -or $AuthMode -eq 'CookieOnly') -and $null -ne $script:IdentityWebSession) {
         $invokeParams['WebSession'] = $script:IdentityWebSession
@@ -474,14 +379,14 @@ function Invoke-IdentityRequestWithRetry {
     param(
         [Parameter(Mandatory)][string[]]$AbsoluteUris,
         [Parameter()][object]$Body,
-        [string]$LogicalName = 'Identity API call',
-        [string[]]$AuthModes = @('BearerCookie','CookieOnly','BearerOnly')
+        [string]$LogicalName = 'Identity API call'
     )
 
+    $authModes = @('BearerCookie','CookieOnly','BearerOnly')
     $errors = @()
 
     foreach ($uri in $AbsoluteUris) {
-        foreach ($mode in $AuthModes) {
+        foreach ($mode in $authModes) {
             try {
                 Write-Log ("Trying {0} via URI '{1}' using auth mode '{2}'..." -f $LogicalName, $uri, $mode) 'Gray'
                 $resp = Invoke-IdentityRequestRaw -AbsoluteUri $uri -Body $Body -AuthMode $mode
@@ -490,12 +395,11 @@ function Invoke-IdentityRequestWithRetry {
             } catch {
                 $status = $null
                 try { $status = [int]$_.Exception.Response.StatusCode.value__ } catch {}
-
                 $msg = $_.Exception.Message
                 $errors += ("URI={0}; Mode={1}; Status={2}; Error={3}" -f $uri, $mode, $status, $msg)
 
                 if ($status -eq 401) {
-                    Write-Log ("401 on {0} via URI '{1}' using auth mode '{2}'." -f $LogicalName, $uri, $mode) 'Yellow'
+                    Write-Log ("401 on {0} via URI '{1}' using auth mode '{2}'. Retrying..." -f $LogicalName, $uri, $mode) 'Yellow'
                     continue
                 }
 
@@ -504,490 +408,49 @@ function Invoke-IdentityRequestWithRetry {
         }
     }
 
-    $detail = ($errors -join ' || ')
-
-    if ($LogicalName -eq 'SetApplicationPermissions') {
-        throw ("Unauthorized persisted for SetApplicationPermissions. Corrected payload was sent, but the endpoint rejected the caller. Confirm this user is System Administrator or has Grant permission on the application/resource. Details: {0}" -f $detail)
-    }
-
-    throw ("Unauthorized persisted for {0}. Details: {1}" -f $LogicalName, $detail)
-}
-
-function Get-UserLookupCandidates {
-    param([Parameter(Mandatory)][string]$UserIdentifier)
-
-    $candidateList = New-Object System.Collections.Generic.List[string]
-
-    $clean = $UserIdentifier.Trim()
-
-    if (-not [string]::IsNullOrWhiteSpace($clean)) { $candidateList.Add($clean) }
-
-    if ($clean -notmatch '@' -and -not [string]::IsNullOrWhiteSpace($DefaultUserSuffix)) {
-        $candidateList.Add($clean + $DefaultUserSuffix)
-    }
-
-    if ($clean -match '@') {
-        $short = ($clean -split '@')[0]
-        if (-not [string]::IsNullOrWhiteSpace($short)) { $candidateList.Add($short) }
-    }
-
-    return @($candidateList | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
-}
-
-function New-ResolvedUserObject {
-    param(
-        [Parameter(Mandatory)][string]$InputValue,
-        [Parameter(Mandatory)][string]$MatchedInput,
-        [Parameter(Mandatory)][string]$Principal,
-        [Parameter(Mandatory)][string]$PrincipalId,
-        [Parameter(Mandatory)][string]$MatchedFrom
-    )
-
-    return [pscustomobject]@{
-        PrincipalType = 'User'
-        Input         = $InputValue
-        MatchedInput  = $MatchedInput
-        Principal     = $Principal
-        PrincipalId   = $PrincipalId
-        MatchedFrom   = $MatchedFrom
-    }
-}
-
-function Get-PrincipalValueFromUserResult {
-    param(
-        [Parameter(Mandatory)]$Result,
-        [Parameter(Mandatory)][string]$Fallback
-    )
-
-    $principalValue = [string](Get-DirectField -Object $Result -FieldName 'UserPrincipalName')
-
-    if ([string]::IsNullOrWhiteSpace($principalValue)) { $principalValue = [string](Get-DirectField -Object $Result -FieldName 'LoginName') }
-    if ([string]::IsNullOrWhiteSpace($principalValue)) { $principalValue = [string](Get-DirectField -Object $Result -FieldName 'EmailAddress') }
-    if ([string]::IsNullOrWhiteSpace($principalValue)) { $principalValue = [string](Get-DirectField -Object $Result -FieldName 'CanonicalName') }
-    if ([string]::IsNullOrWhiteSpace($principalValue)) { $principalValue = $Fallback }
-
-    return $principalValue
-}
-
-function Resolve-IdentityUserUidByGetUserAttributes {
-    param([Parameter(Mandatory)][string]$UserIdentifier)
-
-    $uri = $IdentityApiTenantURL.TrimEnd('/') + '/UserMgmt/GetUserAttributes'
-    $candidates = @(Get-UserLookupCandidates -UserIdentifier $UserIdentifier)
-
-    foreach ($candidate in $candidates) {
-        try {
-            Write-Log ("Resolving Identity user via UserMgmt/GetUserAttributes. Candidate='{0}'..." -f $candidate) 'Gray'
-
-            $body = @{ ID = $candidate }
-
-            $resp = Invoke-IdentityRequestWithRetry -AbsoluteUris @($uri) -Body $body -LogicalName 'GetUserAttributes'
-
-            $success = Get-DirectField -Object $resp -FieldName 'success'
-
-            if ($success -eq $false) {
-                $msg = [string](Get-DirectField -Object $resp -FieldName 'Message')
-                Write-Log ("GetUserAttributes returned success=false for '{0}'. Message={1}" -f $candidate, $msg) 'Yellow'
-                continue
-            }
-
-            $result = Get-DirectField -Object $resp -FieldName 'Result'
-            if ($null -eq $result) {
-                Write-Log ("GetUserAttributes returned no Result for '{0}'." -f $candidate) 'Yellow'
-                continue
-            }
-
-            $principalId = [string](Get-DirectField -Object $result -FieldName 'Uuid')
-            if ([string]::IsNullOrWhiteSpace($principalId)) { $principalId = [string](Get-DirectField -Object $result -FieldName 'Id') }
-            if ([string]::IsNullOrWhiteSpace($principalId)) { $principalId = [string](Get-DirectField -Object $result -FieldName 'UserId') }
-
-            $principalValue = Get-PrincipalValueFromUserResult -Result $result -Fallback $candidate
-
-            if (-not [string]::IsNullOrWhiteSpace($principalId)) {
-                $resolved = New-ResolvedUserObject `
-                    -InputValue $UserIdentifier `
-                    -MatchedInput $candidate `
-                    -Principal $principalValue `
-                    -PrincipalId $principalId `
-                    -MatchedFrom 'UserMgmt/GetUserAttributes'
-
-                Write-Log ("Resolved Identity user without Redrock -> Principal='{0}' PrincipalId='{1}' MatchedInput='{2}'." -f $resolved.Principal, $resolved.PrincipalId, $resolved.MatchedInput) 'Green'
-                Add-ReportRow -Step 'Resolve User Principal' -Status 'SUCCESS' -Detail (ConvertTo-JsonSafe $resolved)
-
-                return $resolved
-            }
-
-            Write-Log ("GetUserAttributes did not return Uuid/Id/UserId for '{0}'." -f $candidate) 'Yellow'
-        } catch {
-            Write-Log ("GetUserAttributes lookup failed for '{0}': {1}" -f $candidate, $_.Exception.Message) 'Yellow'
-        }
-    }
-
-    return $null
-}
-
-function Get-DirectoryServiceQueryRows {
-    param([Parameter(Mandatory)][object]$Response)
-
-    $result = Get-DirectField -Object $Response -FieldName 'Result'
-    if ($null -eq $result) { return @() }
-
-    $results = Get-DirectField -Object $result -FieldName 'Results'
-    if ($null -eq $results) { return @() }
-
-    $rows = @()
-
-    foreach ($item in @($results)) {
-        $row = Get-DirectField -Object $item -FieldName 'Row'
-        if ($null -ne $row) { $rows += $row }
-    }
-
-    return ,$rows
-}
-
-function Resolve-IdentityUserUidByDirectoryServiceQuery {
-    param([Parameter(Mandatory)][string]$UserIdentifier)
-
-    $uri = $IdentityApiTenantURL.TrimEnd('/') + '/UserMgmt/DirectoryServiceQuery'
-    $candidates = @(Get-UserLookupCandidates -UserIdentifier $UserIdentifier)
-
-    foreach ($candidate in $candidates) {
-        $filters = @(
-            @{ Name = 'SystemName';  Filter = @{ SystemName  = @{ _like = $candidate } } },
-            @{ Name = 'Email';       Filter = @{ Email       = @{ _like = $candidate } } },
-            @{ Name = 'DisplayName'; Filter = @{ DisplayName = @{ _like = $candidate } } }
-        )
-
-        foreach ($filterDef in $filters) {
-            try {
-                Write-Log ("Resolving Identity user via UserMgmt/DirectoryServiceQuery. Candidate='{0}', Filter='{1}'..." -f $candidate, $filterDef.Name) 'Gray'
-
-                $userFilterJson = $filterDef.Filter | ConvertTo-Json -Depth 20 -Compress
-
-                $body = @{
-                    user = $userFilterJson
-                }
-
-                $resp = Invoke-IdentityRequestWithRetry -AbsoluteUris @($uri) -Body $body -LogicalName 'DirectoryServiceQuery'
-
-                $rows = @(Get-DirectoryServiceQueryRows -Response $resp)
-
-                if ($rows.Count -lt 1) {
-                    Write-Log ("DirectoryServiceQuery returned no rows for candidate '{0}' using filter '{1}'." -f $candidate, $filterDef.Name) 'Yellow'
-                    continue
-                }
-
-                $candidateLower = $candidate.ToLowerInvariant()
-
-                $bestRows = foreach ($row in $rows) {
-                    $systemName  = [string](Get-DirectField -Object $row -FieldName 'SystemName')
-                    $email       = [string](Get-DirectField -Object $row -FieldName 'EMail')
-                    if ([string]::IsNullOrWhiteSpace($email)) { $email = [string](Get-DirectField -Object $row -FieldName 'Email') }
-                    $displayName = [string](Get-DirectField -Object $row -FieldName 'DisplayName')
-
-                    $score = 0
-
-                    if (-not [string]::IsNullOrWhiteSpace($systemName) -and $systemName.ToLowerInvariant() -eq $candidateLower) { $score += 100 }
-                    if (-not [string]::IsNullOrWhiteSpace($email) -and $email.ToLowerInvariant() -eq $candidateLower) { $score += 95 }
-                    if (-not [string]::IsNullOrWhiteSpace($displayName) -and $displayName.ToLowerInvariant() -eq $candidateLower) { $score += 80 }
-                    if (-not [string]::IsNullOrWhiteSpace($systemName) -and $systemName.ToLowerInvariant().StartsWith($candidateLower)) { $score += 50 }
-                    if (-not [string]::IsNullOrWhiteSpace($email) -and $email.ToLowerInvariant().StartsWith($candidateLower)) { $score += 45 }
-
-                    [pscustomobject]@{
-                        Row   = $row
-                        Score = $score
-                    }
-                }
-
-                $best = $bestRows | Sort-Object Score -Descending | Select-Object -First 1
-
-                if ($null -eq $best -or $best.Score -le 0) {
-                    Write-Log ("DirectoryServiceQuery returned rows for '{0}', but no strong match was identified." -f $candidate) 'Yellow'
-                    continue
-                }
-
-                $bestRow = $best.Row
-
-                $principalId = [string](Get-DirectField -Object $bestRow -FieldName 'InternalName')
-
-                if ([string]::IsNullOrWhiteSpace($principalId)) {
-                    Write-Log ("DirectoryServiceQuery best row did not include InternalName for '{0}'." -f $candidate) 'Yellow'
-                    continue
-                }
-
-                $principalValue = [string](Get-DirectField -Object $bestRow -FieldName 'SystemName')
-                if ([string]::IsNullOrWhiteSpace($principalValue)) { $principalValue = [string](Get-DirectField -Object $bestRow -FieldName 'EMail') }
-                if ([string]::IsNullOrWhiteSpace($principalValue)) { $principalValue = [string](Get-DirectField -Object $bestRow -FieldName 'Email') }
-                if ([string]::IsNullOrWhiteSpace($principalValue)) { $principalValue = [string](Get-DirectField -Object $bestRow -FieldName 'DisplayName') }
-                if ([string]::IsNullOrWhiteSpace($principalValue)) { $principalValue = $candidate }
-
-                $resolved = New-ResolvedUserObject `
-                    -InputValue $UserIdentifier `
-                    -MatchedInput $candidate `
-                    -Principal $principalValue `
-                    -PrincipalId $principalId `
-                    -MatchedFrom 'UserMgmt/DirectoryServiceQuery'
-
-                Write-Log ("Resolved Identity user without Redrock -> Principal='{0}' PrincipalId='{1}' MatchedInput='{2}'." -f $resolved.Principal, $resolved.PrincipalId, $resolved.MatchedInput) 'Green'
-                Add-ReportRow -Step 'Resolve User Principal' -Status 'SUCCESS' -Detail (ConvertTo-JsonSafe $resolved)
-
-                return $resolved
-            } catch {
-                Write-Log ("DirectoryServiceQuery lookup failed for candidate '{0}' filter '{1}': {2}" -f $candidate, $filterDef.Name, $_.Exception.Message) 'Yellow'
-            }
-        }
-    }
-
-    return $null
-}
-
-function Resolve-IdentityUserUid {
-    param([Parameter(Mandatory)][string]$UserIdentifier)
-
-    Write-Log ("Starting non-Redrock Identity user UID resolution for '{0}'." -f $UserIdentifier) 'Cyan'
-
-    $resolved = Resolve-IdentityUserUidByGetUserAttributes -UserIdentifier $UserIdentifier
-
-    if ($null -ne $resolved) { return $resolved }
-
-    Write-Log 'Primary user lookup did not resolve a UID. Trying DirectoryServiceQuery fallback without Redrock...' 'Yellow'
-
-    $resolved = Resolve-IdentityUserUidByDirectoryServiceQuery -UserIdentifier $UserIdentifier
-
-    if ($null -ne $resolved) { return $resolved }
-
-    $tried = @(Get-UserLookupCandidates -UserIdentifier $UserIdentifier) -join ', '
-
-    throw ("No usable Identity user UID could be resolved for '{0}' without Redrock. Tried candidate(s): {1}" -f $UserIdentifier, $tried)
-}
-
-
-function Get-GroupLookupCandidates {
-    param([Parameter(Mandatory)][string]$GroupIdentifier)
-
-    $candidateList = New-Object System.Collections.Generic.List[string]
-    $clean = $GroupIdentifier.Trim()
-
-    if (-not [string]::IsNullOrWhiteSpace($clean)) {
-        $candidateList.Add($clean)
-    }
-
-    if ($clean -match '@') {
-        $short = ($clean -split '@')[0]
-        if (-not [string]::IsNullOrWhiteSpace($short)) {
-            $candidateList.Add($short)
-        }
-    }
-
-    return @($candidateList | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
-}
-
-function New-ResolvedGroupObject {
-    param(
-        [Parameter(Mandatory)][string]$InputValue,
-        [Parameter(Mandatory)][string]$MatchedInput,
-        [Parameter(Mandatory)][string]$Principal,
-        [Parameter(Mandatory)][string]$PrincipalId,
-        [Parameter(Mandatory)][string]$MatchedFrom
-    )
-
-    return [pscustomobject]@{
-        PrincipalType = 'Group'
-        Input         = $InputValue
-        MatchedInput  = $MatchedInput
-        Principal     = $Principal
-        PrincipalId   = $PrincipalId
-        MatchedFrom   = $MatchedFrom
-    }
-}
-
-function Resolve-IdentityGroupUidByDirectoryServiceQuery {
-    param([Parameter(Mandatory)][string]$GroupIdentifier)
-
-    $uri = $IdentityApiTenantURL.TrimEnd('/') + '/UserMgmt/DirectoryServiceQuery'
-    $candidates = @(Get-GroupLookupCandidates -GroupIdentifier $GroupIdentifier)
-
-    foreach ($candidate in $candidates) {
-        $filters = @(
-            @{ Name = 'SystemName';   Filter = @{ SystemName   = @{ _like = $candidate } } },
-            @{ Name = 'DisplayName';  Filter = @{ DisplayName  = @{ _like = $candidate } } },
-            @{ Name = 'InternalName'; Filter = @{ InternalName = @{ _like = $candidate } } }
-        )
-
-        foreach ($filterDef in $filters) {
-            try {
-                Write-Log ("Resolving Identity group via UserMgmt/DirectoryServiceQuery. Candidate='{0}', Filter='{1}'..." -f $candidate, $filterDef.Name) 'Gray'
-
-                $groupFilterJson = $filterDef.Filter | ConvertTo-Json -Depth 20 -Compress
-
-                $bodyVariants = @(
-                    @{
-                        group             = $groupFilterJson
-                        user              = '{}'
-                        roles             = '{}'
-                        directoryServices = @()
-                        Args              = @{
-                            PageNumber = 1
-                            PageSize   = 50
-                            Limit      = 50
-                            SortBy     = ''
-                            direction  = $false
-                            Caching    = -1
-                        }
-                    },
-                    @{
-                        group = $groupFilterJson
-                    }
-                )
-
-                foreach ($body in $bodyVariants) {
-                    $resp = Invoke-IdentityRequestWithRetry -AbsoluteUris @($uri) -Body $body -LogicalName 'DirectoryServiceQuery'
-
-                    $rows = @(Get-DirectoryServiceQueryRows -Response $resp)
-
-                    if ($rows.Count -lt 1) {
-                        Write-Log ("DirectoryServiceQuery returned no group rows for candidate '{0}' using filter '{1}'." -f $candidate, $filterDef.Name) 'Yellow'
-                        continue
-                    }
-
-                    $candidateLower = $candidate.ToLowerInvariant()
-
-                    $bestRows = foreach ($row in $rows) {
-                        $systemName   = [string](Get-DirectField -Object $row -FieldName 'SystemName')
-                        $displayName  = [string](Get-DirectField -Object $row -FieldName 'DisplayName')
-                        $internalName = [string](Get-DirectField -Object $row -FieldName 'InternalName')
-
-                        $score = 0
-
-                        if (-not [string]::IsNullOrWhiteSpace($systemName) -and $systemName.ToLowerInvariant() -eq $candidateLower) { $score += 100 }
-                        if (-not [string]::IsNullOrWhiteSpace($displayName) -and $displayName.ToLowerInvariant() -eq $candidateLower) { $score += 95 }
-                        if (-not [string]::IsNullOrWhiteSpace($internalName) -and $internalName.ToLowerInvariant() -eq $candidateLower) { $score += 90 }
-                        if (-not [string]::IsNullOrWhiteSpace($systemName) -and $systemName.ToLowerInvariant().Contains($candidateLower)) { $score += 50 }
-                        if (-not [string]::IsNullOrWhiteSpace($displayName) -and $displayName.ToLowerInvariant().Contains($candidateLower)) { $score += 45 }
-                        if (-not [string]::IsNullOrWhiteSpace($internalName) -and $internalName.ToLowerInvariant().Contains($candidateLower)) { $score += 40 }
-
-                        [pscustomobject]@{
-                            Row   = $row
-                            Score = $score
-                        }
-                    }
-
-                    $best = $bestRows | Sort-Object Score -Descending | Select-Object -First 1
-
-                    if ($null -eq $best -or $best.Score -le 0) {
-                        Write-Log ("DirectoryServiceQuery returned group rows for '{0}', but no strong match was identified." -f $candidate) 'Yellow'
-                        continue
-                    }
-
-                    $bestRow = $best.Row
-
-                    $principalId = [string](Get-DirectField -Object $bestRow -FieldName 'InternalName')
-                    if ([string]::IsNullOrWhiteSpace($principalId)) {
-                        $principalId = [string](Get-DirectField -Object $bestRow -FieldName 'Uuid')
-                    }
-                    if ([string]::IsNullOrWhiteSpace($principalId)) {
-                        $principalId = [string](Get-DirectField -Object $bestRow -FieldName 'DirectoryServiceUuid')
-                    }
-
-                    if ([string]::IsNullOrWhiteSpace($principalId)) {
-                        Write-Log ("DirectoryServiceQuery best group row did not include InternalName/Uuid for '{0}'." -f $candidate) 'Yellow'
-                        continue
-                    }
-
-                    $principalValue = [string](Get-DirectField -Object $bestRow -FieldName 'SystemName')
-                    if ([string]::IsNullOrWhiteSpace($principalValue)) { $principalValue = [string](Get-DirectField -Object $bestRow -FieldName 'DisplayName') }
-                    if ([string]::IsNullOrWhiteSpace($principalValue)) { $principalValue = $candidate }
-
-                    $resolved = New-ResolvedGroupObject `
-                        -InputValue $GroupIdentifier `
-                        -MatchedInput $candidate `
-                        -Principal $principalValue `
-                        -PrincipalId $principalId `
-                        -MatchedFrom 'UserMgmt/DirectoryServiceQuery'
-
-                    Write-Log ("Resolved Identity group without Redrock -> Principal='{0}' PrincipalId='{1}' MatchedInput='{2}'." -f $resolved.Principal, $resolved.PrincipalId, $resolved.MatchedInput) 'Green'
-                    Add-ReportRow -Step 'Resolve Group Principal' -Status 'SUCCESS' -Detail (ConvertTo-JsonSafe $resolved)
-
-                    return $resolved
-                }
-            } catch {
-                Write-Log ("DirectoryServiceQuery group lookup failed for candidate '{0}' filter '{1}': {2}" -f $candidate, $filterDef.Name, $_.Exception.Message) 'Yellow'
-            }
-        }
-    }
-
-    return $null
-}
-
-function Resolve-IdentityGroupUid {
-    param([Parameter(Mandatory)][string]$GroupIdentifier)
-
-    Write-Log ("Starting non-Redrock Identity group UID resolution for '{0}'." -f $GroupIdentifier) 'Cyan'
-
-    $resolved = Resolve-IdentityGroupUidByDirectoryServiceQuery -GroupIdentifier $GroupIdentifier
-
-    if ($null -ne $resolved) {
-        return $resolved
-    }
-
-    $tried = @(Get-GroupLookupCandidates -GroupIdentifier $GroupIdentifier) -join ', '
-    throw ("No usable Identity group UID could be resolved for '{0}' without Redrock. Tried candidate(s): {1}" -f $GroupIdentifier, $tried)
-}
-
-function Resolve-IdentityPrincipal {
-    param(
-        [Parameter(Mandatory)][string]$Principal,
-        [Parameter(Mandatory)]
-        [ValidateSet('User','Group')]
-        [string]$PrincipalType
-    )
-
-    switch ($PrincipalType) {
-        'User'  { return (Resolve-IdentityUserUid -UserIdentifier $Principal) }
-        'Group' { return (Resolve-IdentityGroupUid -GroupIdentifier $Principal) }
-    }
+    throw ("Unauthorized persisted for {0}. Details: {1}" -f $LogicalName, ($errors -join ' || '))
 }
 
 function Import-AppFromTemplate {
     param([Parameter(Mandatory)][string]$ResolvedTemplateId)
 
     $uri = $IdentityApiTenantURL.TrimEnd('/') + '/SaasManage/ImportAppFromTemplate'
-
-    $body = @{
-        ID = @($ResolvedTemplateId)
-    }
+    $body = @{ ID = @($ResolvedTemplateId) }
 
     $resp = Invoke-IdentityRequestWithRetry -AbsoluteUris @($uri) -Body $body -LogicalName 'ImportAppFromTemplate'
-
-    if (-not $resp.success) { throw ('ImportAppFromTemplate returned success=false: ' + ($resp.Message | Out-String)) }
+    if (-not $resp.success) {
+        throw ('ImportAppFromTemplate returned success=false: ' + ($resp.Message | Out-String))
+    }
 
     $resultItems = @($resp.Result)
-
-    if ($resultItems.Count -lt 1) { throw 'ImportAppFromTemplate returned no result items.' }
+    if ($resultItems.Count -lt 1) {
+        throw 'ImportAppFromTemplate returned no result items.'
+    }
 
     $first = $resultItems[0]
-
-    if ((Get-DirectField -Object $first -FieldName 'success') -ne $true) {
+    $created = Get-DirectField -Object $first -FieldName 'success'
+    if ($created -ne $true) {
         $idVal = [string](Get-DirectField -Object $first -FieldName 'ID')
         $msg = [string](Get-DirectField -Object $first -FieldName 'Message')
         throw ("ImportAppFromTemplate result item failed. ID={0}; Message={1}" -f $idVal, $msg)
     }
 
     $rowKey = [string](Get-DirectField -Object $first -FieldName '_RowKey')
-    if ([string]::IsNullOrWhiteSpace($rowKey)) { $rowKey = [string](Get-DirectField -Object $first -FieldName '_Rowkey') }
-    if ([string]::IsNullOrWhiteSpace($rowKey)) { throw 'ImportAppFromTemplate did not return _RowKey.' }
+    if ([string]::IsNullOrWhiteSpace($rowKey)) {
+        $rowKey = [string](Get-DirectField -Object $first -FieldName '_Rowkey')
+    }
+
+    if ([string]::IsNullOrWhiteSpace($rowKey)) {
+        throw 'ImportAppFromTemplate did not return _RowKey.'
+    }
 
     Write-Log ("Imported new application from template '{0}'. New _RowKey='{1}'." -f $ResolvedTemplateId, $rowKey) 'Green'
     Add-ReportRow -Step 'Create Application' -Status 'SUCCESS' -Detail ("TemplateID={0}; RowKey={1}" -f $ResolvedTemplateId, $rowKey)
-
     return $rowKey
 }
 
 function New-BaseNonScriptFields {
-    param(
-        [Parameter(Mandatory)][string]$ResolvedRowKey,
-        [Parameter(Mandatory)][string]$ResolvedName
-    )
+    param([Parameter(Mandatory)][string]$ResolvedRowKey)
 
     $authRules = @{
         _UniqueKey = 'Condition'
@@ -1002,7 +465,7 @@ function New-BaseNonScriptFields {
 
     return [ordered]@{
         _Rowkey                = $ResolvedRowKey
-        Name                   = $ResolvedName
+        Name                   = $Name
         DisplayName            = $DisplayName
         Category               = $Category
         DefaultAuthProfileInfo = $defaultAuthProfileInfo
@@ -1028,13 +491,9 @@ function New-BaseNonScriptFields {
 }
 
 function New-AdvancedScriptPayloadVariants {
-    param(
-        [Parameter(Mandatory)][string]$ResolvedRowKey,
-        [Parameter(Mandatory)][string]$ResolvedName
-    )
+    param([Parameter(Mandatory)][string]$ResolvedRowKey)
 
-    $base = New-BaseNonScriptFields -ResolvedRowKey $ResolvedRowKey -ResolvedName $ResolvedName
-
+    $base = New-BaseNonScriptFields -ResolvedRowKey $ResolvedRowKey
     $variants = @()
 
     $v1 = [ordered]@{}
@@ -1043,41 +502,86 @@ function New-AdvancedScriptPayloadVariants {
     $variants += ,$v1
 
     $v2 = [ordered]@{}
-    foreach ($k in $base.Keys) { $v2[$k] = $base[$k] }
-    $v2['CBEScript'] = $AdvancedScript
+    foreach ($k in $v1.Keys) {
+        if ($k -eq '_Rowkey') { $v2['_RowKey'] = $v1[$k] } else { $v2[$k] = $v1[$k] }
+    }
     $variants += ,$v2
+
+    $v3 = [ordered]@{
+        _Rowkey             = $ResolvedRowKey
+        Name                = $Name
+        DisplayName         = $DisplayName
+        Description         = $Description
+        IconUri             = $IconUri
+        IsSwsEnabled        = $IsSwsEnabled
+        UserNameStrategy    = $UserNameStrategy
+        FormFillingEnabled  = $FormFillingEnabled
+        AppType             = $AppType
+        WebAppType          = $WebAppType
+        WebUPAppType        = $WebUPAppType
+        TemplateName        = $TemplateName
+        DefaultAuthProfile  = $DefaultAuthProfile
+        Script              = $AdvancedScript
+    }
+    $variants += ,$v3
+
+    $v4 = [ordered]@{}
+    foreach ($k in $v3.Keys) {
+        if ($k -eq '_Rowkey') { $v4['_RowKey'] = $v3[$k] } else { $v4[$k] = $v3[$k] }
+    }
+    $variants += ,$v4
+
+    $v5 = [ordered]@{}
+    foreach ($k in $base.Keys) { $v5[$k] = $base[$k] }
+    $v5['CBEScript'] = $AdvancedScript
+    $variants += ,$v5
+
+    $v6 = [ordered]@{}
+    foreach ($k in $v5.Keys) {
+        if ($k -eq '_Rowkey') { $v6['_RowKey'] = $v5[$k] } else { $v6[$k] = $v5[$k] }
+    }
+    $variants += ,$v6
+
+    $v7 = [ordered]@{
+        _Rowkey     = $ResolvedRowKey
+        Name        = $Name
+        Description = $Description
+        Script      = $AdvancedScript
+    }
+    $variants += ,$v7
+
+    $v8 = [ordered]@{
+        _Rowkey     = $ResolvedRowKey
+        Name        = $Name
+        Description = $Description
+        CBEScript   = $AdvancedScript
+    }
+    $variants += ,$v8
 
     return $variants
 }
 
 function Update-CurrentApplicationWithAdvancedScript {
-    param(
-        [Parameter(Mandatory)][string]$ResolvedRowKey,
-        [Parameter(Mandatory)][string]$ResolvedName
-    )
+    param([Parameter(Mandatory)][string]$ResolvedRowKey)
 
     $uri = $IdentityApiTenantURL.TrimEnd('/') + '/SaasManage/UpdateApplicationDE'
-
-    $variants = New-AdvancedScriptPayloadVariants -ResolvedRowKey $ResolvedRowKey -ResolvedName $ResolvedName
+    $variants = New-AdvancedScriptPayloadVariants -ResolvedRowKey $ResolvedRowKey
 
     $variantNumber = 0
-
     foreach ($payload in $variants) {
         $variantNumber++
-
         try {
             Write-Log ("Trying UpdateApplicationDE advanced-script payload variant #{0}..." -f $variantNumber) 'Gray'
-
             $resp = Invoke-IdentityRequestWithRetry -AbsoluteUris @($uri) -Body $payload -LogicalName 'UpdateApplicationDE'
 
-            if ((Get-DirectField -Object $resp -FieldName 'success') -ne $true) {
+            $success = Get-DirectField -Object $resp -FieldName 'success'
+            if ($success -ne $true) {
                 $msg = [string](Get-DirectField -Object $resp -FieldName 'Message')
                 throw ("UpdateApplicationDE returned success=false. Message={0}" -f $msg)
             }
 
             Write-Log ("UpdateApplicationDE succeeded on advanced-script payload variant #{0}." -f $variantNumber) 'Green'
             Add-ReportRow -Step 'Update Application' -Status 'SUCCESS' -Detail ("RowKey={0}; Variant={1}" -f $ResolvedRowKey, $variantNumber)
-
             return
         } catch {
             Write-Log ("Advanced-script payload variant #{0} failed: {1}" -f $variantNumber, $_.Exception.Message) 'Yellow'
@@ -1085,119 +589,6 @@ function Update-CurrentApplicationWithAdvancedScript {
     }
 
     throw 'All UpdateApplicationDE advanced-script payload variants failed.'
-}
-
-function New-SetPermissionBodies {
-    param(
-        [Parameter(Mandatory)][string]$ResolvedRowKey,
-        [Parameter(Mandatory)]$ResolvedPrincipal
-    )
-
-    # Test mode for /SaasManage/SetApplicationPermissions:
-    # - ID, RowKey, and PVID are all the Application RowKey/AppId.
-    # - Grants is an ARRAY.
-    # - Each Grant uses PType, not Type.
-    # - PrincipalId is the UID/UUID/InternalName resolved from UserMgmt/DirectoryServiceQuery.
-    # - By default PermissionRights is blank. The script will first omit Rights completely,
-    #   then try Rights = "" as a second payload variant.
-
-    $bodies = @()
-
-    $grantNoRights = [ordered]@{
-        Principal   = $ResolvedPrincipal.Principal
-        PrincipalId = $ResolvedPrincipal.PrincipalId
-        PType       = $ResolvedPrincipal.PrincipalType
-    }
-
-    if ([string]::IsNullOrWhiteSpace($PermissionRights)) {
-        $bodies += ,([ordered]@{
-            ID     = $ResolvedRowKey
-            RowKey = $ResolvedRowKey
-            PVID   = $ResolvedRowKey
-            Grants = @($grantNoRights)
-        })
-
-        $grantEmptyRights = [ordered]@{
-            Principal   = $ResolvedPrincipal.Principal
-            PrincipalId = $ResolvedPrincipal.PrincipalId
-            PType       = $ResolvedPrincipal.PrincipalType
-            Rights      = ''
-        }
-
-        $bodies += ,([ordered]@{
-            ID     = $ResolvedRowKey
-            RowKey = $ResolvedRowKey
-            PVID   = $ResolvedRowKey
-            Grants = @($grantEmptyRights)
-        })
-    } else {
-        $grantWithRights = [ordered]@{
-            Principal   = $ResolvedPrincipal.Principal
-            PrincipalId = $ResolvedPrincipal.PrincipalId
-            PType       = $ResolvedPrincipal.PrincipalType
-            Rights      = $PermissionRights
-        }
-
-        $bodies += ,([ordered]@{
-            ID     = $ResolvedRowKey
-            RowKey = $ResolvedRowKey
-            PVID   = $ResolvedRowKey
-            Grants = @($grantWithRights)
-        })
-    }
-
-    return ,$bodies
-}
-
-function Set-ApplicationPermissionsResolved {
-    param(
-        [Parameter(Mandatory)][string]$ResolvedRowKey,
-        [Parameter(Mandatory)]$ResolvedPrincipal
-    )
-
-    $uri = $IdentityApiTenantURL.TrimEnd('/') + '/SaasManage/SetApplicationPermissions'
-    $bodies = @(New-SetPermissionBodies -ResolvedRowKey $ResolvedRowKey -ResolvedPrincipal $ResolvedPrincipal)
-
-    $variantNumber = 0
-    $lastError = $null
-
-    foreach ($body in $bodies) {
-        $variantNumber++
-
-        Write-Log ("SetApplicationPermissions no-rights payload variant #{0} preview:" -f $variantNumber) 'Cyan'
-        Write-Log (ConvertTo-JsonSafe $body) 'Gray'
-
-        try {
-            $resp = Invoke-IdentityRequestWithRetry `
-                -AbsoluteUris @($uri) `
-                -Body $body `
-                -LogicalName 'SetApplicationPermissions' `
-                -AuthModes @('BearerCookie')
-
-            $success = Get-DirectField -Object $resp -FieldName 'success'
-
-            if ($success -eq $false) {
-                $msg = [string](Get-DirectField -Object $resp -FieldName 'Message')
-                throw ("SetApplicationPermissions returned success=false. Message={0}" -f $msg)
-            }
-
-            Write-Log ("SetApplicationPermissions succeeded with no-rights payload variant #{0}." -f $variantNumber) 'Green'
-
-            $rightsDetail = if ([string]::IsNullOrWhiteSpace($PermissionRights)) { 'No Rights / Rights omitted or blank test' } else { $PermissionRights }
-
-            Add-ReportRow -Step 'Assign Permissions' -Status 'SUCCESS' -Detail ("RowKey={0}; Principal={1}; PrincipalId={2}; PType={3}; Rights={4}; Variant={5}" -f $ResolvedRowKey, $ResolvedPrincipal.Principal, $ResolvedPrincipal.PrincipalId, $ResolvedPrincipal.PrincipalType, $rightsDetail, $variantNumber)
-
-            return
-        } catch {
-            $lastError = $_.Exception.Message
-            Write-Log ("SetApplicationPermissions no-rights payload variant #{0} failed: {1}" -f $variantNumber, $lastError) 'Yellow'
-        }
-    }
-
-    Write-Log 'SetApplicationPermissions failed after all no-rights payload variants.' 'Red'
-    Write-Log 'If this still returns HTTP 401, the issue is likely not the Rights value. It may be an endpoint-specific API authorization/session requirement.' 'Yellow'
-
-    throw $lastError
 }
 
 function Invoke-EventuallyConsistentStep {
@@ -1214,7 +605,6 @@ function Invoke-EventuallyConsistentStep {
 
     while ((Get-Date) -lt $deadline) {
         $attempt++
-
         try {
             Write-Log ("{0} attempt #{1}..." -f $OperationName, $attempt) 'Gray'
             & $Operation
@@ -1222,9 +612,7 @@ function Invoke-EventuallyConsistentStep {
             return
         } catch {
             $lastMessage = $_.Exception.Message
-
             Write-Log ("{0} not ready yet on attempt #{1}. Retrying in {2}s. Remaining window: {3}s. Last error: {4}" -f $OperationName, $attempt, $IntervalSeconds, [int][Math]::Max(0, ($deadline - (Get-Date)).TotalSeconds), $lastMessage) 'Yellow'
-
             Start-Sleep -Seconds $IntervalSeconds
         }
     }
@@ -1232,152 +620,67 @@ function Invoke-EventuallyConsistentStep {
     throw ("{0} did not succeed within {1} seconds. Last error: {2}" -f $OperationName, $MaxWaitSeconds, $lastMessage)
 }
 
-function Invoke-CreatePhase {
-    param([Parameter(Mandatory)][string]$ResolvedTemplateId)
-
-    Start-IdentityRegularUserSession
-    return (Import-AppFromTemplate -ResolvedTemplateId $ResolvedTemplateId)
-}
-
-function Invoke-UpdatePhase {
-    param(
-        [Parameter(Mandatory)][string]$CreatedRowKey,
-        [Parameter(Mandatory)][string]$ResolvedName
-    )
+function Invoke-PostCreateUpdatePhase {
+    param([Parameter(Mandatory)][string]$CreatedRowKey)
 
     $attempt = 0
-
-    while ($attempt -lt $MaxPhaseReauthAttempts) {
+    while ($attempt -lt $MaxUpdateReauthAttempts) {
         $attempt++
-
         try {
-            Write-Log ("Starting update phase with fresh Identity session (attempt {0}/{1})..." -f $attempt, $MaxPhaseReauthAttempts) 'Cyan'
-
+            Write-Log ("Starting post-create update phase with fresh Identity session (attempt {0}/{1})..." -f $attempt, $MaxUpdateReauthAttempts) 'Cyan'
             Reset-IdentitySessionState
             Start-IdentityRegularUserSession
 
-            Invoke-EventuallyConsistentStep -Operation {
-                Update-CurrentApplicationWithAdvancedScript -ResolvedRowKey $CreatedRowKey -ResolvedName $ResolvedName
-            } -OperationName 'UpdateApplicationDE' -MaxWaitSeconds $UpdateRetryWindowSeconds -IntervalSeconds $RetryIntervalSeconds
+            Invoke-EventuallyConsistentStep `
+                -Operation {
+                    Update-CurrentApplicationWithAdvancedScript -ResolvedRowKey $CreatedRowKey
+                } `
+                -OperationName 'Post-Create UpdateApplicationDE' `
+                -MaxWaitSeconds $UpdateRetryWindowSeconds `
+                -IntervalSeconds $RetryIntervalSeconds
 
             return
         } catch {
             $msg = $_.Exception.Message
-            Write-Log ("Update phase attempt {0} failed: {1}" -f $attempt, $msg) 'Yellow'
+            Write-Log ("Post-create update phase attempt {0} failed: {1}" -f $attempt, $msg) 'Yellow'
 
-            if ($attempt -ge $MaxPhaseReauthAttempts) { throw }
+            if ($attempt -ge $MaxUpdateReauthAttempts) {
+                throw
+            }
 
-            Start-Sleep -Seconds $RetryIntervalSeconds
-        }
-    }
-}
-
-function Invoke-PermissionPhase {
-    param(
-        [Parameter(Mandatory)][string]$CreatedRowKey,
-        [Parameter(Mandatory)][string]$ResolvedPrincipalText,
-        [Parameter(Mandatory)]
-        [ValidateSet('User','Group')]
-        [string]$ResolvedPrincipalType
-    )
-
-    $attempt = 0
-
-    while ($attempt -lt $MaxPhaseReauthAttempts) {
-        $attempt++
-
-        try {
-            Write-Log ("Starting permission phase with fresh Identity session (attempt {0}/{1})..." -f $attempt, $MaxPhaseReauthAttempts) 'Cyan'
-
-            Reset-IdentitySessionState
-            Start-IdentityRegularUserSession
-
-            $resolvedAgain = Resolve-IdentityPrincipal -Principal $ResolvedPrincipalText -PrincipalType $ResolvedPrincipalType
-
-            Invoke-EventuallyConsistentStep -Operation {
-                Set-ApplicationPermissionsResolved -ResolvedRowKey $CreatedRowKey -ResolvedPrincipal $resolvedAgain
-            } -OperationName 'SetApplicationPermissions' -MaxWaitSeconds $PermissionRetryWindowSeconds -IntervalSeconds $RetryIntervalSeconds
-
-            return
-        } catch {
-            $msg = $_.Exception.Message
-            Write-Log ("Permission phase attempt {0} failed: {1}" -f $attempt, $msg) 'Yellow'
-
-            if ($attempt -ge $MaxPhaseReauthAttempts) { throw }
-
+            Write-Log "Re-establishing Identity session and retrying update phase..." 'Yellow'
             Start-Sleep -Seconds $RetryIntervalSeconds
         }
     }
 }
 
 $createdAppRowKey = $null
-$resolvedName = $null
-$resolvedPrincipalText = $null
-$resolvedPrincipalType = $null
 
 try {
-    if ([string]::IsNullOrWhiteSpace($TemplateId)) { throw 'TemplateId cannot be empty.' }
-
-    Prompt-ForRegularCredential
-
-    $resolvedName = Get-ResolvedAppName
-
-    if (-not $SkipPermissionAssignment) {
-        $resolvedPrincipalType = Get-ResolvedPermissionType
-        $resolvedPrincipalText = Get-ResolvedPermissionPrincipal -ResolvedPrincipalType $resolvedPrincipalType
-    } else {
-        $resolvedPrincipalType = ''
-        $resolvedPrincipalText = ''
+    if ([string]::IsNullOrWhiteSpace($TemplateId)) {
+        throw 'TemplateId cannot be empty.'
+    }
+    if ([string]::IsNullOrWhiteSpace($Name)) {
+        throw 'Name cannot be empty.'
     }
 
-    $flowLabel = if ($SkipPermissionAssignment) { 'create + update only flow; permission assignment skipped' } else { 'create + update + no-rights permission test flow' }
+    Get-RegularCredential
 
-    Write-Log ("Using credential '{0}' for {1}." -f $script:RegularCredential.UserName, $flowLabel) 'Cyan'
-    Write-Log ("Resolved app Name: '{0}'." -f $resolvedName) 'Cyan'
+    Write-Log ("Using regular user credential '{0}' for create + reauth + update flow." -f $script:RegularCredential.UserName) 'Cyan'
+    Add-ReportRow -Step 'Credential Mode' -Status 'INFO' -Detail ("Regular user login as {0}" -f $script:RegularCredential.UserName)
 
-    Add-ReportRow -Step 'Credential Source' -Status 'SUCCESS' -Detail ("Manual user {0}" -f $script:RegularCredential.UserName)
-    Add-ReportRow -Step 'Resolved App Name' -Status 'INFO' -Detail ("Name={0}" -f $resolvedName)
+    # Phase 1: create
+    Start-IdentityRegularUserSession
+    $createdAppRowKey = Import-AppFromTemplate -ResolvedTemplateId $TemplateId
 
-    if (-not $SkipPermissionAssignment) {
-        Write-Log ("Resolved permission target type: '{0}'." -f $resolvedPrincipalType) 'Cyan'
-        Write-Log ("Resolved permission target text: '{0}'." -f $resolvedPrincipalText) 'Cyan'
-
-        $rightsLabel = if ([string]::IsNullOrWhiteSpace($PermissionRights)) { 'NO RIGHTS TEST' } else { $PermissionRights }
-        Add-ReportRow -Step 'Resolved Permission Target' -Status 'INFO' -Detail ("Principal={0}; Type={1}; Rights={2}" -f $resolvedPrincipalText, $resolvedPrincipalType, $rightsLabel)
-
-        Write-Log ("Running preflight Identity {0} UID lookup before creating the app..." -f $resolvedPrincipalType) 'Cyan'
-
-        Reset-IdentitySessionState
-        Start-IdentityRegularUserSession
-
-        $preflightPrincipal = Resolve-IdentityPrincipal -Principal $resolvedPrincipalText -PrincipalType $resolvedPrincipalType
-
-        Write-Log ("Preflight principal lookup succeeded. Principal='{0}', PrincipalId='{1}', Type='{2}'." -f $preflightPrincipal.Principal, $preflightPrincipal.PrincipalId, $preflightPrincipal.PrincipalType) 'Green'
-
-        Reset-IdentitySessionState
-    } else {
-        Write-Log 'SkipPermissionAssignment enabled. No user/group lookup and no SetApplicationPermissions call will be performed.' 'Yellow'
-        Add-ReportRow -Step 'Permission Assignment' -Status 'SKIPPED' -Detail 'SkipPermissionAssignment enabled before app creation.'
-    }
-
-    $createdAppRowKey = Invoke-CreatePhase -ResolvedTemplateId $TemplateId
-
-    Write-Log ("Waiting {0} second(s) before starting update phase..." -f $PreUpdateDelaySeconds) 'Yellow'
+    Write-Log ("Waiting {0} second(s) before starting fresh-session update phase..." -f $PreUpdateDelaySeconds) 'Yellow'
     Start-Sleep -Seconds $PreUpdateDelaySeconds
 
-    Invoke-UpdatePhase -CreatedRowKey $createdAppRowKey -ResolvedName $resolvedName
+    # Phase 2: fresh session update
+    Invoke-PostCreateUpdatePhase -CreatedRowKey $createdAppRowKey
 
-    if (-not $SkipPermissionAssignment) {
-        Invoke-PermissionPhase -CreatedRowKey $createdAppRowKey -ResolvedPrincipalText $resolvedPrincipalText -ResolvedPrincipalType $resolvedPrincipalType
-
-        Write-Log ("Create + update + no-rights permission test completed successfully. Created app row key is '{0}'." -f $createdAppRowKey) 'Green'
-
-        $rightsLabel = if ([string]::IsNullOrWhiteSpace($PermissionRights)) { 'NO RIGHTS TEST' } else { $PermissionRights }
-        Add-ReportRow -Step 'Overall' -Status 'SUCCESS' -Detail ("CreatedRowKey={0}; FinalName={1}; Principal={2}; Type={3}; Rights={4}" -f $createdAppRowKey, $resolvedName, $resolvedPrincipalText, $resolvedPrincipalType, $rightsLabel)
-    } else {
-        Write-Log ("Create + update completed successfully with permission assignment skipped. Created app row key is '{0}'." -f $createdAppRowKey) 'Green'
-        Add-ReportRow -Step 'Overall' -Status 'SUCCESS' -Detail ("CreatedRowKey={0}; FinalName={1}; PermissionAssignment=Skipped" -f $createdAppRowKey, $resolvedName)
-    }
+    Write-Log ("Create + update completed successfully. Created app row key is '{0}'." -f $createdAppRowKey) 'Green'
+    Add-ReportRow -Step 'Overall' -Status 'SUCCESS' -Detail ("CreatedRowKey={0}; FinalName={1}" -f $createdAppRowKey, $Name)
 }
 catch {
     Write-Log ("FAILED: {0}" -f $_.Exception.Message) 'Red'
@@ -1386,7 +689,6 @@ catch {
 finally {
     try {
         $csvDir = Split-Path -Path $ReportCsvPath -Parent
-
         if ($csvDir -and -not (Test-Path $csvDir)) {
             New-Item -Path $csvDir -ItemType Directory -Force | Out-Null
         }
