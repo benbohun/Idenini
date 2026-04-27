@@ -1,17 +1,27 @@
-Now update login method with the login credential below
-
 <#
-Export-AllSafes_CreationDate_CNA.ps1
+Autoonboardingscript_UPDATED.ps1
 
-PURPOSE
-- Log in to CNA Privilege Cloud using the same CCP + Identity header pattern
-- Retrieve all safes visible to the service user
-- Export Safe Name + Creation Date report to CSV
+CNA SAFE AUTO-ONBOARDING
 
-NOTES
-- Gen2 safe listing returns all visible safes and includes creationTime
-- creationTime is returned as Unix time; this script converts it to local datetime
-- Optional -UseGen1API switch is included as a fallback path
+Purpose:
+- Authenticates to CCP using Object:
+    cna-prod.cyberark.cloud-cnarestbot
+- Authenticates to Privilege Cloud using the working CCP + psPAS Identity header pattern
+- Creates Safe
+- Adds required members
+- Looks up the Safe owner AD group from CNA AD OUs before adding it to the Safe
+- Adds the entered AD group as group@cna.com with limited permissions
+- Adds required CyberArk admin/identity members with full permissions
+
+Primary AD group lookup OU:
+    OU=Groups_PROD,OU=Application Services,OU=admin-support,DC=cna,DC=com
+
+Fallback AD group lookup OU:
+    OU=Groups,OU=CyberArk,DC=cna,DC=com
+
+Notes:
+- Does NOT add cnarestbot@cyberark.cloud.6679
+- Does NOT remove CA_PAMDiscovery_SVC@cna.com
 #>
 
 [CmdletBinding()]
@@ -21,7 +31,7 @@ param(
     [string]$PCloudSubdomain   = 'cna-prod',
     [string]$PrivilegeCloudURL = 'https://cna-prod.privilegecloud.cyberark.cloud',
 
-    # ===== CCP settings (CNA) =====
+    # ===== CCP settings CNA =====
     [string]$CCPAddress        = 'https://vskau1p1231.cna.com',
     [string]$CCPLocation       = 'AIMWebService',
     [string]$CCPAppID          = 'PAMDiscovery',
@@ -29,18 +39,31 @@ param(
     [string]$CCPObject         = 'cna-prod.cyberark.cloud-cnarestbot',
     [bool]$CCPWindowsAuth      = $false,
 
-    # ===== Output =====
-    [string]$ReportPath        = 'E:\Installation Media\Script\OnboardScript\logs\CNA_AllSafes_CreationDate.csv',
-    [string]$LogPath           = 'E:\Installation Media\Script\OnboardScript\logs\CNA_AllSafes_CreationDate.log',
+    # ===== Members to evaluate / add =====
+    [string]$AdminGroup        = 'CA_PCloud_Admins@cna.com',
+    [string]$AdminMember       = 'cna_pas_admin@cyberark.cloud.6679',
+    [string]$IdentityMember    = 'identity-privilege-integration-user$@cyberark.cloud.6679',
 
-    # ===== Retrieval options =====
-    [switch]$UseGen1API
+    # ===== Safe defaults =====
+    [string]$ManagingCPM       = 'CNA_PASS_MANG',
+    [int]$RetentionDays        = 120,
+
+    # ===== AD Group lookup OUs =====
+    [string[]]$SearchBaseOUs = @(
+        'OU=Groups_PROD,OU=Application Services,OU=admin-support,DC=cna,DC=com',
+        'OU=Groups,OU=CyberArk,DC=cna,DC=com'
+    ),
+
+    # ===== Logging =====
+    [string]$LogPath           = 'E:\Installation Media\Script\OnboardScript\data\accountonboarding.txt'
 )
 
 # -----------------------------
 # Initial setup
 # -----------------------------
-try { Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force -ErrorAction Stop } catch {}
+try {
+    Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force -ErrorAction Stop
+} catch {}
 
 $psPASDirs = @(
     "$env:ProgramFiles\WindowsPowerShell\Modules\psPAS\6.4.85",
@@ -48,17 +71,17 @@ $psPASDirs = @(
 ) | Where-Object { Test-Path $_ }
 
 foreach ($dir in $psPASDirs) {
-    try { Get-ChildItem -Path $dir -Recurse -File | Unblock-File -ErrorAction SilentlyContinue } catch {}
-}
-
-foreach ($path in @($ReportPath, $LogPath)) {
     try {
-        $parent = Split-Path -Path $path -Parent
-        if ($parent -and -not (Test-Path $parent)) {
-            New-Item -Path $parent -ItemType Directory -Force | Out-Null
-        }
+        Get-ChildItem -Path $dir -Recurse -File | Unblock-File -ErrorAction SilentlyContinue
     } catch {}
 }
+
+try {
+    $parent = Split-Path -Path $LogPath -Parent
+    if ($parent -and -not (Test-Path $parent)) {
+        New-Item -Path $parent -ItemType Directory -Force | Out-Null
+    }
+} catch {}
 
 # -----------------------------
 # Logging
@@ -72,15 +95,53 @@ function Write-Log {
     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     $entry = "$timestamp - $Message"
 
-    try { Write-Host $entry -ForegroundColor $Color } catch { Write-Host $entry }
-    try { Add-Content -Path $LogPath -Value $entry } catch {}
+    try {
+        Write-Host $entry -ForegroundColor $Color
+    } catch {
+        Write-Host $entry
+    }
+
+    try {
+        Add-Content -Path $LogPath -Value $entry
+    } catch {}
+}
+
+# -----------------------------
+# Console box helper
+# -----------------------------
+function Show-Box {
+    param(
+        [string]$Title,
+        [string]$BodyLine1 = '',
+        [string]$BodyLine2 = ''
+    )
+
+    $line = ('=' * 72)
+    Write-Host $line -ForegroundColor DarkGray
+
+    if ($Title) {
+        Write-Host ("[ " + $Title + " ]") -ForegroundColor Gray
+    }
+
+    if ($BodyLine1) {
+        Write-Host $BodyLine1 -ForegroundColor Gray
+    }
+
+    if ($BodyLine2) {
+        Write-Host $BodyLine2 -ForegroundColor Gray
+    }
+
+    Write-Host $line -ForegroundColor DarkGray
 }
 
 # -----------------------------
 # Helpers
 # -----------------------------
 function Get-NormalizedIdentityTenant {
-    param([Parameter(Mandatory)][string]$TenantUrl)
+    param(
+        [Parameter(Mandatory)]
+        [string]$TenantUrl
+    )
 
     $value = $TenantUrl.Trim()
     $value = $value -replace '^https?://', ''
@@ -89,84 +150,146 @@ function Get-NormalizedIdentityTenant {
     return $value
 }
 
-function Get-ObjectPropertyValue {
+function ConvertTo-LdapEscapedValue {
     param(
-        [Parameter(Mandatory)][object]$Object,
-        [Parameter(Mandatory)][string[]]$Names
+        [Parameter(Mandatory)]
+        [string]$Value
     )
 
-    foreach ($name in $Names) {
-        $prop = $Object.PSObject.Properties[$name]
-        if ($prop -and $null -ne $prop.Value -and "$($prop.Value)".Trim() -ne '') {
-            return $prop.Value
-        }
-    }
+    $escaped = $Value
+    $escaped = $escaped -replace '\\', '\5c'
+    $escaped = $escaped -replace '\*', '\2a'
+    $escaped = $escaped -replace '\(', '\28'
+    $escaped = $escaped -replace '\)', '\29'
+    $escaped = $escaped -replace ([string][char]0), '\00'
 
-    return $null
+    return $escaped
 }
 
-function Convert-FromUnixLikeTime {
-    param(
-        [Parameter(ValueFromPipeline = $true)]
-        [AllowNull()]
-        $Value
-    )
-
-    process {
-        if ($null -eq $Value -or "$Value".Trim() -eq '') {
-            return $null
-        }
-
-        $text = "$Value".Trim()
-
-        if ($text -notmatch '^\d+$') {
-            # Already looks like a formatted date string
-            try { return [datetime]$text } catch { return $null }
-        }
-
-        try {
-            $num = [int64]$text
-
-            # Common formats:
-            # 10 digits  = Unix seconds
-            # 13 digits  = Unix milliseconds
-            # 16 digits  = Unix microseconds
-            # 19 digits  = Unix nanoseconds (rare in this context)
-            switch ($text.Length) {
-                10 { return [DateTimeOffset]::FromUnixTimeSeconds($num).LocalDateTime }
-                13 { return [DateTimeOffset]::FromUnixTimeMilliseconds($num).LocalDateTime }
-                16 { return [DateTimeOffset]::FromUnixTimeMilliseconds([int64]($num / 1000)).LocalDateTime }
-                19 { return [DateTimeOffset]::FromUnixTimeMilliseconds([int64]($num / 1000000)).LocalDateTime }
-                default {
-                    # Best effort fallback:
-                    if ($num -lt 32503680000) {
-                        return [DateTimeOffset]::FromUnixTimeSeconds($num).LocalDateTime
-                    } elseif ($num -lt 32503680000000) {
-                        return [DateTimeOffset]::FromUnixTimeMilliseconds($num).LocalDateTime
-                    } else {
-                        return [DateTimeOffset]::FromUnixTimeMilliseconds([int64]($num / 1000)).LocalDateTime
-                    }
-                }
-            }
-        } catch {
-            return $null
-        }
-    }
+# -----------------------------
+# Load required modules
+# -----------------------------
+try {
+    Import-Module psPAS -Force -ErrorAction Stop
+    $mod = Get-Module psPAS
+    Write-Log ("psPAS loaded ({0})." -f $mod.Version) 'Green'
+} catch {
+    Write-Log ("❌ psPAS module not found/loaded: {0}" -f $_.Exception.Message) 'Red'
+    exit 1
 }
 
+try {
+    Import-Module IdentityCommand -Force -ErrorAction SilentlyContinue
+    $idMod = Get-Module IdentityCommand
+    if ($idMod) {
+        Write-Log ("IdentityCommand loaded ({0})." -f $idMod.Version) 'Green'
+    }
+} catch {
+    Write-Log "⚠️ IdentityCommand module could not be imported. Continuing in case Get-IdentityHeader is already available." 'Yellow'
+}
+
+if (-not (Get-Command Get-IdentityHeader -ErrorAction SilentlyContinue)) {
+    Write-Log "❌ Get-IdentityHeader command is not available. Confirm IdentityCommand module is installed and accessible." 'Red'
+    exit 1
+}
+
+# -----------------------------
+# Load Active Directory module
+# -----------------------------
+$ADModuleLoaded = $false
+
+try {
+    Import-Module ActiveDirectory -ErrorAction Stop
+    $ADModuleLoaded = $true
+    Write-Log 'ActiveDirectory module loaded.' 'Green'
+
+    foreach ($ou in $SearchBaseOUs) {
+        Write-Log ("Configured AD group search base: {0}" -f $ou) 'Gray'
+    }
+} catch {
+    Write-Log '⚠️ ActiveDirectory module not available; will still try to add group by UPN.' 'Yellow'
+}
+
+# -----------------------------
+# Permissions
+# -----------------------------
+$LimitedPermPAS = [PSCustomObject]@{
+    UseAccounts                            = $true
+    RetrieveAccounts                       = $true
+    ListAccounts                           = $true
+    AddAccounts                            = $false
+    UpdateAccountContent                   = $true
+    UpdateAccountProperties                = $false
+    InitiateCPMAccountManagementOperations = $true
+    SpecifyNextAccountContent              = $true
+    RenameAccounts                         = $false
+    DeleteAccounts                         = $false
+    UnlockAccounts                         = $false
+    ManageSafe                             = $false
+    ManageSafeMembers                      = $false
+    BackupSafe                             = $false
+    ViewAuditLog                           = $true
+    ViewSafeMembers                        = $true
+    AccessWithoutConfirmation              = $true
+    CreateFolders                          = $false
+    DeleteFolders                          = $false
+    MoveAccountsAndFolders                 = $false
+    RequestsAuthorizationLevel1            = $true
+    RequestsAuthorizationLevel2            = $false
+}
+
+$FullPermPAS = [PSCustomObject]@{
+    UseAccounts                            = $true
+    RetrieveAccounts                       = $true
+    ListAccounts                           = $true
+    AddAccounts                            = $true
+    UpdateAccountContent                   = $true
+    UpdateAccountProperties                = $true
+    InitiateCPMAccountManagementOperations = $true
+    SpecifyNextAccountContent              = $true
+    RenameAccounts                         = $true
+    DeleteAccounts                         = $true
+    UnlockAccounts                         = $true
+    ManageSafe                             = $true
+    ManageSafeMembers                      = $true
+    BackupSafe                             = $true
+    ViewAuditLog                           = $true
+    ViewSafeMembers                        = $true
+    AccessWithoutConfirmation              = $true
+    CreateFolders                          = $true
+    DeleteFolders                          = $true
+    MoveAccountsAndFolders                 = $true
+    RequestsAuthorizationLevel1            = $true
+    RequestsAuthorizationLevel2            = $false
+}
+
+# -----------------------------
+# Login Method: CCP + psPAS Identity Header
+# This section was updated based on the working login method provided.
+# -----------------------------
 function Start-PASSessionFromCCP {
     param(
-        [Parameter(Mandatory)][string]$ObjectName
+        [Parameter(Mandatory)]
+        [string]$ObjectName
     )
 
-    $headers = @{ 'Content-Type' = 'application/json' }
-    $ccpUrl  = "$CCPAddress/$CCPLocation/api/Accounts?AppID=$CCPAppID&Safe=$CCPSafe&Object=$ObjectName"
+    $headers = @{
+        'Content-Type' = 'application/json'
+    }
+
+    $ccpUrl = "$CCPAddress/$CCPLocation/api/Accounts?AppID=$CCPAppID&Safe=$CCPSafe&Object=$ObjectName"
 
     Write-Log ("Retrieving CyberArk API credentials from CCP using Object='{0}'..." -f $ObjectName)
     Write-Log ("CCP URL: {0}" -f $ccpUrl) 'Gray'
 
     try {
-        $resp = Invoke-RestMethod -Uri $ccpUrl -Method GET -Headers $headers -UseDefaultCredentials:$CCPWindowsAuth -ErrorAction Stop
+        $resp = Invoke-RestMethod `
+            -Uri $ccpUrl `
+            -Method GET `
+            -Headers $headers `
+            -UseDefaultCredentials:$CCPWindowsAuth `
+            -ErrorAction Stop
+
         if (-not $resp -or -not $resp.Content) {
             throw 'Empty CCP response'
         }
@@ -176,6 +299,7 @@ function Start-PASSessionFromCCP {
     }
 
     $resolvedUser = $null
+
     if ($resp.PSObject.Properties.Name -contains 'Username') {
         $resolvedUser = [string]$resp.Username
     } elseif ($resp.PSObject.Properties.Name -contains 'UserName') {
@@ -193,7 +317,7 @@ function Start-PASSessionFromCCP {
         $securePass = ConvertTo-SecureString $resp.Content -AsPlainText -Force
         $credential = [PSCredential]::new($resolvedUser, $securePass)
 
-        Write-Log ("Requesting CyberArk PAS authentication (psPAS Identity header) as {0}..." -f $resolvedUser)
+        Write-Log ("Requesting CyberArk PAS authentication using psPAS Identity header as {0}..." -f $resolvedUser)
         Write-Log ("IdentityTenantURL passed to Get-IdentityHeader: {0}" -f $normalizedTenant) 'Gray'
 
         $header = Get-IdentityHeader `
@@ -215,4 +339,287 @@ function Start-PASSessionFromCCP {
     }
 
     return $resp
+}
+
+# -----------------------------
+# AD Group validation helper
+# -----------------------------
+function Read-ValidGroup {
+    while ($true) {
+        $g = Read-Host "Enter the AD Safe Group sAMAccountName only, e.g., ca_xxx_xxx_prod"
+
+        if ([string]::IsNullOrWhiteSpace($g)) {
+            Write-Log '❌ Group cannot be empty.' 'Red'
+            continue
+        }
+
+        $g = $g.Trim()
+
+        if ($g -notmatch '^[A-Za-z0-9_\-\.]+$') {
+            Write-Log '❌ Invalid characters in group name. Enter sAMAccountName only, without @cna.com.' 'Red'
+            continue
+        }
+
+        if (-not $ADModuleLoaded) {
+            Write-Log '⚠️ AD module not loaded, proceeding with provided group name. Script will add it as group@cna.com.' 'Yellow'
+            return $g
+        }
+
+        $escapedSam = ConvertTo-LdapEscapedValue -Value $g
+        $escapedUPN = ConvertTo-LdapEscapedValue -Value "$g@cna.com"
+
+        $ldapFilter = "(|(sAMAccountName=$escapedSam)(userPrincipalName=$escapedUPN)(name=$escapedSam))"
+
+        $foundGroup = $null
+        $foundOU = $null
+
+        foreach ($ou in $SearchBaseOUs) {
+            try {
+                Write-Log ("Searching AD group '{0}' under: {1}" -f $g, $ou) 'Gray'
+
+                $result = Get-ADGroup `
+                    -LDAPFilter $ldapFilter `
+                    -SearchBase $ou `
+                    -Properties SamAccountName,Name,DistinguishedName `
+                    -ErrorAction Stop |
+                    Select-Object -First 1
+
+                if ($result) {
+                    $foundGroup = $result
+                    $foundOU = $ou
+                    break
+                }
+            } catch {
+                Write-Log ("⚠️ Error searching AD for '{0}' in {1}: {2}" -f $g, $ou, $_.Exception.Message) 'Yellow'
+            }
+        }
+
+        if ($foundGroup) {
+            Write-Log ("✅ Found AD Group: {0} | sAM={1}" -f $foundGroup.Name, $foundGroup.SamAccountName) 'Green'
+            Write-Log ("✅ Found under OU: {0}" -f $foundOU) 'Green'
+            Write-Log ("AD DN: {0}" -f $foundGroup.DistinguishedName) 'Gray'
+
+            return $foundGroup.SamAccountName
+        }
+
+        Write-Log '❌ Group not found in configured CNA AD search OUs. Re-enter the correct sAMAccountName.' 'Red'
+
+        foreach ($ou in $SearchBaseOUs) {
+            Write-Log ("Checked OU: {0}" -f $ou) 'Gray'
+        }
+    }
+}
+
+# -----------------------------
+# Safely get current Safe members
+# -----------------------------
+function Get-ExistingSafeMembers {
+    param(
+        [Parameter(Mandatory)]
+        [string]$SafeName
+    )
+
+    $memberSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+
+    try {
+        $members = Get-PASSafeMember -SafeName $SafeName -ErrorAction Stop
+
+        foreach ($m in $members) {
+            $name = $null
+
+            if ($m.PSObject.Properties.Name -contains 'MemberName') {
+                $name = [string]$m.MemberName
+            } elseif ($m.PSObject.Properties.Name -contains 'UserName') {
+                $name = [string]$m.UserName
+            } elseif ($m.PSObject.Properties.Name -contains 'Username') {
+                $name = [string]$m.Username
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace($name)) {
+                [void]$memberSet.Add($name)
+            }
+        }
+    } catch {
+        Write-Log ("ℹ️ Could not list current members for Safe '{0}': {1}" -f $SafeName, $_.Exception.Message) 'Yellow'
+    }
+
+    Write-Output -NoEnumerate $memberSet
+}
+
+# -----------------------------
+# Add member to Safe
+# -----------------------------
+function Add-MemberToSafe {
+    param(
+        [Parameter(Mandatory)]
+        [string]$SafeName,
+
+        [Parameter(Mandatory)]
+        [string]$MemberName,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('Group','User','Role')]
+        [string]$MemberType,
+
+        [Parameter(Mandatory)]
+        [pscustomobject]$Permissions,
+
+        [Parameter()]
+        [object]$ExistingMembers
+    )
+
+    try {
+        if ($ExistingMembers -and $ExistingMembers.Contains($MemberName)) {
+            Write-Log ("ℹ️ Skipping {0} '{1}' because it already exists in Safe '{2}'." -f $MemberType, $MemberName, $SafeName) 'Yellow'
+            return $true
+        }
+
+        Write-Log ("Adding {0} '{1}' to Safe '{2}'..." -f $MemberType, $MemberName, $SafeName)
+
+        $Permissions |
+            Add-PASSafeMember `
+                -SafeName $SafeName `
+                -MemberType $MemberType `
+                -MemberName $MemberName `
+                -ErrorAction Stop |
+            Out-Null
+
+        try {
+            if ($ExistingMembers -and ($ExistingMembers -is [System.Collections.Generic.HashSet[string]])) {
+                [void]$ExistingMembers.Add($MemberName)
+            }
+        } catch {
+            Write-Log ("ℹ️ Member was added, but cache update was skipped for '{0}': {1}" -f $MemberName, $_.Exception.Message) 'Yellow'
+        }
+
+        Write-Log ("✅ Added {0}: {1}." -f $MemberType, $MemberName) 'Green'
+        return $true
+    } catch {
+        Write-Log ("❌ Failed to add '{0}' to Safe '{1}' - {2}" -f $MemberName, $SafeName, $_.Exception.Message) 'Red'
+        return $false
+    }
+}
+
+# =========================
+# MAIN
+# =========================
+
+$response = $null
+
+try {
+    $response = Start-PASSessionFromCCP -ObjectName $CCPObject
+} catch {
+    Write-Log '❌ Authentication failed. Exiting script.' 'Red'
+    exit 1
+}
+
+try {
+    $SafeName = Read-Host 'Enter the Safe Name'
+
+    $DescriptionRaw = $null
+
+    try {
+        Add-Type -AssemblyName Microsoft.VisualBasic -ErrorAction Stop
+
+        $DescriptionRaw = [Microsoft.VisualBasic.Interaction]::InputBox(
+            'Paste a single-line description for the Safe max 200 chars.',
+            'Safe Description',
+            ''
+        )
+    } catch {
+        Show-Box `
+            -Title 'Safe Description' `
+            -BodyLine1 'Paste a single-line description for the Safe max 200 characters.' `
+            -BodyLine2 'Example: Service accounts for AppX PROD.'
+
+        $DescriptionRaw = Read-Host 'Enter the Safe Description single line up to 200 chars'
+    }
+
+    if ([string]::IsNullOrWhiteSpace($SafeName)) {
+        Write-Log '❌ ERROR: Safe Name cannot be empty. Exiting...' 'Red'
+        exit 1
+    }
+
+    $SafeName = $SafeName.Trim()
+
+    if ([string]::IsNullOrWhiteSpace($DescriptionRaw)) {
+        Write-Log '❌ ERROR: Safe Description cannot be empty. Exiting...' 'Red'
+        exit 1
+    }
+
+    $Description = $DescriptionRaw.Trim()
+
+    if ($Description.Length -gt 200) {
+        Write-Log 'ℹ️ Safe Description is greater than 200 characters. Auto-truncating.' 'Yellow'
+        $Description = $Description.Substring(0, 200)
+    }
+
+    # Create Safe
+    try {
+        Write-Log ("🔹 Creating Safe: {0}..." -f $SafeName)
+
+        Add-PASSafe `
+            -SafeName $SafeName `
+            -ManagingCPM $ManagingCPM `
+            -Description $Description `
+            -NumberOfDaysRetention $RetentionDays `
+            -ErrorAction Stop |
+        Out-Null
+
+        Write-Log ("✅ Successfully created Safe: {0}." -f $SafeName) 'Green'
+    } catch {
+        Write-Log ("⚠️ Could not create Safe '{0}': {1}. Continuing to member add..." -f $SafeName, $_.Exception.Message) 'Yellow'
+    }
+
+    # Read and validate target AD group from configured CNA OUs
+    $GroupSam = Read-ValidGroup
+
+    # CyberArk directory group format expected for CNA
+    $TargetGroupUPN = "$GroupSam@cna.com"
+
+    Write-Log ("Resolved target Safe owner group to add: {0}" -f $TargetGroupUPN) 'Green'
+
+    # Get existing members to avoid duplicate add failures
+    $existingMembers = Get-ExistingSafeMembers -SafeName $SafeName
+
+    # Members to add
+    $MembersToAdd = @(
+        @{
+            Name = $TargetGroupUPN
+            Type = 'Group'
+            Perm = $LimitedPermPAS
+        },
+        @{
+            Name = $AdminGroup
+            Type = 'Group'
+            Perm = $FullPermPAS
+        },
+        @{
+            Name = $AdminMember
+            Type = 'User'
+            Perm = $FullPermPAS
+        },
+        @{
+            Name = $IdentityMember
+            Type = 'User'
+            Perm = $FullPermPAS
+        }
+    )
+
+    foreach ($m in $MembersToAdd) {
+        [void](Add-MemberToSafe `
+            -SafeName $SafeName `
+            -MemberName $m.Name `
+            -MemberType $m.Type `
+            -Permissions $m.Perm `
+            -ExistingMembers $existingMembers)
+    }
+
+    Write-Log '✅ Safe member addition process completed.' 'Green'
+    Write-Log '✅ Completed Safe creation and member onboarding using cnarestbot CCP authentication.' 'Green'
+} finally {
+    try {
+        Close-PASSession | Out-Null
+        Write-Log '✅ PAS session closed.' 'Green'
+    } catch {}
 }
