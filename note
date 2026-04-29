@@ -1,152 +1,247 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<configuration>
-  <configSections>
-    <section name="log4net" type="log4net.Config.Log4NetConfigurationSectionHandler, log4net" requirePermission="false" />
-  </configSections>
+Update the safe membership report below the the login method below
 
-  <log4net>
-    <appender name="RollingLogFileAppender" type="log4net.Appender.RollingFileAppender">
-      <file type="log4net.Util.PatternString" value="logs\AIMWSTrace.log" />
-      <appendToFile value="true" />
-      <staticLogFileName value="true" />
-      <rollingStyle value="Size" />
-      <param name="DatePattern" value="dd.MM.yyyy'.log'" />
-      <preserveLogFileNameExtension value="true" />
-      <maxSizeRollBackups value="25" />
-      <maximumFileSize value="10MB" />
-      <layout type="log4net.Layout.PatternLayout">
-        <conversionPattern value="%date | Request %message%newline" />
-      </layout>
-    </appender>
-    <root>
-      <level value="INFO" />
-      <appender-ref ref="RollingLogFileAppender" />
-    </root>
-  </log4net>
+[CmdletBinding()]
+param(
+    # ===== CNA Identity / Privilege Cloud =====
+    [string]$IdentityTenantURL = 'https://aat4012.id.cyberark.cloud',
+    [string]$PCloudSubdomain   = 'cna-prod',
+    [string]$PrivilegeCloudURL = 'https://cna-prod.privilegecloud.cyberark.cloud',
 
-  <appSettings>
-    <add key="AppID" value="AIMWebService" />
+    # ===== CCP settings CNA =====
+    [string]$CCPAddress        = 'https://vskau1p1231.cna.com',
+    [string]$CCPLocation       = 'AIMWebService',
+    [string]$CCPAppID          = 'PAMDiscovery',
+    [string]$CCPSafe           = 'CA_PCloud_Admins',
+    [string]$CCPObject         = 'cna-prod.cyberark.cloud-cnarestbot',
+    [bool]$CCPWindowsAuth      = $false,
 
-    <!-- Configure which object property aliases to include in CCP responses -->
-    <!-- Supported values: "Object" (default), "Name", or "Object,Name" for both -->
-    <!-- Examples: "Object" = Object property only, "Name" = Name property only, "Object,Name" = both properties -->
-    <add key="ObjectAlias" value="Object" />
+    # ===== Members to evaluate / add =====
+    [string]$AdminGroup        = 'CA_PCloud_Admins@cna.com',
+    [string]$AdminMember       = 'cna_pas_admin@cyberark.cloud.6679',
+    [string]$IdentityMember    = 'identity-privilege-integration-user$@cyberark.cloud.6679',
+# -----------------------------
+# Login Method: CCP + psPAS Identity Header
+# This section was updated based on the working login method provided.
+# -----------------------------
+function Start-PASSessionFromCCP {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ObjectName
+    )
 
-    <add key="UsageReportEnabled" value="false" />
+    $headers = @{
+        'Content-Type' = 'application/json'
+    }
 
-    <!-- Set Trusted proxies IPv4 address list, range or subnet in CIDR format. -->
-    <!-- This allows CyberArk CCP/AIMWebService to trust proxied client IP information. -->
-    <!-- Required when using X-Forwarded-For or when passing client certificate through an HTTP header. -->
-    <add key="TrustedProxies" value="10.12.4.5, 10.12.4.20" />
+    $ccpUrl = "$CCPAddress/$CCPLocation/api/Accounts?AppID=$CCPAppID&Safe=$CCPSafe&Object=$ObjectName"
 
-    <!-- Enabling this option causes the named X-Client-Certificate field of the HTTP header to be interpreted as a base64-encoded client certificate. -->
-    <!-- This will only work if the request is coming from a host on the TrustedProxies list. -->
-    <!-- Note that in addition to this HTTP field, the X-Forwarded-For field will also be interpreted. If you do not use this field, be sure to configure the proxy to filter this HTTP header field! -->
-    <!--<add key="ClientCertificateHTTPHeaderFieldName" value="X-Client-Certificate"/>-->
-  </appSettings>
+    Write-Log ("Retrieving CyberArk API credentials from CCP using Object='{0}'..." -f $ObjectName)
+    Write-Log ("CCP URL: {0}" -f $ccpUrl) 'Gray'
 
-  <connectionStrings />
+    try {
+        $resp = Invoke-RestMethod `
+            -Uri $ccpUrl `
+            -Method GET `
+            -Headers $headers `
+            -UseDefaultCredentials:$CCPWindowsAuth `
+            -ErrorAction Stop
 
-  <!--
-    For a description of web.config changes see http://go.microsoft.com/fwlink/?LinkId=235367.
+        if (-not $resp -or -not $resp.Content) {
+            throw 'Empty CCP response'
+        }
+    } catch {
+        Write-Log ("❌ ERROR: CCP credential fetch failed - {0}" -f $_.Exception.Message) 'Red'
+        throw
+    }
 
-    The following attributes can be set on the <httpRuntime> tag.
-      <system.Web>
-        <httpRuntime targetFramework="4.8" />
-      </system.Web>
-  -->
+    $resolvedUser = $null
 
-  <system.web>
-    <httpRuntime enableVersionHeader="false" />
-    <compilation debug="false" targetFramework="4.8" />
+    if ($resp.PSObject.Properties.Name -contains 'Username') {
+        $resolvedUser = [string]$resp.Username
+    } elseif ($resp.PSObject.Properties.Name -contains 'UserName') {
+        $resolvedUser = [string]$resp.UserName
+    }
 
-    <!--
-      The <authentication> section enables configuration 
-      of the security authentication mode used by 
-      ASP.NET to identify an incoming user. 
-    -->
-    <authentication mode="Windows" />
+    if ([string]::IsNullOrWhiteSpace($resolvedUser)) {
+        throw 'CCP returned password but no Username/UserName field.'
+    }
 
-    <!--
-       The <customErrors> section enables configuration 
-       of what to do if/when an unhandled error occurs 
-       during the execution of a request. Specifically, 
-       it enables developers to configure html error pages 
-       to be displayed in place of a error stack trace.
+    Write-Log ("✅ Successfully retrieved credentials for user: {0}" -f $resolvedUser) 'Green'
 
-       <customErrors mode="RemoteOnly" defaultRedirect="GenericErrorPage.htm">
-         <error statusCode="403" redirect="NoAccess.htm" />
-         <error statusCode="404" redirect="FileNotFound.htm" />
-       </customErrors>
-    -->
+    try {
+        $normalizedTenant = Get-NormalizedIdentityTenant -TenantUrl $IdentityTenantURL
+        $securePass = ConvertTo-SecureString $resp.Content -AsPlainText -Force
+        $credential = [PSCredential]::new($resolvedUser, $securePass)
 
-    <pages controlRenderingCompatibilityVersion="4.8" clientIDMode="AutoID" />
-  </system.web>
+        Write-Log ("Requesting CyberArk PAS authentication using psPAS Identity header as {0}..." -f $resolvedUser)
+        Write-Log ("IdentityTenantURL passed to Get-IdentityHeader: {0}" -f $normalizedTenant) 'Gray'
 
-  <!-- 
-        The system.webServer section is required for running ASP.NET AJAX under Internet
-        Information Services 7.0. It is not necessary for previous version of IIS.
-  -->
+        $header = Get-IdentityHeader `
+            -IdentityTenantURL $normalizedTenant `
+            -psPASFormat `
+            -PCloudSubdomain $PCloudSubdomain `
+            -UPCreds $credential
 
-  <system.webServer>
-    <!-- Remove header X-Powered-By from REST response -->
-    <httpProtocol>
-      <customHeaders>
-        <remove name="X-Powered-By" />
-      </customHeaders>
-    </httpProtocol>
+        Use-PASSession $header | Out-Null
 
-    <!-- 
-        Removing Unused HTTP Handlers for Better Performance & Security
-        Based on Microsoft example and related IIS hardening practices.
-    -->
-    <directoryBrowse enabled="false" />
+        if (-not (Get-PASSession)) {
+            throw 'psPAS session not established'
+        }
 
-    <handlers>
-      <remove name="ExtensionlessUrlHandler-Integrated-4.0" />
-      <remove name="OPTIONSVerbHandler" />
-      <remove name="TRACEVerbHandler" />
-      <add name="ExtensionlessUrlHandler-Integrated-4.0" path="*." verb="*" type="System.Web.Handlers.TransferRequestHandler" preCondition="integratedMode,runtimeVersionv4.0" />
-    </handlers>
+        Write-Log ("✅ Authentication successful, PAS session established ({0})." -f $resolvedUser) 'Green'
+    } catch {
+        Write-Log ("❌ Failed to authenticate via psPAS Identity header: {0}" -f $_.Exception.Message) 'Red'
+        throw
+    }
 
-    <security>
-      <access sslFlags="SslNegotiateCert" />
-    </security>
-  </system.webServer>
+    return $resp
+}
 
-  <system.serviceModel />
+# ============================================
+# CCP -> psPAS (no prompts) -> Safe Membership Report
+# ============================================
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$ErrorActionPreference = 'Stop'
+$ProgressPreference    = 'SilentlyContinue'
 
-  <runtime>
-    <assemblyBinding xmlns="urn:schemas-microsoft-com:asm.v1">
-      <dependentAssembly>
-        <assemblyIdentity name="Newtonsoft.Json" publicKeyToken="30ad4fe6b2a6aeed" culture="neutral" />
-        <bindingRedirect oldVersion="0.0.0.0-13.0.0.0" newVersion="13.0.0.0" />
-      </dependentAssembly>
+Import-Module psPAS -Force
 
-      <dependentAssembly>
-        <assemblyIdentity name="System.Web.Helpers" publicKeyToken="31bf3856ad364e35" />
-        <bindingRedirect oldVersion="1.0.0.0-3.0.0.0" newVersion="3.0.0.0" />
-      </dependentAssembly>
+# ---------- Minimal logger (no secrets) ----------
+$LogFile = "E:\Installation Media\Script\OnboardScript\data\SafeMembershipReport.log"
+New-Item -ItemType File -Force -Path $LogFile | Out-Null
+function Write-Log {
+    param([string]$Message, [ConsoleColor]$Color = 'White')
+    $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $line = "$ts - $Message"
+    Write-Host $line -ForegroundColor $Color
+    Add-Content -Path $LogFile -Value $line
+}
 
-      <dependentAssembly>
-        <assemblyIdentity name="System.Web.WebPages" publicKeyToken="31bf3856ad364e35" />
-        <bindingRedirect oldVersion="1.0.0.0-3.0.0.0" newVersion="3.0.0.0" />
-      </dependentAssembly>
+# ---------- CCP / Identity config ----------
+$CCPAddress    = "https://vskau1p1231.cna.com"
+$location      = "AIMWebService"
+$application   = "PAMDiscovery"
+$safeCCP       = "CA_PCloud_Admins"
+$windowsAuth   = $false
+$headers       = @{ 'Content-Type' = 'application/json' }
 
-      <dependentAssembly>
-        <assemblyIdentity name="System.Web.Mvc" publicKeyToken="31bf3856ad364e35" />
-        <bindingRedirect oldVersion="1.0.0.0-5.3.0.0" newVersion="5.3.0.0" />
-      </dependentAssembly>
+$IdentityTenantURL = "aat4012.id.cyberark.cloud"
+$PCloudSubdomain   = "cna-prod"
 
-      <dependentAssembly>
-        <assemblyIdentity name="System.Threading.Tasks.Extensions" publicKeyToken="cc7b13ffcd2ddd51" culture="neutral" />
-        <bindingRedirect oldVersion="0.0.0.0-4.2.0.1" newVersion="4.2.0.1" />
-      </dependentAssembly>
+# Output CSV
+$CsvFilePath = "E:\Installation Media\Script\OnboardScript\data\SafeMembershipReport.csv"
 
-      <dependentAssembly>
-        <assemblyIdentity name="System.Web.Http" publicKeyToken="31bf3856ad364e35" culture="neutral" />
-        <bindingRedirect oldVersion="0.0.0.0-5.3.0.0" newVersion="5.3.0.0" />
-      </dependentAssembly>
-    </assemblyBinding>
-  </runtime>
-</configuration>
+# ---------- Login helper: CCP (Object) -> psPAS header ----------
+function Start-PASSessionFromCCP {
+    param(
+        [Parameter(Mandatory)] [string]$ObjectName,  # e.g., cna.com-CA_PAMDiscovery_SVC
+        [Parameter(Mandatory)] [string]$UPUser       # e.g., CA_PAMDiscovery_SVC
+    )
+
+    $ccpUrl = "$CCPAddress/$location/api/Accounts?AppID=$application&Safe=$safeCCP&Object=$ObjectName"
+    Write-Log "Retrieving CCP credential for '$UPUser' via Object..." 'Cyan'
+
+    $resp = Invoke-RestMethod -Uri $ccpUrl -Method GET -Headers $headers -UseDefaultCredentials:$windowsAuth
+    if (-not $resp -or -not $resp.Content -or -not $resp.Username) {
+        throw "CCP response missing Content/Username."
+    }
+    Write-Log "CCP returned username for service principal." 'Green'
+
+    # Build PSCredential (do not print secrets)
+    $secPass = ConvertTo-SecureString -String $resp.Content -AsPlainText -Force
+    $upCred  = [PSCredential]::new($UPUser, $secPass)
+
+    Write-Log "Requesting Identity header for '$IdentityTenantURL' (subdomain '$PCloudSubdomain')." 'Cyan'
+    $hdr = Get-IdentityHeader -IdentityTenantURL $IdentityTenantURL -psPASFormat -PCloudSubdomain $PCloudSubdomain -UPCreds $upCred
+    Use-PASSession $hdr
+    if (-not (Get-PASSession)) { throw "psPAS session not established." }
+
+    # Minimize plaintext exposure
+    $resp.Content = $null
+    Write-Log "PAS session established (no prompts)." 'Green'
+}
+
+# ---------- Authenticate (service: CA_PAMDiscovery_SVC) ----------
+Start-PASSessionFromCCP -ObjectName "cna.com-CA_PAMDiscovery_SVC" -UPUser "CA_PAMDiscovery_SVC"
+
+# ---------- Step 2: Retrieve All Safes ----------
+Write-Log "Retrieving list of Safes..." 'Yellow'
+try {
+    $Safes = Get-PASSafe -ErrorAction Stop
+    Write-Log "✅ Retrieved $($Safes.Count) Safes." 'Green'
+} catch {
+    Write-Log "❌ ERROR: Failed to retrieve Safes - $($_.Exception.Message)" 'Red'
+    exit 1
+}
+
+# ---------- Step 3: Retrieve Safe Members & Permissions ----------
+$SafeMembersReport = New-Object System.Collections.Generic.List[object]
+
+foreach ($Safe in $Safes) {
+    $SafeName = $Safe.safeName
+    Write-Log "🔹 Retrieving members for Safe: $SafeName" 'Cyan'
+
+    try {
+        $SafeMembers = Get-PASSafeMember -SafeName $SafeName -ErrorAction Stop
+
+        # Normalize to array
+        if ($null -eq $SafeMembers) { $SafeMembers = @() }
+        elseif ($SafeMembers -isnot [System.Collections.IEnumerable]) { $SafeMembers = @($SafeMembers) }
+
+        if ($SafeMembers.Count -eq 0) {
+            Write-Log "⚠️ No members found for Safe: $SafeName" 'Yellow'
+        }
+
+        foreach ($Member in $SafeMembers) {
+            $perm = $Member.Permissions
+
+            $SafeMembersReport.Add([PSCustomObject]@{
+                SafeName                                   = $SafeName
+                Member                                     = $Member.MemberName
+                MemberType                                 = $Member.MemberType
+                UseAccounts                                = $perm.useAccounts
+                RetrieveAccounts                           = $perm.retrieveAccounts
+                ListAccounts                               = $perm.listAccounts
+                AddAccounts                                = $perm.addAccounts
+                UpdateAccountContent                       = $perm.updateAccountContent
+                UpdateAccountProperties                    = $perm.updateAccountProperties
+                InitiateCPMAccountManagementOperations     = $perm.initiateCPMAccountManagementOperations
+                SpecifyNextAccountContent                  = $perm.specifyNextAccountContent
+                RenameAccounts                             = $perm.renameAccounts
+                DeleteAccounts                             = $perm.deleteAccounts
+                UnlockAccounts                             = $perm.unlockAccounts
+                ManageSafe                                 = $perm.manageSafe
+                ManageSafeMembers                          = $perm.manageSafeMembers
+                BackupSafe                                 = $perm.backupSafe
+                ViewAuditLog                               = $perm.viewAuditLog
+                ViewSafeMembers                            = $perm.viewSafeMembers
+                AccessWithoutConfirmation                  = $perm.accessWithoutConfirmation
+                CreateFolders                              = $perm.createFolders
+                DeleteFolders                              = $perm.deleteFolders
+                MoveAccountsAndFolders                     = $perm.moveAccountsAndFolders
+                RequestsAuthorizationLevel1                = $perm.requestsAuthorizationLevel1
+                RequestsAuthorizationLevel2                = $perm.requestsAuthorizationLevel2
+            })
+        }
+        Write-Log "✅ Retrieved $($SafeMembers.Count) members for Safe: $SafeName" 'Green'
+    } catch {
+        Write-Log "❌ ERROR: Failed to retrieve members for Safe: $SafeName - $($_.Exception.Message)" 'Red'
+    }
+}
+
+# ---------- Step 4: Export to CSV ----------
+# Ensure output directory exists
+$dir = Split-Path -Path $CsvFilePath -Parent
+if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+
+try {
+    $SafeMembersReport | Export-Csv -Path $CsvFilePath -NoTypeInformation -Encoding UTF8
+    Write-Log "✅ Safe Member Report successfully exported to: $CsvFilePath" 'Green'
+    Write-Log "🔹 Safe Member Report generation completed." 'Green'
+} catch {
+    Write-Log "❌ ERROR: Failed to export CSV - $($_.Exception.Message)" 'Red'
+    exit 1
+}
+
+# Optional: close session
+try { Close-PASSession | Out-Null } catch {}
