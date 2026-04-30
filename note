@@ -1,43 +1,34 @@
 <#
 .SYNOPSIS
-    CNA CyberArk Safe Member + Account Compliance Report
+    CNA CyberArk Safe Member + Account Compliance Report - Stable Version
 
 .DESCRIPTION
     - Authenticates to CNA Privilege Cloud using CCP + psPAS Identity Header
-    - Pulls account inventory using Get-PASAccount
-    - Pulls platform rotation settings using Get-PASPlatform
-    - Pulls safe members using Get-PASSafeMember
-    - Joins safe membership data to account inventory by Safe name
-    - Calculates Expiration Due (Days) using:
-        1. Explicit expiration property, if CyberArk returns one
-        2. Last Modified Date + platform requirePasswordChangeEveryXDays
-        3. Last Modified Date + DefaultExpirationDays fallback
+    - Pulls all visible accounts once
+    - Groups accounts by Safe without using Generic List cache objects
+    - Retrieves Safe members per Safe
+    - Joins Safe members to accounts
+    - Pulls platform password-change policy from Get-PASPlatform
+    - Calculates Expiration Due Days from:
+        1. Account explicit expiration property, if present
+        2. Account secretManagement.lastModifiedTime + platform requirePasswordChangeEveryXDays
+        3. Account secretManagement.lastModifiedTime + DefaultExpirationDays fallback
 
-.OUTPUT
-    CSV columns:
-        Safe
-        Member
-        MemberType
-        Target Username
-        Address
-        Account Safe
-        Platform Identity
-        Compliance Status
-        Expiration Due (Days)
-        Last Modified Date
+.OUTPUT COLUMNS
+    Safe
+    Member
+    MemberType
+    Target Username
+    Address
+    Account Safe
+    Platform Identity
+    Compliance Status
+    Expiration Due (Days)
+    Last Modified Date
 
 .NOTES
     This script is report-only.
-    It does not add, modify, delete, verify, reconcile, or rotate accounts.
-
-    CyberArk API mapping:
-        Target Username    = account.userName
-        Address            = account.address
-        Account Safe       = account.safeName
-        Platform Identity  = account.platformId
-        Compliance Status  = account.secretManagement.status
-        Last Modified Date = account.secretManagement.lastModifiedDateTime / lastModifiedTime
-        Expiration Due     = calculated from rotation policy where available
+    It does not add, update, delete, reconcile, verify, or rotate accounts.
 #>
 
 [CmdletBinding()]
@@ -56,23 +47,24 @@ param(
     [bool]$CCPWindowsAuth      = $false,
 
     # ===== Processing controls =====
-    # Leave blank to include all account safes visible to the service user.
-    [string]$SafeNameFilter = '',
+    [string]$SafeNameFilter    = '',
 
-    # Recommended default: process only safes that contain accounts.
-    # This avoids spending time on internal/system safes such as VaultInternal, PVWAReports, SharedAuth_Internal, etc.
-    [bool]$ProcessOnlySafesWithAccounts = $true,
-
-    # Include safes that have no account rows in the report.
-    # Usually false for this report because the requested output is account-driven.
+    # Recommended default:
+    # This report is account-driven, so only process safes that contain accounts.
     [bool]$IncludeSafesWithNoAccounts = $false,
 
-    # If platform rotation days cannot be read, use this value.
-    # Set to 0 if you want blank Expiration Due values when platform policy cannot be resolved.
+    # If platform rotation days cannot be resolved, use this fallback.
+    # Set to 0 if you prefer blank Expiration Due values when platform policy is unavailable.
     [int]$DefaultExpirationDays = 90,
 
-    # If platform says performPeriodicChange = false, leave Expiration Due blank unless this is true.
-    [bool]$CalculateExpirationWhenPeriodicChangeDisabled = $false,
+    # If the platform has performPeriodicChange = false, leave expiration blank unless this is true.
+    [bool]$CalculateWhenPeriodicChangeDisabled = $false,
+
+    # Fetch detailed platform info for only the unique platforms found in account inventory.
+    [bool]$FetchPlatformDetails = $true,
+
+    # Optional debug dump of first account/member/platform objects to JSON.
+    [bool]$DebugObjectDump = $false,
 
     # ===== Output paths =====
     [string]$OutputFolder = 'E:\Installation Media\Script\OnboardScript\data',
@@ -96,8 +88,11 @@ if (-not (Test-Path -Path $OutputFolder)) {
     New-Item -ItemType Directory -Path $OutputFolder -Force | Out-Null
 }
 
-$CsvFilePath = Join-Path $OutputFolder $CsvName
-$LogFile     = Join-Path $OutputFolder $LogFileName
+$CsvFilePath      = Join-Path $OutputFolder $CsvName
+$LogFile          = Join-Path $OutputFolder $LogFileName
+$DebugAccountPath = Join-Path $OutputFolder 'Debug_FirstAccount.json'
+$DebugMemberPath  = Join-Path $OutputFolder 'Debug_FirstMember.json'
+$DebugPlatformPath = Join-Path $OutputFolder 'Debug_FirstPlatform.json'
 
 New-Item -ItemType File -Force -Path $LogFile | Out-Null
 
@@ -140,6 +135,34 @@ function Get-NormalizedIdentityTenant {
 }
 
 # ============================================
+# Helper: Convert anything to clean array
+# ============================================
+
+function ConvertTo-CleanArray {
+    param(
+        [AllowNull()]
+        [object]$InputObject
+    )
+
+    if ($null -eq $InputObject) {
+        return @()
+    }
+
+    if ($InputObject -is [System.Array]) {
+        return @($InputObject)
+    }
+
+    if ($InputObject -is [System.Collections.IEnumerable] -and
+        $InputObject -isnot [string] -and
+        $InputObject -isnot [hashtable] -and
+        $InputObject.GetType().FullName -notlike 'System.Management.Automation.PSCustomObject') {
+        return @($InputObject)
+    }
+
+    return @($InputObject)
+}
+
+# ============================================
 # Helper: Get object property safely
 # ============================================
 
@@ -157,12 +180,16 @@ function Get-ObjectPropertyValue {
     }
 
     foreach ($propName in $PropertyNames) {
-        if ($InputObject.PSObject.Properties.Name -contains $propName) {
-            return $InputObject.$propName
-        }
-
         if ($InputObject -is [hashtable] -and $InputObject.ContainsKey($propName)) {
             return $InputObject[$propName]
+        }
+
+        $match = $InputObject.PSObject.Properties |
+            Where-Object { $_.Name -ieq $propName } |
+            Select-Object -First 1
+
+        if ($null -ne $match) {
+            return $match.Value
         }
     }
 
@@ -194,13 +221,82 @@ function Get-NestedPropertyValue {
 
         if ($null -ne $parent) {
             foreach ($childName in $ChildPropertyNames) {
-                if ($parent.PSObject.Properties.Name -contains $childName) {
-                    return $parent.$childName
-                }
+                $childValue = Get-ObjectPropertyValue -InputObject $parent -PropertyNames @($childName)
 
-                if ($parent -is [hashtable] -and $parent.ContainsKey($childName)) {
-                    return $parent[$childName]
+                if ($null -ne $childValue) {
+                    return $childValue
                 }
+            }
+        }
+    }
+
+    return $null
+}
+
+# ============================================
+# Helper: Deep property search
+# Used mainly for platform objects that may differ by psPAS/API version.
+# ============================================
+
+function Find-PropertyDeep {
+    param(
+        [AllowNull()]
+        [object]$InputObject,
+
+        [Parameter(Mandatory)]
+        [string[]]$PropertyNames,
+
+        [int]$MaxDepth = 6
+    )
+
+    if ($null -eq $InputObject -or $MaxDepth -le 0) {
+        return $null
+    }
+
+    if ($InputObject -is [string] -or
+        $InputObject -is [int] -or
+        $InputObject -is [long] -or
+        $InputObject -is [bool] -or
+        $InputObject -is [datetime]) {
+        return $null
+    }
+
+    foreach ($propName in $PropertyNames) {
+        $value = Get-ObjectPropertyValue -InputObject $InputObject -PropertyNames @($propName)
+
+        if ($null -ne $value) {
+            return $value
+        }
+    }
+
+    foreach ($prop in $InputObject.PSObject.Properties) {
+        $child = $prop.Value
+
+        if ($null -eq $child) {
+            continue
+        }
+
+        if ($child -is [string] -or
+            $child -is [int] -or
+            $child -is [long] -or
+            $child -is [bool] -or
+            $child -is [datetime]) {
+            continue
+        }
+
+        if ($child -is [System.Collections.IEnumerable] -and $child -isnot [string]) {
+            foreach ($item in $child) {
+                $found = Find-PropertyDeep -InputObject $item -PropertyNames $PropertyNames -MaxDepth ($MaxDepth - 1)
+
+                if ($null -ne $found) {
+                    return $found
+                }
+            }
+        } else {
+            $found = Find-PropertyDeep -InputObject $child -PropertyNames $PropertyNames -MaxDepth ($MaxDepth - 1)
+
+            if ($null -ne $found) {
+                return $found
             }
         }
     }
@@ -232,7 +328,7 @@ function Convert-CyberArkDate {
         return $Value.ToLocalTime()
     }
 
-    $stringValue = [string]$Value
+    $stringValue = ([string]$Value).Trim()
 
     if ([string]::IsNullOrWhiteSpace($stringValue)) {
         return $null
@@ -246,12 +342,10 @@ function Convert-CyberArkDate {
                 return $null
             }
 
-            # Epoch milliseconds
             if ($number -gt 9999999999) {
                 return [DateTimeOffset]::FromUnixTimeMilliseconds($number).LocalDateTime
             }
 
-            # Epoch seconds
             return [DateTimeOffset]::FromUnixTimeSeconds($number).LocalDateTime
         } catch {
             return $null
@@ -263,6 +357,100 @@ function Convert-CyberArkDate {
     } catch {
         return $null
     }
+}
+
+# ============================================
+# Helper: Resolve account safe name
+# ============================================
+
+function Get-AccountSafeName {
+    param(
+        [AllowNull()]
+        [object]$Account
+    )
+
+    $safe = Get-ObjectPropertyValue -InputObject $Account -PropertyNames @(
+        'safeName',
+        'SafeName',
+        'Safe',
+        'safe'
+    )
+
+    if ($null -eq $safe) {
+        return ''
+    }
+
+    return ([string]$safe).Trim()
+}
+
+# ============================================
+# Helper: Resolve account platform ID
+# ============================================
+
+function Get-AccountPlatformId {
+    param(
+        [AllowNull()]
+        [object]$Account
+    )
+
+    $platform = Get-ObjectPropertyValue -InputObject $Account -PropertyNames @(
+        'platformId',
+        'PlatformID',
+        'PlatformId',
+        'platformID'
+    )
+
+    if ($null -eq $platform) {
+        return ''
+    }
+
+    return ([string]$platform).Trim()
+}
+
+# ============================================
+# Helper: Resolve account target username
+# ============================================
+
+function Get-AccountTargetUsername {
+    param(
+        [AllowNull()]
+        [object]$Account
+    )
+
+    $username = Get-ObjectPropertyValue -InputObject $Account -PropertyNames @(
+        'userName',
+        'UserName',
+        'username',
+        'Username'
+    )
+
+    if ($null -eq $username) {
+        return ''
+    }
+
+    return [string]$username
+}
+
+# ============================================
+# Helper: Resolve account address
+# ============================================
+
+function Get-AccountAddress {
+    param(
+        [AllowNull()]
+        [object]$Account
+    )
+
+    $address = Get-ObjectPropertyValue -InputObject $Account -PropertyNames @(
+        'address',
+        'Address'
+    )
+
+    if ($null -eq $address) {
+        return ''
+    }
+
+    return [string]$address
 }
 
 # ============================================
@@ -302,8 +490,8 @@ function Get-AccountLastModifiedDate {
 }
 
 # ============================================
-# Helper: Get account explicit expiration date if present
-# CyberArk does not always expose this on standard account inventory.
+# Helper: Get explicit account expiration date if present
+# Not always exposed by CyberArk account listing/detail APIs.
 # ============================================
 
 function Get-AccountExplicitExpirationDate {
@@ -402,8 +590,7 @@ function Get-AccountComplianceStatus {
 }
 
 # ============================================
-# Helper: Calculate expiration due days safely
-# Important fix: no [datetime] mandatory binding here.
+# Helper: Calculate expiration due days
 # ============================================
 
 function Get-ExpirationDueDays {
@@ -447,23 +634,32 @@ function Get-ExpirationDueDays {
 }
 
 # ============================================
-# Helper: Get safe name from Safe or Account object
+# Helper: Normalize Safe Member output
+# Handles psPAS direct arrays and wrapped 2nd-gen response.
 # ============================================
 
-function Get-ResolvedSafeName {
+function ConvertTo-SafeMemberArray {
     param(
         [AllowNull()]
-        [object]$InputObject
+        [object]$RawMembers
     )
 
-    return Get-ObjectPropertyValue -InputObject $InputObject -PropertyNames @(
-        'safeName',
-        'SafeName',
-        'Safe',
-        'safe',
-        'Name',
-        'name'
+    if ($null -eq $RawMembers) {
+        return @()
+    }
+
+    $membersProperty = Get-ObjectPropertyValue -InputObject $RawMembers -PropertyNames @(
+        'members',
+        'Members',
+        'value',
+        'Value'
     )
+
+    if ($null -ne $membersProperty) {
+        return ConvertTo-CleanArray -InputObject $membersProperty
+    }
+
+    return ConvertTo-CleanArray -InputObject $RawMembers
 }
 
 # ============================================
@@ -582,49 +778,71 @@ function Start-PASSessionFromCCP {
 }
 
 # ============================================
-# Get Accounts Helper
+# Get All Visible Accounts
 # ============================================
 
 function Get-AllVisiblePASAccounts {
-    $params = @{}
+    Write-Log "Retrieving all visible accounts using Get-PASAccount..." 'Yellow'
 
     $cmd = Get-Command Get-PASAccount -ErrorAction Stop
+    $params = @{}
 
     if ($cmd.Parameters.ContainsKey('Limit')) {
         $params['Limit'] = 1000
-    } elseif ($cmd.Parameters.ContainsKey('limit')) {
-        $params['limit'] = 1000
     }
-
-    Write-Log "Retrieving all visible accounts using Get-PASAccount..." 'Yellow'
 
     $accounts = Get-PASAccount @params -ErrorAction Stop
 
-    if ($null -eq $accounts) {
-        return @()
-    }
+    $accountArray = ConvertTo-CleanArray -InputObject $accounts
 
-    return @($accounts)
+    return $accountArray
 }
 
 # ============================================
-# Get Platform Rotation Map
+# Build Platform Rotation Map
 # ============================================
 
 function Get-PlatformRotationMap {
+    param(
+        [Parameter(Mandatory)]
+        [array]$Accounts
+    )
+
     $map = @{}
 
-    Write-Log "Retrieving platform rotation settings using Get-PASPlatform..." 'Yellow'
+    $platformIds = @(
+        $Accounts |
+            ForEach-Object { Get-AccountPlatformId -Account $_ } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+            Sort-Object -Unique
+    )
+
+    Write-Log ("Unique platform IDs discovered from account inventory: {0}" -f $platformIds.Count) 'Gray'
+
+    if ($platformIds.Count -eq 0) {
+        return $map
+    }
+
+    $platformCmd = Get-Command Get-PASPlatform -ErrorAction SilentlyContinue
+
+    if (-not $platformCmd) {
+        Write-Log "WARNING: Get-PASPlatform command is unavailable. Expiration calculation will use DefaultExpirationDays only." 'Yellow'
+        return $map
+    }
+
+    # Fast preload of all platforms.
+    $allPlatformLookup = @{}
 
     try {
-        $platformCommand = Get-Command Get-PASPlatform -ErrorAction Stop
+        Write-Log "Preloading platform list using Get-PASPlatform..." 'Yellow'
+
         $platformParams = @{}
 
-        if ($platformCommand.Parameters.ContainsKey('Active')) {
+        if ($platformCmd.Parameters.ContainsKey('Active')) {
             $platformParams['Active'] = $true
         }
 
-        if ($platformCommand.Parameters.ContainsKey('PlatformType')) {
+        if ($platformCmd.Parameters.ContainsKey('PlatformType')) {
             $platformParams['PlatformType'] = 'Regular'
         }
 
@@ -632,59 +850,133 @@ function Get-PlatformRotationMap {
 
         $platformItems = @()
 
-        if ($null -eq $platformResponse) {
-            $platformItems = @()
-        } elseif ($platformResponse.PSObject.Properties.Name -contains 'Platforms') {
-            $platformItems = @($platformResponse.Platforms)
+        $wrappedPlatforms = Get-ObjectPropertyValue -InputObject $platformResponse -PropertyNames @(
+            'Platforms',
+            'platforms',
+            'Value',
+            'value'
+        )
+
+        if ($null -ne $wrappedPlatforms) {
+            $platformItems = ConvertTo-CleanArray -InputObject $wrappedPlatforms
         } else {
-            $platformItems = @($platformResponse)
+            $platformItems = ConvertTo-CleanArray -InputObject $platformResponse
         }
 
         foreach ($platform in $platformItems) {
-            $platformId = Get-NestedPropertyValue `
+            $pid = Get-NestedPropertyValue `
                 -InputObject $platform `
                 -ParentPropertyNames @('general', 'General') `
-                -ChildPropertyNames @('id', 'ID', 'platformId', 'PlatformId')
+                -ChildPropertyNames @('id', 'ID', 'platformId', 'PlatformId', 'PlatformID')
 
-            if ([string]::IsNullOrWhiteSpace([string]$platformId)) {
-                $platformId = Get-ObjectPropertyValue -InputObject $platform -PropertyNames @(
+            if ([string]::IsNullOrWhiteSpace([string]$pid)) {
+                $pid = Get-ObjectPropertyValue -InputObject $platform -PropertyNames @(
                     'id',
                     'ID',
                     'platformId',
                     'PlatformId',
-                    'PlatformID'
+                    'PlatformID',
+                    'PlatformName'
                 )
             }
 
-            $rotationDays = Get-NestedPropertyValue `
-                -InputObject $platform `
-                -ParentPropertyNames @('credentialsManagement', 'CredentialsManagement') `
-                -ChildPropertyNames @(
-                    'requirePasswordChangeEveryXDays',
-                    'RequirePasswordChangeEveryXDays'
-                )
-
-            $performPeriodicChange = Get-NestedPropertyValue `
-                -InputObject $platform `
-                -ParentPropertyNames @('credentialsManagement', 'CredentialsManagement') `
-                -ChildPropertyNames @(
-                    'performPeriodicChange',
-                    'PerformPeriodicChange'
-                )
-
-            if (-not [string]::IsNullOrWhiteSpace([string]$platformId)) {
-                $map[[string]$platformId] = [PSCustomObject]@{
-                    PlatformId            = [string]$platformId
-                    RotationDays          = $rotationDays
-                    PerformPeriodicChange = $performPeriodicChange
-                }
+            if (-not [string]::IsNullOrWhiteSpace([string]$pid)) {
+                $allPlatformLookup[[string]$pid] = $platform
             }
         }
 
-        Write-Log ("Platform rotation settings loaded for {0} platform(s)." -f $map.Count) 'Green'
+        Write-Log ("Preloaded {0} platform object(s)." -f $allPlatformLookup.Count) 'Green'
     } catch {
-        Write-Log ("WARNING: Could not retrieve platform settings. Expiration calculation will use DefaultExpirationDays={0}. {1}" -f $DefaultExpirationDays, $_.Exception.Message) 'Yellow'
+        Write-Log ("WARNING: Could not preload platforms. {0}" -f $_.Exception.Message) 'Yellow'
     }
+
+    $platformIndex = 0
+
+    foreach ($platformId in $platformIds) {
+        $platformIndex++
+
+        $platformObject = $null
+
+        if ($FetchPlatformDetails -and $platformCmd.Parameters.ContainsKey('PlatformID')) {
+            try {
+                Write-Log ("[{0}/{1}] Fetching platform details: {2}" -f $platformIndex, $platformIds.Count, $platformId) 'Gray'
+                $platformObject = Get-PASPlatform -PlatformID $platformId -ErrorAction Stop
+            } catch {
+                Write-Log ("WARNING: Could not fetch platform details for '{0}'. Falling back to preloaded platform object. {1}" -f $platformId, $_.Exception.Message) 'Yellow'
+            }
+        }
+
+        if ($null -eq $platformObject -and $allPlatformLookup.ContainsKey($platformId)) {
+            $platformObject = $allPlatformLookup[$platformId]
+        }
+
+        if ($null -eq $platformObject) {
+            $map[$platformId] = [PSCustomObject]@{
+                PlatformId            = $platformId
+                RotationDays          = $DefaultExpirationDays
+                PerformPeriodicChange = $null
+                Source                = 'DefaultFallback'
+            }
+
+            continue
+        }
+
+        if ($DebugObjectDump -and -not (Test-Path $DebugPlatformPath)) {
+            try {
+                $platformObject | ConvertTo-Json -Depth 20 | Out-File -FilePath $DebugPlatformPath -Encoding UTF8
+                Write-Log ("Debug platform object exported to: {0}" -f $DebugPlatformPath) 'Gray'
+            } catch {}
+        }
+
+        $rotationDays = Get-NestedPropertyValue `
+            -InputObject $platformObject `
+            -ParentPropertyNames @('credentialsManagement', 'CredentialsManagement') `
+            -ChildPropertyNames @(
+                'requirePasswordChangeEveryXDays',
+                'RequirePasswordChangeEveryXDays'
+            )
+
+        if ($null -eq $rotationDays) {
+            $rotationDays = Find-PropertyDeep `
+                -InputObject $platformObject `
+                -PropertyNames @(
+                    'requirePasswordChangeEveryXDays',
+                    'RequirePasswordChangeEveryXDays'
+                )
+        }
+
+        $performPeriodicChange = Get-NestedPropertyValue `
+            -InputObject $platformObject `
+            -ParentPropertyNames @('credentialsManagement', 'CredentialsManagement') `
+            -ChildPropertyNames @(
+                'performPeriodicChange',
+                'PerformPeriodicChange'
+            )
+
+        if ($null -eq $performPeriodicChange) {
+            $performPeriodicChange = Find-PropertyDeep `
+                -InputObject $platformObject `
+                -PropertyNames @(
+                    'performPeriodicChange',
+                    'PerformPeriodicChange'
+                )
+        }
+
+        if ($null -eq $rotationDays -or [string]::IsNullOrWhiteSpace([string]$rotationDays)) {
+            if ($DefaultExpirationDays -gt 0) {
+                $rotationDays = $DefaultExpirationDays
+            }
+        }
+
+        $map[$platformId] = [PSCustomObject]@{
+            PlatformId            = $platformId
+            RotationDays          = $rotationDays
+            PerformPeriodicChange = $performPeriodicChange
+            Source                = if ($FetchPlatformDetails) { 'PlatformDetailsOrPreload' } else { 'PlatformPreload' }
+        }
+    }
+
+    Write-Log ("Platform rotation map built for {0} platform(s)." -f $map.Count) 'Green'
 
     return $map
 }
@@ -695,19 +987,19 @@ function Get-PlatformRotationMap {
 
 Write-Log "============================================================" 'Gray'
 Write-Log "CNA Safe Member + Account Compliance Report started." 'Cyan'
-Write-Log ("Identity Tenant URL                    : {0}" -f $IdentityTenantURL) 'Gray'
-Write-Log ("Privilege Cloud URL                    : {0}" -f $PrivilegeCloudURL) 'Gray'
-Write-Log ("PCloud Subdomain                       : {0}" -f $PCloudSubdomain) 'Gray'
-Write-Log ("CCP Address                            : {0}" -f $CCPAddress) 'Gray'
-Write-Log ("CCP AppID                              : {0}" -f $CCPAppID) 'Gray'
-Write-Log ("CCP Safe                               : {0}" -f $CCPSafe) 'Gray'
-Write-Log ("CCP Object                             : {0}" -f $CCPObject) 'Gray'
-Write-Log ("SafeNameFilter                         : {0}" -f $SafeNameFilter) 'Gray'
-Write-Log ("ProcessOnlySafesWithAccounts           : {0}" -f $ProcessOnlySafesWithAccounts) 'Gray'
-Write-Log ("IncludeSafesWithNoAccounts             : {0}" -f $IncludeSafesWithNoAccounts) 'Gray'
-Write-Log ("DefaultExpirationDays                  : {0}" -f $DefaultExpirationDays) 'Gray'
-Write-Log ("CalculateWhenPeriodicChangeDisabled    : {0}" -f $CalculateExpirationWhenPeriodicChangeDisabled) 'Gray'
-Write-Log ("CSV Report                             : {0}" -f $CsvFilePath) 'Gray'
+Write-Log ("Identity Tenant URL                 : {0}" -f $IdentityTenantURL) 'Gray'
+Write-Log ("Privilege Cloud URL                 : {0}" -f $PrivilegeCloudURL) 'Gray'
+Write-Log ("PCloud Subdomain                    : {0}" -f $PCloudSubdomain) 'Gray'
+Write-Log ("CCP Address                         : {0}" -f $CCPAddress) 'Gray'
+Write-Log ("CCP AppID                           : {0}" -f $CCPAppID) 'Gray'
+Write-Log ("CCP Safe                            : {0}" -f $CCPSafe) 'Gray'
+Write-Log ("CCP Object                          : {0}" -f $CCPObject) 'Gray'
+Write-Log ("SafeNameFilter                      : {0}" -f $SafeNameFilter) 'Gray'
+Write-Log ("IncludeSafesWithNoAccounts          : {0}" -f $IncludeSafesWithNoAccounts) 'Gray'
+Write-Log ("DefaultExpirationDays               : {0}" -f $DefaultExpirationDays) 'Gray'
+Write-Log ("CalculateWhenPeriodicChangeDisabled : {0}" -f $CalculateWhenPeriodicChangeDisabled) 'Gray'
+Write-Log ("FetchPlatformDetails                : {0}" -f $FetchPlatformDetails) 'Gray'
+Write-Log ("CSV Report                          : {0}" -f $CsvFilePath) 'Gray'
 Write-Log "============================================================" 'Gray'
 
 # ============================================
@@ -722,18 +1014,24 @@ try {
 }
 
 # ============================================
-# Retrieve accounts first
-# This is faster than querying Get-PASAccount once per safe.
+# Retrieve Account Inventory
 # ============================================
 
 try {
     $Accounts = Get-AllVisiblePASAccounts
 
+    if ($DebugObjectDump -and $Accounts.Count -gt 0) {
+        try {
+            $Accounts[0] | ConvertTo-Json -Depth 20 | Out-File -FilePath $DebugAccountPath -Encoding UTF8
+            Write-Log ("Debug first account object exported to: {0}" -f $DebugAccountPath) 'Gray'
+        } catch {}
+    }
+
     if (-not [string]::IsNullOrWhiteSpace($SafeNameFilter)) {
         $Accounts = @(
             $Accounts | Where-Object {
-                $acctSafe = Get-ResolvedSafeName -InputObject $_
-                $acctSafe -like $SafeNameFilter
+                $safeName = Get-AccountSafeName -Account $_
+                $safeName -like $SafeNameFilter
             }
         )
     }
@@ -745,111 +1043,161 @@ try {
 }
 
 # ============================================
-# Group accounts by Safe
+# Normalize Account Inventory
 # ============================================
 
-$AccountsBySafe = @{}
+$AccountRows = @(
+    foreach ($acct in $Accounts) {
+        $safeName = Get-AccountSafeName -Account $acct
 
-foreach ($account in $Accounts) {
-    $safeName = Get-ResolvedSafeName -InputObject $account
+        if ([string]::IsNullOrWhiteSpace($safeName)) {
+            continue
+        }
 
-    if ([string]::IsNullOrWhiteSpace([string]$safeName)) {
-        continue
+        [PSCustomObject]@{
+            SafeNameKey = $safeName
+            Account     = $acct
+        }
     }
+)
 
-    $safeKey = [string]$safeName
+$AccountGroups = @($AccountRows | Group-Object -Property SafeNameKey | Sort-Object Name)
 
-    if (-not $AccountsBySafe.ContainsKey($safeKey)) {
-        $AccountsBySafe[$safeKey] = New-Object System.Collections.Generic.List[object]
+Write-Log ("Accounts grouped across {0} safe(s)." -f $AccountGroups.Count) 'Green'
+
+# ============================================
+# Optional: Include safes with no accounts
+# Usually not needed for this account-driven report.
+# ============================================
+
+if ($IncludeSafesWithNoAccounts) {
+    try {
+        Write-Log "IncludeSafesWithNoAccounts=True. Retrieving full safe list..." 'Yellow'
+
+        $allSafes = Get-PASSafe -ErrorAction Stop
+        $allSafes = ConvertTo-CleanArray -InputObject $allSafes
+
+        $knownSafeNames = @($AccountGroups | ForEach-Object { $_.Name })
+
+        foreach ($safe in $allSafes) {
+            $safeName = Get-ObjectPropertyValue -InputObject $safe -PropertyNames @(
+                'safeName',
+                'SafeName',
+                'Safe',
+                'Name',
+                'name'
+            )
+
+            if ([string]::IsNullOrWhiteSpace([string]$safeName)) {
+                continue
+            }
+
+            $safeName = ([string]$safeName).Trim()
+
+            if (-not [string]::IsNullOrWhiteSpace($SafeNameFilter) -and $safeName -notlike $SafeNameFilter) {
+                continue
+            }
+
+            if ($knownSafeNames -notcontains $safeName) {
+                $AccountGroups += [PSCustomObject]@{
+                    Name  = $safeName
+                    Count = 0
+                    Group = @()
+                }
+            }
+        }
+
+        $AccountGroups = @($AccountGroups | Sort-Object Name)
+        Write-Log ("Final safe group count including no-account safes: {0}" -f $AccountGroups.Count) 'Green'
+    } catch {
+        Write-Log ("WARNING: Could not retrieve full safe list. Continuing with account safes only. {0}" -f $_.Exception.Message) 'Yellow'
     }
-
-    $AccountsBySafe[$safeKey].Add($account)
 }
 
-Write-Log ("Accounts grouped across {0} safe(s)." -f $AccountsBySafe.Keys.Count) 'Green'
-
 # ============================================
-# Retrieve Safes
+# Build Platform Rotation Map
 # ============================================
-
-Write-Log "Retrieving safe list..." 'Yellow'
 
 try {
-    $Safes = Get-PASSafe -ErrorAction Stop
-
-    if ($null -eq $Safes) {
-        $Safes = @()
-    } else {
-        $Safes = @($Safes)
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($SafeNameFilter)) {
-        $Safes = @(
-            $Safes | Where-Object {
-                $safeName = Get-ResolvedSafeName -InputObject $_
-                $safeName -like $SafeNameFilter
-            }
-        )
-    }
-
-    if ($ProcessOnlySafesWithAccounts) {
-        $Safes = @(
-            $Safes | Where-Object {
-                $safeName = Get-ResolvedSafeName -InputObject $_
-                $AccountsBySafe.ContainsKey([string]$safeName)
-            }
-        )
-    }
-
-    Write-Log ("Retrieved {0} safe(s) to process." -f $Safes.Count) 'Green'
+    $PlatformRotationMap = Get-PlatformRotationMap -Accounts $Accounts
 } catch {
-    Write-Log ("FATAL: Failed to retrieve safes. {0}" -f $_.Exception.Message) 'Red'
-    exit 1
+    Write-Log ("WARNING: Failed to build platform rotation map. Expiration calculation will use fallback only. {0}" -f $_.Exception.Message) 'Yellow'
+    $PlatformRotationMap = @{}
 }
 
 # ============================================
-# Retrieve platform rotation map
+# Build Final Report
 # ============================================
 
-$PlatformRotationMap = Get-PlatformRotationMap
+$ReportRows = New-Object System.Collections.ArrayList
 
-# ============================================
-# Build Report
-# ============================================
-
-$ReportRows = New-Object System.Collections.Generic.List[object]
-
-$totalSafes      = $Safes.Count
+$totalSafes      = $AccountGroups.Count
 $currentSafe     = 0
 $successfulSafes = 0
 $failedSafes     = 0
 $totalRows       = 0
 
-foreach ($Safe in $Safes) {
+foreach ($group in $AccountGroups) {
     $currentSafe++
 
-    $SafeName = Get-ResolvedSafeName -InputObject $Safe
+    $SafeName = ([string]$group.Name).Trim()
 
-    if ([string]::IsNullOrWhiteSpace([string]$SafeName)) {
-        Write-Log ("[{0}/{1}] WARNING: Could not resolve safe name. Skipping." -f $currentSafe, $totalSafes) 'Yellow'
+    if ([string]::IsNullOrWhiteSpace($SafeName)) {
+        Write-Log ("[{0}/{1}] WARNING: Blank safe group name. Skipping." -f $currentSafe, $totalSafes) 'Yellow'
         continue
     }
-
-    $SafeName = [string]$SafeName
 
     Write-Log ("[{0}/{1}] Processing safe: {2}" -f $currentSafe, $totalSafes, $SafeName) 'Cyan'
 
     try {
         # -----------------------------
-        # Retrieve safe members
+        # Accounts for this safe
+        # -----------------------------
+        $SafeAccounts = @(
+            $group.Group |
+                ForEach-Object {
+                    if ($_.PSObject.Properties.Name -contains 'Account') {
+                        $_.Account
+                    }
+                }
+        )
+
+        if ($null -eq $SafeAccounts) {
+            $SafeAccounts = @()
+        }
+
+        Write-Log ("Safe '{0}' account count: {1}" -f $SafeName, $SafeAccounts.Count) 'Gray'
+
+        if ($SafeAccounts.Count -eq 0 -and -not $IncludeSafesWithNoAccounts) {
+            Write-Log ("Safe '{0}' has no accounts. Skipping." -f $SafeName) 'Yellow'
+            $successfulSafes++
+            continue
+        }
+
+        if ($SafeAccounts.Count -eq 0 -and $IncludeSafesWithNoAccounts) {
+            $SafeAccounts = @(
+                [PSCustomObject]@{
+                    safeName = $SafeName
+                    userName = ''
+                    address = ''
+                    platformId = ''
+                    secretManagement = $null
+                }
+            )
+        }
+
+        # -----------------------------
+        # Retrieve Safe Members
         # -----------------------------
         try {
-            $SafeMembers = Get-PASSafeMember -SafeName $SafeName -ErrorAction Stop
+            $rawMembers = Get-PASSafeMember -SafeName $SafeName -ErrorAction Stop
+            $SafeMembers = ConvertTo-SafeMemberArray -RawMembers $rawMembers
 
-            if ($null -eq $SafeMembers) {
-                $SafeMembers = @()
-            } else {
-                $SafeMembers = @($SafeMembers)
+            if ($DebugObjectDump -and $SafeMembers.Count -gt 0 -and -not (Test-Path $DebugMemberPath)) {
+                try {
+                    $SafeMembers[0] | ConvertTo-Json -Depth 20 | Out-File -FilePath $DebugMemberPath -Encoding UTF8
+                    Write-Log ("Debug first safe member object exported to: {0}" -f $DebugMemberPath) 'Gray'
+                } catch {}
             }
 
             Write-Log ("Safe '{0}' member count: {1}" -f $SafeName, $SafeMembers.Count) 'Gray'
@@ -858,39 +1206,11 @@ foreach ($Safe in $Safes) {
             $SafeMembers = @()
         }
 
-        # -----------------------------
-        # Get accounts from grouped cache
-        # -----------------------------
-        if ($AccountsBySafe.ContainsKey($SafeName)) {
-            $SafeAccounts = @($AccountsBySafe[$SafeName])
-        } else {
-            $SafeAccounts = @()
-        }
-
-        Write-Log ("Safe '{0}' account count: {1}" -f $SafeName, $SafeAccounts.Count) 'Gray'
-
-        if ($SafeAccounts.Count -eq 0 -and -not $IncludeSafesWithNoAccounts) {
-            Write-Log ("Safe '{0}' has no accounts. Skipping rows." -f $SafeName) 'Yellow'
-            $successfulSafes++
-            continue
-        }
-
         if ($SafeMembers.Count -eq 0) {
             $SafeMembers = @(
                 [PSCustomObject]@{
                     memberName = ''
                     memberType = ''
-                }
-            )
-        }
-
-        if ($SafeAccounts.Count -eq 0 -and $IncludeSafesWithNoAccounts) {
-            $SafeAccounts = @(
-                [PSCustomObject]@{
-                    safeName   = $SafeName
-                    userName   = ''
-                    address    = ''
-                    platformId = ''
                 }
             )
         }
@@ -916,91 +1236,79 @@ foreach ($Safe in $Safes) {
             )
 
             foreach ($Account in $SafeAccounts) {
-                $targetUsername = Get-ObjectPropertyValue -InputObject $Account -PropertyNames @(
-                    'userName',
-                    'UserName',
-                    'username',
-                    'Username'
-                )
+                try {
+                    $targetUsername = Get-AccountTargetUsername -Account $Account
+                    $address        = Get-AccountAddress -Account $Account
+                    $accountSafe    = Get-AccountSafeName -Account $Account
+                    $platformId     = Get-AccountPlatformId -Account $Account
 
-                $address = Get-ObjectPropertyValue -InputObject $Account -PropertyNames @(
-                    'address',
-                    'Address'
-                )
+                    if ([string]::IsNullOrWhiteSpace($accountSafe)) {
+                        $accountSafe = $SafeName
+                    }
 
-                $accountSafe = Get-ResolvedSafeName -InputObject $Account
+                    $complianceStatus = Get-AccountComplianceStatus -Account $Account
+                    $lastModifiedDate = Get-AccountLastModifiedDate -Account $Account
+                    $explicitExpirationDate = Get-AccountExplicitExpirationDate -Account $Account
 
-                if ([string]::IsNullOrWhiteSpace([string]$accountSafe)) {
-                    $accountSafe = $SafeName
-                }
+                    $rotationDays = $null
+                    $performPeriodicChange = $null
 
-                $platformIdentity = Get-ObjectPropertyValue -InputObject $Account -PropertyNames @(
-                    'platformId',
-                    'PlatformID',
-                    'PlatformId',
-                    'platformID'
-                )
+                    if (-not [string]::IsNullOrWhiteSpace($platformId) -and $PlatformRotationMap.ContainsKey($platformId)) {
+                        $rotationDays = $PlatformRotationMap[$platformId].RotationDays
+                        $performPeriodicChange = $PlatformRotationMap[$platformId].PerformPeriodicChange
+                    }
 
-                $complianceStatus = Get-AccountComplianceStatus -Account $Account
-                $lastModifiedDate = Get-AccountLastModifiedDate -Account $Account
-                $explicitExpirationDate = Get-AccountExplicitExpirationDate -Account $Account
-
-                $rotationDays = $null
-                $performPeriodicChange = $null
-
-                if (-not [string]::IsNullOrWhiteSpace([string]$platformIdentity) -and $PlatformRotationMap.ContainsKey([string]$platformIdentity)) {
-                    $rotationDays = $PlatformRotationMap[[string]$platformIdentity].RotationDays
-                    $performPeriodicChange = $PlatformRotationMap[[string]$platformIdentity].PerformPeriodicChange
-                }
-
-                if ($null -eq $rotationDays -or [string]::IsNullOrWhiteSpace([string]$rotationDays)) {
-                    if ($DefaultExpirationDays -gt 0) {
+                    if (($null -eq $rotationDays -or [string]::IsNullOrWhiteSpace([string]$rotationDays)) -and $DefaultExpirationDays -gt 0) {
                         $rotationDays = $DefaultExpirationDays
                     }
-                }
 
-                $shouldCalculateExpiration = $true
+                    $shouldCalculateExpiration = $true
 
-                if ($null -ne $performPeriodicChange) {
-                    if (([string]$performPeriodicChange).Trim() -ieq 'False' -and -not $CalculateExpirationWhenPeriodicChangeDisabled) {
-                        $shouldCalculateExpiration = $false
+                    if ($null -ne $performPeriodicChange) {
+                        $periodicString = ([string]$performPeriodicChange).Trim()
+
+                        if (($periodicString -ieq 'False' -or $periodicString -ieq 'No') -and -not $CalculateWhenPeriodicChangeDisabled) {
+                            $shouldCalculateExpiration = $false
+                        }
                     }
+
+                    if ($shouldCalculateExpiration) {
+                        $expirationDueDays = Get-ExpirationDueDays `
+                            -ExplicitExpirationDate $explicitExpirationDate `
+                            -LastModifiedDate $lastModifiedDate `
+                            -RotationPeriodDays $rotationDays
+                    } else {
+                        $expirationDueDays = ''
+                    }
+
+                    $lastModifiedOutput = ''
+
+                    if ($null -ne $lastModifiedDate) {
+                        $lastModifiedOutput = $lastModifiedDate.ToString('yyyy-MM-dd HH:mm:ss')
+                    }
+
+                    [void]$ReportRows.Add([PSCustomObject]@{
+                        'Safe'                  = $SafeName
+                        'Member'                = if ($null -eq $memberName) { '' } else { [string]$memberName }
+                        'MemberType'            = if ($null -eq $memberType) { '' } else { [string]$memberType }
+                        'Target Username'       = $targetUsername
+                        'Address'               = $address
+                        'Account Safe'          = $accountSafe
+                        'Platform Identity'     = $platformId
+                        'Compliance Status'     = $complianceStatus
+                        'Expiration Due (Days)' = $expirationDueDays
+                        'Last Modified Date'    = $lastModifiedOutput
+                    })
+
+                    $totalRows++
+                } catch {
+                    Write-Log ("WARNING: Failed to build row for safe '{0}', member '{1}'. {2}" -f $SafeName, $memberName, $_.Exception.Message) 'Yellow'
                 }
-
-                if ($shouldCalculateExpiration) {
-                    $expirationDueDays = Get-ExpirationDueDays `
-                        -ExplicitExpirationDate $explicitExpirationDate `
-                        -LastModifiedDate $lastModifiedDate `
-                        -RotationPeriodDays $rotationDays
-                } else {
-                    $expirationDueDays = ''
-                }
-
-                $lastModifiedOutput = ''
-
-                if ($null -ne $lastModifiedDate) {
-                    $lastModifiedOutput = $lastModifiedDate.ToString('yyyy-MM-dd HH:mm:ss')
-                }
-
-                $ReportRows.Add([PSCustomObject]@{
-                    'Safe'                  = $SafeName
-                    'Member'                = $memberName
-                    'MemberType'            = $memberType
-                    'Target Username'       = $targetUsername
-                    'Address'               = $address
-                    'Account Safe'          = $accountSafe
-                    'Platform Identity'     = $platformIdentity
-                    'Compliance Status'     = $complianceStatus
-                    'Expiration Due (Days)' = $expirationDueDays
-                    'Last Modified Date'    = $lastModifiedOutput
-                })
-
-                $totalRows++
             }
         }
 
         $successfulSafes++
-        Write-Log ("Completed safe '{0}'." -f $SafeName) 'Green'
+        Write-Log ("Completed safe '{0}'. Rows so far: {1}" -f $SafeName, $totalRows) 'Green'
     } catch {
         $failedSafes++
         Write-Log ("ERROR: Failed while processing safe '{0}'. {1}" -f $SafeName, $_.Exception.Message) 'Red'
@@ -1043,7 +1351,7 @@ Write-Log "============================================================" 'Gray'
 Write-Log "Safe Member + Account Compliance Report completed." 'Green'
 Write-Log ("Authenticated User : {0}" -f $AuthenticatedUser) 'Gray'
 Write-Log ("Accounts Retrieved : {0}" -f $Accounts.Count) 'Gray'
-Write-Log ("Safes Processed    : {0}" -f $totalSafes) 'Gray'
+Write-Log ("Safe Groups        : {0}" -f $totalSafes) 'Gray'
 Write-Log ("Successful Safes   : {0}" -f $successfulSafes) 'Green'
 Write-Log ("Failed Safes       : {0}" -f $failedSafes) 'Red'
 Write-Log ("Rows Exported      : {0}" -f $totalRows) 'Gray'
