@@ -1,23 +1,3 @@
-PS E:\Installation Media\Script\OnboardScript> .\Autoonboardingscript.ps1
-2026-05-12 07:10:13 - psPAS loaded (6.4.85).
-2026-05-12 07:10:13 - IdentityCommand loaded (0.2.58).
-2026-05-12 07:10:14 - ActiveDirectory module loaded.
-2026-05-12 07:10:14 - Configured AD group search base: OU=Groups_PROD,OU=Application Services,OU=admin-support,DC=cna,DC=com
-2026-05-12 07:10:14 - Configured AD group search base: OU=Groups,OU=CyberArk,DC=cna,DC=com
-2026-05-12 07:10:14 - Retrieving CyberArk API credentials from CCP using Object='cna-prod.cyberark.cloud-cnarestbot'...
-2026-05-12 07:10:14 - CCP URL: https://vskau1p1231.cna.com/AIMWebService/api/Accounts?AppID=PAMDiscovery&Safe=CA_PCloud_Admins&Object=cna-prod.cyberark.cloud-cnarestbot
-2026-05-12 07:10:14 - ✅ Successfully retrieved credentials for user: cnarestbot@cyberark.cloud.6679
-2026-05-12 07:10:14 - Requesting CyberArk PAS authentication using psPAS Identity header as cnarestbot@cyberark.cloud.6679...
-2026-05-12 07:10:14 - IdentityTenantURL passed to Get-IdentityHeader: aat4012.id.cyberark.cloud
-Challenge 1:
-UP - Enter Password
-Responding with stored credentials
-Error during logon : Authentication (login or challenge) has failed. Please try again or contact your system administrator.
-2026-05-12 07:10:15 - ❌ Failed to authenticate via psPAS Identity header: Cannot bind argument to parameter 'Session' because it is null.
-2026-05-12 07:10:15 - ❌ Authentication failed. Exiting script.
-
-
-
 <#
 Autoonboardingscript_UPDATED.ps1
 
@@ -26,7 +6,9 @@ CNA SAFE AUTO-ONBOARDING
 Purpose:
 - Authenticates to CCP using Object:
     cna-prod.cyberark.cloud-cnarestbot
-- Authenticates to Privilege Cloud using the working CCP + psPAS Identity header pattern
+- Authenticates to Privilege Cloud using CCP credential and psPAS Service User login first
+- Falls back to TenantSubdomain ServiceUser login
+- Falls back to Get-IdentityHeader only if ServiceUser login fails
 - Creates Safe
 - Adds required members
 - Looks up the Safe owner AD group from CNA AD OUs before adding it to the Safe
@@ -40,7 +22,7 @@ Fallback AD group lookup OU:
     OU=Groups,OU=CyberArk,DC=cna,DC=com
 
 Notes:
-- Does NOT add cnarestbot@cyberark.cloud.6679
+- Does NOT add cnarestbot@cyberark.cloud.6679 as a Safe member
 - Does NOT remove CA_PAMDiscovery_SVC@cna.com
 #>
 
@@ -157,17 +139,19 @@ function Show-Box {
 # -----------------------------
 # Helpers
 # -----------------------------
-function Get-NormalizedIdentityTenant {
+function Get-FullHttpsUrl {
     param(
         [Parameter(Mandatory)]
-        [string]$TenantUrl
+        [string]$Url
     )
 
-    $value = $TenantUrl.Trim()
-    $value = $value -replace '^https?://', ''
-    $value = $value.TrimEnd('/')
+    $value = $Url.Trim()
 
-    return $value
+    if ($value -notmatch '^https?://') {
+        $value = "https://$value"
+    }
+
+    return $value.TrimEnd('/')
 }
 
 function ConvertTo-LdapEscapedValue {
@@ -184,6 +168,28 @@ function ConvertTo-LdapEscapedValue {
     $escaped = $escaped -replace ([string][char]0), '\00'
 
     return $escaped
+}
+
+function Test-PASSessionReady {
+    try {
+        $session = Get-PASSession -ErrorAction Stop
+
+        if ($null -eq $session) {
+            return $false
+        }
+
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Clear-ExistingPASSession {
+    try {
+        if (Test-PASSessionReady) {
+            Close-PASSession | Out-Null
+        }
+    } catch {}
 }
 
 # -----------------------------
@@ -203,14 +209,11 @@ try {
     $idMod = Get-Module IdentityCommand
     if ($idMod) {
         Write-Log ("IdentityCommand loaded ({0})." -f $idMod.Version) 'Green'
+    } else {
+        Write-Log "⚠️ IdentityCommand module did not show as loaded. psPAS Shared Services auth may still attempt to import it." 'Yellow'
     }
 } catch {
-    Write-Log "⚠️ IdentityCommand module could not be imported. Continuing in case Get-IdentityHeader is already available." 'Yellow'
-}
-
-if (-not (Get-Command Get-IdentityHeader -ErrorAction SilentlyContinue)) {
-    Write-Log "❌ Get-IdentityHeader command is not available. Confirm IdentityCommand module is installed and accessible." 'Red'
-    exit 1
+    Write-Log "⚠️ IdentityCommand module could not be imported. psPAS ServiceUser authentication may fail if the module is required." 'Yellow'
 }
 
 # -----------------------------
@@ -284,8 +287,7 @@ $FullPermPAS = [PSCustomObject]@{
 }
 
 # -----------------------------
-# Login Method: CCP + psPAS Identity Header
-# This section was updated based on the working login method provided.
+# Login Method: CCP + psPAS ServiceUser primary
 # -----------------------------
 function Start-PASSessionFromCCP {
     param(
@@ -311,7 +313,7 @@ function Start-PASSessionFromCCP {
             -ErrorAction Stop
 
         if (-not $resp -or -not $resp.Content) {
-            throw 'Empty CCP response'
+            throw 'Empty CCP response or missing Content/password field.'
         }
     } catch {
         Write-Log ("❌ ERROR: CCP credential fetch failed - {0}" -f $_.Exception.Message) 'Red'
@@ -330,35 +332,115 @@ function Start-PASSessionFromCCP {
         throw 'CCP returned password but no Username/UserName field.'
     }
 
+    $resolvedUser = $resolvedUser.Trim()
+
     Write-Log ("✅ Successfully retrieved credentials for user: {0}" -f $resolvedUser) 'Green'
 
+    $idUrl = Get-FullHttpsUrl -Url $IdentityTenantURL
+    $pcUrl = Get-FullHttpsUrl -Url $PrivilegeCloudURL
+
+    $securePass = ConvertTo-SecureString $resp.Content -AsPlainText -Force
+    $credential = [PSCredential]::new($resolvedUser, $securePass)
+
+    Clear-ExistingPASSession
+
+    # -------------------------------------------------------
+    # Method 1: Full URL ServiceUser login
+    # -------------------------------------------------------
     try {
-        $normalizedTenant = Get-NormalizedIdentityTenant -TenantUrl $IdentityTenantURL
-        $securePass = ConvertTo-SecureString $resp.Content -AsPlainText -Force
-        $credential = [PSCredential]::new($resolvedUser, $securePass)
+        Write-Log ("Attempting Privilege Cloud login using New-PASSession -ServiceUser with full URLs as {0}..." -f $resolvedUser)
+        Write-Log ("IdentityTenantURL: {0}" -f $idUrl) 'Gray'
+        Write-Log ("PrivilegeCloudURL: {0}" -f $pcUrl) 'Gray'
 
-        Write-Log ("Requesting CyberArk PAS authentication using psPAS Identity header as {0}..." -f $resolvedUser)
-        Write-Log ("IdentityTenantURL passed to Get-IdentityHeader: {0}" -f $normalizedTenant) 'Gray'
+        New-PASSession `
+            -IdentityTenantURL $idUrl `
+            -PrivilegeCloudURL $pcUrl `
+            -Credential $credential `
+            -ServiceUser `
+            -ErrorAction Stop | Out-Null
 
-        $header = Get-IdentityHeader `
-            -IdentityTenantURL $normalizedTenant `
-            -psPASFormat `
-            -PCloudSubdomain $PCloudSubdomain `
-            -UPCreds $credential
-
-        Use-PASSession $header | Out-Null
-
-        if (-not (Get-PASSession)) {
-            throw 'psPAS session not established'
+        if (-not (Test-PASSessionReady)) {
+            throw 'New-PASSession completed but no PAS session was established.'
         }
 
-        Write-Log ("✅ Authentication successful, PAS session established ({0})." -f $resolvedUser) 'Green'
+        Write-Log ("✅ Privilege Cloud authentication successful via ServiceUser full URL method ({0})." -f $resolvedUser) 'Green'
+        return $resp
     } catch {
-        Write-Log ("❌ Failed to authenticate via psPAS Identity header: {0}" -f $_.Exception.Message) 'Red'
-        throw
+        Write-Log ("⚠️ ServiceUser full URL login failed: {0}" -f $_.Exception.Message) 'Yellow'
+        Clear-ExistingPASSession
     }
 
-    return $resp
+    # -------------------------------------------------------
+    # Method 2: TenantSubdomain ServiceUser login
+    # -------------------------------------------------------
+    try {
+        Write-Log ("Attempting Privilege Cloud login using New-PASSession -TenantSubdomain -ServiceUser as {0}..." -f $resolvedUser)
+        Write-Log ("TenantSubdomain: {0}" -f $PCloudSubdomain) 'Gray'
+
+        New-PASSession `
+            -TenantSubdomain $PCloudSubdomain `
+            -Credential $credential `
+            -ServiceUser `
+            -ErrorAction Stop | Out-Null
+
+        if (-not (Test-PASSessionReady)) {
+            throw 'New-PASSession completed but no PAS session was established.'
+        }
+
+        Write-Log ("✅ Privilege Cloud authentication successful via TenantSubdomain ServiceUser method ({0})." -f $resolvedUser) 'Green'
+        return $resp
+    } catch {
+        Write-Log ("⚠️ TenantSubdomain ServiceUser login failed: {0}" -f $_.Exception.Message) 'Yellow'
+        Clear-ExistingPASSession
+    }
+
+    # -------------------------------------------------------
+    # Method 3: Legacy Identity header fallback
+    # -------------------------------------------------------
+    if (Get-Command Get-IdentityHeader -ErrorAction SilentlyContinue) {
+        try {
+            Write-Log ("Attempting fallback login using Get-IdentityHeader as {0}..." -f $resolvedUser)
+            Write-Log ("IdentityTenantURL passed to Get-IdentityHeader: {0}" -f $idUrl) 'Gray'
+            Write-Log ("PCloudSubdomain passed to Get-IdentityHeader: {0}" -f $PCloudSubdomain) 'Gray'
+
+            $header = Get-IdentityHeader `
+                -IdentityTenantURL $idUrl `
+                -psPASFormat `
+                -PCloudSubdomain $PCloudSubdomain `
+                -UPCreds $credential `
+                -ErrorAction Stop
+
+            if ($null -eq $header) {
+                throw 'Get-IdentityHeader returned NULL. Authentication challenge likely failed or credential is not valid for this flow.'
+            }
+
+            Use-PASSession -Session $header -ErrorAction Stop | Out-Null
+
+            if (-not (Test-PASSessionReady)) {
+                throw 'Use-PASSession completed but no PAS session was established.'
+            }
+
+            Write-Log ("✅ Privilege Cloud authentication successful via fallback Identity header method ({0})." -f $resolvedUser) 'Green'
+            return $resp
+        } catch {
+            Write-Log ("❌ Fallback Identity header login failed: {0}" -f $_.Exception.Message) 'Red'
+            Clear-ExistingPASSession
+        }
+    } else {
+        Write-Log "⚠️ Get-IdentityHeader is not available, skipping fallback Identity header login." 'Yellow'
+    }
+
+    throw @"
+Authentication failed after all methods.
+
+Most likely causes:
+1. The CCP Object '$ObjectName' password/content is stale or wrong.
+2. The Identity service user '$resolvedUser' is disabled, locked, expired, or not allowed for API login.
+3. The service user does not have the required Privilege Cloud access.
+4. IdentityCommand/psPAS version mismatch on this server.
+
+Validate the credential in CyberArk Identity and confirm the password currently stored in CCP matches the active service-user secret.
+"@
 }
 
 # -----------------------------
@@ -529,7 +611,7 @@ $response = $null
 try {
     $response = Start-PASSessionFromCCP -ObjectName $CCPObject
 } catch {
-    Write-Log '❌ Authentication failed. Exiting script.' 'Red'
+    Write-Log ("❌ Authentication failed. Exiting script. Details: {0}" -f $_.Exception.Message) 'Red'
     exit 1
 }
 
