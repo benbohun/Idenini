@@ -1,56 +1,55 @@
-Based on the scrip below, i need a script to
-1. Lookup the list of samaccount name in a CSV provided
-2. check if safe account exist in CYberArk with IND_samacountname_employeeID e.g. IND_aalbores_903680
-3. If no create safe and vault account
-4. if safe exist, validate platform, if addess is gdeacu.com on the csv, move platform to WIN_P_DM_EXT_ADM_OTP_CICO_30D
-5. if address is extacu.local on the csv,edit platform to WIN_P_DM_EXT_ADM_OTP_CICO_30D
-6. Then run password change upon modification of platform or vaulting
+Samaccountname,employeeID,Address
+aalbores,903680,extacu.local
+jdoe,903681,gdeacu.com
+
 
 
 
 
 <#
-DisabledAD_Create_IND_Safe_And_Onboard_WIN_Removed.ps1
+Create_Update_IND_Safe_And_Reconcile_By_Address.ps1
 
 PURPOSE
 - Log in to Alliant Privilege Cloud using CCP -> Identity Shared Services -> ServiceUser.
-- Read disabled AD account rows from CSV.
-- Validate whether the target IND_ safe exists.
-- If the safe does not exist, create it from CSV values.
-- Add/ensure standard safe members:
-    - IAM_ACU_CA_Admins with full classic permissions.
-    - Owner email from CSV with limited permissions.
-- Vault/onboard the disabled account into the respective safe.
-- Platform is always WIN_Removed.
-- No ACU/GDE/EXT prompt.
-- No reconcile, no verify, no CPM action, no password change.
+- Read rows from CSV.
+- Resolve IND safe name using:
+    IND_<Samaccountname>_<employeeID>
+- Check if Safe exists.
+- If Safe does not exist:
+    - Create Safe.
+    - Add standard Safe members.
+    - Vault/onboard account.
+    - Run password reconcile after onboarding.
+- If Safe exists:
+    - Validate whether account exists in the Safe.
+    - If account does not exist, vault/onboard account and run reconcile.
+    - If account exists and Address is extacu.local:
+        - Enforce platform WIN_P_DM_EXT_ADM_OTP_CICO_30D.
+        - Run reconcile only if platform was changed.
+    - If account exists and Address is gdeacu.com:
+        - Enforce platform WIN_P_DM_GDE_ADM_OTP_CICO_30D.
+        - Run reconcile only if platform was changed.
+- Default fallback platform remains WIN_Removed for other domains unless changed in parameters.
 
-CSV SUPPORTED COLUMNS
-Required for IND safe naming:
-- Samaccountname
-- employeeID
-- email
+CSV TEMPLATE
 
-Required/recommended for account onboarding:
-- UserName   -> actual disabled account to vault, e.g. A_jdoe, jdoe
-- Address    -> alliantcreditunion.com, gdeacu.com, extacu.local
+Samaccountname,employeeID,email,Address,UserName,InitialPassword
+aalbores,903680,aalbores@alliantcreditunion.com,extacu.local,aalbores,
+jdoe,903681,jdoe@alliantcreditunion.com,gdeacu.com,jdoe,
+asmith,903682,asmith@alliantcreditunion.com,alliantcreditunion.com,A_asmith,
 
-Optional:
-- SafeName   -> if provided, this overrides IND_<Samaccountname>_<employeeID>
-- Password / Secret / InitialPassword -> optional.
+MINIMUM REQUIRED COLUMNS
 
-Example:
-Samaccountname,employeeID,email,Address,UserName
-jdoe,12345,jdoe@alliantcreditunion.com,alliantcreditunion.com,A_jdoe
-asmith,45678,asmith@gdeacu.com,gdeacu.com,asmith
-bwhite,98765,bwhite@extacu.local,extacu.local,bwhite
+Samaccountname,employeeID,Address
+aalbores,903680,extacu.local
+jdoe,903681,gdeacu.com
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
     # ===== CSV / Report Paths =====
-    [string]$CsvPath      = "I:\Script\IDENTITY Script New\csv\Disabled_AD_WIN_Removed.csv",
-    [string]$ReportFolder = "I:\Script\IDENTITY Script New\logs\Disabled_AD_WIN_Removed",
+    [string]$CsvPath      = "I:\Script\IDENTITY Script New\csv\IND_Safe_Platform_Update.csv",
+    [string]$ReportFolder = "I:\Script\IDENTITY Script New\logs\IND_Safe_Platform_Update",
 
     # ===== Identity / Privilege Cloud =====
     [string]$IdentityTenantURL  = "https://aak4521.my.idaptive.app",
@@ -61,8 +60,12 @@ param(
     [string]$Location           = "\",
     [int]   $RetentionDays      = 7,
 
-    # ===== Disabled Account Onboarding Settings =====
-    [string]$PlatformID         = "WIN_Removed",
+    # ===== Platform Settings =====
+    [string]$DefaultPlatformID   = "WIN_Removed",
+    [string]$ExtDomainPlatformID = "WIN_P_DM_EXT_ADM_OTP_CICO_30D",
+    [string]$GdeDomainPlatformID = "WIN_P_DM_GDE_ADM_OTP_CICO_30D",
+
+    # ===== Address Defaults =====
     [string]$DefaultAddress     = "alliantcreditunion.com",
     [string]$DefaultInitialPassword = "",
 
@@ -70,6 +73,9 @@ param(
     [string]$AdminGroupUPN      = "IAM_ACU_CA_Admins@alliantcreditunion.com",
     [string]$AdminGroupSAM      = "IAM_ACU_CA_Admins",
     [switch]$SkipSafeMemberUpdate,
+
+    # ===== Reconcile Settings =====
+    [switch]$SkipReconcile,
 
     # ===== CCP Settings =====
     [string]$CCPAddress         = "https://aam.alliantcreditunion.com",
@@ -94,8 +100,8 @@ if (-not (Test-Path $ReportFolder)) {
 }
 
 $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-$script:LogPath    = Join-Path $ReportFolder "DisabledAD_WIN_Removed_Log_$timestamp.log"
-$script:ReportPath = Join-Path $ReportFolder "DisabledAD_WIN_Removed_Report_$timestamp.csv"
+$script:LogPath    = Join-Path $ReportFolder "IND_Safe_Platform_Update_Log_$timestamp.log"
+$script:ReportPath = Join-Path $ReportFolder "IND_Safe_Platform_Update_Report_$timestamp.csv"
 
 # ============================================================
 # Logging Helpers
@@ -179,7 +185,10 @@ function Normalize-Address {
         [Parameter()][string]$RawAddress
     )
 
-    $addr = $RawAddress.Trim().ToLower()
+    $addr = ""
+    if ($RawAddress) {
+        $addr = $RawAddress.Trim().ToLower()
+    }
 
     if ([string]::IsNullOrWhiteSpace($addr)) {
         return $DefaultAddress.Trim().ToLower()
@@ -200,6 +209,20 @@ function Normalize-Address {
         "^extacu\.local$"               { return "extacu.local" }
 
         default                         { return $addr }
+    }
+}
+
+function Resolve-TargetPlatformID {
+    param(
+        [Parameter(Mandatory)][string]$Address
+    )
+
+    $normalized = Normalize-Address -RawAddress $Address
+
+    switch ($normalized) {
+        "extacu.local" { return $ExtDomainPlatformID }
+        "gdeacu.com"   { return $GdeDomainPlatformID }
+        default        { return $DefaultPlatformID }
     }
 }
 
@@ -268,7 +291,7 @@ function Get-PASAccountIdValue {
         return $null
     }
 
-    foreach ($propName in @("id", "ID", "AccountID", "AccountId")) {
+    foreach ($propName in @("id", "ID", "AccountID", "AccountId", "accountId")) {
         $p = $AccountObject.PSObject.Properties[$propName]
         if ($p -and -not [string]::IsNullOrWhiteSpace([string]$p.Value)) {
             return [string]$p.Value
@@ -460,12 +483,7 @@ function Ensure-SafeMember {
                 return $true
             } catch {
                 $lastErr = $_.Exception.Message
-
-                # FIXED:
-                # Do not use "$hint:" inside double quotes.
-                # PowerShell treats "$hint:" as an invalid scoped variable reference.
                 Write-Warn ("Add member attempt failed for '{0}' using {1}: {2}" -f $MemberName, $hint, $lastErr)
-
                 continue
             }
         } else {
@@ -614,7 +632,7 @@ function Ensure-TargetSafe {
             $description = "Individual safe for $SamAccountName ($EmployeeID)"
         }
     } else {
-        $description = "Safe created by disabled AD WIN_Removed onboarding automation"
+        $description = "Safe created by IND safe automation"
     }
 
     $safeSplat = @{
@@ -652,122 +670,279 @@ function Ensure-TargetSafe {
 }
 
 # ============================================================
-# Account Onboarding to WIN_Removed
+# Account Lookup / Platform Update / Reconcile
 # ============================================================
 
-function Update-ExistingAccountPlatformIfPossible {
-    [CmdletBinding(SupportsShouldProcess = $true)]
+function Find-PASAccountInSafe {
     param(
-        [Parameter(Mandatory)][object]$Account,
         [Parameter(Mandatory)][string]$SafeName,
         [Parameter(Mandatory)][string]$UserName,
         [Parameter(Mandatory)][string]$Address
     )
 
-    $currentPlatform = Get-PASAccountPlatformValue -AccountObject $Account
+    try {
+        $accounts = @(Get-PASAccount -SafeName $SafeName -Search $UserName -ErrorAction SilentlyContinue)
 
-    if ($currentPlatform -eq $PlatformID) {
-        Write-Ok "Existing account '$UserName' in safe '$SafeName' is already on platform '$PlatformID'."
-        return "EXISTS_PLATFORM_OK"
+        $match = $accounts |
+            Where-Object {
+                ($_.UserName -eq $UserName -or $_.username -eq $UserName) -and
+                ($_.Address -eq $Address -or $_.address -eq $Address)
+            } |
+            Select-Object -First 1
+
+        if ($match) {
+            return $match
+        }
+
+        $userMatches = @(
+            $accounts |
+            Where-Object {
+                ($_.UserName -eq $UserName -or $_.username -eq $UserName)
+            }
+        )
+
+        if ($userMatches.Count -eq 1) {
+            Write-Warn "Account '$UserName' matched by username only in safe '$SafeName'. Address returned by API did not exactly match '$Address'."
+            return $userMatches[0]
+        }
+
+        return $null
+    } catch {
+        Write-Warn "Account lookup warning for '$UserName' in safe '$SafeName': $($_.Exception.Message)"
+        return $null
+    }
+}
+
+function Invoke-AccountReconcile {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [Parameter(Mandatory)][string]$AccountID,
+        [Parameter(Mandatory)][string]$SafeName,
+        [Parameter(Mandatory)][string]$UserName
+    )
+
+    $result = [ordered]@{
+        ReconcileAttempted = $false
+        ReconcileStatus    = ""
+        ReconcileError     = ""
     }
 
-    $accountId = Get-PASAccountIdValue -AccountObject $Account
+    if ($SkipReconcile) {
+        $result.ReconcileStatus = "SKIPPED"
+        Write-Warn "Reconcile skipped by parameter for '$SafeName/$UserName'."
+        return [pscustomobject]$result
+    }
+
+    if ([string]::IsNullOrWhiteSpace($AccountID)) {
+        $result.ReconcileStatus = "SKIPPED_NO_ACCOUNT_ID"
+        $result.ReconcileError  = "AccountID is blank."
+        Write-Warn "Reconcile skipped for '$SafeName/$UserName' because AccountID is blank."
+        return [pscustomobject]$result
+    }
+
+    if ($PSCmdlet.ShouldProcess("$SafeName/$UserName [$AccountID]", "Reconcile account password")) {
+        $result.ReconcileAttempted = $true
+
+        try {
+            $uri = "api/Accounts/$AccountID/Reconcile"
+            Invoke-PASRestMethod -Uri $uri -Method POST -ErrorAction Stop | Out-Null
+
+            $result.ReconcileStatus = "RECONCILE_SUBMITTED"
+            Write-Ok "Password reconcile submitted for '$SafeName/$UserName'."
+            return [pscustomobject]$result
+        } catch {
+            $firstErr = $_.Exception.Message
+            Write-Warn "Invoke-PASRestMethod reconcile attempt failed for '$SafeName/$UserName': $firstErr"
+
+            try {
+                if (Get-Command Invoke-PASCPMOperation -ErrorAction SilentlyContinue) {
+                    $supportsAccountId = Test-CommandHasParameter -CommandName "Invoke-PASCPMOperation" -ParameterName "AccountID"
+                    $supportsChangeTask = Test-CommandHasParameter -CommandName "Invoke-PASCPMOperation" -ParameterName "ChangeTask"
+
+                    if ($supportsAccountId -and $supportsChangeTask) {
+                        Invoke-PASCPMOperation -AccountID $AccountID -ChangeTask "Reconcile" -ErrorAction Stop | Out-Null
+
+                        $result.ReconcileStatus = "RECONCILE_SUBMITTED"
+                        Write-Ok "Password reconcile submitted for '$SafeName/$UserName' using Invoke-PASCPMOperation fallback."
+                        return [pscustomobject]$result
+                    }
+                }
+            } catch {
+                $secondErr = $_.Exception.Message
+                $result.ReconcileStatus = "RECONCILE_FAILED"
+                $result.ReconcileError = "REST failed: $firstErr | CPMOperation fallback failed: $secondErr"
+                Write-Warn "Reconcile failed for '$SafeName/$UserName': $($result.ReconcileError)"
+                return [pscustomobject]$result
+            }
+
+            $result.ReconcileStatus = "RECONCILE_FAILED"
+            $result.ReconcileError = $firstErr
+            Write-Warn "Reconcile failed for '$SafeName/$UserName': $firstErr"
+            return [pscustomobject]$result
+        }
+    }
+
+    $result.ReconcileStatus = "WHATIF_RECONCILE"
+    return [pscustomobject]$result
+}
+
+function Update-ExistingAccountPlatformIfNeeded {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [Parameter(Mandatory)][object]$Account,
+        [Parameter(Mandatory)][string]$SafeName,
+        [Parameter(Mandatory)][string]$UserName,
+        [Parameter(Mandatory)][string]$Address,
+        [Parameter(Mandatory)][string]$TargetPlatformID
+    )
+
+    $result = [ordered]@{
+        AccountID        = ""
+        CurrentPlatform  = ""
+        TargetPlatform   = $TargetPlatformID
+        PlatformStatus   = ""
+        PlatformChanged  = $false
+        Error            = ""
+    }
+
+    $currentPlatform = Get-PASAccountPlatformValue -AccountObject $Account
+    $accountId       = Get-PASAccountIdValue -AccountObject $Account
+
+    $result.AccountID       = $accountId
+    $result.CurrentPlatform = $currentPlatform
 
     if ([string]::IsNullOrWhiteSpace($accountId)) {
-        Write-Warn "Existing account '$UserName' found, but AccountID could not be resolved. Platform validation only. CurrentPlatform='$currentPlatform'."
-        return "EXISTS_PLATFORM_UNKNOWN"
+        $result.PlatformStatus = "EXISTS_ACCOUNT_ID_NOT_FOUND"
+        $result.Error = "Existing account found, but AccountID could not be resolved."
+        Write-Warn "Existing account '$UserName' found in safe '$SafeName', but AccountID could not be resolved."
+        return [pscustomobject]$result
     }
 
-    if ([string]::IsNullOrWhiteSpace($currentPlatform)) {
-        Write-Warn "Existing account '$UserName' found, but current platform was not returned by API. AccountID=$accountId."
-    } else {
-        Write-Warn "Existing account '$UserName' found on platform '$currentPlatform'. Target platform is '$PlatformID'."
+    if ($currentPlatform -eq $TargetPlatformID) {
+        $result.PlatformStatus = "EXISTS_PLATFORM_OK"
+        Write-Ok "Existing account '$UserName' in safe '$SafeName' is already on platform '$TargetPlatformID'."
+        return [pscustomobject]$result
     }
+
+    Write-Warn "Existing account '$UserName' in safe '$SafeName' is on platform '$currentPlatform'. Target platform is '$TargetPlatformID'."
 
     $canSetPlatform = (Test-CommandHasParameter -CommandName "Set-PASAccount" -ParameterName "AccountID") -and
                       (Test-CommandHasParameter -CommandName "Set-PASAccount" -ParameterName "PlatformID")
 
     if (-not $canSetPlatform) {
-        Write-Warn "Set-PASAccount in this psPAS version does not expose AccountID + PlatformID parameters. Platform was not changed."
-        return "EXISTS_PLATFORM_NOT_CHANGED"
+        $result.PlatformStatus = "PLATFORM_NOT_CHANGED_UNSUPPORTED_PSPAS"
+        $result.Error = "Set-PASAccount does not expose AccountID + PlatformID parameters in this psPAS version."
+        Write-Warn $result.Error
+        return [pscustomobject]$result
     }
 
     $setSplat = @{
         AccountID  = $accountId
-        PlatformID = $PlatformID
+        PlatformID = $TargetPlatformID
     }
 
-    if ($PSCmdlet.ShouldProcess("$SafeName/$UserName [$accountId]", "Set-PASAccount PlatformID=$PlatformID")) {
+    if ($PSCmdlet.ShouldProcess("$SafeName/$UserName [$accountId]", "Set-PASAccount PlatformID=$TargetPlatformID")) {
         try {
             Set-PASAccount @setSplat -ErrorAction Stop | Out-Null
-            Write-Ok "Updated existing account '$UserName' platform to '$PlatformID'."
-            return "EXISTS_PLATFORM_UPDATED"
+
+            $result.PlatformStatus  = "PLATFORM_UPDATED"
+            $result.PlatformChanged = $true
+
+            Write-Ok "Updated existing account '$UserName' platform to '$TargetPlatformID'."
+            return [pscustomobject]$result
         } catch {
-            Write-Warn "Failed to update existing account '$UserName' platform to '$PlatformID': $($_.Exception.Message)"
-            return "EXISTS_PLATFORM_UPDATE_FAILED"
+            $result.PlatformStatus = "PLATFORM_UPDATE_FAILED"
+            $result.Error = $_.Exception.Message
+
+            Write-Warn "Failed to update existing account '$UserName' platform to '$TargetPlatformID': $($_.Exception.Message)"
+            return [pscustomobject]$result
         }
     }
 
-    return "WHATIF_PLATFORM_UPDATE"
+    $result.PlatformStatus = "WHATIF_PLATFORM_UPDATE"
+    return [pscustomobject]$result
 }
 
-function Add-WINRemovedAccount {
+function Add-Or-Update-INDAccount {
     [CmdletBinding(SupportsShouldProcess = $true)]
     param(
         [Parameter(Mandatory)][string]$SafeName,
         [Parameter(Mandatory)][string]$UserName,
         [Parameter(Mandatory)][string]$Address,
+        [Parameter(Mandatory)][string]$TargetPlatformID,
         [Parameter()][string]$Secret = ""
     )
 
     $result = [ordered]@{
-        UserName = $UserName
-        Address  = $Address
-        Platform = $PlatformID
-        Status   = ""
-        Error    = ""
+        UserName             = $UserName
+        Address              = $Address
+        TargetPlatform       = $TargetPlatformID
+        AccountID            = ""
+        AccountStatus        = ""
+        PlatformStatus       = ""
+        ReconcileStatus      = ""
+        ReconcileAttempted   = $false
+        Error                = ""
     }
 
     if ([string]::IsNullOrWhiteSpace($SafeName) -or
         [string]::IsNullOrWhiteSpace($UserName) -or
         [string]::IsNullOrWhiteSpace($Address)) {
 
-        $result.Status = "SKIPPED_MISSING_FIELD"
-        $result.Error  = "SafeName, UserName, or Address is blank."
+        $result.AccountStatus = "SKIPPED_MISSING_FIELD"
+        $result.Error = "SafeName, UserName, or Address is blank."
 
-        Write-Warn "Account onboarding skipped because SafeName, UserName, or Address is blank."
+        Write-Warn "Account processing skipped because SafeName, UserName, or Address is blank."
         return [pscustomobject]$result
     }
 
-    Write-Info "Checking whether account '$UserName' already exists in safe '$SafeName' with address '$Address'..."
+    Write-Info "Checking whether account '$UserName' exists in safe '$SafeName' with address '$Address'..."
 
-    $existingAcct = $null
-
-    try {
-        $existingAcct = Get-PASAccount -SafeName $SafeName -Search $UserName -ErrorAction SilentlyContinue |
-            Where-Object {
-                ($_.UserName -eq $UserName -or $_.username -eq $UserName) -and
-                ($_.Address -eq $Address -or $_.address -eq $Address)
-            } |
-            Select-Object -First 1
-    } catch {
-        Write-Warn "Account lookup warning for '$UserName' in safe '$SafeName': $($_.Exception.Message)"
-    }
+    $existingAcct = Find-PASAccountInSafe -SafeName $SafeName -UserName $UserName -Address $Address
 
     if ($existingAcct) {
-        $platformStatus = Update-ExistingAccountPlatformIfPossible `
-            -Account  $existingAcct `
-            -SafeName $SafeName `
-            -UserName $UserName `
-            -Address  $Address
+        $result.AccountStatus = "EXISTS"
 
-        $result.Status = $platformStatus
+        $platformResult = Update-ExistingAccountPlatformIfNeeded `
+            -Account          $existingAcct `
+            -SafeName         $SafeName `
+            -UserName         $UserName `
+            -Address          $Address `
+            -TargetPlatformID $TargetPlatformID
+
+        $result.AccountID      = $platformResult.AccountID
+        $result.PlatformStatus = $platformResult.PlatformStatus
+
+        if ($platformResult.Error) {
+            $result.Error = $platformResult.Error
+        }
+
+        if ($platformResult.PlatformChanged -eq $true) {
+            $reconcileResult = Invoke-AccountReconcile `
+                -AccountID $platformResult.AccountID `
+                -SafeName  $SafeName `
+                -UserName  $UserName
+
+            $result.ReconcileStatus    = $reconcileResult.ReconcileStatus
+            $result.ReconcileAttempted = $reconcileResult.ReconcileAttempted
+
+            if ($reconcileResult.ReconcileError) {
+                if ($result.Error) {
+                    $result.Error = "$($result.Error) | Reconcile: $($reconcileResult.ReconcileError)"
+                } else {
+                    $result.Error = $reconcileResult.ReconcileError
+                }
+            }
+        } else {
+            $result.ReconcileStatus = "NOT_REQUIRED_NO_PLATFORM_CHANGE"
+        }
+
         return [pscustomobject]$result
     }
 
     $acctSplat = @{
         SafeName   = $SafeName
-        PlatformID = $PlatformID
+        PlatformID = $TargetPlatformID
         Address    = $Address
         UserName   = $UserName
     }
@@ -793,26 +968,52 @@ function Add-WINRemovedAccount {
         }
     }
 
-    Write-Info "Onboarding disabled account '$UserName' to safe '$SafeName' using platform '$PlatformID'..."
+    Write-Info "Vaulting account '$UserName' to safe '$SafeName' using platform '$TargetPlatformID'..."
 
-    if ($PSCmdlet.ShouldProcess("$SafeName/$UserName", "Add-PASAccount PlatformID=$PlatformID")) {
+    if ($PSCmdlet.ShouldProcess("$SafeName/$UserName", "Add-PASAccount PlatformID=$TargetPlatformID")) {
         try {
-            Add-PASAccount @acctSplat -ErrorAction Stop | Out-Null
+            $newAcct = Add-PASAccount @acctSplat -ErrorAction Stop
 
-            $result.Status = "ONBOARDED"
-            Write-Ok "Onboarded disabled account '$UserName' into safe '$SafeName' with platform '$PlatformID'."
+            $result.AccountStatus  = "ONBOARDED"
+            $result.PlatformStatus = "ONBOARDED_WITH_TARGET_PLATFORM"
+
+            Write-Ok "Vaulted account '$UserName' into safe '$SafeName' with platform '$TargetPlatformID'."
+
+            $accountId = Get-PASAccountIdValue -AccountObject $newAcct
+
+            if ([string]::IsNullOrWhiteSpace($accountId)) {
+                Start-Sleep -Seconds 2
+                $lookupAfterAdd = Find-PASAccountInSafe -SafeName $SafeName -UserName $UserName -Address $Address
+                $accountId = Get-PASAccountIdValue -AccountObject $lookupAfterAdd
+            }
+
+            $result.AccountID = $accountId
+
+            $reconcileResult = Invoke-AccountReconcile `
+                -AccountID $accountId `
+                -SafeName  $SafeName `
+                -UserName  $UserName
+
+            $result.ReconcileStatus    = $reconcileResult.ReconcileStatus
+            $result.ReconcileAttempted = $reconcileResult.ReconcileAttempted
+
+            if ($reconcileResult.ReconcileError) {
+                $result.Error = $reconcileResult.ReconcileError
+            }
 
             return [pscustomobject]$result
         } catch {
-            $result.Status = "FAILED_ONBOARD"
-            $result.Error  = $_.Exception.Message
+            $result.AccountStatus = "FAILED_ONBOARD"
+            $result.Error = $_.Exception.Message
 
-            Write-Err "Failed to onboard account '$UserName' into safe '$SafeName': $($_.Exception.Message)"
+            Write-Err "Failed to vault account '$UserName' into safe '$SafeName': $($_.Exception.Message)"
             return [pscustomobject]$result
         }
     }
 
-    $result.Status = "WHATIF_ONBOARD"
+    $result.AccountStatus = "WHATIF_ONBOARD"
+    $result.PlatformStatus = "WHATIF_ONBOARD"
+    $result.ReconcileStatus = "WHATIF_RECONCILE_AFTER_ONBOARD"
     return [pscustomobject]$result
 }
 
@@ -820,7 +1021,7 @@ function Add-WINRemovedAccount {
 # Row Processor
 # ============================================================
 
-function Process-DisabledADRow {
+function Process-INDRow {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][object]$Row,
@@ -831,31 +1032,36 @@ function Process-DisabledADRow {
     $eid   = Get-RowValue -Row $Row -Names @("employeeID", "EmployeeID", "EmployeeId", "EmpID")
     $email = Get-RowValue -Row $Row -Names @("email", "Email", "OwnerEmail", "UPN", "OwnerUPN")
 
-    $rawAddress = Get-RowValue -Row $Row -Names @("Address", "Domain", "AdminAddressDomain", "AccountAddress", "AccountDomain")
-    $address    = Normalize-Address -RawAddress $rawAddress
+    $rawAddress       = Get-RowValue -Row $Row -Names @("Address", "Domain", "AdminAddressDomain", "AccountAddress", "AccountDomain")
+    $address          = Normalize-Address -RawAddress $rawAddress
+    $targetPlatformID = Resolve-TargetPlatformID -Address $address
 
-    $safeName   = Resolve-SafeName -Row $Row
-    $userName   = Resolve-AccountUserName -Row $Row -Address $address
+    $safeName = Resolve-SafeName -Row $Row
+    $userName = Resolve-AccountUserName -Row $Row -Address $address
 
-    $secret     = Get-RowValue -Row $Row -Names @("Password", "Secret", "InitialPassword", "Content")
+    $secret = Get-RowValue -Row $Row -Names @("Password", "Secret", "InitialPassword", "Content")
 
     Write-Info "============================================================"
-    Write-Info "Row $RowNumber | Safe='$safeName' | Account='$userName' | Address='$address'"
+    Write-Info "Row $RowNumber | Safe='$safeName' | Account='$userName' | Address='$address' | TargetPlatform='$targetPlatformID'"
 
     $summary = [ordered]@{
-        RowNumber       = $RowNumber
-        Samaccountname  = $sam
-        EmployeeID      = $eid
-        OwnerEmail      = $email
-        SafeName        = $safeName
-        Address         = $address
-        UserName        = $userName
-        PlatformID      = $PlatformID
-        SafeStatus      = ""
-        MemberStatus    = ""
-        AccountStatus   = ""
-        OverallStatus   = ""
-        Error           = ""
+        RowNumber          = $RowNumber
+        Samaccountname     = $sam
+        EmployeeID         = $eid
+        OwnerEmail         = $email
+        SafeName           = $safeName
+        Address            = $address
+        UserName           = $userName
+        TargetPlatformID   = $targetPlatformID
+        AccountID          = ""
+        SafeStatus         = ""
+        MemberStatus       = ""
+        AccountStatus      = ""
+        PlatformStatus     = ""
+        ReconcileStatus    = ""
+        ReconcileAttempted = $false
+        OverallStatus      = ""
+        Error              = ""
     }
 
     try {
@@ -889,6 +1095,7 @@ function Process-DisabledADRow {
 
             if (-not $okAdmin) {
                 Write-Warn "Retrying admin group using SAM '$AdminGroupSAM'..."
+
                 $okAdmin = Ensure-SafeMember `
                     -SafeName   $safeName `
                     -MemberName $AdminGroupSAM `
@@ -936,23 +1143,36 @@ function Process-DisabledADRow {
             $summary.MemberStatus = "SKIPPED"
         }
 
-        $acctResult = Add-WINRemovedAccount `
-            -SafeName $safeName `
-            -UserName $userName `
-            -Address  $address `
-            -Secret   $secret
+        $acctResult = Add-Or-Update-INDAccount `
+            -SafeName         $safeName `
+            -UserName         $userName `
+            -Address          $address `
+            -TargetPlatformID $targetPlatformID `
+            -Secret           $secret
 
-        $summary.AccountStatus = $acctResult.Status
+        $summary.AccountID          = $acctResult.AccountID
+        $summary.AccountStatus      = $acctResult.AccountStatus
+        $summary.PlatformStatus     = $acctResult.PlatformStatus
+        $summary.ReconcileStatus    = $acctResult.ReconcileStatus
+        $summary.ReconcileAttempted = $acctResult.ReconcileAttempted
 
         if ($acctResult.Error) {
             $summary.Error = $acctResult.Error
         }
 
-        if ($acctResult.Status -like "FAILED*") {
+        if ($acctResult.AccountStatus -like "FAILED*" -or
+            $acctResult.PlatformStatus -like "*FAILED*" -or
+            $acctResult.ReconcileStatus -like "*FAILED*") {
+
             $summary.OverallStatus = "FAILED"
-        } elseif ($summary.MemberStatus -like "*failed*") {
+        }
+        elseif ($summary.MemberStatus -like "*failed*") {
             $summary.OverallStatus = "COMPLETED_WITH_MEMBER_WARNING"
-        } else {
+        }
+        elseif ($acctResult.ReconcileStatus -like "RECONCILE_FAILED") {
+            $summary.OverallStatus = "COMPLETED_WITH_RECONCILE_WARNING"
+        }
+        else {
             $summary.OverallStatus = "OK"
         }
 
@@ -976,10 +1196,13 @@ $sessionCreated = $false
 $runSummary = New-Object System.Collections.Generic.List[object]
 
 try {
-    Write-Info "Disabled AD -> WIN_Removed onboarding script starting..."
-    Write-Info "CSV Path       : $CsvPath"
-    Write-Info "Report Folder  : $ReportFolder"
-    Write-Info "Target Platform: $PlatformID"
+    Write-Info "IND Safe platform validation/onboarding/reconcile script starting..."
+    Write-Info "CSV Path              : $CsvPath"
+    Write-Info "Report Folder         : $ReportFolder"
+    Write-Info "Default Platform      : $DefaultPlatformID"
+    Write-Info "EXT Target Platform   : $ExtDomainPlatformID"
+    Write-Info "GDE Target Platform   : $GdeDomainPlatformID"
+    Write-Info "Skip Reconcile        : $SkipReconcile"
 
     if (-not (Test-Path $CsvPath)) {
         throw "CSV not found: $CsvPath"
@@ -1020,14 +1243,14 @@ try {
     foreach ($row in $rows) {
         $rowNumber++
 
-        $rowResult = Process-DisabledADRow -Row $row -RowNumber $rowNumber
+        $rowResult = Process-INDRow -Row $row -RowNumber $rowNumber
         $runSummary.Add($rowResult) | Out-Null
     }
 
     $runSummary | Export-Csv -Path $script:ReportPath -NoTypeInformation -Encoding UTF8
 
     $okCount     = @($runSummary | Where-Object { $_.OverallStatus -eq "OK" }).Count
-    $warnCount   = @($runSummary | Where-Object { $_.OverallStatus -like "*WARNING*" }).Count
+    $warnCount   = @($runSummary | Where-Object { $_.OverallStatus -like "*WARNING*" -or $_.OverallStatus -like "*WARN*" }).Count
     $failedCount = @($runSummary | Where-Object { $_.OverallStatus -like "FAILED*" }).Count
     $totalCount  = $runSummary.Count
 
