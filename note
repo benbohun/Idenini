@@ -1,728 +1,186 @@
 <#
-Install-OracleInstantClient-ForCPM.ps1
+Set-OraclePath-CPM.ps1
 
 Purpose:
-- Install/configure Oracle Instant Client for CyberArk CPM Oracle/ODBC password management.
-- Supports ZIP packages or already-extracted Oracle Instant Client folders.
-- Installs Basic package files into the same folder as ODBC.
-- Registers Oracle ODBC driver.
-- Sets Machine PATH.
-- Sets TNS_ADMIN.
-- Validates Oracle files, ODBC driver registration, and path resolution.
+- Set Oracle Instant Client 21_18 first in Machine PATH
+- Remove duplicate/old Oracle instantclient PATH entries
+- Set TNS_ADMIN
+- Validate Oracle client visibility
 
-Default source folder:
-E:\Installation Media\odbc
-
-Recommended CyberArk CPM target folder:
-E:\oracle\instantclient
+Run as Administrator.
 #>
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $false)]
-    [string]$SourceFolder = "E:\Installation Media\odbc",
-
-    [Parameter(Mandatory = $false)]
-    [string]$BasicZipPath = "",
-
-    [Parameter(Mandatory = $false)]
-    [string]$OdbcZipPath = "",
-
-    [Parameter(Mandatory = $false)]
-    [string]$SqlPlusZipPath = "",
-
-    [Parameter(Mandatory = $false)]
-    [string]$InstallDir = "E:\oracle\instantclient",
-
-    [Parameter(Mandatory = $false)]
-    [string]$TnsAdminDir = "E:\oracle\instantclient\network\admin",
-
-    [Parameter(Mandatory = $false)]
-    [string]$TnsNamesPath = "",
-
-    [Parameter(Mandatory = $false)]
-    [switch]$CleanExistingOraclePathEntries,
-
-    [Parameter(Mandatory = $false)]
-    [switch]$RegisterOdbc,
-
-    [Parameter(Mandatory = $false)]
-    [switch]$ReRegisterOdbc,
-
-    [Parameter(Mandatory = $false)]
-    [switch]$ClearOracleHome,
-
-    [Parameter(Mandatory = $false)]
-    [switch]$SkipBackup
+    [string]$OracleInstantClientPath = "E:\oracle\instantclient_21_18",
+    [string]$TnsAdminPath = "E:\oracle\instantclient_21_18\network\admin",
+    [switch]$ClearOracleHome
 )
 
-Set-StrictMode -Version 2.0
 $ErrorActionPreference = "Stop"
-
-$TempRoot = $null
 
 function Write-Info {
     param([string]$Message)
-    Write-Host "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | INFO  | $Message" -ForegroundColor Cyan
+    Write-Host "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | INFO | $Message" -ForegroundColor Cyan
 }
 
-function Write-Good {
+function Write-OK {
     param([string]$Message)
-    Write-Host "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | OK    | $Message" -ForegroundColor Green
+    Write-Host "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | OK   | $Message" -ForegroundColor Green
 }
 
-function Write-Warn {
+function Write-WarnMsg {
     param([string]$Message)
-    Write-Host "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | WARN  | $Message" -ForegroundColor Yellow
+    Write-Host "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | WARN | $Message" -ForegroundColor Yellow
 }
 
-function Write-Bad {
-    param([string]$Message)
-    Write-Host "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | ERROR | $Message" -ForegroundColor Red
+# Confirm elevated PowerShell
+$Identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$Principal = New-Object Security.Principal.WindowsPrincipal($Identity)
+
+if (-not $Principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw "Run PowerShell as Administrator."
 }
 
-function Assert-Administrator {
-    $Identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $Principal = New-Object Security.Principal.WindowsPrincipal($Identity)
+$OracleInstantClientPath = $OracleInstantClientPath.TrimEnd("\")
+$TnsAdminPath = $TnsAdminPath.TrimEnd("\")
 
-    if (-not $Principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        throw "Run PowerShell as Administrator before running this script."
-    }
+Write-Info "Oracle Instant Client Path: $OracleInstantClientPath"
+Write-Info "TNS_ADMIN Path             : $TnsAdminPath"
+
+if (-not (Test-Path -LiteralPath $OracleInstantClientPath -PathType Container)) {
+    throw "Oracle Instant Client folder not found: $OracleInstantClientPath"
 }
 
-function Assert-FileIfProvided {
-    param(
-        [string]$Path,
-        [string]$Label
-    )
+# Validate core Oracle files
+$FilesToCheck = @(
+    "oci.dll",
+    "oraociei.dll",
+    "odbc_install.exe",
+    "sqora32.dll",
+    "sqoras32.dll"
+)
 
-    if ([string]::IsNullOrWhiteSpace($Path)) {
-        return
-    }
+foreach ($File in $FilesToCheck) {
+    $FullPath = Join-Path $OracleInstantClientPath $File
 
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
-        throw "$Label was provided but was not found: $Path"
-    }
-}
-
-function Backup-ExistingInstall {
-    param([string]$Path)
-
-    if ($SkipBackup) {
-        Write-Warn "Backup skipped because -SkipBackup was used."
-        return
-    }
-
-    if (-not (Test-Path -LiteralPath $Path)) {
-        return
-    }
-
-    $ExistingItems = Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue | Select-Object -First 1
-
-    if ($null -eq $ExistingItems) {
-        return
-    }
-
-    $Parent = Split-Path -Path $Path -Parent
-    $Leaf = Split-Path -Path $Path -Leaf
-    $Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-    $BackupPath = Join-Path $Parent "$Leaf.backup_$Timestamp"
-
-    Write-Info "Backing up existing Oracle Instant Client folder to: $BackupPath"
-    Copy-Item -LiteralPath $Path -Destination $BackupPath -Recurse -Force
-    Write-Good "Backup completed: $BackupPath"
-}
-
-function Get-ZipByPattern {
-    param(
-        [string]$Folder,
-        [string]$PackageType
-    )
-
-    if (-not (Test-Path -LiteralPath $Folder -PathType Container)) {
-        return $null
-    }
-
-    $AllZips = Get-ChildItem -LiteralPath $Folder -Recurse -File -Filter "*.zip" -ErrorAction SilentlyContinue
-
-    if ($PackageType -eq "Basic") {
-        $Candidates = $AllZips | Where-Object {
-            $_.Name -match "(?i)basic" -and
-            $_.Name -notmatch "(?i)odbc|sqlplus|tools|sdk"
-        }
-
-        $Preferred = $Candidates | Where-Object { $_.Name -notmatch "(?i)lite" } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-
-        if ($null -ne $Preferred) {
-            return $Preferred.FullName
-        }
-
-        return ($Candidates | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
-    }
-
-    if ($PackageType -eq "ODBC") {
-        return ($AllZips | Where-Object {
-            $_.Name -match "(?i)odbc"
-        } | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
-    }
-
-    if ($PackageType -eq "SQLPlus") {
-        return ($AllZips | Where-Object {
-            $_.Name -match "(?i)sqlplus"
-        } | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
-    }
-
-    return $null
-}
-
-function Find-FolderContainingFile {
-    param(
-        [string]$Folder,
-        [string[]]$ExpectedFiles,
-        [string]$Label
-    )
-
-    if (-not (Test-Path -LiteralPath $Folder -PathType Container)) {
-        return $null
-    }
-
-    foreach ($ExpectedFile in $ExpectedFiles) {
-        $Match = Get-ChildItem -LiteralPath $Folder -Recurse -File -Filter $ExpectedFile -ErrorAction SilentlyContinue |
-            Sort-Object FullName |
-            Select-Object -First 1
-
-        if ($null -ne $Match) {
-            Write-Info "$Label source folder detected using $ExpectedFile at: $($Match.Directory.FullName)"
-            return $Match.Directory.FullName
-        }
-    }
-
-    return $null
-}
-
-function New-CleanDirectory {
-    param([string]$Path)
-
-    if (Test-Path -LiteralPath $Path) {
-        Remove-Item -LiteralPath $Path -Recurse -Force
-    }
-
-    New-Item -ItemType Directory -Path $Path -Force | Out-Null
-}
-
-function Expand-ZipToTemp {
-    param(
-        [string]$ZipPath,
-        [string]$TempRoot,
-        [string]$Label
-    )
-
-    if ([string]::IsNullOrWhiteSpace($ZipPath)) {
-        return $null
-    }
-
-    if (-not (Test-Path -LiteralPath $ZipPath -PathType Leaf)) {
-        throw "$Label ZIP not found: $ZipPath"
-    }
-
-    $SafeLabel = $Label -replace '[^a-zA-Z0-9_-]', '_'
-    $Destination = Join-Path $TempRoot $SafeLabel
-
-    Write-Info "Extracting $Label package: $ZipPath"
-    New-CleanDirectory -Path $Destination
-
-    Expand-Archive -LiteralPath $ZipPath -DestinationPath $Destination -Force
-
-    return $Destination
-}
-
-function Find-InstantClientContentRoot {
-    param(
-        [string]$ExtractedPath,
-        [string[]]$ExpectedFiles,
-        [string]$Label
-    )
-
-    if (-not (Test-Path -LiteralPath $ExtractedPath -PathType Container)) {
-        throw "Extracted path not found for $Label $ExtractedPath"
-    }
-
-    foreach ($ExpectedFile in $ExpectedFiles) {
-        $Match = Get-ChildItem -LiteralPath $ExtractedPath -Recurse -File -Filter $ExpectedFile -ErrorAction SilentlyContinue |
-            Sort-Object FullName |
-            Select-Object -First 1
-
-        if ($null -ne $Match) {
-            Write-Info "$Label root detected using $ExpectedFile at: $($Match.Directory.FullName)"
-            return $Match.Directory.FullName
-        }
-    }
-
-    $Candidate = Get-ChildItem -LiteralPath $ExtractedPath -Recurse -Directory -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -match '^instantclient' } |
-        Sort-Object FullName |
-        Select-Object -First 1
-
-    if ($null -ne $Candidate) {
-        Write-Warn "$Label root inferred from folder name: $($Candidate.FullName)"
-        return $Candidate.FullName
-    }
-
-    throw "Unable to detect Instant Client content root for $Label under $ExtractedPath"
-}
-
-function Copy-FolderContents {
-    param(
-        [string]$SourceRoot,
-        [string]$DestinationRoot,
-        [string]$Label
-    )
-
-    if (-not (Test-Path -LiteralPath $SourceRoot -PathType Container)) {
-        throw "Source root not found for $Label $SourceRoot"
-    }
-
-    if (-not (Test-Path -LiteralPath $DestinationRoot)) {
-        New-Item -ItemType Directory -Path $DestinationRoot -Force | Out-Null
-    }
-
-    $SourceNormalized = $SourceRoot.TrimEnd("\")
-    $DestNormalized = $DestinationRoot.TrimEnd("\")
-
-    if ($SourceNormalized -ieq $DestNormalized) {
-        Write-Warn "$Label source and destination are the same. Copy skipped: $SourceRoot"
-        return
-    }
-
-    Write-Info "Copying $Label files into: $DestinationRoot"
-
-    Get-ChildItem -LiteralPath $SourceRoot -Force | ForEach-Object {
-        $Destination = Join-Path $DestinationRoot $_.Name
-        Copy-Item -LiteralPath $_.FullName -Destination $Destination -Recurse -Force
-    }
-
-    Write-Good "$Label files copied."
-}
-
-function Install-PackageFromZipOrFolder {
-    param(
-        [string]$Label,
-        [string]$ZipPath,
-        [string]$FallbackFolder,
-        [string[]]$ExpectedFiles,
-        [string]$DestinationRoot,
-        [string]$TempRoot
-    )
-
-    if (-not [string]::IsNullOrWhiteSpace($ZipPath)) {
-        $Extracted = Expand-ZipToTemp -ZipPath $ZipPath -TempRoot $TempRoot -Label $Label
-        $Root = Find-InstantClientContentRoot -ExtractedPath $Extracted -ExpectedFiles $ExpectedFiles -Label $Label
-        Copy-FolderContents -SourceRoot $Root -DestinationRoot $DestinationRoot -Label $Label
-        return $true
-    }
-
-    $RootFromFolder = Find-FolderContainingFile -Folder $FallbackFolder -ExpectedFiles $ExpectedFiles -Label $Label
-
-    if ($null -ne $RootFromFolder) {
-        Copy-FolderContents -SourceRoot $RootFromFolder -DestinationRoot $DestinationRoot -Label $Label
-        return $true
-    }
-
-    return $false
-}
-
-function Set-MachinePath {
-    param(
-        [string]$PreferredPath,
-        [bool]$CleanOracleEntries
-    )
-
-    $PreferredPath = $PreferredPath.TrimEnd("\")
-    $CurrentMachinePath = [Environment]::GetEnvironmentVariable("PATH", "Machine")
-
-    if ($null -eq $CurrentMachinePath) {
-        $CurrentMachinePath = ""
-    }
-
-    $Items = $CurrentMachinePath -split ";" |
-        ForEach-Object { $_.Trim() } |
-        Where-Object { $_ -ne "" }
-
-    if ($CleanOracleEntries) {
-        Write-Info "Removing existing Oracle Instant Client entries from Machine PATH."
-        $Items = $Items | Where-Object {
-            $_ -notmatch '(?i)\\oracle\\instantclient'
-        }
+    if (Test-Path -LiteralPath $FullPath -PathType Leaf) {
+        Write-OK "Found: $FullPath"
     } else {
-        Write-Info "Removing exact duplicate of preferred Oracle path from Machine PATH."
-        $Items = $Items | Where-Object {
-            $_.TrimEnd("\") -ine $PreferredPath
-        }
+        Write-WarnMsg "Missing: $FullPath"
     }
-
-    $NewItems = New-Object System.Collections.Generic.List[string]
-    $NewItems.Add($PreferredPath)
-
-    foreach ($Item in $Items) {
-        $ItemClean = $Item.TrimEnd("\")
-
-        if ([string]::IsNullOrWhiteSpace($ItemClean)) {
-            continue
-        }
-
-        $AlreadyExists = $false
-
-        foreach ($ExistingItem in $NewItems) {
-            if ($ExistingItem.TrimEnd("\") -ieq $ItemClean) {
-                $AlreadyExists = $true
-                break
-            }
-        }
-
-        if (-not $AlreadyExists) {
-            $NewItems.Add($ItemClean)
-        }
-    }
-
-    $NewPath = $NewItems -join ";"
-
-    [Environment]::SetEnvironmentVariable("PATH", $NewPath, "Machine")
-
-    if ($env:PATH -notmatch [regex]::Escape($PreferredPath)) {
-        $env:PATH = "$PreferredPath;$env:PATH"
-    }
-
-    Write-Good "Machine PATH updated. Preferred Oracle path is first: $PreferredPath"
 }
 
-function Set-TnsAdmin {
-    param([string]$Path)
-
-    if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
-        New-Item -ItemType Directory -Path $Path -Force | Out-Null
-    }
-
-    [Environment]::SetEnvironmentVariable("TNS_ADMIN", $Path, "Machine")
-    $env:TNS_ADMIN = $Path
-
-    Write-Good "Machine TNS_ADMIN set to: $Path"
+# Create TNS_ADMIN folder
+if (-not (Test-Path -LiteralPath $TnsAdminPath -PathType Container)) {
+    New-Item -ItemType Directory -Path $TnsAdminPath -Force | Out-Null
+    Write-OK "Created TNS_ADMIN folder: $TnsAdminPath"
 }
 
-function Clear-OracleHomeIfRequested {
-    if (-not $ClearOracleHome) {
-        $ExistingOracleHome = [Environment]::GetEnvironmentVariable("ORACLE_HOME", "Machine")
+# Backup existing Machine PATH
+New-Item -ItemType Directory -Path "C:\Temp" -Force | Out-Null
 
-        if (-not [string]::IsNullOrWhiteSpace($ExistingOracleHome)) {
-            Write-Warn "ORACLE_HOME is currently set to: $ExistingOracleHome"
-            Write-Warn "Instant Client usually does not require ORACLE_HOME."
-            Write-Warn "Use -ClearOracleHome if you want this script to remove ORACLE_HOME."
-        }
+$CurrentMachinePath = [Environment]::GetEnvironmentVariable("PATH", "Machine")
+$BackupFile = "C:\Temp\MachinePath_Backup_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
 
-        return
+$CurrentMachinePath | Out-File -FilePath $BackupFile -Encoding UTF8
+
+Write-OK "Backed up current Machine PATH to: $BackupFile"
+
+# Remove old Oracle instantclient entries
+$PathItems = $CurrentMachinePath -split ";" |
+    ForEach-Object { $_.Trim() } |
+    Where-Object { $_ -ne "" }
+
+$CleanedPathItems = $PathItems | Where-Object {
+    $_ -notmatch "(?i)\\oracle\\instantclient"
+}
+
+# Put preferred Oracle path first
+$NewPathItems = @($OracleInstantClientPath) + $CleanedPathItems
+
+# Remove duplicates
+$FinalPathItems = New-Object System.Collections.Generic.List[string]
+
+foreach ($Item in $NewPathItems) {
+    $CleanItem = $Item.TrimEnd("\")
+
+    if ([string]::IsNullOrWhiteSpace($CleanItem)) {
+        continue
     }
 
+    $Exists = $false
+
+    foreach ($Existing in $FinalPathItems) {
+        if ($Existing.TrimEnd("\") -ieq $CleanItem) {
+            $Exists = $true
+            break
+        }
+    }
+
+    if (-not $Exists) {
+        $FinalPathItems.Add($CleanItem)
+    }
+}
+
+$NewMachinePath = $FinalPathItems -join ";"
+
+[Environment]::SetEnvironmentVariable("PATH", $NewMachinePath, "Machine")
+$env:PATH = "$OracleInstantClientPath;$env:PATH"
+
+Write-OK "Updated Machine PATH. Oracle Instant Client is now first: $OracleInstantClientPath"
+
+# Set TNS_ADMIN
+[Environment]::SetEnvironmentVariable("TNS_ADMIN", $TnsAdminPath, "Machine")
+$env:TNS_ADMIN = $TnsAdminPath
+
+Write-OK "Set Machine TNS_ADMIN to: $TnsAdminPath"
+
+# Optional ORACLE_HOME cleanup
+if ($ClearOracleHome) {
     [Environment]::SetEnvironmentVariable("ORACLE_HOME", $null, "Machine")
     Remove-Item Env:\ORACLE_HOME -ErrorAction SilentlyContinue
+    Write-OK "Cleared Machine ORACLE_HOME."
+} else {
+    $OracleHome = [Environment]::GetEnvironmentVariable("ORACLE_HOME", "Machine")
 
-    Write-Good "Machine ORACLE_HOME cleared."
+    if (-not [string]::IsNullOrWhiteSpace($OracleHome)) {
+        Write-WarnMsg "ORACLE_HOME is currently set to: $OracleHome"
+        Write-WarnMsg "Instant Client usually does not require ORACLE_HOME."
+    }
 }
 
-function Invoke-Process {
-    param(
-        [string]$FilePath,
-        [string]$WorkingDirectory,
-        [string]$Arguments = ""
-    )
+Write-Host ""
+Write-Host "===== VALIDATION =====" -ForegroundColor Cyan
 
-    if (-not (Test-Path -LiteralPath $FilePath -PathType Leaf)) {
-        throw "Executable not found: $FilePath"
-    }
+Write-Host ""
+Write-Host "Oracle entries in Machine PATH:" -ForegroundColor Cyan
+([Environment]::GetEnvironmentVariable("PATH", "Machine") -split ";") |
+    Where-Object { $_ -match "(?i)oracle|instantclient" } |
+    ForEach-Object { Write-Host $_ }
 
-    Write-Info "Running: $FilePath $Arguments"
+Write-Host ""
+Write-Host "TNS_ADMIN:" -ForegroundColor Cyan
+Write-Host ([Environment]::GetEnvironmentVariable("TNS_ADMIN", "Machine"))
 
-    $Process = Start-Process `
-        -FilePath $FilePath `
-        -ArgumentList $Arguments `
-        -WorkingDirectory $WorkingDirectory `
-        -NoNewWindow `
-        -Wait `
-        -PassThru
+Write-Host ""
+Write-Host "where.exe oci.dll:" -ForegroundColor Cyan
+where.exe oci.dll 2>$null
 
-    Write-Info "Exit code: $($Process.ExitCode)"
+Write-Host ""
+Write-Host "where.exe odbc_install.exe:" -ForegroundColor Cyan
+where.exe odbc_install.exe 2>$null
 
-    return $Process.ExitCode
-}
-
-function Register-OracleOdbc {
-    param(
-        [string]$OracleHomePath,
-        [bool]$DoReRegister
-    )
-
-    $OdbcInstall = Join-Path $OracleHomePath "odbc_install.exe"
-    $OdbcUninstall = Join-Path $OracleHomePath "odbc_uninstall.exe"
-
-    if (-not (Test-Path -LiteralPath $OdbcInstall -PathType Leaf)) {
-        Write-Warn "odbc_install.exe not found in $OracleHomePath. ODBC registration skipped."
-        return
-    }
-
-    if ($DoReRegister -and (Test-Path -LiteralPath $OdbcUninstall -PathType Leaf)) {
-        Write-Warn "Re-register requested. Running odbc_uninstall.exe first."
-
-        try {
-            [void](Invoke-Process -FilePath $OdbcUninstall -WorkingDirectory $OracleHomePath)
-        } catch {
-            Write-Warn "odbc_uninstall.exe returned an error/warning: $($_.Exception.Message)"
-        }
-    }
-
-    [void](Invoke-Process -FilePath $OdbcInstall -WorkingDirectory $OracleHomePath)
-    Write-Good "Oracle ODBC registration attempted."
-}
-
-function Copy-TnsNamesIfProvided {
-    param(
-        [string]$SourcePath,
-        [string]$DestinationDir
-    )
-
-    if ([string]::IsNullOrWhiteSpace($SourcePath)) {
-        Write-Info "No tnsnames.ora source provided. Skipping tnsnames.ora copy."
-        return
-    }
-
-    if (-not (Test-Path -LiteralPath $SourcePath -PathType Leaf)) {
-        throw "tnsnames.ora source file not found: $SourcePath"
-    }
-
-    if (-not (Test-Path -LiteralPath $DestinationDir -PathType Container)) {
-        New-Item -ItemType Directory -Path $DestinationDir -Force | Out-Null
-    }
-
-    $Destination = Join-Path $DestinationDir "tnsnames.ora"
-
-    Write-Info "Copying tnsnames.ora to: $Destination"
-    Copy-Item -LiteralPath $SourcePath -Destination $Destination -Force
-    Write-Good "tnsnames.ora copied."
-}
-
-function Show-Validation {
-    param(
-        [string]$OraclePath,
-        [string]$TnsPath
-    )
-
-    Write-Host ""
-    Write-Host "================ VALIDATION ================" -ForegroundColor Cyan
-
-    $FilesToCheck = @(
-        "oci.dll",
-        "oraociei.dll",
-        "orannzsbb.dll",
-        "odbc_install.exe",
-        "odbc_uninstall.exe",
-        "sqora32.dll",
-        "sqoras32.dll",
-        "sqlplus.exe"
-    )
-
-    Write-Host ""
-    Write-Host "Oracle Instant Client files:" -ForegroundColor Cyan
-
-    $FileResults = foreach ($File in $FilesToCheck) {
-        $FullPath = Join-Path $OraclePath $File
-
-        [PSCustomObject]@{
-            File   = $FullPath
-            Exists = Test-Path -LiteralPath $FullPath
-        }
-    }
-
-    $FileResults | Format-Table -AutoSize
-
-    Write-Host ""
-    Write-Host "Oracle-related Machine environment variables:" -ForegroundColor Cyan
-
-    $PathOracleEntries = ([Environment]::GetEnvironmentVariable("PATH", "Machine") -split ";") |
-        Where-Object { $_ -match '(?i)oracle|instantclient' }
-
-    [PSCustomObject]@{
-        PATH_OracleEntries = ($PathOracleEntries -join " | ")
-        TNS_ADMIN          = [Environment]::GetEnvironmentVariable("TNS_ADMIN", "Machine")
-        ORACLE_HOME        = [Environment]::GetEnvironmentVariable("ORACLE_HOME", "Machine")
-    } | Format-List
-
-    Write-Host ""
-    Write-Host "where.exe checks:" -ForegroundColor Cyan
-
-    foreach ($Command in @("oci.dll", "sqlplus.exe", "odbc_install.exe")) {
-        Write-Host "where $Command" -ForegroundColor Yellow
-
-        try {
-            & where.exe $Command 2>$null
-        } catch {
-            Write-Warn "where.exe check failed for $Command"
-        }
-    }
-
-    Write-Host ""
-    Write-Host "ODBC Oracle drivers registered:" -ForegroundColor Cyan
-
-    try {
-        $OdbcDrivers = Get-OdbcDriver | Where-Object {
-            $_.Name -match "Oracle"
-        } | Select-Object Name, Platform
-
-        if ($null -eq $OdbcDrivers) {
-            Write-Warn "No Oracle ODBC drivers found through Get-OdbcDriver."
-        } else {
-            $OdbcDrivers | Format-Table -AutoSize
-        }
-    } catch {
-        Write-Warn "Unable to query ODBC drivers with Get-OdbcDriver. Error: $($_.Exception.Message)"
-    }
-
-    Write-Host ""
-    Write-Host "TNS_ADMIN folder:" -ForegroundColor Cyan
-
-    [PSCustomObject]@{
-        TnsAdminDir       = $TnsPath
-        TnsAdminExists    = Test-Path -LiteralPath $TnsPath
-        TnsNamesOraExists = Test-Path -LiteralPath (Join-Path $TnsPath "tnsnames.ora")
-    } | Format-List
-
-    Write-Host "============================================" -ForegroundColor Cyan
-}
-
+Write-Host ""
+Write-Host "Oracle ODBC drivers:" -ForegroundColor Cyan
 try {
-    Write-Info "Oracle Instant Client install/configuration starting."
-
-    Assert-Administrator
-
-    $SourceFolder = $SourceFolder.TrimEnd("\")
-    $InstallDir = $InstallDir.TrimEnd("\")
-    $TnsAdminDir = $TnsAdminDir.TrimEnd("\")
-
-    if (-not (Test-Path -LiteralPath $SourceFolder -PathType Container)) {
-        throw "Source folder not found: $SourceFolder"
-    }
-
-    Assert-FileIfProvided -Path $BasicZipPath -Label "Basic ZIP"
-    Assert-FileIfProvided -Path $OdbcZipPath -Label "ODBC ZIP"
-    Assert-FileIfProvided -Path $SqlPlusZipPath -Label "SQLPlus ZIP"
-    Assert-FileIfProvided -Path $TnsNamesPath -Label "tnsnames.ora"
-
-    Write-Info "SourceFolder : $SourceFolder"
-    Write-Info "InstallDir   : $InstallDir"
-    Write-Info "TnsAdminDir  : $TnsAdminDir"
-
-    if ([string]::IsNullOrWhiteSpace($BasicZipPath)) {
-        $BasicZipPath = Get-ZipByPattern -Folder $SourceFolder -PackageType "Basic"
-    }
-
-    if ([string]::IsNullOrWhiteSpace($OdbcZipPath)) {
-        $OdbcZipPath = Get-ZipByPattern -Folder $SourceFolder -PackageType "ODBC"
-    }
-
-    if ([string]::IsNullOrWhiteSpace($SqlPlusZipPath)) {
-        $SqlPlusZipPath = Get-ZipByPattern -Folder $SourceFolder -PackageType "SQLPlus"
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($BasicZipPath)) {
-        Write-Info "Basic package detected: $BasicZipPath"
-    } else {
-        Write-Warn "No Basic ZIP detected. Script will look for extracted Basic files under source folder."
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($OdbcZipPath)) {
-        Write-Info "ODBC package detected: $OdbcZipPath"
-    } else {
-        Write-Warn "No ODBC ZIP detected. Script will look for extracted ODBC files under source folder."
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($SqlPlusZipPath)) {
-        Write-Info "SQLPlus package detected: $SqlPlusZipPath"
-    } else {
-        Write-Warn "No SQLPlus package detected. SQLPlus is optional."
-    }
-
-    $InstallParent = Split-Path -Path $InstallDir -Parent
-
-    if (-not (Test-Path -LiteralPath $InstallParent -PathType Container)) {
-        New-Item -ItemType Directory -Path $InstallParent -Force | Out-Null
-    }
-
-    Backup-ExistingInstall -Path $InstallDir
-
-    if (-not (Test-Path -LiteralPath $InstallDir -PathType Container)) {
-        New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
-    }
-
-    $TempRoot = Join-Path $env:TEMP ("OracleInstantClientInstall_" + (Get-Date -Format "yyyyMMdd_HHmmss"))
-    New-Item -ItemType Directory -Path $TempRoot -Force | Out-Null
-
-    Write-Info "Temporary extraction folder: $TempRoot"
-
-    $BasicInstalled = Install-PackageFromZipOrFolder `
-        -Label "Basic" `
-        -ZipPath $BasicZipPath `
-        -FallbackFolder $SourceFolder `
-        -ExpectedFiles @("oci.dll", "oraociei.dll") `
-        -DestinationRoot $InstallDir `
-        -TempRoot $TempRoot
-
-    if (-not $BasicInstalled) {
-        throw "Basic package was not found. Place the Oracle Instant Client Basic ZIP under '$SourceFolder' or pass -BasicZipPath."
-    }
-
-    $OdbcInstalled = Install-PackageFromZipOrFolder `
-        -Label "ODBC" `
-        -ZipPath $OdbcZipPath `
-        -FallbackFolder $SourceFolder `
-        -ExpectedFiles @("odbc_install.exe", "sqora32.dll", "sqoras32.dll") `
-        -DestinationRoot $InstallDir `
-        -TempRoot $TempRoot
-
-    if (-not $OdbcInstalled) {
-        Write-Warn "ODBC package was not found under source folder. If ODBC files already exist in $InstallDir, registration may still work."
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($SqlPlusZipPath)) {
-        [void](Install-PackageFromZipOrFolder `
-            -Label "SQLPlus" `
-            -ZipPath $SqlPlusZipPath `
-            -FallbackFolder $SourceFolder `
-            -ExpectedFiles @("sqlplus.exe") `
-            -DestinationRoot $InstallDir `
-            -TempRoot $TempRoot)
-    }
-
-    Set-TnsAdmin -Path $TnsAdminDir
-    Copy-TnsNamesIfProvided -SourcePath $TnsNamesPath -DestinationDir $TnsAdminDir
-
-    Set-MachinePath -PreferredPath $InstallDir -CleanOracleEntries ([bool]$CleanExistingOraclePathEntries)
-
-    Clear-OracleHomeIfRequested
-
-    if ($RegisterOdbc -or $ReRegisterOdbc) {
-        Register-OracleOdbc -OracleHomePath $InstallDir -DoReRegister ([bool]$ReRegisterOdbc)
-    } else {
-        Write-Warn "ODBC registration skipped. Use -RegisterOdbc or -ReRegisterOdbc if needed."
-    }
-
-    Show-Validation -OraclePath $InstallDir -TnsPath $TnsAdminDir
-
-    Write-Good "Oracle Instant Client install/configuration completed."
-    Write-Warn "Restart the CyberArk Password Manager services or reboot the CPM server before Oracle Verify/Change testing."
-    Write-Warn "Recommended test order: run Verify on one low-risk Oracle account first, then Change."
-
+    Get-OdbcDriver | Where-Object {
+        $_.Name -match "Oracle"
+    } | Select-Object Name, Platform | Format-Table -AutoSize
 } catch {
-    Write-Bad $_.Exception.Message
-    throw
-} finally {
-    if ($null -ne $TempRoot -and (Test-Path -LiteralPath $TempRoot)) {
-        Write-Info "Cleaning temporary extraction folder: $TempRoot"
-        Remove-Item -LiteralPath $TempRoot -Recurse -Force -ErrorAction SilentlyContinue
-    }
+    Write-WarnMsg "Could not query ODBC drivers using Get-OdbcDriver."
 }
+
+Write-Host ""
+Write-OK "Oracle PATH configuration completed."
+Write-WarnMsg "Restart CyberArk CPM services or reboot the server before Oracle Verify/Change testing."
