@@ -1,37 +1,34 @@
 <#
-SafeMembershipReport_NormalIdentityUser.ps1
+SafeMembershipReport_NormalUser_MFA.ps1
 
 PURPOSE
 - Prompts for normal CyberArk Identity / Privilege Cloud user credentials.
 - Does NOT use CCP.
 - Does NOT use ServiceUser mode.
-- Uses New-PASSession with -IdentityUser.
+- Explicitly runs CyberArk Identity MFA using New-IDSession.
+- Converts the successful MFA-authenticated Identity session into a psPAS session.
 - Enumerates all Safes via Get-PASSafe.
 - Enumerates Safe Members via Get-PASSafeMember.
 - Exports full Safe membership and permissions report to CSV.
 
-AUTH METHOD
-- Normal Identity user:
-  New-PASSession -IdentityTenantURL <IdentityURL> -PrivilegeCloudURL <PCloudURL> -Credential <Cred> -IdentityUser
+IMPORTANT
+- Run this from an interactive PowerShell console.
+- When MFA challenge selection appears, select the required MFA method and complete the challenge.
+- After MFA succeeds, the script continues automatically.
 
 REQUIREMENTS
-- psPAS module
-- IdentityCommand module
-- User must have permissions to list Safes and view Safe Members.
+- psPAS module.
+- IdentityCommand module.
+- Your user must be allowed to authenticate to CyberArk Identity.
+- Your user must have permission to list Safes and view Safe Members.
 #>
 
 [CmdletBinding()]
 param(
     # ===== Identity / Privilege Cloud URLs =====
-    [string]$IdentityTenantURL = "https://YOUR-IDENTITY-TENANT-URL",
+    [string]$IdentityTenantURL = "https://abq4291.id.cyberark.cloud",
 
-    [string]$PrivilegeCloudURL = "https://YOUR-PRIVILEGE-CLOUD-URL",
-
-    # Optional fallback login style.
-    # Example: mtbanktest
-    # Only use this if you want to log in with:
-    # New-PASSession -TenantSubdomain mtbanktest -Credential $Credential -IdentityUser
-    [string]$TenantSubdomain = "",
+    [string]$PrivilegeCloudURL = "https://mtbanktest.privilegecloud.cyberark.cloud",
 
     # ===== Output =====
     [string]$CsvFilePath = "",
@@ -206,44 +203,146 @@ function Write-ExceptionDetails {
     }
 }
 
-function Start-NormalIdentityUserPASSession {
+function Start-MFAIdentitySession {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
-        [PSCredential]$Credential,
+        [string]$TenantURL,
 
         [Parameter(Mandatory)]
-        [string]$IdentityTenantURL,
+        [PSCredential]$Credential
+    )
+
+    Write-Log "Starting CyberArk Identity login with MFA support..." "Cyan"
+    Write-Log "Identity tenant: $TenantURL" "Cyan"
+    Write-Log "When prompted, select and complete the MFA challenge." "Yellow"
+
+    $idSession = New-IDSession `
+        -tenant_url $TenantURL `
+        -Credential $Credential `
+        -ErrorAction Stop
+
+    if ($null -eq $idSession) {
+        throw "New-IDSession returned no session object after authentication."
+    }
+
+    $token = Get-ObjectPropertyValue -InputObject $idSession -PropertyNames @(
+        "Token",
+        "token",
+        "access_token",
+        "accessToken"
+    )
+
+    if ([string]::IsNullOrWhiteSpace($token)) {
+        throw "Identity MFA authentication completed, but no token was returned from New-IDSession."
+    }
+
+    Write-Log "CyberArk Identity MFA authentication completed successfully." "Green"
+
+    return $idSession
+}
+
+function Convert-IDSessionTo-PASSession {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        $IDSession,
 
         [Parameter(Mandatory)]
         [string]$PrivilegeCloudURL,
 
-        [string]$TenantSubdomain
+        [Parameter(Mandatory)]
+        [string]$Username
     )
 
-    if (-not [string]::IsNullOrWhiteSpace($TenantSubdomain)) {
-        Write-Log "Authenticating using TenantSubdomain method..." "Cyan"
-        Write-Log "TenantSubdomain: $TenantSubdomain" "Cyan"
+    Write-Log "Converting Identity MFA session into psPAS session..." "Cyan"
 
-        New-PASSession `
-            -TenantSubdomain $TenantSubdomain `
-            -Credential $Credential `
-            -IdentityUser `
-            -ErrorAction Stop | Out-Null
+    $PrivilegeCloudURL = $PrivilegeCloudURL.TrimEnd("/")
+    $baseUri = "$PrivilegeCloudURL/PasswordVault"
 
-        return
+    $token = Get-ObjectPropertyValue -InputObject $IDSession -PropertyNames @(
+        "Token",
+        "token"
+    )
+
+    $accessToken = Get-ObjectPropertyValue -InputObject $IDSession -PropertyNames @(
+        "access_token",
+        "accessToken"
+    )
+
+    $tokenType = Get-ObjectPropertyValue -InputObject $IDSession -PropertyNames @(
+        "token_type",
+        "tokenType"
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($token)) {
+        $authHeader = "Bearer $token"
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($accessToken)) {
+        if ([string]::IsNullOrWhiteSpace($tokenType)) {
+            $tokenType = "Bearer"
+        }
+
+        $authHeader = "$tokenType $accessToken"
+    }
+    else {
+        throw "Unable to locate Identity token or access_token on the New-IDSession result."
     }
 
-    Write-Log "Authenticating using IdentityTenantURL and PrivilegeCloudURL method..." "Cyan"
-    Write-Log "IdentityTenantURL: $IdentityTenantURL" "Cyan"
-    Write-Log "PrivilegeCloudURL: $PrivilegeCloudURL" "Cyan"
+    $webSession = $null
 
-    New-PASSession `
-        -IdentityTenantURL $IdentityTenantURL `
-        -PrivilegeCloudURL $PrivilegeCloudURL `
-        -Credential $Credential `
-        -IdentityUser `
-        -ErrorAction Stop | Out-Null
+    try {
+        $webSession = $IDSession.GetWebSession()
+    }
+    catch {
+        Write-Log "IDSession.GetWebSession() failed. Creating a new WebRequestSession object. Warning: $($_.Exception.Message)" "Yellow"
+    }
+
+    if ($null -eq $webSession) {
+        $webSession = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+    }
+
+    if (-not ($webSession.PSObject.Properties.Name -contains "Headers")) {
+        $webSession | Add-Member -MemberType NoteProperty -Name Headers -Value @{} -Force
+    }
+
+    if ($null -eq $webSession.Headers) {
+        $webSession.Headers = @{}
+    }
+
+    $webSession.Headers["Authorization"] = $authHeader
+
+    $pasSession = [PSCustomObject]@{
+        BaseURI         = $baseUri
+        ApiURI          = $PrivilegeCloudURL
+        WebSession      = $webSession
+        ExternalVersion = [System.Version]"0.0"
+        StartTime       = Get-Date
+        User            = $Username
+    }
+
+    $pasSession.PSObject.TypeNames.Insert(0, "psPAS.CyberArk.Vault.Session")
+
+    Use-PASSession -Session $pasSession
+
+    if (-not (Get-PASSession)) {
+        throw "Use-PASSession did not establish a psPAS session."
+    }
+
+    try {
+        $server = Get-PASServer -ErrorAction Stop
+        if ($server.ExternalVersion) {
+            $currentSession = Get-PASSession
+            $currentSession.ExternalVersion = [System.Version]$server.ExternalVersion
+            Use-PASSession -Session $currentSession
+            Write-Log "Privilege Cloud server version detected: $($server.ExternalVersion)" "Green"
+        }
+    }
+    catch {
+        Write-Log "Version check warning. Session is still usable. Details: $($_.Exception.Message)" "Yellow"
+    }
+
+    Write-Log "psPAS session established using MFA-authenticated Identity token." "Green"
 }
 
 # =========================
@@ -264,13 +363,8 @@ Write-Log "Log file path: $LogFile" "Cyan"
 $IdentityTenantURL = $IdentityTenantURL.TrimEnd("/")
 $PrivilegeCloudURL = $PrivilegeCloudURL.TrimEnd("/")
 
-if ([string]::IsNullOrWhiteSpace($TenantSubdomain)) {
-    Assert-UrlReady -Name "IdentityTenantURL" -Url $IdentityTenantURL
-    Assert-UrlReady -Name "PrivilegeCloudURL" -Url $PrivilegeCloudURL
-}
-else {
-    Write-Log "TenantSubdomain was provided, so direct URL validation will be skipped for authentication." "Yellow"
-}
+Assert-UrlReady -Name "IdentityTenantURL" -Url $IdentityTenantURL
+Assert-UrlReady -Name "PrivilegeCloudURL" -Url $PrivilegeCloudURL
 
 # =========================
 # Import modules
@@ -291,36 +385,19 @@ try {
     Write-Log "IdentityCommand module loaded successfully." "Green"
 }
 catch {
-    Write-Log "Failed to load IdentityCommand module. Normal Identity user login requires IdentityCommand." "Red"
+    Write-Log "Failed to load IdentityCommand module. MFA login requires IdentityCommand." "Red"
     Write-ExceptionDetails -ErrorRecord $_ -Prefix "IdentityCommand IMPORT ERROR"
     throw
 }
 
 # =========================
-# Validate New-PASSession parameters
+# Validate required commands
 # =========================
 
-try {
-    $newPasSessionCommand = Get-Command New-PASSession -ErrorAction Stop
-
-    if (-not $newPasSessionCommand.Parameters.ContainsKey("IdentityUser")) {
-        throw "Installed psPAS does not expose the -IdentityUser parameter. Update psPAS."
+foreach ($requiredCommand in @("New-IDSession", "Use-PASSession", "Get-PASSession", "Get-PASSafe", "Get-PASSafeMember")) {
+    if (-not (Get-Command $requiredCommand -ErrorAction SilentlyContinue)) {
+        throw "Required command not found: $requiredCommand"
     }
-
-    if (-not $newPasSessionCommand.Parameters.ContainsKey("IdentityTenantURL")) {
-        throw "Installed psPAS does not expose the -IdentityTenantURL parameter. Update psPAS."
-    }
-
-    if (-not $newPasSessionCommand.Parameters.ContainsKey("PrivilegeCloudURL")) {
-        throw "Installed psPAS does not expose the -PrivilegeCloudURL parameter. Update psPAS."
-    }
-
-    Write-Log "New-PASSession supports required Identity user parameters." "Green"
-}
-catch {
-    Write-Log "New-PASSession validation failed." "Red"
-    Write-ExceptionDetails -ErrorRecord $_ -Prefix "New-PASSession VALIDATION ERROR"
-    throw
 }
 
 # =========================
@@ -344,33 +421,34 @@ try {
         throw "Credential username is empty."
     }
 
-    # Authenticate as normal Identity user
-    Write-Log "Authenticating to Privilege Cloud as normal Identity user..." "Cyan"
-
+    # MFA authentication first
     try {
-        Start-NormalIdentityUserPASSession `
-            -Credential $Credential `
-            -IdentityTenantURL $IdentityTenantURL `
-            -PrivilegeCloudURL $PrivilegeCloudURL `
-            -TenantSubdomain $TenantSubdomain
+        $idSession = Start-MFAIdentitySession `
+            -TenantURL $IdentityTenantURL `
+            -Credential $Credential
 
-        if (-not (Get-PASSession)) {
-            throw "psPAS session was not established."
-        }
+        Convert-IDSessionTo-PASSession `
+            -IDSession $idSession `
+            -PrivilegeCloudURL $PrivilegeCloudURL `
+            -Username $Credential.UserName
 
         $sessionCreated = $true
-        Write-Log "Authenticated successfully as normal Identity user: $($Credential.UserName)" "Green"
     }
     catch {
         Write-Log "Authentication failed before Safe enumeration." "Red"
         Write-ExceptionDetails -ErrorRecord $_ -Prefix "AUTH ERROR"
-
-        Write-Log "Run this standalone test to isolate Identity authentication:" "Yellow"
-        Write-Log 'Import-Module IdentityCommand -Force' "Yellow"
-        Write-Log '$Cred = Get-Credential' "Yellow"
-        Write-Log "New-IDSession -tenant_url `"$IdentityTenantURL`" -Credential `$Cred -Verbose" "Yellow"
-
         throw
+    }
+
+    # Confirm logged-on user if supported
+    try {
+        $loggedOnUser = Get-PASLoggedOnUser -ErrorAction Stop
+        if ($loggedOnUser) {
+            Write-Log "Logged on to Privilege Cloud as: $($loggedOnUser.UserName)" "Green"
+        }
+    }
+    catch {
+        Write-Log "Get-PASLoggedOnUser warning. Continuing. Details: $($_.Exception.Message)" "Yellow"
     }
 
     # Retrieve Safes
