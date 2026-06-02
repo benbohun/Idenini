@@ -1,52 +1,29 @@
 <#
-SafeMembershipReport_BrowserSAML_MFA.ps1
+SafeMembershipReport_NormalIdentityUser.ps1
 
 PURPOSE
-- Launches browser-based SAML MFA flow.
-- Uses the SAMLResponse to authenticate to CyberArk Privilege Cloud / PVWA API.
+- Uses the normal supported CyberArk Privilege Cloud Shared Services login for a human Identity user.
 - Does NOT use CCP.
-- Does NOT use ServiceUser.
-- Does NOT use IdentityCommand / New-IDSession.
-- Enumerates all Safes via Get-PASSafe.
-- Enumerates Safe Members via Get-PASSafeMember.
-- Exports full Safe membership and permissions report to CSV.
+- Does NOT use ServiceUser mode.
+- Uses:
+    New-PASSession -IdentityTenantURL ... -PrivilegeCloudURL ... -Credential ... -IdentityUser
+- Forces module version validation so old IdentityCommand versions do not silently break login.
+- Adds a raw StartAuthentication diagnostic test to expose the real Identity API error if New-PASSession fails.
+- Enumerates Safes and Safe Members.
+- Exports a Safe Membership report to CSV.
 
 IMPORTANT
-- You need the IDP-initiated SAML login URL for the CyberArk PVWA / Privilege Cloud application.
-- This is NOT the IdentityTenantURL.
-- This is usually the SSO launch URL from CyberArk Identity, Okta, Entra ID, Ping, etc.
-- Example:
-    https://your-idp/saml-launch-url-for-cyberark-pvwa
-
-REQUIREMENTS
-- psPAS module.
-- One of the following:
-    1. getSAMLResponse.exe from getSAMLResponse-Interactive project, recommended for modern browser/FIDO/WebAuthn.
-    OR
-    2. PS-SAML-Interactive.psm1 module with New-SAMLInteractive function.
-
-NOTES
-- The PowerShell PS-SAML-Interactive module may use older embedded browser components.
-- The getSAMLResponse.exe option is better for modern browser-based MFA.
+- Run from an interactive PowerShell session.
+- Recommended: PowerShell 7.x if available.
+- If using Windows PowerShell 5.1, make sure old IdentityCommand versions are removed or not loaded first.
 #>
 
 [CmdletBinding()]
 param(
-    # ===== CyberArk Privilege Cloud / PVWA URL =====
-    # Do not include /PasswordVault at the end.
+    # ===== Identity / Privilege Cloud URLs =====
+    [string]$IdentityTenantURL = "https://abq4291.id.cyberark.cloud",
+
     [string]$PrivilegeCloudURL = "https://mtbanktest.privilegecloud.cyberark.cloud",
-
-    # ===== SAML Browser Login URL =====
-    # This must be the IDP-initiated SAML launch URL for the CyberArk PVWA / Privilege Cloud app.
-    # This is NOT the IdentityTenantURL.
-    [string]$SAMLLoginURL = "https://YOUR-IDP-SAML-LAUNCH-URL-FOR-CYBERARK-PVWA",
-
-    # ===== Browser SAML helper =====
-    # Recommended: path to getSAMLResponse.exe.
-    [string]$GetSAMLResponseExePath = "",
-
-    # Alternative: path to PS-SAML-Interactive.psm1.
-    [string]$SAMLInteractiveModulePath = "",
 
     # ===== Output =====
     [string]$CsvFilePath = "",
@@ -54,7 +31,9 @@ param(
     [string]$LogFile = "",
 
     # ===== Optional =====
-    [switch]$SkipVersionCheck
+    [switch]$LoginOnly,
+
+    [switch]$RunStartAuthenticationProbe
 )
 
 # =========================
@@ -120,6 +99,36 @@ function Write-Log {
 
     Add-Content -Path $LogFile -Value $entry
     Write-Host $entry -ForegroundColor $Color
+}
+
+function Write-ExceptionDetails {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        $ErrorRecord,
+
+        [string]$Prefix = "ERROR"
+    )
+
+    try {
+        Write-Log "$Prefix Message: $($ErrorRecord.Exception.Message)" "Red"
+
+        if ($ErrorRecord.Exception.InnerException) {
+            Write-Log "$Prefix InnerException: $($ErrorRecord.Exception.InnerException.Message)" "Red"
+        }
+
+        if ($ErrorRecord.ErrorDetails -and $ErrorRecord.ErrorDetails.Message) {
+            Write-Log "$Prefix ErrorDetails: $($ErrorRecord.ErrorDetails.Message)" "Red"
+        }
+
+        if ($ErrorRecord.InvocationInfo) {
+            Write-Log "$Prefix ScriptLineNumber: $($ErrorRecord.InvocationInfo.ScriptLineNumber)" "Red"
+            Write-Log "$Prefix PositionMessage: $($ErrorRecord.InvocationInfo.PositionMessage)" "Red"
+        }
+    }
+    catch {
+        Write-Log "$Prefix Unable to expand exception details: $($_.Exception.Message)" "Yellow"
+    }
 }
 
 function Assert-UrlReady {
@@ -194,180 +203,249 @@ function Get-PermissionValue {
     return Get-ObjectPropertyValue -InputObject $Permissions -PropertyNames @($PermissionName)
 }
 
-function Write-ExceptionDetails {
+function Show-ModuleInventory {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
-        $ErrorRecord,
-
-        [string]$Prefix = "ERROR"
+        [string[]]$ModuleNames
     )
 
+    foreach ($moduleName in $ModuleNames) {
+        Write-Log "Checking installed versions for module: $moduleName" "Cyan"
+
+        $installed = @(Get-Module -ListAvailable -Name $moduleName |
+            Sort-Object Version -Descending |
+            Select-Object Name, Version, Path)
+
+        if (-not $installed -or $installed.Count -eq 0) {
+            Write-Log "Module not found: $moduleName" "Red"
+            continue
+        }
+
+        foreach ($m in $installed) {
+            Write-Log ("Found {0} version {1} at {2}" -f $m.Name, $m.Version, $m.Path) "Yellow"
+        }
+    }
+}
+
+function Import-RequiredModuleHighestVersion {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Name,
+
+        [Parameter(Mandatory)]
+        [version]$MinimumVersion
+    )
+
+    Remove-Module -Name $Name -Force -ErrorAction SilentlyContinue
+
+    $module = Get-Module -ListAvailable -Name $Name |
+        Sort-Object Version -Descending |
+        Select-Object -First 1
+
+    if (-not $module) {
+        throw "Required module not installed: $Name"
+    }
+
+    if ([version]$module.Version -lt $MinimumVersion) {
+        throw "$Name version $($module.Version) is installed, but minimum required is $MinimumVersion. Update the module."
+    }
+
+    Import-Module $module.Path -Force -ErrorAction Stop
+
+    $loaded = Get-Module -Name $Name
+
+    Write-Log ("Loaded {0} version {1} from {2}" -f $loaded.Name, $loaded.Version, $loaded.Path) "Green"
+}
+
+function Test-IdentityStartAuthenticationRaw {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$TenantUrl,
+
+        [Parameter(Mandatory)]
+        [string]$Username
+    )
+
+    $TenantUrl = $TenantUrl.TrimEnd("/")
+    $uri = "$TenantUrl/Security/StartAuthentication"
+
+    Write-Log "Running raw StartAuthentication probe..." "Cyan"
+    Write-Log "Probe URI: $uri" "Cyan"
+    Write-Log "Probe username: $Username" "Cyan"
+
+    $headers = @{
+        "accept"     = "*/*"
+        "OobIdPAuth" = "true"
+    }
+
+    $body = @{
+        User    = $Username
+        Version = "1.0"
+    } | ConvertTo-Json
+
     try {
-        Write-Log "$Prefix Message: $($ErrorRecord.Exception.Message)" "Red"
+        $response = Invoke-WebRequest `
+            -Uri $uri `
+            -Method POST `
+            -Headers $headers `
+            -ContentType "application/json" `
+            -Body $body `
+            -UseBasicParsing `
+            -ErrorAction Stop
 
-        if ($ErrorRecord.Exception.InnerException) {
-            Write-Log "$Prefix InnerException: $($ErrorRecord.Exception.InnerException.Message)" "Red"
+        Write-Log "Raw StartAuthentication HTTP status: $($response.StatusCode)" "Green"
+
+        $content = $response.Content
+
+        if (-not [string]::IsNullOrWhiteSpace($content)) {
+            try {
+                $json = $content | ConvertFrom-Json -ErrorAction Stop
+
+                Write-Log "StartAuthentication returned JSON successfully." "Green"
+
+                if ($json.PodFqdn) {
+                    Write-Log "Identity tenant redirected to PodFqdn: $($json.PodFqdn)" "Yellow"
+                }
+
+                if ($json.IdpRedirectShortUrl) {
+                    Write-Log "Tenant returned IdpRedirectShortUrl, meaning OOB IdP auth is expected." "Yellow"
+                }
+
+                if ($json.Challenges) {
+                    Write-Log "Tenant returned challenge package count: $($json.Challenges.Count)" "Green"
+                }
+
+                if ($json.Summary) {
+                    Write-Log "StartAuthentication Summary: $($json.Summary)" "Yellow"
+                }
+
+                return $json
+            }
+            catch {
+                Write-Log "StartAuthentication response was not JSON. Raw response follows:" "Yellow"
+                Write-Log $content "Yellow"
+                return $content
+            }
         }
-
-        if ($ErrorRecord.ErrorDetails -and $ErrorRecord.ErrorDetails.Message) {
-            Write-Log "$Prefix ErrorDetails: $($ErrorRecord.ErrorDetails.Message)" "Red"
-        }
-
-        if ($ErrorRecord.InvocationInfo) {
-            Write-Log "$Prefix ScriptLineNumber: $($ErrorRecord.InvocationInfo.ScriptLineNumber)" "Red"
-            Write-Log "$Prefix PositionMessage: $($ErrorRecord.InvocationInfo.PositionMessage)" "Red"
+        else {
+            Write-Log "StartAuthentication returned empty content." "Yellow"
+            return $null
         }
     }
     catch {
-        Write-Log "$Prefix Unable to expand exception details: $($_.Exception.Message)" "Yellow"
+        Write-Log "Raw StartAuthentication probe failed." "Red"
+
+        try {
+            $webResponse = $_.Exception.Response
+
+            if ($webResponse) {
+                Write-Log "HTTP StatusCode: $([int]$webResponse.StatusCode) $($webResponse.StatusDescription)" "Red"
+
+                $stream = $webResponse.GetResponseStream()
+                if ($stream) {
+                    $reader = New-Object System.IO.StreamReader($stream)
+                    $errorContent = $reader.ReadToEnd()
+
+                    if (-not [string]::IsNullOrWhiteSpace($errorContent)) {
+                        Write-Log "Raw error response body:" "Red"
+                        Write-Log $errorContent "Red"
+                    }
+                }
+            }
+        }
+        catch {
+            Write-Log "Unable to read raw HTTP error response: $($_.Exception.Message)" "Yellow"
+        }
+
+        Write-ExceptionDetails -ErrorRecord $_ -Prefix "RAW STARTAUTH ERROR"
+        throw
     }
 }
 
-function Get-SAMLResponseInteractive {
+function Start-NormalIdentityUserSession {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
-        [string]$LoginURL,
-
-        [string]$ExePath,
-
-        [string]$ModulePath
-    )
-
-    Write-Log "Starting browser-based SAML MFA login..." "Cyan"
-    Write-Log "SAML Login URL: $LoginURL" "Cyan"
-
-    $samlResponse = $null
-
-    if (-not [string]::IsNullOrWhiteSpace($ExePath)) {
-        if (-not (Test-Path -Path $ExePath)) {
-            throw "getSAMLResponse.exe was specified but was not found at: $ExePath"
-        }
-
-        Write-Log "Using getSAMLResponse.exe for browser SAML authentication." "Cyan"
-
-        $samlResponse = & $ExePath $LoginURL
-
-        if ($LASTEXITCODE -ne 0) {
-            throw "getSAMLResponse.exe returned exit code $LASTEXITCODE."
-        }
-    }
-    elseif (-not [string]::IsNullOrWhiteSpace($ModulePath)) {
-        if (-not (Test-Path -Path $ModulePath)) {
-            throw "PS-SAML-Interactive module was specified but was not found at: $ModulePath"
-        }
-
-        Write-Log "Importing PS-SAML-Interactive module: $ModulePath" "Cyan"
-        Import-Module $ModulePath -Force -ErrorAction Stop
-
-        if (-not (Get-Command New-SAMLInteractive -ErrorAction SilentlyContinue)) {
-            throw "New-SAMLInteractive command was not found after importing: $ModulePath"
-        }
-
-        Write-Log "Using New-SAMLInteractive for browser SAML authentication." "Cyan"
-
-        $samlResponse = New-SAMLInteractive -LoginIDP $LoginURL
-    }
-    else {
-        throw "No browser SAML helper was provided. Provide either -GetSAMLResponseExePath or -SAMLInteractiveModulePath."
-    }
-
-    if ($null -eq $samlResponse) {
-        throw "No SAMLResponse was returned from the browser SAML login."
-    }
-
-    $samlResponse = ($samlResponse | Out-String).Trim()
-
-    if ([string]::IsNullOrWhiteSpace($samlResponse)) {
-        throw "SAMLResponse was empty after browser SAML login."
-    }
-
-    if ($samlResponse -notmatch "^[A-Za-z0-9+/=]+$") {
-        Write-Log "Warning: SAMLResponse contains characters outside standard Base64. Continuing because some tools may return encoded output." "Yellow"
-    }
-
-    Write-Log "SAMLResponse captured successfully." "Green"
-
-    return $samlResponse
-}
-
-function Start-PASSAMLSession {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [string]$BaseURL,
+        [string]$IdentityTenantURL,
 
         [Parameter(Mandatory)]
-        [string]$SAMLResponse,
+        [string]$PrivilegeCloudURL,
 
-        [switch]$SkipVersionCheck
+        [Parameter(Mandatory)]
+        [PSCredential]$Credential
     )
 
-    $BaseURL = $BaseURL.TrimEnd("/")
+    Write-Log "Authenticating using normal Identity user flow..." "Cyan"
+    Write-Log "IdentityTenantURL: $IdentityTenantURL" "Cyan"
+    Write-Log "PrivilegeCloudURL: $PrivilegeCloudURL" "Cyan"
+    Write-Log "This uses New-PASSession -IdentityUser. Complete any MFA challenge presented by IdentityCommand." "Yellow"
 
-    Write-Log "Authenticating to CyberArk using SAMLResponse..." "Cyan"
-    Write-Log "Base URL: $BaseURL" "Cyan"
-
-    $sessionParams = @{
-        BaseURI      = $BaseURL
-        SAMLAuth    = $true
-        SAMLResponse = $SAMLResponse
-        ErrorAction  = "Stop"
-    }
-
-    if ($SkipVersionCheck) {
-        $sessionParams["SkipVersionCheck"] = $true
-    }
-
-    New-PASSession @sessionParams | Out-Null
+    New-PASSession `
+        -IdentityTenantURL $IdentityTenantURL `
+        -PrivilegeCloudURL $PrivilegeCloudURL `
+        -Credential $Credential `
+        -IdentityUser `
+        -ErrorAction Stop `
+        -Verbose | Out-Null
 
     if (-not (Get-PASSession)) {
-        throw "psPAS session was not established after SAML authentication."
+        throw "New-PASSession completed but no psPAS session was established."
     }
 
-    Write-Log "psPAS SAML session established successfully." "Green"
+    Write-Log "psPAS session established successfully." "Green"
 }
 
 # =========================
-# Initialize output paths
+# Initialize
 # =========================
 
 Ensure-ParentFolder -Path $CsvFilePath
 Ensure-ParentFolder -Path $LogFile
 
-Write-Log "Safe Member Report starting..." "Cyan"
+Write-Log "Safe Membership Report starting..." "Cyan"
+Write-Log "PowerShell edition: $($PSVersionTable.PSEdition)" "Cyan"
+Write-Log "PowerShell version: $($PSVersionTable.PSVersion)" "Cyan"
 Write-Log "CSV output path: $CsvFilePath" "Cyan"
 Write-Log "Log file path: $LogFile" "Cyan"
 
-# =========================
-# Validate URLs
-# =========================
-
+$IdentityTenantURL = $IdentityTenantURL.TrimEnd("/")
 $PrivilegeCloudURL = $PrivilegeCloudURL.TrimEnd("/")
-$SAMLLoginURL = $SAMLLoginURL.Trim()
 
+Assert-UrlReady -Name "IdentityTenantURL" -Url $IdentityTenantURL
 Assert-UrlReady -Name "PrivilegeCloudURL" -Url $PrivilegeCloudURL
-Assert-UrlReady -Name "SAMLLoginURL" -Url $SAMLLoginURL
 
 # =========================
-# Import psPAS
+# Module validation
 # =========================
+
+Show-ModuleInventory -ModuleNames @("IdentityCommand", "psPAS")
 
 try {
-    Import-Module psPAS -Force -ErrorAction Stop
-    Write-Log "psPAS module loaded successfully." "Green"
+    # IdentityCommand 0.3.61 is used because older versions had weaker/broken error reporting around Invoke-IDRestMethod.
+    Import-RequiredModuleHighestVersion -Name "IdentityCommand" -MinimumVersion ([version]"0.3.61")
+
+    # psPAS 6.0+ introduced Shared Services Identity user auth.
+    # 6.4.85 works in many environments, but newer is preferred.
+    Import-RequiredModuleHighestVersion -Name "psPAS" -MinimumVersion ([version]"6.0.0")
 }
 catch {
-    Write-Log "Failed to load psPAS module." "Red"
-    Write-ExceptionDetails -ErrorRecord $_ -Prefix "psPAS IMPORT ERROR"
+    Write-Log "Module validation failed." "Red"
+    Write-ExceptionDetails -ErrorRecord $_ -Prefix "MODULE ERROR"
+
+    Write-Log "Recommended remediation commands:" "Yellow"
+    Write-Log "Close all PowerShell windows, reopen as admin or normal user, then run:" "Yellow"
+    Write-Log "Uninstall-Module IdentityCommand -AllVersions -Force" "Yellow"
+    Write-Log "Uninstall-Module psPAS -AllVersions -Force" "Yellow"
+    Write-Log "Install-Module IdentityCommand -Scope CurrentUser -Force -AllowClobber" "Yellow"
+    Write-Log "Install-Module psPAS -Scope CurrentUser -Force -AllowClobber" "Yellow"
+
     throw
 }
 
-# =========================
-# Validate psPAS commands
-# =========================
-
+# Validate expected commands
 foreach ($requiredCommand in @(
     "New-PASSession",
     "Get-PASSession",
@@ -376,23 +454,24 @@ foreach ($requiredCommand in @(
     "Get-PASSafeMember"
 )) {
     if (-not (Get-Command $requiredCommand -ErrorAction SilentlyContinue)) {
-        throw "Required command not found: $requiredCommand"
+        throw "Required command not found after module import: $requiredCommand"
     }
 }
 
 $newPasSessionCommand = Get-Command New-PASSession -ErrorAction Stop
 
 foreach ($requiredParameter in @(
-    "BaseURI",
-    "SAMLAuth",
-    "SAMLResponse"
+    "IdentityTenantURL",
+    "PrivilegeCloudURL",
+    "Credential",
+    "IdentityUser"
 )) {
     if (-not $newPasSessionCommand.Parameters.ContainsKey($requiredParameter)) {
-        throw "Installed psPAS New-PASSession does not support parameter: -$requiredParameter. Update psPAS."
+        throw "New-PASSession does not support parameter -$requiredParameter. Loaded psPAS version is not compatible."
     }
 }
 
-Write-Log "New-PASSession supports SAML authentication parameters." "Green"
+Write-Log "New-PASSession supports required Identity user parameters." "Green"
 
 # =========================
 # Main
@@ -402,32 +481,60 @@ $sessionCreated = $false
 $SafeMembersReport = New-Object System.Collections.Generic.List[object]
 
 try {
-    # Browser SAML MFA
-    $SAMLResponse = Get-SAMLResponseInteractive `
-        -LoginURL $SAMLLoginURL `
-        -ExePath $GetSAMLResponseExePath `
-        -ModulePath $SAMLInteractiveModulePath
+    Write-Log "Prompting for normal CyberArk Identity / Privilege Cloud user credential..." "Cyan"
 
-    # Authenticate to CyberArk with SAMLResponse
-    Start-PASSAMLSession `
-        -BaseURL $PrivilegeCloudURL `
-        -SAMLResponse $SAMLResponse `
-        -SkipVersionCheck:$SkipVersionCheck
+    $Credential = Get-Credential -Message "Enter your CyberArk Identity / Privilege Cloud username and password"
 
-    $sessionCreated = $true
+    if ($null -eq $Credential) {
+        throw "Credential prompt was cancelled."
+    }
 
-    # Optional logged-on user check
+    if ([string]::IsNullOrWhiteSpace($Credential.UserName)) {
+        throw "Credential username is empty."
+    }
+
+    if ($RunStartAuthenticationProbe) {
+        Test-IdentityStartAuthenticationRaw `
+            -TenantUrl $IdentityTenantURL `
+            -Username $Credential.UserName | Out-Null
+    }
+
     try {
-        if (Get-Command Get-PASLoggedOnUser -ErrorAction SilentlyContinue) {
-            $loggedOnUser = Get-PASLoggedOnUser -ErrorAction Stop
+        Start-NormalIdentityUserSession `
+            -IdentityTenantURL $IdentityTenantURL `
+            -PrivilegeCloudURL $PrivilegeCloudURL `
+            -Credential $Credential
 
-            if ($loggedOnUser) {
-                Write-Log "Logged on to CyberArk as: $($loggedOnUser.UserName)" "Green"
-            }
-        }
+        $sessionCreated = $true
     }
     catch {
-        Write-Log "Get-PASLoggedOnUser warning. Continuing. Details: $($_.Exception.Message)" "Yellow"
+        Write-Log "Authentication failed before Safe enumeration." "Red"
+        Write-ExceptionDetails -ErrorRecord $_ -Prefix "AUTH ERROR"
+
+        Write-Log "Running raw StartAuthentication probe to expose the real Identity API response..." "Yellow"
+
+        try {
+            Test-IdentityStartAuthenticationRaw `
+                -TenantUrl $IdentityTenantURL `
+                -Username $Credential.UserName | Out-Null
+        }
+        catch {
+            Write-Log "Raw StartAuthentication probe also failed." "Red"
+        }
+
+        Write-Log "Most likely causes:" "Yellow"
+        Write-Log "1. Older IdentityCommand module is still being loaded from another path." "Yellow"
+        Write-Log "2. Identity authentication policy for this user is not API-compatible." "Yellow"
+        Write-Log "3. User is not found in this Identity tenant or username format is wrong." "Yellow"
+        Write-Log "4. Tenant URL is correct, but redirects to a pod/FQDN and the module is failing during that redirect." "Yellow"
+        Write-Log "5. Proxy/TLS inspection is modifying the Identity API response." "Yellow"
+
+        throw
+    }
+
+    if ($LoginOnly) {
+        Write-Log "LoginOnly switch was specified. Authentication succeeded. Stopping before report generation." "Yellow"
+        return
     }
 
     # Retrieve Safes
@@ -436,7 +543,7 @@ try {
     $Safes = @(Get-PASSafe -ErrorAction Stop)
 
     if (-not $Safes -or $Safes.Count -eq 0) {
-        Write-Log "No Safes returned from Get-PASSafe. Validate Admin PCloud membership and Safe permissions." "Yellow"
+        Write-Log "No Safes returned from Get-PASSafe. Validate Admin PCloud group membership and Safe permissions." "Yellow"
         return
     }
 
@@ -544,7 +651,7 @@ try {
         Write-Log "Safe Member Report exported successfully. Total rows: $($SafeMembersReport.Count)" "Green"
     }
 
-    Write-Log "Safe Member Report generation completed." "Cyan"
+    Write-Log "Safe Membership Report generation completed." "Cyan"
 }
 catch {
     Write-Log "FATAL ERROR: $($_.Exception.Message)" "Red"
@@ -553,7 +660,7 @@ finally {
     if ($sessionCreated) {
         try {
             Close-PASSession | Out-Null
-            Write-Log "Logged off from CyberArk." "Green"
+            Write-Log "Logged off from Privilege Cloud." "Green"
         }
         catch {
             Write-Log "Logoff warning: $($_.Exception.Message)" "Yellow"
