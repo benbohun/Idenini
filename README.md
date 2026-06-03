@@ -1,0 +1,146 @@
+# CyberArk Vaulted Account Field Updater
+
+## Description
+
+`Update-VaultedAccounts.ps1` updates existing CyberArk Privilege Cloud vaulted account fields from a CSV file.
+
+The script performs validation before sending updates:
+
+- Confirms the CSV contains an account identifier.
+- Retrieves the current account details by Account ID.
+- Loads regular account platforms from CyberArk.
+- Validates that a target platform exists and is active.
+- Prevents platform changes where the source and target platform `systemType` do not match.
+- Checks target Safe compatibility against the target platform `AllowedSafes` value when available.
+- Validates `Prop:<PropertyName>` columns against the target platform required/optional property list unless `-AllowUnknownPlatformProperties` is used.
+- Treats a Safe change as a Safe-move request. Because CyberArk REST does not expose the same UI safe-move action as a simple PATCH field, the script creates a replacement account in the target Safe. Source deletion is disabled unless explicitly requested.
+
+## Dependencies
+
+- Windows PowerShell 5.1 or later.
+- Network access to:
+  - `https://<identity-tenant-id>.id.cyberark.cloud/oauth2/platformtoken`
+  - `https://<subdomain>.privilegecloud.cyberark.cloud/PasswordVault/API`
+- CyberArk Identity service user configured for OAuth client-credentials access.
+- API user permissions:
+  - List accounts in source Safe.
+  - Update account properties for in-place field updates.
+  - List/Create/Update account properties in target Safe for Safe-change create operations.
+  - Retrieve account/password value only if using Safe-change create mode.
+  - Delete accounts only if `-DeleteSourceAfterSafeMove -ConfirmDeleteSourceAfterMove YES` is used.
+- Proxy access if your environment requires it.
+
+## File layout
+
+```text
+CyberArk-AccountFieldUpdater/
+  Update-VaultedAccounts.ps1
+  .env
+  env/
+    dev.env
+    prod.env
+  samples/
+    account-update-template.csv
+  logs/
+  reports/
+```
+
+## Environment files
+
+`.env` stores shared values:
+
+```ini
+TENANT_ID="aak4521"
+SUB_DOMAIN="alliantcredit"
+PROXY_ADDRESS="proxy.company.com"
+PROXY_PORT="8080"
+```
+
+`env/dev.env` or `env/prod.env` overrides environment-specific values:
+
+```ini
+PROXY="http://proxy.company.com:8080"
+PVWA="https://alliantcredit.privilegecloud.cyberark.cloud"
+```
+
+`PVWA` can be either the tenant root URL or the full API URL. The script normalizes it to `/PasswordVault/API`.
+
+## CSV columns
+
+Required column:
+
+| Column | Accepted aliases | Notes |
+|---|---|---|
+| `AccountID` | `Account ID`, `id`, `ID` | CyberArk account ID from the Accounts API. |
+
+Optional update columns:
+
+| Column | Accepted aliases | REST target |
+|---|---|---|
+| `TargetSafeName` | `Target Safe`, `Migrated Safe`, `New Safe`, `SafeName` | Safe change request. Creates replacement account in target Safe. |
+| `TargetPlatformID` | `Target Platform ID`, `Migrated Platform ID`, `New Platform ID`, `PlatformID` | `/platformId` |
+| `TargetName` | `Target Name`, `Migrated Name`, `New Name`, `Name` | `/name` |
+| `TargetAddress` | `Target Address`, `Migrated Target system address`, `New Address`, `Address` | `/address` |
+| `TargetUserName` | `Target Username`, `Migrated Target system user name`, `New UserName`, `UserName` | `/userName` |
+| `AutomaticManagementEnabled` | `Automatic Management Enabled` | `/secretManagement/automaticManagementEnabled` |
+| `DisableAutomaticManagement` | `Disable Automatic Management` | Inverted into `/secretManagement/automaticManagementEnabled` |
+| `ManualManagementReason` | `Manual Management Reason` | `/secretManagement/manualManagementReason` |
+| `Prop:<PropertyName>` | `Property:<PropertyName>`, `PlatformProperty:<PropertyName>` | `/platformAccountProperties` |
+
+Example:
+
+```csv
+AccountID,TargetPlatformID,TargetAddress,TargetUserName,Prop:LogonDomain
+12_34,WinDomain,server01.example.com,administrator,ACU
+```
+
+## Usage
+
+Preview only:
+
+```powershell
+.\Update-VaultedAccounts.ps1 -CsvFile .\samples\account-update-template.csv -Environment dev -Preview
+```
+
+Patch account fields in place:
+
+```powershell
+.\Update-VaultedAccounts.ps1 -CsvFile .\input\prod-update.csv -Environment prod
+```
+
+Safe-change create mode:
+
+```powershell
+.\Update-VaultedAccounts.ps1 -CsvFile .\input\safe-move.csv -Environment prod `
+  -AllowSafeMove `
+  -AllowSecretRetrievalForSafeMove `
+  -SafeMoveReason "CHG123456 approved safe migration"
+```
+
+Safe-change create mode with source deletion after the target account is created:
+
+```powershell
+.\Update-VaultedAccounts.ps1 -CsvFile .\input\safe-move.csv -Environment prod `
+  -AllowSafeMove `
+  -AllowSecretRetrievalForSafeMove `
+  -DeleteSourceAfterSafeMove `
+  -ConfirmDeleteSourceAfterMove YES `
+  -SafeMoveReason "CHG123456 approved safe migration"
+```
+
+## Notes on token handling
+
+A bearer token cannot be hashed and then used for API authentication. The script therefore:
+
+- Requests the real bearer token from CyberArk Identity.
+- Keeps the real token in memory only.
+- Logs only a SHA256 fingerprint prefix for troubleshooting correlation.
+- Sends the real token only in the `Authorization: Bearer <token>` header.
+
+## Safe-change behavior
+
+CyberArk documents moving accounts between Safes as a controlled workflow with checks around permissions, CPM activity, unique account names, locked accounts, platform AllowedSafes, linked accounts, and account-level permissions. This script does not use unsupported internal UI calls.
+
+For Safe changes, it creates the account in the target Safe through the supported Add Account API. That means the new target account receives a new account ID. The source account remains unless `-DeleteSourceAfterSafeMove -ConfirmDeleteSourceAfterMove YES` is provided.
+
+Review linked logon/reconcile accounts, object-level permissions, account groups, and CPM status after any Safe-change run.
