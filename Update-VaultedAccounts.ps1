@@ -6,14 +6,22 @@
     PAM Team - account field update helper.
 
     Line of action:
-      1. Read .env and env-specific file.
-      2. Prompt for CyberArk Identity service-user credentials.
-      3. Request an ISPSS OAuth token from /oauth2/platformtoken.
-      4. Log only a SHA256 fingerprint of the token. The real token stays in memory.
-      5. Read the CSV and validate account/platform/safe changes before touching the account.
-      6. PATCH normal field changes in place.
-      7. If a target Safe is supplied, create a replacement account in the target Safe.
-         Source deletion is optional and must be explicitly confirmed.
+      1. Read the shared .env file and the selected environment file under .\env.
+      2. Build the Identity token URL, PVWA API base URL, and proxy settings from those files.
+      3. Prompt for CyberArk Identity service-user credentials at run time. No password is stored in the script.
+      4. Request an ISPSS OAuth token from /oauth2/platformtoken.
+      5. Keep the usable bearer token only in memory, and write only a short SHA256 fingerprint to the log.
+      6. Import the CSV and make sure every row has an AccountID value.
+      7. Load the CyberArk regular platform inventory once, then reuse it for every row.
+      8. For every CSV row, read the current account before deciding what should change.
+      9. Validate platform changes before update. Target platform must exist, be active, be regular,
+         and have the same CyberArk system/device type as the source platform.
+     10. Validate Target Safe access and platform AllowedSafes before any safe-change operation.
+     11. For same-Safe updates, send a PATCH request only for fields that actually changed.
+     12. For Safe changes, create a replacement account in the target Safe only when the explicit
+         safe-move switches are supplied. Source deletion remains blocked unless separately confirmed.
+     13. Write a result row for every CSV row to the report CSV, including success, preview, skipped,
+         failed, or partial status.
 
 .NOTES
     Tested for Windows PowerShell 5.1 syntax.
@@ -69,14 +77,20 @@ param(
     [string]$LogId = ''
 )
 
+# Stop immediately inside each try/catch block so failures are handled by the script instead of being silently ignored.
 $ErrorActionPreference = 'Stop'
+# Force TLS 1.2 for older Windows PowerShell hosts that may otherwise negotiate weaker protocols.
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
+# Script-scoped variables are used by helper functions after the initial configuration is loaded.
 $script:LogFile = $null
 $script:ReportFile = $null
 $script:Config = $null
 $script:PlatformCache = @{}
 
+<#
+    Returns true when a value is empty or still contains a placeholder. This keeps placeholder env values from being treated as real configuration.
+#>
 function Test-BlankValue {
     param([object]$Value)
 
@@ -87,6 +101,9 @@ function Test-BlankValue {
     return $false
 }
 
+<#
+    Creates the logs and reports folders when needed, then starts a new timestamped log and report file for this run.
+#>
 function New-RunLog {
     if (-not (Test-Path $LogFolder)) { New-Item -Path $LogFolder -ItemType Directory -Force | Out-Null }
     if (-not (Test-Path $ReportFolder)) { New-Item -Path $ReportFolder -ItemType Directory -Force | Out-Null }
@@ -100,6 +117,9 @@ function New-RunLog {
     Set-Content -Path $script:LogFile -Value "$(Get-Date -Format s) source=New-RunLog [INFO] Starting run"
 }
 
+<#
+    Writes a consistent log entry to the log file and mirrors it to the console with warning/error highlighting.
+#>
 function Write-RunLog {
     param(
         [string]$Source,
@@ -122,6 +142,9 @@ function Write-RunLog {
     }
 }
 
+<#
+    Reads simple KEY=VALUE entries from an env file. Blank lines and comments are ignored, and surrounding quotes are removed.
+#>
 function Read-DotEnvFile {
     param([string]$Path)
 
@@ -153,6 +176,9 @@ function Read-DotEnvFile {
     return $result
 }
 
+<#
+    Merges multiple env maps. Later files win, so dev.env/prod.env can override shared .env values.
+#>
 function Join-EnvValues {
     param([hashtable[]]$Maps)
 
@@ -165,6 +191,9 @@ function Join-EnvValues {
     return $merged
 }
 
+<#
+    Normalizes whatever PVWA value is supplied so all later REST calls can append PasswordVault/API paths consistently.
+#>
 function Normalize-PvwaApiBase {
     param([string]$PvwaValue)
 
@@ -177,6 +206,9 @@ function Normalize-PvwaApiBase {
     return "$base/PasswordVault/API"
 }
 
+<#
+    Turns TENANT_ID into a full CyberArk Identity base URL. Accepts either tenant short name or full URL.
+#>
 function Resolve-IdentityBase {
     param([hashtable]$Settings)
 
@@ -193,6 +225,9 @@ function Resolve-IdentityBase {
     return "https://$tenant.id.cyberark.cloud"
 }
 
+<#
+    Builds the proxy URL from PROXY or PROXY_ADDRESS/PROXY_PORT values. Also supports the ROXY_ADDRESS typo from the original sample.
+#>
 function Get-ProxyFromSettings {
     param([hashtable]$Settings)
 
@@ -212,7 +247,11 @@ function Get-ProxyFromSettings {
     return "$proxyAddress`:$($proxyPort.Trim())"
 }
 
+<#
+    Loads shared and environment-specific settings, builds runtime URLs, applies proxy settings, and stores configuration in script scope.
+#>
 function Import-RunConfig {
+    # Resolve the shared env file and the selected dev/prod env file.
     $baseFile = Join-Path $PSScriptRoot '.env'
     $envFile1 = Join-Path $EnvFolder "$Environment.env"
     $envFile2 = Join-Path $PSScriptRoot "$Environment.env"
@@ -230,6 +269,7 @@ function Import-RunConfig {
         throw "Could not find environment file for '$Environment'. Expected $envFile1 or $envFile2"
     }
 
+    # Merge shared and environment-specific settings. Values in dev.env/prod.env override .env.
     $settings = Join-EnvValues -Maps @($base, $envSpecific)
 
     if (Test-BlankValue $settings['PVWA']) {
@@ -239,6 +279,7 @@ function Import-RunConfig {
         $settings['PVWA'] = "https://$($settings['SUB_DOMAIN']).privilegecloud.cyberark.cloud"
     }
 
+    # Convert flexible config values into exact URLs used by REST calls.
     $identityBase = Resolve-IdentityBase -Settings $settings
     $apiBase = Normalize-PvwaApiBase -PvwaValue $settings['PVWA']
     $proxy = Get-ProxyFromSettings -Settings $settings
@@ -260,6 +301,9 @@ function Import-RunConfig {
     Write-RunLog 'Import-RunConfig' "Environment=$Environment IdentityBase=$identityBase ApiBase=$apiBase ProxyConfigured=$([bool]$proxy)" 'INFO'
 }
 
+<#
+    Converts a hashtable into application/x-www-form-urlencoded text for the Identity token request.
+#>
 function ConvertTo-FormBody {
     param([hashtable]$Body)
 
@@ -272,6 +316,9 @@ function ConvertTo-FormBody {
     return ($pairs -join '&')
 }
 
+<#
+    Creates a SHA256 hash of the bearer token for logging. This is for traceability only and cannot be used to authenticate.
+#>
 function Get-Sha256Fingerprint {
     param([string]$Text)
 
@@ -286,6 +333,9 @@ function Get-Sha256Fingerprint {
     }
 }
 
+<#
+    Extracts useful response-body text from failed REST calls so API errors are easier to troubleshoot.
+#>
 function Get-WebErrorText {
     param([System.Management.Automation.ErrorRecord]$ErrorRecord)
 
@@ -307,10 +357,15 @@ function Get-WebErrorText {
     return $msg
 }
 
+<#
+    Prompts for the service-user credential, requests the Identity bearer token, and logs only a fingerprint of the token.
+#>
 function Get-IdentityBearerToken {
     Write-RunLog 'Get-IdentityBearerToken' 'Prompting for CyberArk Identity service-user credentials' 'INFO'
+    # Prompt at run time so secrets are not stored in the script, CSV, env file, or Git repo.
     $credential = Get-Credential -Message 'Enter CyberArk Identity service-user credentials'
 
+    # CyberArk Identity platform-token endpoint expects a form-urlencoded client_credentials request.
     $body = ConvertTo-FormBody -Body @{
         grant_type = 'client_credentials'
         client_id = $credential.UserName
@@ -340,6 +395,7 @@ function Get-IdentityBearerToken {
         throw 'Identity token response did not include access_token.'
     }
 
+    # Keep the real token in memory only. Log only a fingerprint for troubleshooting correlation.
     $token = [string]$response.access_token
     $fingerprint = Get-Sha256Fingerprint -Text $token
     Write-RunLog 'Get-IdentityBearerToken' "Token acquired. SHA256 fingerprint=$($fingerprint.Substring(0,16))... ExpiresIn=$($response.expires_in)" 'INFO'
@@ -347,6 +403,9 @@ function Get-IdentityBearerToken {
     return $token
 }
 
+<#
+    Central wrapper for CyberArk REST calls. It builds the URL, adds the bearer token, serializes JSON, applies proxy settings, and normalizes errors.
+#>
 function Invoke-CyberArkRest {
     param(
         [ValidateSet('GET','POST','PATCH','DELETE')]
@@ -361,6 +420,7 @@ function Invoke-CyberArkRest {
         [string]$ContentType = 'application/json'
     )
 
+    # Accept either a full URL or a relative PasswordVault/API path.
     if ($Path -match '^https?://') {
         $uri = $Path
     }
@@ -368,6 +428,7 @@ function Invoke-CyberArkRest {
         $uri = "$($script:Config.ApiBase)/$($Path.TrimStart('/'))"
     }
 
+    # Add the bearer token to every CyberArk API call.
     $params = @{
         Method = $Method
         Uri = $uri
@@ -377,6 +438,7 @@ function Invoke-CyberArkRest {
 
     if ($Method -ne 'GET' -and $Method -ne 'DELETE') { $params['ContentType'] = $ContentType }
 
+    # Convert object bodies to JSON. String bodies are already serialized or form encoded.
     if ($null -ne $Body) {
         if ($Body -is [string]) { $params['Body'] = $Body }
         else { $params['Body'] = ($Body | ConvertTo-Json -Depth 30 -Compress) }
@@ -393,10 +455,14 @@ function Invoke-CyberArkRest {
     }
 }
 
+<#
+    Validates the CSV file, removes empty rows, confirms an AccountID column is present, and returns all rows for processing.
+#>
 function Get-CsvRows {
     if (-not (Test-Path $CsvFile)) { throw "CSV file not found: $CsvFile" }
     if ((Get-Item $CsvFile).Length -eq 0) { throw "CSV file is empty: $CsvFile" }
 
+    # Import the CSV and drop fully blank rows so accidental empty lines do not cause failures.
     $rows = Import-Csv -Path $CsvFile | Where-Object {
         ($_.PSObject.Properties.Value | Where-Object { $null -ne $_ -and $_.ToString().Trim().Length -gt 0 }).Count -gt 0
     }
@@ -414,6 +480,9 @@ function Get-CsvRows {
     return @($rows)
 }
 
+<#
+    Reads a value from a CSV row using several accepted column aliases so the CSV remains flexible.
+#>
 function Get-RowValue {
     param(
         [pscustomobject]$Row,
@@ -429,6 +498,9 @@ function Get-RowValue {
     return $null
 }
 
+<#
+    Converts friendly CSV values such as yes/no, true/false, or 1/0 into real Boolean values.
+#>
 function ConvertTo-BooleanValue {
     param([string]$Value)
 
@@ -440,6 +512,9 @@ function ConvertTo-BooleanValue {
     }
 }
 
+<#
+    Collects platform account properties from CSV columns named Prop:<name>, Property:<name>, or PlatformProperty:<name>.
+#>
 function Get-RowPlatformProperties {
     param([pscustomobject]$Row)
 
@@ -455,10 +530,14 @@ function Get-RowPlatformProperties {
     return $props
 }
 
+<#
+    Loads regular CyberArk platforms once at the beginning of the run so every account row can be validated locally.
+#>
 function Get-PlatformInventory {
     param([string]$Token)
 
     Write-RunLog 'Get-PlatformInventory' 'Loading platform inventory' 'INFO'
+    # Only regular platforms are loaded because this script updates vaulted account platforms, not group or dependent platform types.
     $response = Invoke-CyberArkRest -Method GET -Path 'Platforms?PlatformType=Regular' -Token $Token
     $map = @{}
 
@@ -472,6 +551,9 @@ function Get-PlatformInventory {
     Write-RunLog 'Get-PlatformInventory' "Loaded $($map.Count) regular platform(s)" 'INFO'
 }
 
+<#
+    Looks up a platform from the cached inventory using exact or case-insensitive matching.
+#>
 function Get-PlatformById {
     param([string]$PlatformId)
 
@@ -485,6 +567,9 @@ function Get-PlatformById {
     return $null
 }
 
+<#
+    Builds the allowed platform-property name list from the target platform required and optional property definitions.
+#>
 function Get-PlatformPropertyNames {
     param([object]$Platform)
 
@@ -498,6 +583,9 @@ function Get-PlatformPropertyNames {
     return $names
 }
 
+<#
+    Stops the row when the CSV attempts to update a platform property that is not defined on the selected platform.
+#>
 function Assert-PlatformPropertiesAllowed {
     param(
         [hashtable]$Properties,
@@ -517,12 +605,16 @@ function Assert-PlatformPropertiesAllowed {
     }
 }
 
+<#
+    Checks whether a target Safe is allowed by the platform AllowedSafes pattern.
+#>
 function Test-SafeAllowedByPlatform {
     param(
         [object]$Platform,
         [string]$SafeName
     )
 
+    # CyberArk platforms may restrict which Safes can hold accounts for that platform.
     $allowedSafes = $null
     if ($null -ne $Platform.credentialsManagement) { $allowedSafes = $Platform.credentialsManagement.allowedSafes }
 
@@ -544,6 +636,9 @@ function Test-SafeAllowedByPlatform {
     return $false
 }
 
+<#
+    Checks that the target Safe exists and that the API user can access it before creating an account there.
+#>
 function Test-SafeExists {
     param(
         [string]$SafeName,
@@ -560,6 +655,9 @@ function Test-SafeExists {
     }
 }
 
+<#
+    Performs the core platform validation: source/target platform exist, target is active/regular, device type matches, and target Safe is allowed.
+#>
 function Assert-PlatformChangeAllowed {
     param(
         [object]$CurrentPlatform,
@@ -570,6 +668,7 @@ function Assert-PlatformChangeAllowed {
     if ($null -eq $CurrentPlatform) { throw 'Current platform could not be found in platform inventory.' }
     if ($null -eq $TargetPlatform) { throw 'Target platform could not be found in platform inventory.' }
 
+    # Do not move or patch an account into an inactive platform.
     if ($TargetPlatform.general.active -ne $true) {
         throw "Target platform '$($TargetPlatform.general.id)' is not active."
     }
@@ -578,6 +677,7 @@ function Assert-PlatformChangeAllowed {
         throw "Target platform '$($TargetPlatform.general.id)' is not a regular account platform."
     }
 
+    # Platform changes are allowed only when CyberArk reports the same system/device type.
     $currentType = [string]$CurrentPlatform.general.systemType
     $targetType = [string]$TargetPlatform.general.systemType
     if ($currentType -ne $targetType) {
@@ -589,6 +689,9 @@ function Assert-PlatformChangeAllowed {
     }
 }
 
+<#
+    Reads the current CyberArk account record before deciding what the CSV row should update.
+#>
 function Get-AccountById {
     param(
         [string]$AccountId,
@@ -599,6 +702,9 @@ function Get-AccountById {
     return Invoke-CyberArkRest -Method GET -Path "Accounts/$id/" -Token $Token
 }
 
+<#
+    Retrieves the current account secret when a Safe-change clone is explicitly approved.
+#>
 function Get-AccountSecretValue {
     param(
         [string]$AccountId,
@@ -617,6 +723,9 @@ function Get-AccountSecretValue {
     return [string]$response
 }
 
+<#
+    Combines current platform account properties with CSV-supplied properties. CSV values override current values.
+#>
 function Merge-PlatformProperties {
     param(
         [object]$CurrentProperties,
@@ -635,6 +744,9 @@ function Merge-PlatformProperties {
     return $merged
 }
 
+<#
+    Builds the JSON Patch operation array for same-Safe updates, adding only fields that actually need to change.
+#>
 function New-PatchBody {
     param(
         [object]$CurrentAccount,
@@ -647,6 +759,7 @@ function New-PatchBody {
         [hashtable]$PlatformProperties
     )
 
+    # Build a JSON Patch array. Each entry represents one field update sent to PATCH /Accounts/{id}/.
     $ops = @()
 
     if (-not (Test-BlankValue $TargetName) -and $TargetName -ne $CurrentAccount.name) {
@@ -665,6 +778,7 @@ function New-PatchBody {
         $ops += @{ op = 'replace'; path = '/platformId'; value = $TargetPlatformId }
     }
 
+    # Platform properties are sent as one object. Existing properties not included here remain unchanged by CyberArk.
     if ($PlatformProperties.Count -gt 0) {
         $ops += @{ op = 'add'; path = '/platformAccountProperties'; value = $PlatformProperties }
     }
@@ -683,6 +797,9 @@ function New-PatchBody {
     return $ops
 }
 
+<#
+    Builds the POST body used to create the replacement account in the target Safe during safe-change handling.
+#>
 function New-AccountCreateBody {
     param(
         [object]$CurrentAccount,
@@ -697,6 +814,7 @@ function New-AccountCreateBody {
         [hashtable]$PlatformProperties
     )
 
+    # For target Safe creation, keep current values unless the CSV supplied replacement values.
     $name = if (Test-BlankValue $TargetName) { $CurrentAccount.name } else { $TargetName }
     $address = if (Test-BlankValue $TargetAddress) { $CurrentAccount.address } else { $TargetAddress }
     $userName = if (Test-BlankValue $TargetUserName) { $CurrentAccount.userName } else { $TargetUserName }
@@ -715,6 +833,7 @@ function New-AccountCreateBody {
     if (-not (Test-BlankValue $ManualManagementReason)) { $manualReason = $ManualManagementReason }
     if ($autoMgmt -eq $true) { $manualReason = '' }
 
+    # New-account create body. The secret is required because the public REST API creates a new account rather than performing the UI move operation.
     $body = [ordered]@{
         name = $name
         address = $address
@@ -737,6 +856,9 @@ function New-AccountCreateBody {
     return $body
 }
 
+<#
+    Appends the outcome for a processed CSV row to the report CSV.
+#>
 function Add-ReportRow {
     param([pscustomobject]$Row)
 
@@ -748,6 +870,9 @@ function Add-ReportRow {
     }
 }
 
+<#
+    Sends the PATCH request for normal updates when there is at least one operation to send.
+#>
 function Invoke-AccountPatch {
     param(
         [string]$AccountId,
@@ -760,6 +885,9 @@ function Invoke-AccountPatch {
     return Invoke-CyberArkRest -Method PATCH -Path "Accounts/$id/" -Token $Token -Body $PatchOps
 }
 
+<#
+    Handles the create side of a Safe change. It retrieves the secret, builds the new account body, and creates the target account.
+#>
 function Invoke-SafeMoveCreate {
     param(
         [object]$CurrentAccount,
@@ -774,10 +902,12 @@ function Invoke-SafeMoveCreate {
         [string]$Token
     )
 
+    # Safe change is intentionally gated because this path retrieves the current secret to create the target account.
     if (-not $AllowSecretRetrievalForSafeMove) {
         throw 'Safe change requires -AllowSecretRetrievalForSafeMove because REST-based clone/create needs the current secret value. Use UI move if secret retrieval is not approved.'
     }
 
+    # Retrieve the existing secret only after the user supplied the explicit safe-move approval switch.
     $secret = Get-AccountSecretValue -AccountId $CurrentAccount.id -Token $Token
     if (Test-BlankValue $secret) { throw 'Retrieved secret was empty. New account was not created.' }
 
@@ -795,12 +925,16 @@ function Invoke-SafeMoveCreate {
     return Invoke-CyberArkRest -Method POST -Path 'Accounts?AllowAccountDuplications=false' -Token $Token -Body $body
 }
 
+<#
+    Optionally deletes the source account after target creation, but only when both delete-confirmation switches are supplied.
+#>
 function Remove-SourceAccountAfterMove {
     param(
         [string]$AccountId,
         [string]$Token
     )
 
+    # Keep the source account by default so safe-change testing does not remove the original record.
     if (-not $DeleteSourceAfterSafeMove) { return 'Source account kept. DeleteSourceAfterSafeMove was not supplied.' }
     if ($ConfirmDeleteSourceAfterMove -ne 'YES') { return 'Source account kept. ConfirmDeleteSourceAfterMove was not YES.' }
 
@@ -809,6 +943,9 @@ function Remove-SourceAccountAfterMove {
     return 'Source account deleted after target account creation.'
 }
 
+<#
+    Processes one CSV row end to end: read account, validate target platform/Safe, choose patch versus safe-change create, and return result.
+#>
 function Invoke-RowUpdate {
     param(
         [pscustomobject]$CsvRow,
@@ -816,6 +953,7 @@ function Invoke-RowUpdate {
         [string]$Token
     )
 
+    # Read all supported CSV aliases for the fields this script can update.
     $accountId = Get-RowValue -Row $CsvRow -Names @('AccountID','Account ID','id','ID')
     $targetSafe = Get-RowValue -Row $CsvRow -Names @('TargetSafeName','Target Safe','Migrated Safe','New Safe','SafeName')
     $targetPlatformId = Get-RowValue -Row $CsvRow -Names @('TargetPlatformID','Target Platform ID','Migrated Platform ID','New Platform ID','PlatformID')
@@ -827,6 +965,7 @@ function Invoke-RowUpdate {
     $manualReason = Get-RowValue -Row $CsvRow -Names @('ManualManagementReason','Manual Management Reason')
     $csvProps = Get-RowPlatformProperties -Row $CsvRow
 
+    # Prepare a standard report row before doing any update. This guarantees every CSV row gets a result.
     $result = [ordered]@{
         Row = $RowNumber
         AccountID = $accountId
@@ -843,10 +982,12 @@ function Invoke-RowUpdate {
     try {
         if (Test-BlankValue $accountId) { throw 'AccountID is blank.' }
 
+        # Always read the current account first so validation compares CSV targets to the real vaulted state.
         $current = Get-AccountById -AccountId $accountId -Token $Token
         $result.SourceSafe = $current.safeName
         $result.SourcePlatform = $current.platformId
 
+        # When Target Safe or Target Platform is blank, use the current account value to avoid accidental changes.
         if (Test-BlankValue $targetSafe) { $targetSafe = $current.safeName }
         if (Test-BlankValue $targetPlatformId) { $targetPlatformId = $current.platformId }
 
@@ -856,9 +997,11 @@ function Invoke-RowUpdate {
         $currentPlatform = Get-PlatformById -PlatformId $current.platformId
         $targetPlatform = Get-PlatformById -PlatformId $targetPlatformId
 
+        # Validate platform/device type and AllowedSafes before building any update request.
         Assert-PlatformChangeAllowed -CurrentPlatform $currentPlatform -TargetPlatform $targetPlatform -TargetSafe $targetSafe
         Assert-PlatformPropertiesAllowed -Properties $csvProps -Platform $targetPlatform
 
+        # AutomaticManagementEnabled and DisableAutomaticManagement are optional. Null means leave current CPM management setting unchanged.
         $automaticManagement = $null
         if (-not (Test-BlankValue $disableMgmtRaw)) {
             $automaticManagement = -not (ConvertTo-BooleanValue -Value $disableMgmtRaw)
@@ -867,6 +1010,7 @@ function Invoke-RowUpdate {
             $automaticManagement = ConvertTo-BooleanValue -Value $enableMgmtRaw
         }
 
+        # A different Target Safe changes the path from PATCH to create-target-account workflow.
         $isSafeChange = ($targetSafe -ne $current.safeName)
         if ($isSafeChange) {
             $result.Action = 'SafeMoveCreate'
@@ -879,6 +1023,7 @@ function Invoke-RowUpdate {
                 throw "Target Safe '$targetSafe' was not found or API user cannot access it."
             }
 
+            # Preview validates the row and reports what would happen without creating, patching, or deleting anything.
             if ($Preview) {
                 $result.Result = 'PREVIEW'
                 $result.Message = 'Safe change validated. No account created because -Preview was supplied.'
@@ -909,6 +1054,7 @@ function Invoke-RowUpdate {
             return [pscustomobject]$result
         }
 
+        # Same-Safe changes use PATCH and include only values that changed.
         $patchOps = New-PatchBody -CurrentAccount $current `
             -TargetName $targetName `
             -TargetAddress $targetAddress `
@@ -944,7 +1090,11 @@ function Invoke-RowUpdate {
     }
 }
 
+<#
+    Main execution block. Initializes logging/config, authenticates, loads platforms, processes each CSV row, and writes final log/report paths.
+#>
 function Start-AccountUpdateRun {
+    # Step 1: create log/report files, then load runtime configuration from .env and env/<environment>.env.
     New-RunLog
     Import-RunConfig
 
@@ -954,14 +1104,17 @@ function Start-AccountUpdateRun {
 
     if ($Preview) { Write-RunLog 'Start-AccountUpdateRun' 'Preview mode enabled. No account update/create/delete calls will be sent.' 'WARN' }
 
+    # Step 2: import CSV, authenticate to Identity, then cache platform inventory for validation.
     $rows = Get-CsvRows
     $token = Get-IdentityBearerToken
     Get-PlatformInventory -Token $token
 
     $rowNumber = 1
+    # Step 3: process each CSV row independently so one failed account does not stop the full batch.
     foreach ($row in $rows) {
         Write-RunLog 'Start-AccountUpdateRun' "Processing CSV row $rowNumber" 'INFO'
         $outcome = Invoke-RowUpdate -CsvRow $row -RowNumber $rowNumber -Token $token
+        # Step 4: write the row result immediately so progress is preserved even if a later row fails.
         Add-ReportRow -Row $outcome
 
         if ($outcome.Result -eq 'FAILED') {
@@ -977,4 +1130,5 @@ function Start-AccountUpdateRun {
     Write-RunLog 'Start-AccountUpdateRun' "Run completed. Report=$script:ReportFile Log=$script:LogFile" 'INFO'
 }
 
+# Start the controlled update workflow.
 Start-AccountUpdateRun
