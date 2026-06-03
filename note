@@ -1,35 +1,578 @@
-2026-06-03 17:24:08 | INFO | CyberArk Identity OAuth token test from CCP starting.
-2026-06-03 17:24:08 | INFO | IdentityTenantURL: https://aak4521.my.idaptive.app
-2026-06-03 17:24:08 | INFO | IdentityOAuthAppId: identityapi
-2026-06-03 17:24:08 | INFO | TokenOnly: False
-2026-06-03 17:24:08 | INFO | Retrieving service user credential from CCP.
-2026-06-03 17:24:08 | INFO | CCP URL: https://aam.alliantcreditunion.com/AIMWebService/api/Accounts?AppID=ACURestAPI&Safe=ACU-VAULT-API&Object=Application-CyberArkVau
-ltRestAPI-alliantcredit.cyberark.cloud
-2026-06-03 17:24:09 | SUCCESS | CCP returned service user username: acurestapi_local@alliantcreditunion.admin
-2026-06-03 17:24:09 | INFO | Requesting Identity OAuth token from: https://aak4521.my.idaptive.app/oauth2/token/identityapi
-2026-06-03 17:24:09 | INFO | OAuth Client ID from CCP: acurestapi_local@alliantcreditunion.admin
-2026-06-03 17:24:09 | INFO | OAuth Scope: reporting
-2026-06-03 17:24:09 | INFO | Trying token request: Basic auth header using URL-encoded client_id and secret before Base64
-2026-06-03 17:24:09 | WARN | Token request failed using Basic auth header using URL-encoded client_id and secret before Base64. Response: HTTP 400 Bad Request. The re
-mote server returned an error: (400) Bad Request.
-2026-06-03 17:24:09 | INFO | Trying token request: Basic auth header using raw client_id and secret before Base64
-2026-06-03 17:24:10 | WARN | Token request failed using Basic auth header using raw client_id and secret before Base64. Response: HTTP 400 Bad Request. The remote ser
-ver returned an error: (400) Bad Request.
-2026-06-03 17:24:10 | ERROR | FAILED: Unable to retrieve Identity OAuth token.
+<#
+Test-IdentityReportingToken_FromCCP_Deep.ps1
 
-Last response:
-HTTP 400 Bad Request. The remote server returned an error: (400) Bad Request.
+Purpose:
+- Retrieve CyberArk Identity API service user credential from CCP.
+- Test OAuth client_credentials token against CyberArk Identity.
+- Test one or more OAuth app IDs, for example:
+    identityapi
+    your custom OAuth2 Client Application ID
+- Test Basic Auth header formats.
+- Test raw CCP password and trimmed CCP password.
+- Run a Redrock/query validation if token succeeds.
 
-Validate:
-1. Service user is enabled.
-2. Service user is configured as a Service User.
-3. Service user is configured as OAuth confidential client.
-4. OAuth app alias is correct: identityapi
-5. Token endpoint is correct: https://aak4521.my.idaptive.app/oauth2/token/identityapi
-6. Scope exists exactly as: reporting
-7. Scope REST Regex is exactly: Redrock/query
-8. Auth method includes Client Creds.
-9. Service user is added under OAuth app Permissions.
-10. Service user role has Report Management.
-11. CCP password is current for the service user.
-2026-06-03 17:24:10 | INFO | Log file: I:\Script\IDENTITY Script New\logs\IdentityOAuthTest\IdentityOAuthTest_20260603_172408.log
+This script does not update CyberArk Safes or change anything.
+
+CyberArk Identity expected settings:
+- Service user:
+    Is Service User = selected
+    Is OAuth confidential client = selected
+- Role:
+    Report Management = assigned
+- OAuth2 Client app:
+    Client ID Type = Confidential
+    Must be OAuth Client = selected
+    Auth methods = Client Creds
+    Scope name = reporting
+    REST Regex = Redrock/query
+    Permissions = service user added with permissions
+#>
+
+[CmdletBinding()]
+param(
+    # ===== Identity tenant =====
+    [string]$IdentityTenantURL = "https://aak4521.my.idaptive.app",
+
+    # IMPORTANT:
+    # Try identityapi first because CyberArk query docs show /oauth2/token/identityapi.
+    # If your OAuth2 Client app Application ID is different, add it here too.
+    [string[]]$IdentityOAuthAppIds = @("identityapi"),
+
+    # OAuth scope for Redrock reporting.
+    [string]$Scope = "reporting",
+
+    # ===== CCP settings =====
+    [string]$CCPAddress     = "https://aam.alliantcreditunion.com",
+    [string]$CCPLocation    = "AIMWebService",
+    [string]$CCPAppID       = "ACURestAPI",
+    [string]$CCPSafe        = "ACU-VAULT-API",
+    [string]$CCPObject      = "Application-CyberArkVaultRestAPI-alliantcredit.cyberark.cloud",
+    [bool]  $CCPWindowsAuth = $false,
+
+    # ===== Output =====
+    [string]$OutputFolder = "I:\Script\IDENTITY Script New\logs\IdentityOAuthTest",
+    [string]$LogFile      = "",
+
+    # Skip Redrock/query and only test token retrieval.
+    [switch]$TokenOnly
+)
+
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$ErrorActionPreference = "Stop"
+
+if (-not (Test-Path -Path $OutputFolder)) {
+    New-Item -Path $OutputFolder -ItemType Directory -Force | Out-Null
+}
+
+$RunStamp = Get-Date -Format "yyyyMMdd_HHmmss"
+
+if ([string]::IsNullOrWhiteSpace($LogFile)) {
+    $LogFile = Join-Path $OutputFolder "IdentityOAuthDeepTest_$RunStamp.log"
+}
+
+function Write-Log {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Message,
+
+        [ValidateSet("INFO", "WARN", "ERROR", "SUCCESS")]
+        [string]$Level = "INFO"
+    )
+
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $entry = "$timestamp | $Level | $Message"
+
+    Add-Content -Path $LogFile -Value $entry
+
+    switch ($Level) {
+        "SUCCESS" { Write-Host $entry -ForegroundColor Green }
+        "WARN"    { Write-Host $entry -ForegroundColor Yellow }
+        "ERROR"   { Write-Host $entry -ForegroundColor Red }
+        default   { Write-Host $entry -ForegroundColor White }
+    }
+}
+
+function ConvertTo-UrlEncodedValue {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Value
+    )
+
+    return [System.Uri]::EscapeDataString($Value)
+}
+
+function Read-HttpResponseBody {
+    param(
+        [Parameter(Mandatory)]
+        [System.Net.WebResponse]$Response
+    )
+
+    $stream = $null
+    $reader = $null
+
+    try {
+        $stream = $Response.GetResponseStream()
+
+        if (-not $stream) {
+            return ""
+        }
+
+        $reader = New-Object System.IO.StreamReader($stream)
+        return $reader.ReadToEnd()
+    }
+    finally {
+        if ($reader) {
+            $reader.Close()
+        }
+
+        if ($stream) {
+            $stream.Close()
+        }
+    }
+}
+
+function Invoke-HttpPost {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Uri,
+
+        [Parameter(Mandatory)]
+        [string]$Body,
+
+        [Parameter(Mandatory)]
+        [string]$ContentType,
+
+        [hashtable]$Headers = @{}
+    )
+
+    $request = [System.Net.WebRequest]::Create($Uri)
+    $request.Method = "POST"
+    $request.ContentType = $ContentType
+    $request.Accept = "application/json"
+
+    foreach ($key in $Headers.Keys) {
+        $request.Headers.Add($key, [string]$Headers[$key])
+    }
+
+    $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($Body)
+    $request.ContentLength = $bodyBytes.Length
+
+    $requestStream = $null
+
+    try {
+        $requestStream = $request.GetRequestStream()
+        $requestStream.Write($bodyBytes, 0, $bodyBytes.Length)
+    }
+    finally {
+        if ($requestStream) {
+            $requestStream.Close()
+        }
+    }
+
+    try {
+        $response = $request.GetResponse()
+        $responseBody = Read-HttpResponseBody -Response $response
+
+        return [PSCustomObject]@{
+            Success          = $true
+            StatusCode       = [int]$response.StatusCode
+            StatusDescription = [string]$response.StatusDescription
+            Body             = $responseBody
+        }
+    }
+    catch [System.Net.WebException] {
+        $webResponse = $_.Exception.Response
+
+        if ($webResponse) {
+            $errorBody = Read-HttpResponseBody -Response $webResponse
+
+            return [PSCustomObject]@{
+                Success          = $false
+                StatusCode       = [int]$webResponse.StatusCode
+                StatusDescription = [string]$webResponse.StatusDescription
+                Body             = $errorBody
+            }
+        }
+
+        return [PSCustomObject]@{
+            Success          = $false
+            StatusCode       = ""
+            StatusDescription = ""
+            Body             = $_.Exception.Message
+        }
+    }
+}
+
+function Get-ServiceUserCredentialFromCCP {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$CCPAddress,
+        [Parameter(Mandatory)][string]$Location,
+        [Parameter(Mandatory)][string]$AppID,
+        [Parameter(Mandatory)][string]$Safe,
+        [Parameter(Mandatory)][string]$Object,
+        [bool]$WindowsAuth = $false
+    )
+
+    $base = $CCPAddress.TrimEnd("/")
+    $loc  = $Location.Trim("/")
+
+    $encodedAppID  = ConvertTo-UrlEncodedValue -Value $AppID
+    $encodedSafe   = ConvertTo-UrlEncodedValue -Value $Safe
+    $encodedObject = ConvertTo-UrlEncodedValue -Value $Object
+
+    $url = "{0}/{1}/api/Accounts?AppID={2}&Safe={3}&Object={4}" -f `
+        $base, `
+        $loc, `
+        $encodedAppID, `
+        $encodedSafe, `
+        $encodedObject
+
+    Write-Log "Retrieving service user credential from CCP."
+    Write-Log ("CCP URL: {0}" -f $url)
+
+    try {
+        $headers = @{
+            "Content-Type" = "application/json"
+        }
+
+        $resp = Invoke-RestMethod `
+            -Uri $url `
+            -Method GET `
+            -Headers $headers `
+            -UseDefaultCredentials:$WindowsAuth `
+            -ErrorAction Stop
+
+        if (-not $resp.UserName -or -not $resp.Content) {
+            throw "CCP response is missing UserName or Content."
+        }
+
+        Write-Log ("CCP returned service user username: {0}" -f $resp.UserName) "SUCCESS"
+
+        return [PSCustomObject]@{
+            UserName = [string]$resp.UserName
+            Secret   = [string]$resp.Content
+        }
+    }
+    catch {
+        throw "CCP credential retrieval failed. $($_.Exception.Message)"
+    }
+}
+
+function New-BasicAuthHeaderValue {
+    param(
+        [Parameter(Mandatory)][string]$ClientId,
+        [Parameter(Mandatory)][string]$ClientSecret,
+        [Parameter(Mandatory)][string]$PairMode,
+        [Parameter(Mandatory)][string]$EncodingName
+    )
+
+    if ($PairMode -eq "UrlEncoded") {
+        $pair = "{0}:{1}" -f `
+            ([System.Uri]::EscapeDataString($ClientId)), `
+            ([System.Uri]::EscapeDataString($ClientSecret))
+    }
+    else {
+        $pair = "{0}:{1}" -f $ClientId, $ClientSecret
+    }
+
+    if ($EncodingName -eq "UTF8") {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($pair)
+    }
+    else {
+        $bytes = [System.Text.Encoding]::ASCII.GetBytes($pair)
+    }
+
+    $basicToken = [Convert]::ToBase64String($bytes)
+    return "Basic $basicToken"
+}
+
+function Get-SecretDiagnostics {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Secret
+    )
+
+    return [PSCustomObject]@{
+        Length        = $Secret.Length
+        StartsWithWS  = [bool]($Secret -match "^\s")
+        EndsWithWS    = [bool]($Secret -match "\s$")
+        ContainsCR    = [bool]($Secret.Contains("`r"))
+        ContainsLF    = [bool]($Secret.Contains("`n"))
+        ContainsTab   = [bool]($Secret.Contains("`t"))
+    }
+}
+
+function Get-IdentityReportingToken {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$IdentityTenantURL,
+        [Parameter(Mandatory)][string[]]$IdentityOAuthAppIds,
+        [Parameter(Mandatory)][string]$ClientId,
+        [Parameter(Mandatory)][string]$ClientSecret,
+        [Parameter(Mandatory)][string]$Scope
+    )
+
+    $tenant = $IdentityTenantURL.TrimEnd("/")
+
+    $secretDiagnostics = Get-SecretDiagnostics -Secret $ClientSecret
+
+    Write-Log ("OAuth Client ID from CCP: {0}" -f $ClientId)
+    Write-Log ("OAuth Scope: {0}" -f $Scope)
+    Write-Log ("Secret diagnostics: Length={0}; StartsWithWS={1}; EndsWithWS={2}; ContainsCR={3}; ContainsLF={4}; ContainsTab={5}" -f `
+        $secretDiagnostics.Length, `
+        $secretDiagnostics.StartsWithWS, `
+        $secretDiagnostics.EndsWithWS, `
+        $secretDiagnostics.ContainsCR, `
+        $secretDiagnostics.ContainsLF, `
+        $secretDiagnostics.ContainsTab)
+
+    $secretCandidates = New-Object System.Collections.Generic.List[object]
+
+    $secretCandidates.Add([PSCustomObject]@{
+        Name   = "Raw CCP secret"
+        Secret = $ClientSecret
+    }) | Out-Null
+
+    $trimmedSecret = $ClientSecret.Trim()
+
+    if ($trimmedSecret -ne $ClientSecret) {
+        $secretCandidates.Add([PSCustomObject]@{
+            Name   = "Trimmed CCP secret"
+            Secret = $trimmedSecret
+        }) | Out-Null
+    }
+
+    $body = "grant_type=client_credentials&scope=$([System.Uri]::EscapeDataString($Scope))"
+
+    $attempts = New-Object System.Collections.Generic.List[object]
+
+    foreach ($appId in $IdentityOAuthAppIds) {
+        foreach ($secretCandidate in $secretCandidates) {
+            foreach ($pairMode in @("UrlEncoded", "Raw")) {
+                foreach ($encodingName in @("ASCII", "UTF8")) {
+                    $attempts.Add([PSCustomObject]@{
+                        AppId        = $appId
+                        SecretName   = $secretCandidate.Name
+                        Secret       = $secretCandidate.Secret
+                        PairMode     = $pairMode
+                        EncodingName = $encodingName
+                    }) | Out-Null
+                }
+            }
+        }
+    }
+
+    $lastFailure = $null
+
+    foreach ($attempt in $attempts) {
+        $appId = ([string]$attempt.AppId).Trim("/")
+        $tokenUri = "$tenant/oauth2/token/$appId"
+
+        Write-Log ("Trying token URL: {0}" -f $tokenUri)
+        Write-Log ("Attempt details: Secret={0}; PairMode={1}; Encoding={2}" -f `
+            $attempt.SecretName, `
+            $attempt.PairMode, `
+            $attempt.EncodingName)
+
+        $authValue = New-BasicAuthHeaderValue `
+            -ClientId $ClientId `
+            -ClientSecret $attempt.Secret `
+            -PairMode $attempt.PairMode `
+            -EncodingName $attempt.EncodingName
+
+        $headers = @{
+            Authorization = $authValue
+        }
+
+        $response = Invoke-HttpPost `
+            -Uri $tokenUri `
+            -Body $body `
+            -ContentType "application/x-www-form-urlencoded" `
+            -Headers $headers
+
+        if ($response.Success) {
+            try {
+                $json = $response.Body | ConvertFrom-Json -ErrorAction Stop
+
+                if ($json.access_token) {
+                    Write-Log ("Token request succeeded. AppId={0}; Secret={1}; PairMode={2}; Encoding={3}" -f `
+                        $appId, `
+                        $attempt.SecretName, `
+                        $attempt.PairMode, `
+                        $attempt.EncodingName) "SUCCESS"
+
+                    return [PSCustomObject]@{
+                        AccessToken  = [string]$json.access_token
+                        TokenType    = [string]$json.token_type
+                        ExpiresIn    = $json.expires_in
+                        Scope        = $json.scope
+                        AppIdUsed    = $appId
+                        SecretUsed   = [string]$attempt.SecretName
+                        PairModeUsed = [string]$attempt.PairMode
+                        EncodingUsed = [string]$attempt.EncodingName
+                        RawBody      = [string]$response.Body
+                    }
+                }
+
+                Write-Log ("HTTP success but no access_token. Body: {0}" -f $response.Body) "WARN"
+            }
+            catch {
+                Write-Log ("HTTP success but response was not JSON. Body: {0}" -f $response.Body) "WARN"
+            }
+        }
+        else {
+            $lastFailure = $response
+
+            Write-Log ("Token request failed. HTTP {0} {1}. Body: {2}" -f `
+                $response.StatusCode, `
+                $response.StatusDescription, `
+                $response.Body) "WARN"
+        }
+    }
+
+    $lastStatus = ""
+    $lastBody = ""
+
+    if ($lastFailure) {
+        $lastStatus = "HTTP $($lastFailure.StatusCode) $($lastFailure.StatusDescription)"
+        $lastBody = $lastFailure.Body
+    }
+
+    $msg = @"
+Unable to retrieve Identity OAuth token.
+
+Last failure:
+$lastStatus
+$lastBody
+
+Most likely causes:
+1. The OAuth2 Client app Application ID is not identityapi.
+   - Add the real Application ID to -IdentityOAuthAppIds and test again.
+2. The CCP object password is not the current password for the service user.
+3. The exact CCP-returned user is not added under the OAuth2 Client app Permissions tab.
+4. The exact CCP-returned user does not have Report Management through a role.
+5. Scope is not exactly reporting.
+6. REST Regex is not exactly Redrock/query.
+7. Client Creds is not selected under Auth methods.
+8. The user is not marked as both Is Service User and Is OAuth confidential client.
+"@
+
+    throw $msg
+}
+
+function Invoke-RedrockQueryTest {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$IdentityTenantURL,
+        [Parameter(Mandatory)][string]$AccessToken
+    )
+
+    $tenant = $IdentityTenantURL.TrimEnd("/")
+    $queryUri = "$tenant/Redrock/query"
+
+    Write-Log ("Testing Redrock query endpoint: {0}" -f $queryUri)
+
+    $headers = @{
+        Authorization = "Bearer $AccessToken"
+    }
+
+    $payload = @{
+        Script = "Select ID, UserName, DisplayName from User ORDER BY UserName COLLATE NOCASE"
+        Args = @{
+            PageNumber = 1
+            PageSize   = 10
+            Limit      = 10
+            Caching    = -1
+        }
+    } | ConvertTo-Json -Depth 10
+
+    $response = Invoke-HttpPost `
+        -Uri $queryUri `
+        -Body $payload `
+        -ContentType "application/json" `
+        -Headers $headers
+
+    if (-not $response.Success) {
+        throw ("Redrock query failed. HTTP {0} {1}. Body: {2}" -f `
+            $response.StatusCode, `
+            $response.StatusDescription, `
+            $response.Body)
+    }
+
+    try {
+        $json = $response.Body | ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
+        throw ("Redrock query response was not valid JSON. Body: {0}" -f $response.Body)
+    }
+
+    if ($json.success -eq $false) {
+        throw ("Redrock returned success=false. Message: {0}. Body: {1}" -f $json.Message, $response.Body)
+    }
+
+    Write-Log "Redrock query succeeded." "SUCCESS"
+
+    $rows = @()
+
+    if ($json.Result -and $json.Result.Results) {
+        $rows = @($json.Result.Results | ForEach-Object { $_.Row })
+    }
+
+    Write-Log ("Redrock returned {0} row(s)." -f $rows.Count) "SUCCESS"
+
+    if ($rows.Count -gt 0) {
+        Write-Host ""
+        Write-Host "Sample Redrock result:" -ForegroundColor Cyan
+        $rows | Select-Object -First 10 | Format-Table -AutoSize
+    }
+
+    return $json
+}
+
+try {
+    Write-Log "CyberArk Identity OAuth deep test from CCP starting."
+    Write-Log ("IdentityTenantURL: {0}" -f $IdentityTenantURL)
+    Write-Log ("IdentityOAuthAppIds to test: {0}" -f ($IdentityOAuthAppIds -join ", "))
+    Write-Log ("TokenOnly: {0}" -f [bool]$TokenOnly)
+
+    $ccpCredential = Get-ServiceUserCredentialFromCCP `
+        -CCPAddress $CCPAddress `
+        -Location $CCPLocation `
+        -AppID $CCPAppID `
+        -Safe $CCPSafe `
+        -Object $CCPObject `
+        -WindowsAuth:$CCPWindowsAuth
+
+    $tokenResult = Get-IdentityReportingToken `
+        -IdentityTenantURL $IdentityTenantURL `
+        -IdentityOAuthAppIds $IdentityOAuthAppIds `
+        -ClientId $ccpCredential.UserName `
+        -ClientSecret $ccpCredential.Secret `
+        -Scope $Scope
+
+    Write-Log ("Access token received. TokenType={0}; ExpiresIn={1}; AppIdUsed={2}; SecretUsed={3}; PairMode={4}; Encoding={5}" -f `
+        $tokenResult.TokenType, `
+        $tokenResult.ExpiresIn, `
+        $tokenResult.AppIdUsed, `
+        $tokenResult.SecretUsed, `
+        $tokenResult.PairModeUsed, `
+        $tokenResult.EncodingUsed) "SUCCESS"
+
+    if ($TokenOnly) {
+        Write-Log "TokenOnly was used. Skipping Redrock/query test." "SUCCESS"
+        return
+    }
+
+    Invoke-RedrockQueryTest `
+        -IdentityTenantURL $IdentityTenantURL `
+        -AccessToken $tokenResult.AccessToken | Out-Null
+
+    Write-Log "CyberArk Identity OAuth token and Redrock query test completed successfully." "SUCCESS"
+}
+catch {
+    Write-Log ("FAILED: {0}" -f $_.Exception.Message) "ERROR"
+}
+finally {
+    Write-Log ("Log file: {0}" -f $LogFile)
+}
