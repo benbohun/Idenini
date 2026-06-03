@@ -1,745 +1,271 @@
-<#
-SafeMembershipReport_IdentityUser_MFA_Code_Proxy.ps1
+Am trying to develop a script that will update existing vaulted account fields based on a provided CSV
+I need the script to do validation of Platform type before updating as there are different platforms
+Safe updates will mean to move an account from one safe to another
+The script should have comments on line of action
+Script to follow a structure where env variable file are reference seperately
+For Authentication, i want it to prompt the identity service credentials then hash the auth token, and use the auth token to login 
+Ensure this does not look like AI generated code
+Also this should have a readme.md file with Description,Dependencies
+While updating, if there are platform or safe changes, script should check to make sure platform device type match, also safe update would mean moving account to new safe
+Make this script intuitive as much as possible, avoid making it look like AI generated script
 
-PURPOSE
-- Generates CyberArk Privilege Cloud Safe Membership report.
-- Uses normal CyberArk Identity user authentication.
-- Does NOT use CCP.
-- Does NOT use ServiceUser mode.
-- Supports proxy.
-- Supports interactive MFA/code entry through IdentityCommand:
-    - SMS/OATH code: PowerShell prompts you to enter the code.
-    - Browser/OOB auth: Browser launches; complete the browser flow.
-      If the browser shows a confirmation code, paste/enter it where the browser/IdP instructs.
-      The script waits/polls and continues after authentication succeeds.
 
-AUTH METHOD
-New-PASSession `
-    -IdentityTenantURL $IdentityTenantURL `
-    -PrivilegeCloudURL $PrivilegeCloudURL `
-    -Credential $Credential `
-    -IdentityUser
+dev.env
+PROXY="Placehold"
+PVWA="Placehold"
 
-REQUIREMENTS
-- psPAS module.
-- IdentityCommand module.
-- Run from an interactive PowerShell console.
-- User must have permission to list Safes and view Safe Members.
+prod.env
+PROXY="Placehold"
+PVWA="Placehold"
+
+.env
+ROXY_ADDRESS="Placehold"
+PROXY_PORT="Placehold"
+TENANT_ID="Placehold"
+SUB_DOMAIN="Placehold"
+
+
+
+
+below is an example
+
+<# 
+  .SYNOPSIS
+    script updates accounts using REST API based on csv input
+  .DESCRIPTION
+    PAM Team 2/25/2026
+        - usages
+            - used to migrate domain accounts from OMNG to AMNG safes 
+            - update `$HEADER`, `$BACKOUT_HEADER`, and patch $fields to fit use case
+        - dependencies
+            - API user that has access to safes (svcmigrationapi)
+            - authentication requires D:\scripts\wpa\automations\auth\Get-AuthToken.ps1
+            - CSV file that contains both current values and new values, 
+            where the new-value column name is prepended with `Migrated `
+            - CSV file must also contain `Account ID`, used to determine api endpoint
+        - known issues
+            - cannot update device type, therefore cannot change platform that is different device type
+                - use classic web ui for bulk ops
+            - cannot move accounts to another safe
+                - use classic web ui for bulk ops
+                - accountid changes per safe
+                - to get previous password versions, move back to old safe 
+            - not an issue: replacing 1 platform prop only replaces that prop, and does not affect other props
+  .EXAMPLE
+    .\update-accounts -CSVFile <CSVFilePath> [-Backout] [-LogID <STRING>]
 #>
 
-[CmdletBinding()]
 param(
-    # ===== Identity / Privilege Cloud URLs =====
-    [string]$IdentityTenantURL = "https://abq4291.id.cyberark.cloud",
-
-    [string]$PrivilegeCloudURL = "https://mtbanktest.privilegecloud.cyberark.cloud",
-
-    # ===== Proxy Settings =====
-    # Replace with actual proxy, for example:
-    # http://proxy.company.com:8080
-    [string]$ProxyAddress = "http://YOUR-PROXY-FQDN:PORT",
-
-    # Use logged-on Windows credentials for proxy auth
-    [switch]$ProxyUseDefaultCredentials,
-
-    # Use this if proxy requires separate username/password
-    [switch]$PromptForProxyCredential,
-
-    # ===== Output =====
-    [string]$CsvFilePath = "",
-
-    [string]$LogFile = "",
-
-    # ===== Optional =====
-    [switch]$LoginOnly,
-
-    # Runs proxy-aware StartAuthentication test before actual login
-    [switch]$RunStartAuthenticationProbe
+  [Parameter(mandatory=$true)]
+  [string]$CSVFile,
+  [switch]$Backout,
+  [string]$LogID=""
 )
 
-# =========================
-# Runtime settings
-# =========================
+$Global:proxy=""
+$Global:pvwa=""
+$Global:logger=""
+$LOGS=".\logs"
+$HEADER="Migrated Platform ID,Migrated Target system address,Migrated Target system user name,Account ID"
+$BACKOUT_HEADER="Platform ID,Target system address,Target system user name,Account ID,Name"
+$SCRIPT = [System.IO.Path]::GetFileNameWithoutExtension($PSCommandPath)
+if ($Backout){$HEADER = $BACKOUT_HEADER}
+$DebugPreference = "Continue" #TODO: turn off before production
+#$DebugPreference = "SilentlyContinue"
 
-$ErrorActionPreference = "Stop"
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-
-# =========================
-# Helper functions
-# =========================
-
-function Get-SafeScriptRoot {
-    [CmdletBinding()]
-    param()
-
-    if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) {
-        return $PSScriptRoot
-    }
-
-    if (
-        $MyInvocation -and
-        $MyInvocation.MyCommand -and
-        -not [string]::IsNullOrWhiteSpace($MyInvocation.MyCommand.Path)
-    ) {
-        $parent = Split-Path -Path $MyInvocation.MyCommand.Path -Parent
-
-        if (-not [string]::IsNullOrWhiteSpace($parent)) {
-            return $parent
-        }
-    }
-
-    return (Get-Location).Path
-}
-
-function Ensure-ParentFolder {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [string]$Path
-    )
-
-    if ([string]::IsNullOrWhiteSpace($Path)) {
-        throw "Path value is empty. Cannot create parent folder."
-    }
-
-    $parent = Split-Path -Path $Path -Parent
-
-    if ([string]::IsNullOrWhiteSpace($parent)) {
-        return
-    }
-
-    if (-not (Test-Path -Path $parent)) {
-        New-Item -Path $parent -ItemType Directory -Force | Out-Null
-    }
-}
-
-function Write-Log {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [string]$Message,
-
-        [ConsoleColor]$Color = [ConsoleColor]::White
-    )
-
-    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $entry = "$timestamp | $Message"
-
-    Add-Content -Path $LogFile -Value $entry
-    Write-Host $entry -ForegroundColor $Color
-}
-
-function Write-ExceptionDetails {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        $ErrorRecord,
-
-        [string]$Prefix = "ERROR"
-    )
-
+<#
+    setup and start new log file
+#>
+function New-Log() {
     try {
-        Write-Log "$Prefix Message: $($ErrorRecord.Exception.Message)" "Red"
-
-        if ($ErrorRecord.Exception.InnerException) {
-            Write-Log "$Prefix InnerException: $($ErrorRecord.Exception.InnerException.Message)" "Red"
-        }
-
-        if ($ErrorRecord.ErrorDetails -and $ErrorRecord.ErrorDetails.Message) {
-            Write-Log "$Prefix ErrorDetails: $($ErrorRecord.ErrorDetails.Message)" "Red"
-        }
-
-        if ($ErrorRecord.InvocationInfo) {
-            Write-Log "$Prefix ScriptLineNumber: $($ErrorRecord.InvocationInfo.ScriptLineNumber)" "Red"
-            Write-Log "$Prefix PositionMessage: $($ErrorRecord.InvocationInfo.PositionMessage)" "Red"
-        }
+        $dt = (Get-Date).ToString("yyyyMMdd-HHmmss")
+        $fd += "${SCRIPT}_$dt"
+        if ($LogID -ne "") {$fd += "_$LogID"}
+        if ($Backout) {$fd += "_Backout"}
+        $Global:logger = "$LOGS\$fd.log"
+        Set-Content -Path $Global:logger -Value "Starting new log..." -ErrorAction Stop
+        $func = $MyInvocation.MyCommand.Name
+        Write-Log "$func ($SCRIPT)" "Starting new log" "DEBUG"
     }
     catch {
-        Write-Host "$Prefix Unable to expand exception details: $($_.Exception.Message)" -ForegroundColor Yellow
+        write-error $_
     }
 }
 
-function Assert-UrlReady {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [string]$Name,
-
-        [Parameter(Mandatory)]
-        [string]$Url
-    )
-
-    if ([string]::IsNullOrWhiteSpace($Url)) {
-        throw "$Name is empty."
-    }
-
-    if (
-        $Url -match "YOUR-" -or
-        $Url -match "PLACEHOLDER" -or
-        $Url -match "<" -or
-        $Url -match ">"
-    ) {
-        throw "$Name still contains a placeholder value: $Url"
-    }
-
-    if ($Url -notmatch "^https://") {
-        throw "$Name must start with https://. Current value: $Url"
-    }
-}
-
-function Test-IsProxyPlaceholder {
-    [CmdletBinding()]
-    param(
-        [string]$ProxyAddress
-    )
-
-    if ([string]::IsNullOrWhiteSpace($ProxyAddress)) {
-        return $true
-    }
-
-    if (
-        $ProxyAddress -match "YOUR-" -or
-        $ProxyAddress -match "PLACEHOLDER" -or
-        $ProxyAddress -match "<" -or
-        $ProxyAddress -match ">"
-    ) {
-        return $true
-    }
-
-    return $false
-}
-
-function Set-PowerShellProxy {
-    [CmdletBinding()]
-    param(
-        [string]$ProxyAddress,
-
-        [switch]$ProxyUseDefaultCredentials,
-
-        [switch]$PromptForProxyCredential
-    )
-
-    if (Test-IsProxyPlaceholder -ProxyAddress $ProxyAddress) {
-        Write-Log "Proxy address is blank or still a placeholder. Explicit proxy configuration skipped." "Yellow"
-        Write-Log "Current ProxyAddress value: $ProxyAddress" "Yellow"
-        return
-    }
-
-    Write-Log "Configuring PowerShell/.NET default proxy: $ProxyAddress" "Cyan"
-
-    $proxy = New-Object System.Net.WebProxy($ProxyAddress, $true)
-
-    if ($ProxyUseDefaultCredentials) {
-        Write-Log "Proxy authentication mode: current Windows credentials." "Cyan"
-        $proxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials
-    }
-    elseif ($PromptForProxyCredential) {
-        Write-Log "Prompting for proxy credential..." "Cyan"
-
-        $proxyCred = Get-Credential -Message "Enter proxy credential"
-
-        if ($null -eq $proxyCred) {
-            throw "Proxy credential prompt was cancelled."
-        }
-
-        $netCred = $proxyCred.GetNetworkCredential()
-
-        $proxy.Credentials = New-Object System.Net.NetworkCredential(
-            $netCred.UserName,
-            $netCred.Password,
-            $netCred.Domain
-        )
-    }
-    else {
-        Write-Log "Proxy authentication mode: no proxy credential specified." "Yellow"
-    }
-
-    [System.Net.WebRequest]::DefaultWebProxy = $proxy
-
-    # Helps tools that honor environment proxy variables.
-    $env:HTTP_PROXY  = $ProxyAddress
-    $env:HTTPS_PROXY = $ProxyAddress
-
-    Write-Log "Proxy configuration applied." "Green"
-}
-
-function Import-HighestModule {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [string]$Name
-    )
-
-    Remove-Module -Name $Name -Force -ErrorAction SilentlyContinue
-
-    $module = Get-Module -ListAvailable -Name $Name |
-        Sort-Object Version -Descending |
-        Select-Object -First 1
-
-    if (-not $module) {
-        throw "Required module not installed: $Name"
-    }
-
-    Import-Module $module.Path -Force -ErrorAction Stop
-
-    $loaded = Get-Module -Name $Name
-
-    Write-Log "Loaded $($loaded.Name) version $($loaded.Version) from $($loaded.Path)" "Green"
-}
-
-function Get-ObjectPropertyValue {
-    [CmdletBinding()]
-    param(
-        [Parameter()]
-        $InputObject,
-
-        [Parameter(Mandatory)]
-        [string[]]$PropertyNames
-    )
-
-    if ($null -eq $InputObject) {
-        return $null
-    }
-
-    foreach ($propertyName in $PropertyNames) {
-        $property = $InputObject.PSObject.Properties |
-            Where-Object { $_.Name -ieq $propertyName } |
-            Select-Object -First 1
-
-        if ($null -ne $property) {
-            return $property.Value
-        }
-    }
-
-    return $null
-}
-
-function Get-PermissionValue {
-    [CmdletBinding()]
-    param(
-        [Parameter()]
-        $Permissions,
-
-        [Parameter(Mandatory)]
-        [string]$PermissionName
-    )
-
-    if ($null -eq $Permissions) {
-        return $null
-    }
-
-    return Get-ObjectPropertyValue -InputObject $Permissions -PropertyNames @($PermissionName)
-}
-
-function Test-IdentityStartAuthenticationRaw {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [string]$TenantUrl,
-
-        [Parameter(Mandatory)]
-        [string]$Username,
-
-        [string]$ProxyAddress,
-
-        [switch]$ProxyUseDefaultCredentials
-    )
-
-    $TenantUrl = $TenantUrl.TrimEnd("/")
-    $uri = "$TenantUrl/Security/StartAuthentication"
-
-    Write-Log "Running proxy-aware StartAuthentication probe..." "Cyan"
-    Write-Log "Probe URI: $uri" "Cyan"
-    Write-Log "Probe username: $Username" "Cyan"
-
-    $headers = @{
-        "accept"     = "*/*"
-        "OobIdPAuth" = "true"
-    }
-
-    $body = @{
-        User    = $Username
-        Version = "1.0"
-    } | ConvertTo-Json
-
-    $params = @{
-        Uri             = $uri
-        Method          = "POST"
-        Headers         = $headers
-        ContentType     = "application/json"
-        Body            = $body
-        UseBasicParsing = $true
-        ErrorAction     = "Stop"
-    }
-
-    if (-not (Test-IsProxyPlaceholder -ProxyAddress $ProxyAddress)) {
-        $params["Proxy"] = $ProxyAddress
-
-        if ($ProxyUseDefaultCredentials) {
-            $params["ProxyUseDefaultCredentials"] = $true
-        }
-    }
-
+<#
+    writes standard log messages
+#>
+function Write-Log([string]$src, [string]$msg, [string]$level="INFO"){
     try {
-        $response = Invoke-WebRequest @params
-
-        Write-Log "Raw StartAuthentication HTTP status: $($response.StatusCode)" "Green"
-
-        if (-not [string]::IsNullOrWhiteSpace($response.Content)) {
-            try {
-                $json = $response.Content | ConvertFrom-Json -ErrorAction Stop
-
-                Write-Log "StartAuthentication returned JSON successfully." "Green"
-
-                if ($json.PodFqdn) {
-                    Write-Log "PodFqdn: $($json.PodFqdn)" "Yellow"
-                }
-
-                if ($json.IdpRedirectShortUrl) {
-                    Write-Log "IdpRedirectShortUrl returned. Browser/OOB authentication is expected." "Yellow"
-                }
-
-                if ($json.Challenges) {
-                    Write-Log "Challenge package count: $($json.Challenges.Count)" "Green"
-                }
-
-                if ($json.Summary) {
-                    Write-Log "Summary: $($json.Summary)" "Yellow"
-                }
-            }
-            catch {
-                Write-Log "Raw response was not JSON:" "Yellow"
-                Write-Log $response.Content "Yellow"
-            }
-        }
+        $dt = (Get-Date).ToString("yyyyMMdd-HHmmss")
+        Add-Content -Path $Global:logger -Value "$dt source=$src [$level] $msg" -ErrorAction Stop
     }
     catch {
-        Write-Log "Raw StartAuthentication probe failed." "Red"
-        Write-ExceptionDetails -ErrorRecord $_ -Prefix "RAW STARTAUTH ERROR"
-        throw
+        Write-Error $_
     }
 }
 
-function Start-IdentityUserSession {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [string]$IdentityTenantURL,
-
-        [Parameter(Mandatory)]
-        [string]$PrivilegeCloudURL,
-
-        [Parameter(Mandatory)]
-        [PSCredential]$Credential
-    )
-
-    Write-Log "Authenticating using normal CyberArk Identity user flow..." "Cyan"
-    Write-Log "IdentityTenantURL: $IdentityTenantURL" "Cyan"
-    Write-Log "PrivilegeCloudURL: $PrivilegeCloudURL" "Cyan"
-
-    Write-Log "MFA/code handling instructions:" "Yellow"
-    Write-Log "1. If PowerShell prompts for SMS/OATH/passcode, paste the code into the PowerShell prompt." "Yellow"
-    Write-Log "2. If a browser opens, complete the browser authentication." "Yellow"
-    Write-Log "3. If the browser displays a confirmation code, copy/paste it wherever the browser/IdP page instructs." "Yellow"
-    Write-Log "4. Do not close this PowerShell window. It should continue after authentication succeeds." "Yellow"
-
-    New-PASSession `
-        -IdentityTenantURL $IdentityTenantURL `
-        -PrivilegeCloudURL $PrivilegeCloudURL `
-        -Credential $Credential `
-        -IdentityUser `
-        -Verbose `
-        -ErrorAction Stop | Out-Null
-
-    if (-not (Get-PASSession)) {
-        throw "New-PASSession completed but no psPAS session was established."
-    }
-
-    Write-Log "psPAS Identity user session established successfully." "Green"
-}
-
-# =========================
-# Resolve output paths safely
-# =========================
-
-$ScriptRoot = Get-SafeScriptRoot
-
-if ([string]::IsNullOrWhiteSpace($CsvFilePath)) {
-    $CsvFilePath = Join-Path -Path $ScriptRoot -ChildPath "csv\SafeMembersReport.csv"
-}
-
-if ([string]::IsNullOrWhiteSpace($LogFile)) {
-    $LogFile = Join-Path -Path $ScriptRoot -ChildPath "logs\SafeMemberAudit.log"
-}
-
-Ensure-ParentFolder -Path $CsvFilePath
-Ensure-ParentFolder -Path $LogFile
-
-# =========================
-# Initialize logging
-# =========================
-
-Write-Log "Safe Membership Report starting..." "Cyan"
-Write-Log "PowerShell edition: $($PSVersionTable.PSEdition)" "Cyan"
-Write-Log "PowerShell version: $($PSVersionTable.PSVersion)" "Cyan"
-Write-Log "Script root resolved as: $ScriptRoot" "Cyan"
-Write-Log "CSV output path: $CsvFilePath" "Cyan"
-Write-Log "Log file path: $LogFile" "Cyan"
-
-$IdentityTenantURL = $IdentityTenantURL.TrimEnd("/")
-$PrivilegeCloudURL = $PrivilegeCloudURL.TrimEnd("/")
-
-Assert-UrlReady -Name "IdentityTenantURL" -Url $IdentityTenantURL
-Assert-UrlReady -Name "PrivilegeCloudURL" -Url $PrivilegeCloudURL
-
-Write-Log "IdentityTenantURL: $IdentityTenantURL" "Cyan"
-Write-Log "PrivilegeCloudURL: $PrivilegeCloudURL" "Cyan"
-
-# =========================
-# Configure proxy before module login
-# =========================
-
-Set-PowerShellProxy `
-    -ProxyAddress $ProxyAddress `
-    -ProxyUseDefaultCredentials:$ProxyUseDefaultCredentials `
-    -PromptForProxyCredential:$PromptForProxyCredential
-
-# =========================
-# Import required modules
-# =========================
-
-try {
-    Import-HighestModule -Name "IdentityCommand"
-    Import-HighestModule -Name "psPAS"
-}
-catch {
-    Write-Log "Module import failed." "Red"
-    Write-ExceptionDetails -ErrorRecord $_ -Prefix "MODULE ERROR"
-    throw
-}
-
-# =========================
-# Validate required commands
-# =========================
-
-foreach ($requiredCommand in @(
-    "New-PASSession",
-    "Get-PASSession",
-    "Close-PASSession",
-    "Get-PASSafe",
-    "Get-PASSafeMember"
-)) {
-    if (-not (Get-Command $requiredCommand -ErrorAction SilentlyContinue)) {
-        throw "Required command not found after module import: $requiredCommand"
-    }
-}
-
-$newPasSessionCommand = Get-Command New-PASSession -ErrorAction Stop
-
-foreach ($requiredParameter in @(
-    "IdentityTenantURL",
-    "PrivilegeCloudURL",
-    "Credential",
-    "IdentityUser"
-)) {
-    if (-not $newPasSessionCommand.Parameters.ContainsKey($requiredParameter)) {
-        throw "New-PASSession does not support parameter -$requiredParameter. Loaded psPAS version may not be compatible."
-    }
-}
-
-Write-Log "New-PASSession supports required Identity user authentication parameters." "Green"
-
-# =========================
-# Main
-# =========================
-
-$sessionCreated = $false
-$SafeMembersReport = New-Object System.Collections.Generic.List[object]
-
-try {
-    Write-Log "Prompting for normal CyberArk Identity / Privilege Cloud user credential..." "Cyan"
-
-    $Credential = Get-Credential -Message "Enter your CyberArk Identity / Privilege Cloud username and password"
-
-    if ($null -eq $Credential) {
-        throw "Credential prompt was cancelled."
-    }
-
-    if ([string]::IsNullOrWhiteSpace($Credential.UserName)) {
-        throw "Credential username is empty."
-    }
-
-    if ($RunStartAuthenticationProbe) {
-        Test-IdentityStartAuthenticationRaw `
-            -TenantUrl $IdentityTenantURL `
-            -Username $Credential.UserName `
-            -ProxyAddress $ProxyAddress `
-            -ProxyUseDefaultCredentials:$ProxyUseDefaultCredentials
-    }
-
+<#
+    determines domain and uses appropriate <DOAMIN>.env file
+#>
+function Set-Env(){
+    $func = $MyInvocation.MyCommand.Name
     try {
-        Start-IdentityUserSession `
-            -IdentityTenantURL $IdentityTenantURL `
-            -PrivilegeCloudURL $PrivilegeCloudURL `
-            -Credential $Credential
+        $domain = ${env:USERDOMAIN}.ToLower()
+        $fd = "$domain.env"
+        $data = (Get-Content -Raw $fd -ErrorAction Stop).Trim() -split "`n" #XXX: .Split("`n") pwsh replaced `n with " "  
+        $Global:proxy = $data[0].Trim().Split("=")[1]
+        $Global:pvwa = $data[1].Trim().Split("=")[1]
 
-        $sessionCreated = $true
+        # set proxy
+        [System.Net.WebRequest]::DefaultWebProxy = New-Object System.Net.WebProxy($Global:proxy) -ErrorAction Stop
+        Write-Log "$func ($SCRIPT)" "$domain environment setup successful" "DEBUG"
     }
     catch {
-        Write-Log "Authentication failed before Safe enumeration." "Red"
-        Write-ExceptionDetails -ErrorRecord $_ -Prefix "AUTH ERROR"
-
-        Write-Log "Authentication did not complete. Validate:" "Yellow"
-        Write-Log "1. Proxy address and proxy authentication are correct." "Yellow"
-        Write-Log "2. IdentityCommand and psPAS are updated." "Yellow"
-        Write-Log "3. Browser/OOB confirmation was completed within the allowed time." "Yellow"
-        Write-Log "4. If PowerShell prompted for a code, the code was entered into the PowerShell prompt." "Yellow"
-        Write-Log "5. If browser displayed a confirmation code, it was pasted into the browser/IdP confirmation page." "Yellow"
-
-        throw
+        Write-Log "$func ($SCRIPT)" $_ "ERROR"        
+        write-error $_
     }
+}
 
-    if ($LoginOnly) {
-        Write-Log "LoginOnly switch was specified. Authentication succeeded. Stopping before report generation." "Yellow"
-        return
-    }
+<# 
+    tests and gets CSV data
+#>
+function Get-CSV(){
+    $func = $MyInvocation.MyCommand.Name    
+    try {
+        # test file exists
+        if (-not (test-path $CSVFile)) {throw [System.IO.FileNotFoundException]::new("ERROR: File Not Found: $CSVFile", $CSVFile)}
 
-    # =========================
-    # Retrieve Safes
-    # =========================
+        # test file is not empty
+        if ((Get-Item $CSVFile).Length -eq 0) {throw "ERROR: File Is Empty: $CSVFile"}
 
-    Write-Log "Retrieving Safes via Get-PASSafe..." "Cyan"
+        # test min required header
+        $requiredHeader = $HEADER.Split(",")
+        $fileHeader = (Get-Content -Path $CSVFile -First 1).TrimStart("`u{FEFF}") -split ','        
+        $missingHeader = $requiredHeader | Where-Object { $_ -notin $fileheader }
+        if ($missingHeader) {throw "ERROR: Missing Required Column(s): $($missingHeader -join ', ')"}
 
-    $Safes = @(Get-PASSafe -ErrorAction Stop)
-
-    if (-not $Safes -or $Safes.Count -eq 0) {
-        Write-Log "No Safes returned from Get-PASSafe. Validate Admin PCloud membership and Safe permissions." "Yellow"
-        return
-    }
-
-    Write-Log "Retrieved $($Safes.Count) Safe(s)." "Green"
-
-    # =========================
-    # Enumerate Safe Members
-    # =========================
-
-    $safeIndex = 0
-
-    foreach ($Safe in $Safes) {
-        $safeIndex++
-
-        $SafeName = Get-ObjectPropertyValue -InputObject $Safe -PropertyNames @(
-            "SafeName",
-            "safeName",
-            "safeUrlId"
-        )
-
-        if ([string]::IsNullOrWhiteSpace($SafeName)) {
-            Write-Log "Skipping Safe at index $safeIndex because SafeName could not be resolved." "Yellow"
-            continue
-        }
-
-        Write-Log "[$safeIndex/$($Safes.Count)] Retrieving members for Safe: $SafeName" "Cyan"
-
-        try {
-            $SafeMembers = @(Get-PASSafeMember -SafeName $SafeName -ErrorAction Stop)
-
-            if (-not $SafeMembers -or $SafeMembers.Count -eq 0) {
-                Write-Log "No members found for Safe: $SafeName" "Yellow"
-                continue
+        # get data
+        $rows = Import-Csv -Path $CSVFile | 
+            Where-Object {
+                # Keep the row if at least one field has non-whitespace content
+                ($_.PSObject.Properties.Value | Where-Object {
+                    $_ -ne $null -and $_.ToString().Trim().Length -gt 0
+                }).Count -gt 0
             }
+        # test data exists
+        if ($rows.Length -eq 0) {throw "ERROR: No Data Rows to Process: $CSVFile"}
+        Write-Log "$func ($SCRIPT)" "Captured $($rows.Length) data rows successful" "DEBUG"
+        $rows = $rows | Select-Object $requiredHeader
+        return $rows
+    }
+    catch {
+        Write-Log "$func ($SCRIPT)" $_ "ERROR"        
+        write-error $_        
+    }
+}
 
-            foreach ($Member in $SafeMembers) {
-                $perm = Get-ObjectPropertyValue -InputObject $Member -PropertyNames @(
-                    "Permissions",
-                    "permissions"
-                )
+<#
+    gets identity oauth token
+    #TODO: get new token after x api calls
+#>
+function Get-Token() {
+    $func = $MyInvocation.MyCommand.Name    
+    try {
+        $token = & $AUTHN
+        $token = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto([System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($token.Password))
+        Write-Log "$func ($SCRIPT)" "Acquired token successful" "DEBUG"
+        return $token
+    }
+    catch {
+        Write-Log "$func ($SCRIPT)" $_ "ERROR: Cannot aquire token using: $AUTHN"  
+        Write-Error $_
+    }
+}
 
-                $memberName = Get-ObjectPropertyValue -InputObject $Member -PropertyNames @(
-                    "MemberName",
-                    "memberName",
-                    "UserName",
-                    "username",
-                    "Name",
-                    "name"
-                )
+<# 
+    call rest api to update accounts 
+#>
+function Invoke-API($token, [PSCustomObject]$obj){
+    $func = $MyInvocation.MyCommand.Name    
+    $id = $obj.PSObject.Properties['Account ID'].Value
+    try {
+        $fields = @(
+            'Migrated Target system address',
+            'Migrated Target system user name'#,
+            #'Migrated Platform ID',
+            )
+        $secretMgmt = $true
 
-                $memberType = Get-ObjectPropertyValue -InputObject $Member -PropertyNames @(
-                    "MemberType",
-                    "memberType",
-                    "Type",
-                    "type"
-                )
-
-                $SafeMembersReport.Add([PSCustomObject]@{
-                    SafeName                               = $SafeName
-                    Member                                 = $memberName
-                    MemberType                             = $memberType
-
-                    UseAccounts                            = Get-PermissionValue -Permissions $perm -PermissionName "useAccounts"
-                    RetrieveAccounts                       = Get-PermissionValue -Permissions $perm -PermissionName "retrieveAccounts"
-                    ListAccounts                           = Get-PermissionValue -Permissions $perm -PermissionName "listAccounts"
-                    AddAccounts                            = Get-PermissionValue -Permissions $perm -PermissionName "addAccounts"
-                    UpdateAccountContent                   = Get-PermissionValue -Permissions $perm -PermissionName "updateAccountContent"
-                    UpdateAccountProperties                = Get-PermissionValue -Permissions $perm -PermissionName "updateAccountProperties"
-                    InitiateCPMAccountManagementOperations = Get-PermissionValue -Permissions $perm -PermissionName "initiateCPMAccountManagementOperations"
-                    SpecifyNextAccountContent              = Get-PermissionValue -Permissions $perm -PermissionName "specifyNextAccountContent"
-                    RenameAccounts                         = Get-PermissionValue -Permissions $perm -PermissionName "renameAccounts"
-                    DeleteAccounts                         = Get-PermissionValue -Permissions $perm -PermissionName "deleteAccounts"
-                    UnlockAccounts                         = Get-PermissionValue -Permissions $perm -PermissionName "unlockAccounts"
-                    ManageSafe                             = Get-PermissionValue -Permissions $perm -PermissionName "manageSafe"
-                    ManageSafeMembers                      = Get-PermissionValue -Permissions $perm -PermissionName "manageSafeMembers"
-                    BackupSafe                             = Get-PermissionValue -Permissions $perm -PermissionName "backupSafe"
-                    ViewAuditLog                           = Get-PermissionValue -Permissions $perm -PermissionName "viewAuditLog"
-                    ViewSafeMembers                        = Get-PermissionValue -Permissions $perm -PermissionName "viewSafeMembers"
-                    AccessWithoutConfirmation              = Get-PermissionValue -Permissions $perm -PermissionName "accessWithoutConfirmation"
-                    CreateFolders                          = Get-PermissionValue -Permissions $perm -PermissionName "createFolders"
-                    DeleteFolders                          = Get-PermissionValue -Permissions $perm -PermissionName "deleteFolders"
-                    MoveAccountsAndFolders                 = Get-PermissionValue -Permissions $perm -PermissionName "moveAccountsAndFolders"
-                    RequestsAuthorizationLevel1            = Get-PermissionValue -Permissions $perm -PermissionName "requestsAuthorizationLevel1"
-                    RequestsAuthorizationLevel2            = Get-PermissionValue -Permissions $perm -PermissionName "requestsAuthorizationLevel2"
-                }) | Out-Null
+        # test case for backout header
+        if ($Backout) {
+            for ($i=0; $i -lt $fields.Length; $i++){
+                $fields[$i] = ($fields[$i]).Replace('Migrated ', "")
             }
-
-            Write-Log "Retrieved $($SafeMembers.Count) member(s) for Safe: $SafeName" "Green"
+            $secretMgmt = $false
         }
-        catch {
-            Write-Log "ERROR: Failed to retrieve members for Safe '$SafeName'." "Red"
-            Write-ExceptionDetails -ErrorRecord $_ -Prefix "SAFE MEMBER ERROR"
-            continue
+
+        # update account - patch body must be an array of objects
+        $_name = $obj.PSObject.Properties[$fields[0]].Value + "-" + $obj.PSObject.Properties[$fields[1]].Value
+        if ($Backout){$_name = $obj.PSObject.Properties['Name'].Value}
+        $_address = $obj.PSObject.Properties[$fields[0]].Value
+        $_username = $obj.PSObject.Properties[$fields[1]].Value
+        #$_platform =  $obj.PSObject.Properties[$fields[2]].Value
+
+        $PatchBody = @(
+            @{ op = "replace"; path = "/name"; value = $_name},
+            @{ op = "replace"; path = "/address"; value = $_address},
+            @{ op = "replace"; path = "/userName"; value = $_username},
+            #@{ op = "replace"; path = "/platformID"; value = $_platform},
+            @{ op = "replace"; path = "/secretManagement/automaticManagementEnabled"; value = $secretMgmt }
+            )
+
+        # remove or add reason based on if cpm mgmt is enabled 
+        if ($secretMgmt) {
+            #$PatchBody += @{ op = "remove"; path = "/secretManagement/manualManagementReason"}
+            $PatchBody += @{ op = "replace"; path = "/secretManagement/manualManagementReason"; value = ""}            
         }
+        else {
+            $PatchBody += @{ op = "replace"; path = "/secretManagement/manualManagementReason"; value = "Backout: AMNG=>OMNG"}
+        }
+
+        $PatchBody = $PatchBody | ConvertTo-Json
+        write-debug $PatchBody
+
+        $headers = @{Authorization = "Bearer $token"}        
+        $Updated = Invoke-RestMethod -Method PATCH `
+        -Uri "$PVWA/$id" `
+        -Headers $headers -ContentType "application/json" -Body $PatchBody
+        Write-Debug ($Updated | ConvertTo-Json)
+
+        Write-Host "Processed ACCOUNT_ID=$id ($_name) successful"
+        Write-Log "$func ($SCRIPT)" "Processed ACCOUNT_ID=$id ($_name) successfully"
     }
-
-    # =========================
-    # Export report
-    # =========================
-
-    if (-not $SafeMembersReport -or $SafeMembersReport.Count -eq 0) {
-        Write-Log "No Safe Member data collected. CSV export skipped." "Yellow"
+    catch {
+        Write-Host "ERROR: Cannot process ACCOUNT_ID=$id ($_name)"          
+        Write-Log "$func ($SCRIPT)" $_ "ERROR: Cannot process ACCOUNT_ID=$id ($_name)"  
+        #continue to next account
     }
-    else {
-        Write-Log "Exporting Safe Member Report to: $CsvFilePath" "Cyan"
-
-        $SafeMembersReport |
-            Sort-Object SafeName, Member |
-            Export-Csv -Path $CsvFilePath -NoTypeInformation -Encoding UTF8
-
-        Write-Log "Safe Member Report exported successfully. Total rows: $($SafeMembersReport.Count)" "Green"
-    }
-
-    Write-Log "Safe Membership Report generation completed." "Cyan"
 }
-catch {
-    Write-Log "FATAL ERROR: $($_.Exception.Message)" "Red"
-}
-finally {
-    if ($sessionCreated) {
-        try {
-            Close-PASSession | Out-Null
-            Write-Log "Logged off from Privilege Cloud." "Green"
-        }
-        catch {
-            Write-Log "Logoff warning: $($_.Exception.Message)" "Yellow"
-        }
+
+<#
+    main
+#>
+function Start-Script() {
+    New-Log
+    Set-Env
+    $dataRows = Get-CSV
+    Write-Debug ( ($dataRows | Format-Table -AutoSize | Out-String).TrimEnd() )
+    $token = Get-Token
+    #process data rows by calling rest api for each row
+    $dataRows | % {
+                    Invoke-API $token $_
+                    write-debug ($_ | ConvertTo-Json -Depth 5)
+                    #$_.PSObject.Properties | Select-Object Name, value
+                    #Start-Sleep 10
     }
 }
+
+Start-Script
+
+
