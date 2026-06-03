@@ -1,271 +1,238 @@
-Am trying to develop a script that will update existing vaulted account fields based on a provided CSV
-I need the script to do validation of Platform type before updating as there are different platforms
-Safe updates will mean to move an account from one safe to another
-The script should have comments on line of action
-Script to follow a structure where env variable file are reference seperately
-For Authentication, i want it to prompt the identity service credentials then hash the auth token, and use the auth token to login 
-Ensure this does not look like AI generated code
-Also this should have a readme.md file with Description,Dependencies
-While updating, if there are platform or safe changes, script should check to make sure platform device type match, also safe update would mean moving account to new safe
-Make this script intuitive as much as possible, avoid making it look like AI generated script
+todo
+Develop a script that takes care of this issues
+1. Scan for every identity user that was newly created in CyberArk Identity
+2. Validate if user have *IND_username_ in Safe list using their samaccountname since all IND safe beginds with IND_samaccountname
+3. If safe exist, add user to the existing individual safe
+4. assign default individual user samaccountname@alliantcreditunion.com to their matching safe with default safe permission
+5. Ensure to validate that User was just added to CyberArk identity 
+    @{
+        UseAccounts                             = $true
+        RetrieveAccounts                        = $true
+        ListAccounts                            = $true
+        AddAccounts                             = $false
+        UpdateAccountContent                    = $true
+        UpdateAccountProperties                 = $false
+        InitiateCPMAccountManagementOperations  = $true
+        SpecifyNextAccountContent               = $false
+        RenameAccounts                          = $false
+        DeleteAccounts                          = $false
+        UnlockAccounts                          = $false
+        ManageSafe                              = $false
+        ManageSafeMembers                       = $false
+        BackupSafe                              = $false
+        ViewAuditLog                            = $true
+        ViewSafeMembers                         = $true
+        AccessWithoutConfirmation               = $true
+        CreateFolders                           = $false
+        DeleteFolders                           = $false
+        MoveAccountsAndFolders                  = $false
+		
+Now we will be setting this up as a schedule task to run daily
 
+Use the login method
 
-dev.env
-PROXY="Placehold"
-PVWA="Placehold"
+<#
+SafeMemberReport_IdentityServiceUser.ps1
 
-prod.env
-PROXY="Placehold"
-PVWA="Placehold"
-
-.env
-ROXY_ADDRESS="Placehold"
-PROXY_PORT="Placehold"
-TENANT_ID="Placehold"
-SUB_DOMAIN="Placehold"
-
-
-
-
-below is an example
-
-<# 
-  .SYNOPSIS
-    script updates accounts using REST API based on csv input
-  .DESCRIPTION
-    PAM Team 2/25/2026
-        - usages
-            - used to migrate domain accounts from OMNG to AMNG safes 
-            - update `$HEADER`, `$BACKOUT_HEADER`, and patch $fields to fit use case
-        - dependencies
-            - API user that has access to safes (svcmigrationapi)
-            - authentication requires D:\scripts\wpa\automations\auth\Get-AuthToken.ps1
-            - CSV file that contains both current values and new values, 
-            where the new-value column name is prepended with `Migrated `
-            - CSV file must also contain `Account ID`, used to determine api endpoint
-        - known issues
-            - cannot update device type, therefore cannot change platform that is different device type
-                - use classic web ui for bulk ops
-            - cannot move accounts to another safe
-                - use classic web ui for bulk ops
-                - accountid changes per safe
-                - to get previous password versions, move back to old safe 
-            - not an issue: replacing 1 platform prop only replaces that prop, and does not affect other props
-  .EXAMPLE
-    .\update-accounts -CSVFile <CSVFilePath> [-Backout] [-LogID <STRING>]
+- Auth: CCP → Identity Shared Services → ServiceUser (same method as your APP/IND scripts)
+- Enumerates all Safes via Get-PASSafe
+- For each Safe, enumerates members via Get-PASSafeMember
+- Exports full membership + permissions report to CSV
 #>
 
+[CmdletBinding()]
 param(
-  [Parameter(mandatory=$true)]
-  [string]$CSVFile,
-  [switch]$Backout,
-  [string]$LogID=""
+    # ===== Identity / Privilege Cloud (Shared Services) =====
+    [string]$IdentityTenantURL  = "https://aak4521.my.idaptive.app",
+    [string]$PrivilegeCloudURL  = "https://alliantcredit.privilegecloud.cyberark.cloud",
+
+    # ===== CCP settings (for API Service User stored in Vault) =====
+    [string]$CCPAddress         = "https://aam.alliantcreditunion.com",
+    [string]$CCPLocation        = "AIMWebService",
+    [string]$CCPAppID           = "ACURestAPI",
+    [string]$CCPSafe            = "ACU-VAULT-API",
+    [string]$CCPObject          = "Application-CyberArkVaultRestAPI-alliantcredit.cyberark.cloud",
+    [bool]  $CCPWindowsAuth     = $false,
+
+    # ===== Output =====
+    [string]$CsvFilePath        = "I:\Script\IDENTITY Script New\csv\SafeMembersReport.csv",
+    [string]$LogFile            = "SafeMemberAudit.log"
 )
 
-$Global:proxy=""
-$Global:pvwa=""
-$Global:logger=""
-$LOGS=".\logs"
-$HEADER="Migrated Platform ID,Migrated Target system address,Migrated Target system user name,Account ID"
-$BACKOUT_HEADER="Platform ID,Target system address,Target system user name,Account ID,Name"
-$SCRIPT = [System.IO.Path]::GetFileNameWithoutExtension($PSCommandPath)
-if ($Backout){$HEADER = $BACKOUT_HEADER}
-$DebugPreference = "Continue" #TODO: turn off before production
-#$DebugPreference = "SilentlyContinue"
+# --- TLS & modules ---
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-<#
-    setup and start new log file
-#>
-function New-Log() {
-    try {
-        $dt = (Get-Date).ToString("yyyyMMdd-HHmmss")
-        $fd += "${SCRIPT}_$dt"
-        if ($LogID -ne "") {$fd += "_$LogID"}
-        if ($Backout) {$fd += "_Backout"}
-        $Global:logger = "$LOGS\$fd.log"
-        Set-Content -Path $Global:logger -Value "Starting new log..." -ErrorAction Stop
-        $func = $MyInvocation.MyCommand.Name
-        Write-Log "$func ($SCRIPT)" "Starting new log" "DEBUG"
-    }
-    catch {
-        write-error $_
-    }
+Import-Module psPAS           -ErrorAction Stop
+Import-Module IdentityCommand -ErrorAction Stop
+
+$ErrorActionPreference = 'Stop'
+
+# --- Logging helper ---
+function Write-Log {
+    param(
+        [Parameter(Mandatory)][string]$Message,
+        [ConsoleColor]$Color = [ConsoleColor]::White
+    )
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $entry     = "$timestamp | $Message"
+    Add-Content -Path $LogFile -Value $entry
+    Write-Host $entry -ForegroundColor $Color
 }
 
-<#
-    writes standard log messages
-#>
-function Write-Log([string]$src, [string]$msg, [string]$level="INFO"){
-    try {
-        $dt = (Get-Date).ToString("yyyyMMdd-HHmmss")
-        Add-Content -Path $Global:logger -Value "$dt source=$src [$level] $msg" -ErrorAction Stop
+Write-Log "🔹 Safe Member Report (Identity Service User) starting..." 'Cyan'
+
+# --- CCP → PSCredential (API Service User) ---
+function Get-ServiceUserCredentialFromCCP {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$CCPAddress,
+        [Parameter(Mandatory)][string]$Location,
+        [Parameter(Mandatory)][string]$AppID,
+        [Parameter(Mandatory)][string]$Safe,
+        [Parameter(Mandatory)][string]$Object,
+        [bool]$WindowsAuth = $false
+    )
+
+    $base = $CCPAddress.TrimEnd('/')
+    $loc  = $Location.Trim('/')
+
+    $url  = "{0}/{1}/api/Accounts?AppID={2}&Safe={3}&Object={4}" -f $base, $loc, $AppID, $Safe, $Object
+
+    Write-Log "🛠  Retrieving Service User credential from CCP: $url" 'Cyan'
+
+    $headers = @{ "Content-Type" = "application/json" }
+
+    $resp = Invoke-RestMethod -Uri $url -Method GET -Headers $headers -UseDefaultCredentials:$WindowsAuth -ErrorAction Stop
+
+    if (-not $resp.UserName -or -not $resp.Content) {
+        throw "CCP response missing UserName/Content. Raw: $($resp | ConvertTo-Json -Depth 5)"
     }
-    catch {
-        Write-Error $_
-    }
+
+    Write-Log ("✅ CCP returned service user: {0}" -f $resp.UserName) 'Green'
+
+    $sec = ConvertTo-SecureString $resp.Content -AsPlainText -Force
+    return [PSCredential]::new($resp.UserName, $sec)
 }
 
-<#
-    determines domain and uses appropriate <DOAMIN>.env file
-#>
-function Set-Env(){
-    $func = $MyInvocation.MyCommand.Name
-    try {
-        $domain = ${env:USERDOMAIN}.ToLower()
-        $fd = "$domain.env"
-        $data = (Get-Content -Raw $fd -ErrorAction Stop).Trim() -split "`n" #XXX: .Split("`n") pwsh replaced `n with " "  
-        $Global:proxy = $data[0].Trim().Split("=")[1]
-        $Global:pvwa = $data[1].Trim().Split("=")[1]
+# --- MAIN ---
+$sessionCreated    = $false
+$SafeMembersReport = @()
 
-        # set proxy
-        [System.Net.WebRequest]::DefaultWebProxy = New-Object System.Net.WebProxy($Global:proxy) -ErrorAction Stop
-        Write-Log "$func ($SCRIPT)" "$domain environment setup successful" "DEBUG"
+try {
+    # 1) Get Service User creds from CCP
+    $serviceCred = Get-ServiceUserCredentialFromCCP `
+        -CCPAddress $CCPAddress `
+        -Location   $CCPLocation `
+        -AppID      $CCPAppID `
+        -Safe       $CCPSafe `
+        -Object     $CCPObject `
+        -WindowsAuth:$CCPWindowsAuth
+
+    # 2) Authenticate via Identity Shared Services using SERVICE USER
+    Write-Log "🛠  Authenticating to Privilege Cloud via Identity (Service User)..." 'Cyan'
+
+    New-PASSession `
+        -IdentityTenantURL $IdentityTenantURL `
+        -PrivilegeCloudURL $PrivilegeCloudURL `
+        -Credential        $serviceCred `
+        -ServiceUser `
+        -ErrorAction Stop | Out-Null
+
+    if (-not (Get-PASSession)) { throw "psPAS session not established via ServiceUser." }
+
+    $sessionCreated = $true
+    Write-Log ("✅ Authenticated to {0} as service user: {1}" -f $PrivilegeCloudURL, $serviceCred.UserName) 'Green'
+
+    # 3) Get all Safes
+    Write-Log "🛠  Retrieving safes via Get-PASSafe..." 'Cyan'
+    $Safes = Get-PASSafe -ErrorAction Stop
+
+    if (-not $Safes -or $Safes.Count -eq 0) {
+        Write-Log "⚠️  No safes returned from Get-PASSafe." 'Yellow'
+        return
     }
-    catch {
-        Write-Log "$func ($SCRIPT)" $_ "ERROR"        
-        write-error $_
-    }
-}
 
-<# 
-    tests and gets CSV data
-#>
-function Get-CSV(){
-    $func = $MyInvocation.MyCommand.Name    
-    try {
-        # test file exists
-        if (-not (test-path $CSVFile)) {throw [System.IO.FileNotFoundException]::new("ERROR: File Not Found: $CSVFile", $CSVFile)}
+    Write-Log ("📦 Retrieved {0} safes." -f $Safes.Count) 'Green'
 
-        # test file is not empty
-        if ((Get-Item $CSVFile).Length -eq 0) {throw "ERROR: File Is Empty: $CSVFile"}
+    # 4) For each Safe, get Safe Members and permissions
+    $i = 0
+    foreach ($Safe in $Safes) {
+        $i++
+        $SafeName = $Safe.SafeName
+        Write-Log ("🔹 [{0}/{1}] Retrieving members for Safe: {2}" -f $i, $Safes.Count, $SafeName) 'Cyan'
 
-        # test min required header
-        $requiredHeader = $HEADER.Split(",")
-        $fileHeader = (Get-Content -Path $CSVFile -First 1).TrimStart("`u{FEFF}") -split ','        
-        $missingHeader = $requiredHeader | Where-Object { $_ -notin $fileheader }
-        if ($missingHeader) {throw "ERROR: Missing Required Column(s): $($missingHeader -join ', ')"}
+        try {
+            $SafeMembers = Get-PASSafeMember -SafeName $SafeName -ErrorAction Stop
 
-        # get data
-        $rows = Import-Csv -Path $CSVFile | 
-            Where-Object {
-                # Keep the row if at least one field has non-whitespace content
-                ($_.PSObject.Properties.Value | Where-Object {
-                    $_ -ne $null -and $_.ToString().Trim().Length -gt 0
-                }).Count -gt 0
+            if (-not $SafeMembers -or $SafeMembers.Count -eq 0) {
+                Write-Log ("⚠️  No members found for Safe: {0}" -f $SafeName) 'Yellow'
+                continue
             }
-        # test data exists
-        if ($rows.Length -eq 0) {throw "ERROR: No Data Rows to Process: $CSVFile"}
-        Write-Log "$func ($SCRIPT)" "Captured $($rows.Length) data rows successful" "DEBUG"
-        $rows = $rows | Select-Object $requiredHeader
-        return $rows
-    }
-    catch {
-        Write-Log "$func ($SCRIPT)" $_ "ERROR"        
-        write-error $_        
-    }
-}
 
-<#
-    gets identity oauth token
-    #TODO: get new token after x api calls
-#>
-function Get-Token() {
-    $func = $MyInvocation.MyCommand.Name    
-    try {
-        $token = & $AUTHN
-        $token = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto([System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($token.Password))
-        Write-Log "$func ($SCRIPT)" "Acquired token successful" "DEBUG"
-        return $token
-    }
-    catch {
-        Write-Log "$func ($SCRIPT)" $_ "ERROR: Cannot aquire token using: $AUTHN"  
-        Write-Error $_
-    }
-}
+            foreach ($Member in $SafeMembers) {
 
-<# 
-    call rest api to update accounts 
-#>
-function Invoke-API($token, [PSCustomObject]$obj){
-    $func = $MyInvocation.MyCommand.Name    
-    $id = $obj.PSObject.Properties['Account ID'].Value
-    try {
-        $fields = @(
-            'Migrated Target system address',
-            'Migrated Target system user name'#,
-            #'Migrated Platform ID',
-            )
-        $secretMgmt = $true
+                # Defensive null-check on Permissions so script doesn't blow up on weird entries
+                $perm = $Member.Permissions
 
-        # test case for backout header
-        if ($Backout) {
-            for ($i=0; $i -lt $fields.Length; $i++){
-                $fields[$i] = ($fields[$i]).Replace('Migrated ', "")
+                $SafeMembersReport += [PSCustomObject]@{
+                    SafeName                               = $SafeName
+                    Member                                 = $Member.MemberName
+                    MemberType                             = $Member.MemberType
+
+                    UseAccounts                            = $perm.useAccounts
+                    RetrieveAccounts                       = $perm.retrieveAccounts
+                    ListAccounts                           = $perm.listAccounts
+                    AddAccounts                            = $perm.addAccounts
+                    UpdateAccountContent                   = $perm.updateAccountContent
+                    UpdateAccountProperties                = $perm.updateAccountProperties
+                    InitiateCPMAccountManagementOperations = $perm.initiateCPMAccountManagementOperations
+                    SpecifyNextAccountContent              = $perm.specifyNextAccountContent
+                    RenameAccounts                         = $perm.renameAccounts
+                    DeleteAccounts                         = $perm.deleteAccounts
+                    UnlockAccounts                         = $perm.unlockAccounts
+                    ManageSafe                             = $perm.manageSafe
+                    ManageSafeMembers                      = $perm.manageSafeMembers
+                    BackupSafe                             = $perm.backupSafe
+                    ViewAuditLog                           = $perm.viewAuditLog
+                    ViewSafeMembers                        = $perm.viewSafeMembers
+                    AccessWithoutConfirmation              = $perm.accessWithoutConfirmation
+                    CreateFolders                          = $perm.createFolders
+                    DeleteFolders                          = $perm.deleteFolders
+                    MoveAccountsAndFolders                 = $perm.moveAccountsAndFolders
+                    RequestsAuthorizationLevel1            = $perm.requestsAuthorizationLevel1
+                    RequestsAuthorizationLevel2            = $perm.requestsAuthorizationLevel2
+                }
             }
-            $secretMgmt = $false
+
+            Write-Log ("✅ Retrieved {0} member(s) for Safe: {1}" -f $SafeMembers.Count, $SafeName) 'Green'
         }
-
-        # update account - patch body must be an array of objects
-        $_name = $obj.PSObject.Properties[$fields[0]].Value + "-" + $obj.PSObject.Properties[$fields[1]].Value
-        if ($Backout){$_name = $obj.PSObject.Properties['Name'].Value}
-        $_address = $obj.PSObject.Properties[$fields[0]].Value
-        $_username = $obj.PSObject.Properties[$fields[1]].Value
-        #$_platform =  $obj.PSObject.Properties[$fields[2]].Value
-
-        $PatchBody = @(
-            @{ op = "replace"; path = "/name"; value = $_name},
-            @{ op = "replace"; path = "/address"; value = $_address},
-            @{ op = "replace"; path = "/userName"; value = $_username},
-            #@{ op = "replace"; path = "/platformID"; value = $_platform},
-            @{ op = "replace"; path = "/secretManagement/automaticManagementEnabled"; value = $secretMgmt }
-            )
-
-        # remove or add reason based on if cpm mgmt is enabled 
-        if ($secretMgmt) {
-            #$PatchBody += @{ op = "remove"; path = "/secretManagement/manualManagementReason"}
-            $PatchBody += @{ op = "replace"; path = "/secretManagement/manualManagementReason"; value = ""}            
+        catch {
+            Write-Log ("❌ ERROR: Failed to retrieve members for Safe: {0} - {1}" -f $SafeName, $_.Exception.Message) 'Red'
         }
-        else {
-            $PatchBody += @{ op = "replace"; path = "/secretManagement/manualManagementReason"; value = "Backout: AMNG=>OMNG"}
-        }
-
-        $PatchBody = $PatchBody | ConvertTo-Json
-        write-debug $PatchBody
-
-        $headers = @{Authorization = "Bearer $token"}        
-        $Updated = Invoke-RestMethod -Method PATCH `
-        -Uri "$PVWA/$id" `
-        -Headers $headers -ContentType "application/json" -Body $PatchBody
-        Write-Debug ($Updated | ConvertTo-Json)
-
-        Write-Host "Processed ACCOUNT_ID=$id ($_name) successful"
-        Write-Log "$func ($SCRIPT)" "Processed ACCOUNT_ID=$id ($_name) successfully"
     }
-    catch {
-        Write-Host "ERROR: Cannot process ACCOUNT_ID=$id ($_name)"          
-        Write-Log "$func ($SCRIPT)" $_ "ERROR: Cannot process ACCOUNT_ID=$id ($_name)"  
-        #continue to next account
+
+    # 5) Export to CSV
+    if (-not $SafeMembersReport -or $SafeMembersReport.Count -eq 0) {
+        Write-Log "⚠️  No Safe Member data collected; skipping CSV export." 'Yellow'
+    }
+    else {
+        Write-Log ("🛠  Exporting Safe Member Report to: {0}" -f $CsvFilePath) 'Cyan'
+        $SafeMembersReport | Export-Csv -Path $CsvFilePath -NoTypeInformation -Encoding UTF8
+        Write-Log "✅ Safe Member Report successfully exported." 'Green'
+    }
+
+    Write-Log "🔹 Safe Member Report generation completed." 'Cyan'
+}
+catch {
+    Write-Log ("❌ FATAL ERROR: {0}" -f $_.Exception.Message) 'Red'
+}
+finally {
+    if ($sessionCreated) {
+        try {
+            Close-PASSession | Out-Null
+            Write-Log "✅ Logged off from Privilege Cloud." 'Green'
+        } catch {
+            Write-Log ("⚠️  Logoff warning: {0}" -f $_.Exception.Message) 'Yellow'
+        }
     }
 }
-
-<#
-    main
-#>
-function Start-Script() {
-    New-Log
-    Set-Env
-    $dataRows = Get-CSV
-    Write-Debug ( ($dataRows | Format-Table -AutoSize | Out-String).TrimEnd() )
-    $token = Get-Token
-    #process data rows by calling rest api for each row
-    $dataRows | % {
-                    Invoke-API $token $_
-                    write-debug ($_ | ConvertTo-Json -Depth 5)
-                    #$_.PSObject.Properties | Select-Object Name, value
-                    #Start-Sleep 10
-    }
-}
-
-Start-Script
-
-
