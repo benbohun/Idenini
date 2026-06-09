@@ -1,29 +1,1618 @@
-2026-06-09 17:27:52 | INFO | IND Safe Identity user membership sync starting.
-2026-06-09 17:27:52 | INFO | DryRun mode: False
-2026-06-09 17:27:52 | INFO | LiveRun mode: True
-2026-06-09 17:27:52 | INFO | LookbackDays parameter retained for compatibility: 1
-2026-06-09 17:27:52 | INFO | Discovery mode: Safe-driven Identity user scan. Event table query is bypassed.
-2026-06-09 17:27:52 | INFO | Identity OAuth Application ID: RestAPI
-2026-06-09 17:27:52 | INFO | PowerShell Version      : 5.1.17763.8755
-2026-06-09 17:27:52 | INFO | PowerShell Path         : C:\Windows\System32\WindowsPowerShell\v1.0
-2026-06-09 17:27:52 | INFO | 64-bit Process          : True
-2026-06-09 17:27:52 | INFO | Run As User             : ACU\SVC_IAMCArkWinPrd
-2026-06-09 17:27:52 | INFO | Original PSModulePath   : C:\Users\SVC_IAMCArkWinPrd\Documents\WindowsPowerShell\Modules;C:\Program Files (x86)\WindowsPowerShell\Modules;C:\Program Files\WindowsPowerShell\Modules;C:\Windows\system32\WindowsPowerShell\v1.0\Modules;C:\Program Files (x86)\AutoIt3\AutoItX
-2026-06-09 17:27:52 | INFO | Private ModuleRoot      : I:\Script\IDENTITY Script New\Onbarding Project\Modules
-2026-06-09 17:27:52 | INFO | Runtime PSModulePath    : I:\Script\IDENTITY Script New\Onbarding Project\Modules;C:\Users\SVC_IAMCArkWinPrd\Documents\WindowsPowerShell\Modules;C:\Program Files (x86)\WindowsPowerShell\Modules;C:\Program Files\WindowsPowerShell\Modules;C:\Windows\system32\WindowsPowerShell\v1.0\Modules;C:\Program Files (x86)\AutoIt3\AutoItX
-2026-06-09 17:27:52 | INFO | Importing private IdentityCommand: Version=0.3.61; Path=I:\Script\IDENTITY Script New\Onbarding Project\Modules\IdentityCommand\0.3.61\IdentityCommand.psd1
-2026-06-09 17:27:52 | INFO | Importing private psPAS          : Version=7.0.242; Path=I:\Script\IDENTITY Script New\Onbarding Project\Modules\psPAS\7.0.242\psPAS.psd1
-2026-06-09 17:27:53 | INFO | Loaded psPAS Version       : 7.0.242
-2026-06-09 17:27:53 | INFO | Loaded psPAS Path          : I:\Script\IDENTITY Script New\Onbarding Project\Modules\psPAS\7.0.242\psPAS.psm1
-2026-06-09 17:27:53 | INFO | Loaded IdentityCommand Ver : 0.3.61
-2026-06-09 17:27:53 | INFO | Loaded IdentityCommand Path: I:\Script\IDENTITY Script New\Onbarding Project\Modules\IdentityCommand\0.3.61\IdentityCommand.psm1
-2026-06-09 17:27:53 | INFO | New-PASSession detected parameters: IdentityTenantURL, PrivilegeCloudURL, TenantSubdomain, Credential, ServiceUser, BaseURI
-2026-06-09 17:27:53 | WARN | Live mode enabled. Safe membership changes can be made.
-2026-06-09 17:27:53 | INFO | Retrieving service user credential from CCP.
-2026-06-09 17:27:53 | INFO | CCP URL: https://aam.alliantcreditunion.com/AIMWebService/api/Accounts?AppID=ACURestAPI&Safe=ACU-VAULT-API&Object=Application-CyberArkVaultRestAPI-alliantcredit.cyberark.cloud
-2026-06-09 17:27:53 | SUCCESS | CCP returned service user username: acurestapi_local@alliantcreditunion.admin
-2026-06-09 17:27:53 | INFO | Requesting Identity OAuth token from: https://aak4521.my.idaptive.app/oauth2/token/RestAPI
-2026-06-09 17:27:53 | INFO | OAuth Client ID from CCP: acurestapi_local@alliantcreditunion.admin
-2026-06-09 17:27:53 | INFO | OAuth Scope: reporting
-2026-06-09 17:27:54 | SUCCESS | Identity OAuth token retrieved. TokenType=Bearer; ExpiresIn=31536000
-2026-06-09 17:27:54 | INFO | Querying CyberArk Identity DSUsers table.
+<#
+IND_AddNewIdentityUsersToSafe.ps1
+
+RECENT LOGIN VERSION
+
+Purpose:
+- Retrieve CyberArk Identity / Privilege Cloud service-user credential from CCP.
+- Authenticate to CyberArk Identity OAuth using OAuth2 Client App ID RestAPI.
+- Query CyberArk Identity User table for users with recent LastLogin.
+- Match each recently logged-in user to an IND Safe:
+    IND_<samAccountName>
+    IND_<samAccountName>_*
+- Add samAccountName@alliantcreditunion.com to the matching IND Safe if missing.
+- Apply default individual Safe permissions.
+- Export audit results to CSV.
+
+Why this version:
+- Event table query failed in this tenant with:
+    Argument types do not match
+- Full DSUsers query is too slow in a large tenant.
+- The business process requires Identity to be the source of truth because idle-user cleanup removes users from IND Safes.
+- When a cleaned-up user logs in again, CyberArk Identity User.LastLogin is updated, allowing this script to detect the re-login and restore the user to the matching IND Safe.
+
+Important:
+- This script does NOT rename/remove old psPAS modules.
+- This script does NOT permanently change server/global/user PSModulePath.
+- It uses a private module folder only for this PowerShell process:
+    I:\Script\IDENTITY Script New\Onbarding Project\Modules
+
+Recommended:
+- For a scheduled task that runs every 15-30 minutes, use -LookbackHours 2.
+- For daily processing, use -LookbackDays 1 or omit both because LookbackDays defaults to 1.
+- Test query only first:
+    .\IND_AddNewIdentityUsersToSafe.ps1 -RecentLoginQueryOnly -LookbackHours 2
+
+Safety:
+- Bare execution is dry-run.
+- Use -LiveRun to actually add/update Safe members.
+#>
+
+[CmdletBinding()]
+param(
+    # ===== Identity / Privilege Cloud =====
+    [string]$IdentityTenantURL  = "https://aak4521.my.idaptive.app",
+    [string]$PrivilegeCloudURL  = "https://alliantcredit.privilegecloud.cyberark.cloud",
+
+    # Confirmed working OAuth Application ID.
+    [string]$IdentityOAuthAppId = "RestAPI",
+
+    # OAuth scope configured with REST Regex: Redrock/query
+    [string]$OAuthScope         = "reporting",
+
+    # ===== CCP settings =====
+    [string]$CCPAddress         = "https://aam.alliantcreditunion.com",
+    [string]$CCPLocation        = "AIMWebService",
+    [string]$CCPAppID           = "ACURestAPI",
+    [string]$CCPSafe            = "ACU-VAULT-API",
+    [string]$CCPObject          = "Application-CyberArkVaultRestAPI-alliantcredit.cyberark.cloud",
+    [bool]  $CCPWindowsAuth     = $false,
+
+    # ===== IND Safe matching =====
+    [string]$IndSafePrefix      = "IND_",
+    [string]$DefaultUserDomain  = "alliantcreditunion.com",
+    [string]$PreferredSearchIn  = "alliantcreditunion.com",
+
+    # ===== Recent login window =====
+    # If LookbackHours is greater than 0, it takes priority.
+    # Otherwise LookbackDays is used.
+    [int]$LookbackHours         = 0,
+    [int]$LookbackDays          = 1,
+
+    # Fallback throttle if DateFunc query fails and script must query recently sorted users then filter locally.
+    [int]$MaxRecentLoginRows    = 500,
+
+    # Optional Safe filter for testing.
+    # Example: -SafeNameFilter "IND_jdoe*"
+    [string]$SafeNameFilter     = "",
+
+    # Optional safety throttle for testing.
+    # Example: -MaxUsersForTest 5
+    [int]$MaxUsersForTest       = 0,
+
+    # Include users that are not StatusEnum Active.
+    [switch]$IncludeNonActive,
+
+    # ===== Output =====
+    [string]$OutputFolder       = "I:\Script\IDENTITY Script New\logs\INDSafeUserMembership",
+    [string]$CsvFilePath        = "",
+    [string]$LogFile            = "",
+
+    # ===== Private module folder for this script only =====
+    [string]$ScriptModuleRoot   = "I:\Script\IDENTITY Script New\Onbarding Project\Modules",
+    [version]$MinimumPsPASVersion = "6.0.0",
+
+    # ===== Run behavior =====
+    [switch]$LiveRun,
+    [switch]$UpdateExistingMember,
+
+    # Only validates CCP + OAuth token.
+    [switch]$TokenOnly,
+
+    # Only queries recent Identity logins and exports CSV. No Privilege Cloud login or Safe changes.
+    [switch]$RecentLoginQueryOnly
+)
+
+$DryRun = -not $LiveRun
+
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$ErrorActionPreference = "Stop"
+
+# =========================
+# Output setup
+# =========================
+
+if ($LookbackHours -lt 0) {
+    throw "LookbackHours cannot be negative."
+}
+
+if ($LookbackDays -lt 1) {
+    throw "LookbackDays must be 1 or higher when LookbackHours is not used."
+}
+
+if ($MaxRecentLoginRows -lt 1) {
+    throw "MaxRecentLoginRows must be 1 or higher."
+}
+
+if (-not (Test-Path -Path $OutputFolder)) {
+    New-Item -Path $OutputFolder -ItemType Directory -Force | Out-Null
+}
+
+$RunStamp = Get-Date -Format "yyyyMMdd_HHmmss"
+
+if ([string]::IsNullOrWhiteSpace($LogFile)) {
+    $LogFile = Join-Path $OutputFolder "INDSafeUserMembership_$RunStamp.log"
+}
+
+if ([string]::IsNullOrWhiteSpace($CsvFilePath)) {
+    $CsvFilePath = Join-Path $OutputFolder "INDSafeUserMembership_$RunStamp.csv"
+}
+
+$script:RunResults = New-Object System.Collections.Generic.List[object]
+$script:OriginalPSModulePath = $null
+
+# =========================
+# Default IND Safe permissions
+# =========================
+
+$IndividualSafePermissions = @{
+    UseAccounts                            = $true
+    RetrieveAccounts                       = $true
+    ListAccounts                           = $true
+    AddAccounts                            = $false
+    UpdateAccountContent                   = $true
+    UpdateAccountProperties                = $false
+    InitiateCPMAccountManagementOperations = $true
+    SpecifyNextAccountContent              = $false
+    RenameAccounts                         = $false
+    DeleteAccounts                         = $false
+    UnlockAccounts                         = $false
+    ManageSafe                             = $false
+    ManageSafeMembers                      = $false
+    BackupSafe                             = $false
+    ViewAuditLog                           = $true
+    ViewSafeMembers                        = $true
+    AccessWithoutConfirmation              = $true
+    CreateFolders                          = $false
+    DeleteFolders                          = $false
+    MoveAccountsAndFolders                 = $false
+}
+
+# =========================
+# Logging
+# =========================
+
+function Write-Log {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Message,
+
+        [ValidateSet("INFO", "WARN", "ERROR", "SUCCESS")]
+        [string]$Level = "INFO"
+    )
+
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $entry = "$timestamp | $Level | $Message"
+
+    Add-Content -Path $LogFile -Value $entry
+
+    switch ($Level) {
+        "SUCCESS" { Write-Host $entry -ForegroundColor Green }
+        "WARN"    { Write-Host $entry -ForegroundColor Yellow }
+        "ERROR"   { Write-Host $entry -ForegroundColor Red }
+        default   { Write-Host $entry -ForegroundColor White }
+    }
+}
+
+function Add-RunResult {
+    param(
+        [string]$SamAccountName,
+        [string]$UserPrincipalName,
+        [string]$SafeName,
+        [string]$MemberName,
+        [string]$Action,
+        [string]$Status,
+        [string]$Detail,
+        [string]$IdentityUserId,
+        [string]$IdentityDisplayName,
+        [string]$IdentityEmail,
+        [string]$IdentityLastLogin,
+        [string]$IdentityStatus,
+        [string]$IdentitySourceDs,
+        [string]$IdentitySourceDsType
+    )
+
+    $script:RunResults.Add([PSCustomObject]@{
+        RunTime              = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        SamAccountName       = $SamAccountName
+        UserPrincipalName    = $UserPrincipalName
+        SafeName             = $SafeName
+        MemberName           = $MemberName
+        Action               = $Action
+        Status               = $Status
+        Detail               = $Detail
+        IdentityUserId       = $IdentityUserId
+        IdentityDisplayName  = $IdentityDisplayName
+        IdentityEmail        = $IdentityEmail
+        IdentityLastLogin    = $IdentityLastLogin
+        IdentityStatus       = $IdentityStatus
+        IdentitySourceDs     = $IdentitySourceDs
+        IdentitySourceDsType = $IdentitySourceDsType
+    }) | Out-Null
+}
+
+# =========================
+# Private module loading
+# =========================
+
+function Find-PrivateModuleFile {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$ModuleRoot,
+
+        [Parameter(Mandatory)]
+        [string]$ModuleName,
+
+        [version]$MinimumVersion = "0.0.0"
+    )
+
+    if (-not (Test-Path $ModuleRoot)) {
+        throw "Private module root does not exist: $ModuleRoot"
+    }
+
+    $moduleFolder = Join-Path $ModuleRoot $ModuleName
+
+    if (-not (Test-Path $moduleFolder)) {
+        throw "Private module folder does not exist: $moduleFolder"
+    }
+
+    $moduleFiles = @(
+        Get-ChildItem -Path $moduleFolder -Recurse -File -ErrorAction Stop |
+            Where-Object {
+                $_.Name -ieq "$ModuleName.psd1" -or
+                $_.Name -ieq "$ModuleName.psm1"
+            } |
+            ForEach-Object {
+                $version = [version]"0.0.0"
+
+                if ($_.FullName -match "\\$([regex]::Escape($ModuleName))\\([^\\]+)\\$([regex]::Escape($ModuleName))\.ps[dm]1$") {
+                    try {
+                        $version = [version]$matches[1]
+                    }
+                    catch {
+                        $version = [version]"0.0.0"
+                    }
+                }
+
+                [PSCustomObject]@{
+                    ModuleName = $ModuleName
+                    Version    = $version
+                    Path       = $_.FullName
+                    Extension  = $_.Extension
+                }
+            } |
+            Where-Object { $_.Version -ge $MinimumVersion } |
+            Sort-Object -Property `
+                @{ Expression = { $_.Version }; Descending = $true },
+                @{ Expression = { if ($_.Extension -ieq ".psd1") { 0 } else { 1 } }; Descending = $false }
+    )
+
+    $selected = @($moduleFiles | Select-Object -First 1)
+
+    if (-not $selected) {
+        throw @"
+No valid private module file found.
+
+ModuleName     : $ModuleName
+ModuleRoot     : $ModuleRoot
+MinimumVersion : $MinimumVersion
+
+Expected examples:
+$ModuleRoot\$ModuleName\6.x.x\$ModuleName.psd1
+$ModuleRoot\$ModuleName\6.x.x\$ModuleName.psm1
+"@
+    }
+
+    return $selected
+}
+
+function Initialize-RequiredModules {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$ScriptModuleRoot,
+
+        [Parameter(Mandatory)]
+        [version]$MinimumPsPASVersion
+    )
+
+    Write-Log ("PowerShell Version      : {0}" -f $PSVersionTable.PSVersion)
+    Write-Log ("PowerShell Path         : {0}" -f $PSHOME)
+    Write-Log ("64-bit Process          : {0}" -f [Environment]::Is64BitProcess)
+    Write-Log ("Run As User             : {0}" -f [System.Security.Principal.WindowsIdentity]::GetCurrent().Name)
+    Write-Log ("Original PSModulePath   : {0}" -f $env:PSModulePath)
+    Write-Log ("Private ModuleRoot      : {0}" -f $ScriptModuleRoot)
+
+    if (-not (Test-Path $ScriptModuleRoot)) {
+        throw @"
+Private module folder does not exist:
+$ScriptModuleRoot
+
+Create it and save modules into it:
+Save-Module psPAS -Path "$ScriptModuleRoot" -Force
+Save-Module IdentityCommand -Path "$ScriptModuleRoot" -Force
+"@
+    }
+
+    $script:OriginalPSModulePath = $env:PSModulePath
+
+    if ($env:PSModulePath -notlike "*$ScriptModuleRoot*") {
+        $env:PSModulePath = "$ScriptModuleRoot;$env:PSModulePath"
+    }
+
+    Write-Log ("Runtime PSModulePath    : {0}" -f $env:PSModulePath)
+
+    Remove-Module psPAS -Force -ErrorAction SilentlyContinue
+    Remove-Module IdentityCommand -Force -ErrorAction SilentlyContinue
+
+    $privateIdentityCommand = Find-PrivateModuleFile `
+        -ModuleRoot $ScriptModuleRoot `
+        -ModuleName "IdentityCommand" `
+        -MinimumVersion ([version]"0.0.0")
+
+    $privatePsPAS = Find-PrivateModuleFile `
+        -ModuleRoot $ScriptModuleRoot `
+        -ModuleName "psPAS" `
+        -MinimumVersion $MinimumPsPASVersion
+
+    Write-Log ("Importing private IdentityCommand: Version={0}; Path={1}" -f $privateIdentityCommand.Version, $privateIdentityCommand.Path)
+    Import-Module $privateIdentityCommand.Path -Force -ErrorAction Stop
+
+    Write-Log ("Importing private psPAS          : Version={0}; Path={1}" -f $privatePsPAS.Version, $privatePsPAS.Path)
+    Import-Module $privatePsPAS.Path -Force -ErrorAction Stop
+
+    $pspasModule = Get-Module psPAS
+    $idcModule   = Get-Module IdentityCommand
+    $newSession  = Get-Command New-PASSession -ErrorAction Stop
+
+    Write-Log ("Loaded psPAS Version       : {0}" -f $pspasModule.Version)
+    Write-Log ("Loaded psPAS Path          : {0}" -f $pspasModule.Path)
+    Write-Log ("Loaded IdentityCommand Ver : {0}" -f $idcModule.Version)
+    Write-Log ("Loaded IdentityCommand Path: {0}" -f $idcModule.Path)
+
+    $importantParams = @(
+        "IdentityTenantURL",
+        "PrivilegeCloudURL",
+        "TenantSubdomain",
+        "Credential",
+        "ServiceUser",
+        "BaseURI"
+    )
+
+    $availableImportantParams = @(
+        $importantParams | Where-Object { $newSession.Parameters.ContainsKey($_) }
+    ) -join ", "
+
+    Write-Log ("New-PASSession detected parameters: {0}" -f $availableImportantParams)
+
+    if (-not $newSession.Parameters.ContainsKey("ServiceUser")) {
+        $availableParams = ($newSession.Parameters.Keys | Sort-Object) -join ", "
+
+        throw @"
+The private psPAS module loaded, but New-PASSession does not support -ServiceUser.
+
+Loaded psPAS:
+Version: $($pspasModule.Version)
+Path   : $($pspasModule.Path)
+
+Required:
+psPAS 6.x or newer with Privilege Cloud Shared Services support.
+
+Available New-PASSession parameters:
+$availableParams
+"@
+    }
+
+    if (-not $newSession.Parameters.ContainsKey("IdentityTenantURL") -and -not $newSession.Parameters.ContainsKey("TenantSubdomain")) {
+        $availableParams = ($newSession.Parameters.Keys | Sort-Object) -join ", "
+
+        throw @"
+The private New-PASSession command does not support -IdentityTenantURL or -TenantSubdomain.
+
+Loaded psPAS:
+Version: $($pspasModule.Version)
+Path   : $($pspasModule.Path)
+
+Available New-PASSession parameters:
+$availableParams
+"@
+    }
+}
+
+# =========================
+# Utility functions
+# =========================
+
+function Convert-ToCleanString {
+    param([object]$Value)
+
+    if ($null -eq $Value) {
+        return ""
+    }
+
+    return ([string]$Value).Trim()
+}
+
+function ConvertTo-UrlEncodedValue {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Value
+    )
+
+    return [System.Uri]::EscapeDataString($Value)
+}
+
+function Read-HttpResponseBody {
+    param(
+        [Parameter(Mandatory)]
+        [System.Net.WebResponse]$Response
+    )
+
+    $stream = $null
+    $reader = $null
+
+    try {
+        $stream = $Response.GetResponseStream()
+
+        if (-not $stream) {
+            return ""
+        }
+
+        $reader = New-Object System.IO.StreamReader($stream)
+        return $reader.ReadToEnd()
+    }
+    finally {
+        if ($reader) {
+            $reader.Close()
+        }
+
+        if ($stream) {
+            $stream.Close()
+        }
+    }
+}
+
+function Invoke-HttpPost {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Uri,
+
+        [Parameter(Mandatory)]
+        [string]$Body,
+
+        [Parameter(Mandatory)]
+        [string]$ContentType,
+
+        [hashtable]$Headers = @{}
+    )
+
+    $request = [System.Net.WebRequest]::Create($Uri)
+    $request.Method = "POST"
+    $request.ContentType = $ContentType
+    $request.Accept = "application/json"
+
+    foreach ($key in $Headers.Keys) {
+        $request.Headers.Add($key, [string]$Headers[$key])
+    }
+
+    $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($Body)
+    $request.ContentLength = $bodyBytes.Length
+
+    $requestStream = $null
+
+    try {
+        $requestStream = $request.GetRequestStream()
+        $requestStream.Write($bodyBytes, 0, $bodyBytes.Length)
+    }
+    finally {
+        if ($requestStream) {
+            $requestStream.Close()
+        }
+    }
+
+    try {
+        $response = $request.GetResponse()
+        $responseBody = Read-HttpResponseBody -Response $response
+
+        return [PSCustomObject]@{
+            Success           = $true
+            StatusCode        = [int]$response.StatusCode
+            StatusDescription = [string]$response.StatusDescription
+            Body              = $responseBody
+        }
+    }
+    catch [System.Net.WebException] {
+        $webResponse = $_.Exception.Response
+
+        if ($webResponse) {
+            $errorBody = Read-HttpResponseBody -Response $webResponse
+
+            return [PSCustomObject]@{
+                Success           = $false
+                StatusCode        = [int]$webResponse.StatusCode
+                StatusDescription = [string]$webResponse.StatusDescription
+                Body              = $errorBody
+            }
+        }
+
+        return [PSCustomObject]@{
+            Success           = $false
+            StatusCode        = ""
+            StatusDescription = ""
+            Body              = $_.Exception.Message
+        }
+    }
+}
+
+function Convert-FromIdentityDate {
+    param([object]$Value)
+
+    if (-not $Value) {
+        return $null
+    }
+
+    $text = [string]$Value
+
+    if ($text -match "/Date\((\d+)\)/") {
+        $epochMs = [Int64]$matches[1]
+        return ([DateTimeOffset]::FromUnixTimeMilliseconds($epochMs)).LocalDateTime
+    }
+
+    try {
+        return [datetime]$text
+    }
+    catch {
+        return $null
+    }
+}
+
+function Get-TenantSubdomainFromIdentityUrl {
+    param(
+        [Parameter(Mandatory)]
+        [string]$IdentityTenantURL
+    )
+
+    $clean = $IdentityTenantURL.Trim().TrimEnd("/")
+    $uri = [Uri]$clean
+    return ($uri.Host -split "\.")[0]
+}
+
+function Get-LookbackSettings {
+    param(
+        [int]$LookbackHours,
+        [int]$LookbackDays
+    )
+
+    if ($LookbackHours -gt 0) {
+        $cutoff = (Get-Date).AddHours(-1 * $LookbackHours)
+        return [PSCustomObject]@{
+            Mode        = "Hours"
+            Value       = $LookbackHours
+            DateFuncArg = "-{0} hours" -f $LookbackHours
+            Cutoff      = $cutoff
+        }
+    }
+
+    $cutoff = (Get-Date).AddDays(-1 * $LookbackDays)
+    return [PSCustomObject]@{
+        Mode        = "Days"
+        Value       = $LookbackDays
+        DateFuncArg = "-{0}" -f $LookbackDays
+        Cutoff      = $cutoff
+    }
+}
+
+function Resolve-SamFromIdentityFields {
+    param(
+        [string]$UserName,
+        [string]$Email,
+        [string]$DefaultUserDomain
+    )
+
+    $values = @(
+        (Convert-ToCleanString $UserName),
+        (Convert-ToCleanString $Email)
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+
+    foreach ($value in $values) {
+        if ($value -match "^[^\\]+\\([^\\]+)$") {
+            $candidate = $matches[1].Trim()
+            if (-not [string]::IsNullOrWhiteSpace($candidate)) {
+                return $candidate
+            }
+        }
+
+        if ($value -match "^([^@]+)@([^@]+)$") {
+            $candidate = $matches[1].Trim()
+            if (-not [string]::IsNullOrWhiteSpace($candidate)) {
+                return $candidate
+            }
+        }
+    }
+
+    foreach ($value in $values) {
+        if ($value -notmatch "[@\\,=]") {
+            return $value.Trim()
+        }
+    }
+
+    return ""
+}
+
+# =========================
+# CCP and OAuth
+# =========================
+
+function Get-ServiceUserCredentialFromCCP {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$CCPAddress,
+        [Parameter(Mandatory)][string]$Location,
+        [Parameter(Mandatory)][string]$AppID,
+        [Parameter(Mandatory)][string]$Safe,
+        [Parameter(Mandatory)][string]$Object,
+        [bool]$WindowsAuth = $false
+    )
+
+    $base = $CCPAddress.TrimEnd("/")
+    $loc  = $Location.Trim("/")
+
+    $encodedAppID  = ConvertTo-UrlEncodedValue -Value $AppID
+    $encodedSafe   = ConvertTo-UrlEncodedValue -Value $Safe
+    $encodedObject = ConvertTo-UrlEncodedValue -Value $Object
+
+    $url = "{0}/{1}/api/Accounts?AppID={2}&Safe={3}&Object={4}" -f `
+        $base, `
+        $loc, `
+        $encodedAppID, `
+        $encodedSafe, `
+        $encodedObject
+
+    Write-Log "Retrieving service user credential from CCP."
+    Write-Log ("CCP URL: {0}" -f $url)
+
+    try {
+        $headers = @{
+            "Content-Type" = "application/json"
+        }
+
+        $resp = Invoke-RestMethod `
+            -Uri $url `
+            -Method GET `
+            -Headers $headers `
+            -UseDefaultCredentials:$WindowsAuth `
+            -ErrorAction Stop
+
+        if (-not $resp.UserName -or -not $resp.Content) {
+            throw "CCP response is missing UserName or Content."
+        }
+
+        Write-Log ("CCP returned service user username: {0}" -f $resp.UserName) "SUCCESS"
+
+        return [PSCustomObject]@{
+            UserName = [string]$resp.UserName
+            Secret   = [string]$resp.Content
+        }
+    }
+    catch {
+        throw "CCP credential retrieval failed. $($_.Exception.Message)"
+    }
+}
+
+function New-BasicAuthHeaderValue {
+    param(
+        [Parameter(Mandatory)][string]$ClientId,
+        [Parameter(Mandatory)][string]$ClientSecret
+    )
+
+    $pair = "{0}:{1}" -f $ClientId, $ClientSecret
+    $bytes = [System.Text.Encoding]::ASCII.GetBytes($pair)
+    $basicToken = [Convert]::ToBase64String($bytes)
+
+    return "Basic $basicToken"
+}
+
+function Get-IdentityReportingToken {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$IdentityTenantURL,
+        [Parameter(Mandatory)][string]$IdentityOAuthAppId,
+        [Parameter(Mandatory)][string]$ClientId,
+        [Parameter(Mandatory)][string]$ClientSecret,
+        [Parameter(Mandatory)][string]$Scope
+    )
+
+    $tenant = $IdentityTenantURL.TrimEnd("/")
+    $appId  = $IdentityOAuthAppId.Trim("/")
+    $tokenUri = "$tenant/oauth2/token/$appId"
+
+    Write-Log ("Requesting Identity OAuth token from: {0}" -f $tokenUri)
+    Write-Log ("OAuth Client ID from CCP: {0}" -f $ClientId)
+    Write-Log ("OAuth Scope: {0}" -f $Scope)
+
+    $body = "grant_type=client_credentials&scope=$([System.Uri]::EscapeDataString($Scope))"
+
+    $headers = @{
+        Authorization = New-BasicAuthHeaderValue `
+            -ClientId $ClientId `
+            -ClientSecret $ClientSecret
+    }
+
+    $response = Invoke-HttpPost `
+        -Uri $tokenUri `
+        -Body $body `
+        -ContentType "application/x-www-form-urlencoded" `
+        -Headers $headers
+
+    if (-not $response.Success) {
+        throw @"
+Unable to retrieve Identity OAuth token.
+
+Token URL:
+$tokenUri
+
+HTTP Response:
+$($response.StatusCode) $($response.StatusDescription)
+
+Response Body:
+$($response.Body)
+"@
+    }
+
+    try {
+        $json = $response.Body | ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
+        throw ("Identity token response was not valid JSON. Body: {0}" -f $response.Body)
+    }
+
+    if (-not $json.access_token) {
+        throw ("Identity token response did not include access_token. Body: {0}" -f $response.Body)
+    }
+
+    Write-Log ("Identity OAuth token retrieved. TokenType={0}; ExpiresIn={1}" -f $json.token_type, $json.expires_in) "SUCCESS"
+
+    return [string]$json.access_token
+}
+
+# =========================
+# Redrock User.LastLogin query
+# =========================
+
+function Invoke-RedrockSingleCall {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$IdentityTenantURL,
+        [Parameter(Mandatory)][string]$AccessToken,
+        [Parameter(Mandatory)][string]$Query,
+        [int]$PageNumber = 1,
+        [int]$PageSize = 1000,
+        [switch]$WithoutArgs
+    )
+
+    $tenant = $IdentityTenantURL.TrimEnd("/")
+    $queryUri = "$tenant/Redrock/query"
+
+    $headers = @{
+        Authorization = "Bearer $AccessToken"
+    }
+
+    if ($WithoutArgs) {
+        $payloadObject = [ordered]@{
+            Script = $Query
+        }
+    }
+    else {
+        $payloadObject = [ordered]@{
+            Script = $Query
+            args   = @{
+                PageNumber = $PageNumber
+                PageSize   = $PageSize
+                Limit      = $PageSize
+                Caching    = -1
+                direction  = $false
+                SortBy     = "LastLogin"
+            }
+        }
+    }
+
+    $payload = $payloadObject | ConvertTo-Json -Depth 10
+
+    $response = Invoke-HttpPost `
+        -Uri $queryUri `
+        -Body $payload `
+        -ContentType "application/json" `
+        -Headers $headers
+
+    if (-not $response.Success) {
+        throw ("Redrock query HTTP failed. HTTP {0} {1}. Body: {2}. Query: {3}" -f `
+            $response.StatusCode, `
+            $response.StatusDescription, `
+            $response.Body, `
+            $Query)
+    }
+
+    try {
+        $json = $response.Body | ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
+        $sample = $response.Body
+
+        if ($sample.Length -gt 1000) {
+            $sample = $sample.Substring(0, 1000)
+        }
+
+        throw ("Redrock query response was not valid JSON. Error: {0}. BodySample: {1}" -f `
+            $_.Exception.Message, `
+            $sample)
+    }
+
+    if ($json.success -eq $false) {
+        $message = ""
+
+        if ($json.Message) {
+            $message = [string]$json.Message
+        }
+        elseif ($json.message) {
+            $message = [string]$json.message
+        }
+        else {
+            $message = "No explicit Redrock message returned."
+        }
+
+        throw ("Redrock returned success=false. Message: {0}. Query: {1}" -f $message, $Query)
+    }
+
+    return $json
+}
+
+function Convert-RedrockJsonToRows {
+    param([object]$Json)
+
+    $rows = @()
+
+    if ($Json.Result -and $Json.Result.Results) {
+        $rows = @($Json.Result.Results | ForEach-Object { $_.Row })
+    }
+
+    return @($rows)
+}
+
+function Get-RecentLoggedInIdentityUsers {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$IdentityTenantURL,
+        [Parameter(Mandatory)][string]$AccessToken,
+        [int]$LookbackHours,
+        [int]$LookbackDays,
+        [int]$MaxRecentLoginRows,
+        [string]$DefaultUserDomain,
+        [switch]$IncludeNonActive
+    )
+
+    $lookback = Get-LookbackSettings -LookbackHours $LookbackHours -LookbackDays $LookbackDays
+
+    Write-Log ("Recent login cutoff mode: {0}; Value: {1}; Local cutoff: {2}" -f `
+        $lookback.Mode, `
+        $lookback.Value, `
+        $lookback.Cutoff.ToString("yyyy-MM-dd HH:mm:ss"))
+
+    $dateFuncArg = $lookback.DateFuncArg
+
+    # Primary query: directly filter by LastLogin.
+    # User table has LastLogin DateTime. This avoids Event and DSUsers.
+    $primaryQuery = @"
+Select ID, Username, DisplayName, Email, LastLogin, StatusEnum, SourceDs, SourceDsType, DirectoryServiceUuid, Forest
+from User
+where LastLogin >= DateFunc('now', '$dateFuncArg')
+ORDER BY LastLogin DESC
+"@
+
+    $rows = @()
+    $usedQueryMode = ""
+
+    try {
+        Write-Log ("Querying CyberArk Identity User table by LastLogin using DateFunc('now', '{0}')." -f $dateFuncArg)
+        # No args on primary query to avoid the tenant-specific "Argument types do not match" behavior seen with Event query attempts.
+        $json = Invoke-RedrockSingleCall `
+            -IdentityTenantURL $IdentityTenantURL `
+            -AccessToken $AccessToken `
+            -Query $primaryQuery `
+            -WithoutArgs
+
+        $rows = @(Convert-RedrockJsonToRows -Json $json)
+        $usedQueryMode = "User.LastLogin DateFunc"
+        Write-Log ("Recent LastLogin query succeeded. Retrieved {0} row(s)." -f $rows.Count) "SUCCESS"
+    }
+    catch {
+        Write-Log ("Recent LastLogin DateFunc query failed: {0}" -f $_.Exception.Message) "WARN"
+        Write-Log ("Falling back to top {0} users sorted by LastLogin, then filtering locally." -f $MaxRecentLoginRows) "WARN"
+
+        $fallbackQuery = @"
+Select ID, Username, DisplayName, Email, LastLogin, StatusEnum, SourceDs, SourceDsType, DirectoryServiceUuid, Forest
+from User
+where LastLogin is not null
+ORDER BY LastLogin DESC
+"@
+
+        try {
+            $json = Invoke-RedrockSingleCall `
+                -IdentityTenantURL $IdentityTenantURL `
+                -AccessToken $AccessToken `
+                -Query $fallbackQuery `
+                -PageNumber 1 `
+                -PageSize $MaxRecentLoginRows
+
+            $rows = @(Convert-RedrockJsonToRows -Json $json)
+            $usedQueryMode = "User.LastLogin sorted fallback with args"
+            Write-Log ("Sorted LastLogin fallback query succeeded. Retrieved {0} row(s)." -f $rows.Count) "SUCCESS"
+        }
+        catch {
+            Write-Log ("Sorted LastLogin fallback with args failed: {0}" -f $_.Exception.Message) "WARN"
+
+            $json = Invoke-RedrockSingleCall `
+                -IdentityTenantURL $IdentityTenantURL `
+                -AccessToken $AccessToken `
+                -Query $fallbackQuery `
+                -WithoutArgs
+
+            $rows = @(Convert-RedrockJsonToRows -Json $json)
+            $usedQueryMode = "User.LastLogin sorted fallback without args"
+            Write-Log ("Sorted LastLogin fallback without args succeeded. Retrieved {0} row(s)." -f $rows.Count) "SUCCESS"
+        }
+    }
+
+    $candidates = New-Object System.Collections.Generic.List[object]
+
+    foreach ($row in $rows) {
+        $lastLoginDate = Convert-FromIdentityDate -Value $row.LastLogin
+
+        if (-not $lastLoginDate) {
+            continue
+        }
+
+        # Always filter locally as protection, even when server-side DateFunc worked.
+        if ($lastLoginDate -lt $lookback.Cutoff) {
+            continue
+        }
+
+        $statusEnum = Convert-ToCleanString $row.StatusEnum
+
+        if (-not $IncludeNonActive) {
+            if (-not [string]::IsNullOrWhiteSpace($statusEnum) -and $statusEnum -ine "Active") {
+                continue
+            }
+        }
+
+        $username = Convert-ToCleanString $row.Username
+        $email = Convert-ToCleanString $row.Email
+
+        $sam = Resolve-SamFromIdentityFields `
+            -UserName $username `
+            -Email $email `
+            -DefaultUserDomain $DefaultUserDomain
+
+        $sam = Convert-ToCleanString $sam
+
+        if ([string]::IsNullOrWhiteSpace($sam)) {
+            Write-Log ("Skipping recent login because samAccountName could not be resolved. Username={0}; Email={1}" -f $username, $email) "WARN"
+            continue
+        }
+
+        if ($sam -match "\$$") {
+            Write-Log ("Skipping computer/service-style identity from recent login query: {0}" -f $sam) "WARN"
+            continue
+        }
+
+        $upn = ""
+
+        if ($username -match "@") {
+            $upn = $username
+        }
+        elseif ($email -match "@") {
+            $upn = $email
+        }
+        else {
+            $upn = "{0}@{1}" -f $sam, $DefaultUserDomain
+        }
+
+        $candidates.Add([PSCustomObject]@{
+            SamAccountName       = $sam
+            UserPrincipalName    = $upn
+            IdentityUserId       = Convert-ToCleanString $row.ID
+            DisplayName          = Convert-ToCleanString $row.DisplayName
+            Email                = $email
+            LastLoginRaw         = Convert-ToCleanString $row.LastLogin
+            LastLogin            = $lastLoginDate
+            StatusEnum           = $statusEnum
+            SourceDs             = Convert-ToCleanString $row.SourceDs
+            SourceDsType         = Convert-ToCleanString $row.SourceDsType
+            DirectoryServiceUuid = Convert-ToCleanString $row.DirectoryServiceUuid
+            Forest               = Convert-ToCleanString $row.Forest
+            QueryMode            = $usedQueryMode
+        }) | Out-Null
+    }
+
+    $deduped = $candidates |
+        Sort-Object `
+            @{ Expression = { $_.SamAccountName }; Descending = $false },
+            @{ Expression = { $_.LastLogin }; Descending = $true } |
+        Group-Object SamAccountName |
+        ForEach-Object { $_.Group | Select-Object -First 1 }
+
+    return @($deduped)
+}
+
+# =========================
+# Privilege Cloud
+# =========================
+
+function Connect-PrivilegeCloudServiceUser {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$IdentityTenantURL,
+        [Parameter(Mandatory)][string]$PrivilegeCloudURL,
+        [Parameter(Mandatory)][PSCredential]$Credential
+    )
+
+    $cmd = Get-Command New-PASSession -ErrorAction Stop
+    $params = $cmd.Parameters
+
+    if ($params.ContainsKey("IdentityTenantURL") -and $params.ContainsKey("PrivilegeCloudURL") -and $params.ContainsKey("ServiceUser")) {
+        Write-Log "Using New-PASSession with -IdentityTenantURL, -PrivilegeCloudURL, and -ServiceUser."
+
+        New-PASSession `
+            -IdentityTenantURL $IdentityTenantURL `
+            -PrivilegeCloudURL $PrivilegeCloudURL `
+            -Credential $Credential `
+            -ServiceUser `
+            -ErrorAction Stop | Out-Null
+
+        return
+    }
+
+    if ($params.ContainsKey("TenantSubdomain") -and $params.ContainsKey("ServiceUser")) {
+        $tenantSubdomain = Get-TenantSubdomainFromIdentityUrl -IdentityTenantURL $IdentityTenantURL
+
+        Write-Log ("Using New-PASSession fallback with -TenantSubdomain {0} and -ServiceUser." -f $tenantSubdomain) "WARN"
+
+        New-PASSession `
+            -TenantSubdomain $tenantSubdomain `
+            -Credential $Credential `
+            -ServiceUser `
+            -ErrorAction Stop | Out-Null
+
+        return
+    }
+
+    $availableParams = ($params.Keys | Sort-Object) -join ", "
+
+    throw @"
+Unable to authenticate to Privilege Cloud.
+
+The loaded New-PASSession command does not support a valid ServiceUser login method.
+
+Required:
+- Either IdentityTenantURL + PrivilegeCloudURL + ServiceUser
+- Or TenantSubdomain + ServiceUser
+
+Available parameters:
+$availableParams
+"@
+}
+
+function Get-TargetIndSafes {
+    [CmdletBinding()]
+    param(
+        [string]$IndSafePrefix,
+        [string]$SafeNameFilter
+    )
+
+    Write-Log "Retrieving IND Safes from Privilege Cloud."
+
+    $getSafeCommand = Get-Command Get-PASSafe -ErrorAction Stop
+    $safeQueryUsed = "Get-PASSafe"
+
+    try {
+        if ($getSafeCommand.Parameters.ContainsKey("search")) {
+            Write-Log ("Using Get-PASSafe -search {0} to reduce Safe retrieval scope." -f $IndSafePrefix)
+            $allSafes = @(Get-PASSafe -search $IndSafePrefix -ErrorAction Stop)
+            $safeQueryUsed = "Get-PASSafe -search"
+        }
+        elseif ($getSafeCommand.Parameters.ContainsKey("Search")) {
+            Write-Log ("Using Get-PASSafe -Search {0} to reduce Safe retrieval scope." -f $IndSafePrefix)
+            $allSafes = @(Get-PASSafe -Search $IndSafePrefix -ErrorAction Stop)
+            $safeQueryUsed = "Get-PASSafe -Search"
+        }
+        else {
+            Write-Log "Get-PASSafe does not expose Search parameter in this module/session. Retrieving all Safes then filtering locally." "WARN"
+            $allSafes = @(Get-PASSafe -ErrorAction Stop)
+        }
+    }
+    catch {
+        Write-Log ("Safe search call failed: {0}. Falling back to Get-PASSafe without search." -f $_.Exception.Message) "WARN"
+        $allSafes = @(Get-PASSafe -ErrorAction Stop)
+        $safeQueryUsed = "Get-PASSafe fallback without search"
+    }
+
+    if (-not $allSafes -or $allSafes.Count -eq 0) {
+        throw "No Safes were returned by $safeQueryUsed."
+    }
+
+    $targetSafes = @(
+        $allSafes |
+            Where-Object { $_.SafeName -like "$IndSafePrefix*" }
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($SafeNameFilter)) {
+        $targetSafes = @(
+            $targetSafes |
+                Where-Object { $_.SafeName -like $SafeNameFilter }
+        )
+
+        Write-Log ("Applied SafeNameFilter: {0}. Matching IND Safes: {1}" -f $SafeNameFilter, $targetSafes.Count)
+    }
+
+    $targetSafes = @($targetSafes | Sort-Object SafeName)
+
+    Write-Log ("Retrieved {0} Safe(s) from API; IND Safe(s) available for matching: {1}" -f $allSafes.Count, $targetSafes.Count) "SUCCESS"
+
+    return @($targetSafes)
+}
+
+function Get-INDMatchingSafe {
+    param(
+        [Parameter(Mandatory)]$Safes,
+        [Parameter(Mandatory)][string]$SamAccountName,
+        [string]$IndSafePrefix = "IND_"
+    )
+
+    $escapedSam = [regex]::Escape($SamAccountName)
+    $escapedPrefix = [regex]::Escape($IndSafePrefix)
+
+    $pattern = "^{0}{1}($|_)" -f $escapedPrefix, $escapedSam
+
+    $matches = @(
+        $Safes |
+            Where-Object { $_.SafeName -match $pattern } |
+            Sort-Object SafeName
+    )
+
+    return $matches
+}
+
+function Get-SafeMember {
+    param(
+        [Parameter(Mandatory)][string]$SafeName,
+        [Parameter(Mandatory)][string]$MemberName,
+        [string]$SamAccountName
+    )
+
+    try {
+        $members = Get-PASSafeMember -SafeName $SafeName -ErrorAction Stop
+        $targetMember = $MemberName.ToLower()
+        $targetSam = ""
+
+        if (-not [string]::IsNullOrWhiteSpace($SamAccountName)) {
+            $targetSam = $SamAccountName.ToLower()
+        }
+
+        return @(
+            $members |
+                Where-Object {
+                    $existing = ""
+
+                    if ($_.MemberName) {
+                        $existing = $_.MemberName.ToLower()
+                    }
+
+                    ($existing -eq $targetMember) -or
+                    (-not [string]::IsNullOrWhiteSpace($targetSam) -and $existing -eq $targetSam)
+                } |
+                Select-Object -First 1
+        )
+    }
+    catch {
+        Write-Log ("Could not retrieve members for Safe {0}. Error: {1}" -f $SafeName, $_.Exception.Message) "WARN"
+        return $null
+    }
+}
+
+function Invoke-PSPASCommandFiltered {
+    param(
+        [Parameter(Mandatory)][string]$CommandName,
+        [Parameter(Mandatory)][hashtable]$Parameters
+    )
+
+    $command = Get-Command -Name $CommandName -ErrorAction Stop
+    $validParameterNames = @($command.Parameters.Keys)
+    $filtered = @{}
+
+    foreach ($key in $Parameters.Keys) {
+        if ($validParameterNames -contains $key) {
+            $filtered[$key] = $Parameters[$key]
+        }
+        else {
+            Write-Log ("Skipping unsupported parameter for {0}: {1}" -f $CommandName, $key) "WARN"
+        }
+    }
+
+    & $CommandName @filtered
+}
+
+function Add-IndividualUserToSafe {
+    param(
+        [Parameter(Mandatory)][string]$SafeName,
+        [Parameter(Mandatory)][string]$MemberName,
+        [Parameter(Mandatory)][hashtable]$Permissions,
+        [string]$PreferredSearchIn,
+        [switch]$DryRun
+    )
+
+    $splat = @{
+        SafeName    = $SafeName
+        MemberName  = $MemberName
+        ErrorAction = "Stop"
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($PreferredSearchIn)) {
+        $splat["SearchIn"] = $PreferredSearchIn
+    }
+
+    foreach ($key in $Permissions.Keys) {
+        $splat[$key] = $Permissions[$key]
+    }
+
+    if ($DryRun) {
+        Write-Log ("DRY RUN: Would add {0} to {1}." -f $MemberName, $SafeName)
+        return
+    }
+
+    try {
+        Invoke-PSPASCommandFiltered -CommandName "Add-PASSafeMember" -Parameters $splat | Out-Null
+        Write-Log ("Added {0} to {1}." -f $MemberName, $SafeName) "SUCCESS"
+    }
+    catch {
+        if ($splat.ContainsKey("SearchIn")) {
+            Write-Log ("Add with SearchIn failed for {0}. Retrying without SearchIn. Error: {1}" -f $MemberName, $_.Exception.Message) "WARN"
+
+            $splat.Remove("SearchIn")
+
+            Invoke-PSPASCommandFiltered -CommandName "Add-PASSafeMember" -Parameters $splat | Out-Null
+            Write-Log ("Added {0} to {1} without SearchIn." -f $MemberName, $SafeName) "SUCCESS"
+        }
+        else {
+            throw
+        }
+    }
+}
+
+function Set-IndividualUserSafePermission {
+    param(
+        [Parameter(Mandatory)][string]$SafeName,
+        [Parameter(Mandatory)][string]$MemberName,
+        [Parameter(Mandatory)][hashtable]$Permissions,
+        [switch]$DryRun
+    )
+
+    $splat = @{
+        SafeName    = $SafeName
+        MemberName  = $MemberName
+        ErrorAction = "Stop"
+    }
+
+    foreach ($key in $Permissions.Keys) {
+        $splat[$key] = $Permissions[$key]
+    }
+
+    if ($DryRun) {
+        Write-Log ("DRY RUN: Would update permissions for {0} on {1}." -f $MemberName, $SafeName)
+        return
+    }
+
+    Invoke-PSPASCommandFiltered -CommandName "Set-PASSafeMember" -Parameters $splat | Out-Null
+    Write-Log ("Updated permissions for {0} on {1}." -f $MemberName, $SafeName) "SUCCESS"
+}
+
+# =========================
+# Main
+# =========================
+
+$sessionCreated = $false
+
+try {
+    Write-Log "IND Safe recent-login Identity user membership sync starting."
+    Write-Log ("DryRun mode: {0}" -f [bool]$DryRun)
+    Write-Log ("LiveRun mode: {0}" -f [bool]$LiveRun)
+    Write-Log ("LookbackHours: {0}" -f $LookbackHours)
+    Write-Log ("LookbackDays: {0}" -f $LookbackDays)
+    Write-Log ("MaxRecentLoginRows: {0}" -f $MaxRecentLoginRows)
+    Write-Log ("Discovery mode: Identity User.LastLogin recent-login query. DSUsers and Event are bypassed.")
+    Write-Log ("Identity OAuth Application ID: {0}" -f $IdentityOAuthAppId)
+
+    Initialize-RequiredModules `
+        -ScriptModuleRoot $ScriptModuleRoot `
+        -MinimumPsPASVersion $MinimumPsPASVersion
+
+    if ($DryRun) {
+        Write-Log "Safe mode enabled. No Safe membership changes will be made."
+    }
+    else {
+        Write-Log "Live mode enabled. Safe membership changes can be made." "WARN"
+    }
+
+    $ccpCredential = Get-ServiceUserCredentialFromCCP `
+        -CCPAddress $CCPAddress `
+        -Location $CCPLocation `
+        -AppID $CCPAppID `
+        -Safe $CCPSafe `
+        -Object $CCPObject `
+        -WindowsAuth:$CCPWindowsAuth
+
+    $identityToken = Get-IdentityReportingToken `
+        -IdentityTenantURL $IdentityTenantURL `
+        -IdentityOAuthAppId $IdentityOAuthAppId `
+        -ClientId $ccpCredential.UserName `
+        -ClientSecret $ccpCredential.Secret `
+        -Scope $OAuthScope
+
+    if ($TokenOnly) {
+        Write-Log "TokenOnly switch was used. CCP + OAuth token test completed successfully." "SUCCESS"
+        return
+    }
+
+    $recentUsers = @(Get-RecentLoggedInIdentityUsers `
+        -IdentityTenantURL $IdentityTenantURL `
+        -AccessToken $identityToken `
+        -LookbackHours $LookbackHours `
+        -LookbackDays $LookbackDays `
+        -MaxRecentLoginRows $MaxRecentLoginRows `
+        -DefaultUserDomain $DefaultUserDomain `
+        -IncludeNonActive:$IncludeNonActive)
+
+    if ($MaxUsersForTest -gt 0) {
+        Write-Log ("MaxUsersForTest enabled. Processing first {0} recent-login user(s) only." -f $MaxUsersForTest) "WARN"
+        $recentUsers = @($recentUsers | Select-Object -First $MaxUsersForTest)
+    }
+
+    Write-Log ("Validated {0} recent-login Identity user candidate(s)." -f $recentUsers.Count) "SUCCESS"
+
+    if ($RecentLoginQueryOnly) {
+        $recentUsers |
+            Select-Object SamAccountName, UserPrincipalName, DisplayName, Email, LastLogin, StatusEnum, SourceDs, SourceDsType, IdentityUserId, QueryMode |
+            Export-Csv -Path $CsvFilePath -NoTypeInformation -Encoding UTF8
+
+        Write-Log "RecentLoginQueryOnly switch was used. No Privilege Cloud session or Safe changes were performed." "SUCCESS"
+        Write-Log ("Recent-login CSV exported to: {0}" -f $CsvFilePath) "SUCCESS"
+        return
+    }
+
+    if (-not $recentUsers -or $recentUsers.Count -eq 0) {
+        Write-Log "No recently logged-in Identity users were found in the lookback window." "WARN"
+        return
+    }
+
+    Write-Log "Authenticating to Privilege Cloud using Identity Service User."
+
+    $securePassword = ConvertTo-SecureString $ccpCredential.Secret -AsPlainText -Force
+    $serviceCred = [PSCredential]::new($ccpCredential.UserName, $securePassword)
+
+    Connect-PrivilegeCloudServiceUser `
+        -IdentityTenantURL $IdentityTenantURL `
+        -PrivilegeCloudURL $PrivilegeCloudURL `
+        -Credential $serviceCred
+
+    if (-not (Get-PASSession)) {
+        throw "psPAS session was not established."
+    }
+
+    $sessionCreated = $true
+    Write-Log ("Authenticated to Privilege Cloud as {0}." -f $ccpCredential.UserName) "SUCCESS"
+
+    $indSafes = @(Get-TargetIndSafes `
+        -IndSafePrefix $IndSafePrefix `
+        -SafeNameFilter $SafeNameFilter)
+
+    if (-not $indSafes -or $indSafes.Count -eq 0) {
+        throw "No IND Safes were returned using prefix/filter."
+    }
+
+    $processedUserCount = 0
+    $noMatchingSafeCount = 0
+    $skippedExistingCount = 0
+    $addOrUpdateCount = 0
+    $failedCount = 0
+
+    foreach ($user in $recentUsers) {
+        $processedUserCount++
+
+        $sam = Convert-ToCleanString $user.SamAccountName
+        $upn = Convert-ToCleanString $user.UserPrincipalName
+        $memberName = "{0}@{1}" -f $sam, $DefaultUserDomain
+
+        Write-Log ("Processing recent-login user {0}; LastLogin={1}; target member={2}." -f `
+            $sam, `
+            $user.LastLogin.ToString("yyyy-MM-dd HH:mm:ss"), `
+            $memberName)
+
+        $matchingSafes = @(Get-INDMatchingSafe `
+            -Safes $indSafes `
+            -SamAccountName $sam `
+            -IndSafePrefix $IndSafePrefix)
+
+        if (-not $matchingSafes -or $matchingSafes.Count -eq 0) {
+            $noMatchingSafeCount++
+
+            Write-Log ("No matching IND Safe found for recent-login user {0}." -f $sam) "WARN"
+
+            Add-RunResult `
+                -SamAccountName $sam `
+                -UserPrincipalName $upn `
+                -SafeName "" `
+                -MemberName $memberName `
+                -Action "SafeLookup" `
+                -Status "NoMatchingSafe" `
+                -Detail "No Safe matched IND_<samAccountName> or IND_<samAccountName>_*." `
+                -IdentityUserId $user.IdentityUserId `
+                -IdentityDisplayName $user.DisplayName `
+                -IdentityEmail $user.Email `
+                -IdentityLastLogin $user.LastLogin.ToString("yyyy-MM-dd HH:mm:ss") `
+                -IdentityStatus $user.StatusEnum `
+                -IdentitySourceDs $user.SourceDs `
+                -IdentitySourceDsType $user.SourceDsType
+
+            continue
+        }
+
+        if ($matchingSafes.Count -gt 1) {
+            Write-Log ("Multiple IND Safes matched {0}. Using first result: {1}" -f $sam, $matchingSafes[0].SafeName) "WARN"
+        }
+
+        $targetSafe = $matchingSafes[0].SafeName
+
+        try {
+            $existingMember = Get-SafeMember `
+                -SafeName $targetSafe `
+                -MemberName $memberName `
+                -SamAccountName $sam
+
+            if ($existingMember) {
+                if ($UpdateExistingMember) {
+                    Set-IndividualUserSafePermission `
+                        -SafeName $targetSafe `
+                        -MemberName $memberName `
+                        -Permissions $IndividualSafePermissions `
+                        -DryRun:$DryRun
+
+                    $addOrUpdateCount++
+
+                    Add-RunResult `
+                        -SamAccountName $sam `
+                        -UserPrincipalName $upn `
+                        -SafeName $targetSafe `
+                        -MemberName $memberName `
+                        -Action "UpdateExistingMember" `
+                        -Status "Success" `
+                        -Detail "Member already existed; permissions were updated or would be updated in dry-run." `
+                        -IdentityUserId $user.IdentityUserId `
+                        -IdentityDisplayName $user.DisplayName `
+                        -IdentityEmail $user.Email `
+                        -IdentityLastLogin $user.LastLogin.ToString("yyyy-MM-dd HH:mm:ss") `
+                        -IdentityStatus $user.StatusEnum `
+                        -IdentitySourceDs $user.SourceDs `
+                        -IdentitySourceDsType $user.SourceDsType
+                }
+                else {
+                    $skippedExistingCount++
+
+                    Write-Log ("Member {0} already exists in Safe {1}. Skipping." -f $memberName, $targetSafe) "WARN"
+
+                    Add-RunResult `
+                        -SamAccountName $sam `
+                        -UserPrincipalName $upn `
+                        -SafeName $targetSafe `
+                        -MemberName $memberName `
+                        -Action "SkipExistingMember" `
+                        -Status "Skipped" `
+                        -Detail "Member already exists. Use -UpdateExistingMember to refresh permissions." `
+                        -IdentityUserId $user.IdentityUserId `
+                        -IdentityDisplayName $user.DisplayName `
+                        -IdentityEmail $user.Email `
+                        -IdentityLastLogin $user.LastLogin.ToString("yyyy-MM-dd HH:mm:ss") `
+                        -IdentityStatus $user.StatusEnum `
+                        -IdentitySourceDs $user.SourceDs `
+                        -IdentitySourceDsType $user.SourceDsType
+                }
+
+                continue
+            }
+
+            Add-IndividualUserToSafe `
+                -SafeName $targetSafe `
+                -MemberName $memberName `
+                -Permissions $IndividualSafePermissions `
+                -PreferredSearchIn $PreferredSearchIn `
+                -DryRun:$DryRun
+
+            $addOrUpdateCount++
+
+            Add-RunResult `
+                -SamAccountName $sam `
+                -UserPrincipalName $upn `
+                -SafeName $targetSafe `
+                -MemberName $memberName `
+                -Action "AddMember" `
+                -Status "Success" `
+                -Detail "Member added or would be added with default individual Safe permissions." `
+                -IdentityUserId $user.IdentityUserId `
+                -IdentityDisplayName $user.DisplayName `
+                -IdentityEmail $user.Email `
+                -IdentityLastLogin $user.LastLogin.ToString("yyyy-MM-dd HH:mm:ss") `
+                -IdentityStatus $user.StatusEnum `
+                -IdentitySourceDs $user.SourceDs `
+                -IdentitySourceDsType $user.SourceDsType
+        }
+        catch {
+            $failedCount++
+
+            Write-Log ("Failed processing {0} for Safe {1}. Error: {2}" -f $memberName, $targetSafe, $_.Exception.Message) "ERROR"
+
+            Add-RunResult `
+                -SamAccountName $sam `
+                -UserPrincipalName $upn `
+                -SafeName $targetSafe `
+                -MemberName $memberName `
+                -Action "AddOrUpdateMember" `
+                -Status "Failed" `
+                -Detail $_.Exception.Message `
+                -IdentityUserId $user.IdentityUserId `
+                -IdentityDisplayName $user.DisplayName `
+                -IdentityEmail $user.Email `
+                -IdentityLastLogin $user.LastLogin.ToString("yyyy-MM-dd HH:mm:ss") `
+                -IdentityStatus $user.StatusEnum `
+                -IdentitySourceDs $user.SourceDs `
+                -IdentitySourceDsType $user.SourceDsType
+        }
+    }
+
+    Write-Log ("Recent-login users processed: {0}" -f $processedUserCount) "SUCCESS"
+    Write-Log ("Users without matching IND Safe: {0}" -f $noMatchingSafeCount)
+    Write-Log ("Members skipped because they already exist: {0}" -f $skippedExistingCount)
+    Write-Log ("Add/update actions processed or simulated: {0}" -f $addOrUpdateCount) "SUCCESS"
+    Write-Log ("Failures: {0}" -f $failedCount)
+    Write-Log "IND Safe recent-login Identity user membership sync completed." "SUCCESS"
+}
+catch {
+    Write-Log ("Fatal error: {0}" -f $_.Exception.Message) "ERROR"
+}
+finally {
+    try {
+        if ($script:RunResults.Count -gt 0) {
+            $script:RunResults |
+                Export-Csv -Path $CsvFilePath -NoTypeInformation -Encoding UTF8
+
+            Write-Log ("Audit CSV exported to: {0}" -f $CsvFilePath) "SUCCESS"
+        }
+        else {
+            Write-Log "No audit rows were generated."
+        }
+    }
+    catch {
+        Write-Log ("Failed to export audit CSV: {0}" -f $_.Exception.Message) "ERROR"
+    }
+
+    if ($sessionCreated) {
+        try {
+            Close-PASSession | Out-Null
+            Write-Log "Closed Privilege Cloud session." "SUCCESS"
+        }
+        catch {
+            Write-Log ("Session close warning: {0}" -f $_.Exception.Message) "WARN"
+        }
+    }
+
+    if ($script:OriginalPSModulePath) {
+        $env:PSModulePath = $script:OriginalPSModulePath
+    }
+}
