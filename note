@@ -1,7 +1,7 @@
 <#
 IND_AddNewIdentityUsersToSafe.ps1
 
-RECENT LOGIN VERSION
+RECENT LOGIN VERSION - V3 REGEX-SAFE
 
 Purpose:
 - Retrieve CyberArk Identity / Privilege Cloud service-user credential from CCP.
@@ -30,6 +30,7 @@ Important:
 Recommended:
 - For a scheduled task that runs every 15-30 minutes, use -LookbackHours 2.
 - For daily processing, use -LookbackDays 1 or omit both because LookbackDays defaults to 1.
+- V3 fix: recent-login row parsing avoids regex/-split for backslash values.
 - Test query only first:
     .\IND_AddNewIdentityUsersToSafe.ps1 -RecentLoginQueryOnly -LookbackHours 2
 
@@ -553,10 +554,23 @@ function Convert-FromIdentityDate {
     }
 
     $text = [string]$Value
+    $text = $text.Trim()
 
-    if ($text -match "/Date\((\d+)\)/") {
-        $epochMs = [Int64]$matches[1]
-        return ([DateTimeOffset]::FromUnixTimeMilliseconds($epochMs)).LocalDateTime
+    # Regex-free parser for /Date(1712345678901)/ values.
+    if ($text.StartsWith("/Date(") -and $text.Contains(")/")) {
+        try {
+            $startIndex = $text.IndexOf("(") + 1
+            $endIndex = $text.IndexOf(")", $startIndex)
+
+            if ($startIndex -gt 0 -and $endIndex -gt $startIndex) {
+                $epochText = $text.Substring($startIndex, $endIndex - $startIndex)
+                $epochMs = [Int64]$epochText
+                return ([DateTimeOffset]::FromUnixTimeMilliseconds($epochMs)).LocalDateTime
+            }
+        }
+        catch {
+            return $null
+        }
     }
 
     try {
@@ -616,21 +630,22 @@ function Resolve-SamFromIdentityFields {
     ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
 
     foreach ($value in $values) {
-        # Avoid regex for DOMAIN\user parsing because some values can trigger
-        # PowerShell/.NET regex errors such as: Illegal \ at end of pattern.
-        $backslashIndex = $value.IndexOf([char]92)
+        # DOMAIN\user parsing without regex or -split.
+        $backslashIndex = $value.LastIndexOf([char]92)
 
-        if ($backslashIndex -ge 0) {
-            $parts = $value.Split([char]92)
-            $candidate = ($parts | Select-Object -Last 1).Trim()
+        if ($backslashIndex -ge 0 -and $backslashIndex -lt ($value.Length - 1)) {
+            $candidate = $value.Substring($backslashIndex + 1).Trim()
 
             if (-not [string]::IsNullOrWhiteSpace($candidate)) {
                 return $candidate
             }
         }
 
-        if ($value.Contains("@")) {
-            $candidate = ($value -split "@", 2)[0].Trim()
+        # user@domain parsing without regex or -split.
+        $atIndex = $value.IndexOf('@')
+
+        if ($atIndex -gt 0) {
+            $candidate = $value.Substring(0, $atIndex).Trim()
 
             if (-not [string]::IsNullOrWhiteSpace($candidate)) {
                 return $candidate
@@ -640,9 +655,9 @@ function Resolve-SamFromIdentityFields {
 
     foreach ($value in $values) {
         $hasBackslash = ($value.IndexOf([char]92) -ge 0)
-        $hasAt        = $value.Contains("@")
-        $hasComma     = $value.Contains(",")
-        $hasEquals    = $value.Contains("=")
+        $hasAt        = ($value.IndexOf('@') -ge 0)
+        $hasComma     = ($value.IndexOf(',') -ge 0)
+        $hasEquals    = ($value.IndexOf('=') -ge 0)
 
         if (-not $hasBackslash -and -not $hasAt -and -not $hasComma -and -not $hasEquals) {
             return $value.Trim()
@@ -1012,17 +1027,17 @@ ORDER BY LastLogin DESC
             continue
         }
 
-        if ($sam -match "\$$") {
+        if ($sam.EndsWith('$')) {
             Write-Log ("Skipping computer/service-style identity from recent login query: {0}" -f $sam) "WARN"
             continue
         }
 
         $upn = ""
 
-        if ($username -match "@") {
+        if ($username.Contains('@')) {
             $upn = $username
         }
-        elseif ($email -match "@") {
+        elseif ($email.Contains('@')) {
             $upn = $email
         }
         else {
