@@ -1,75 +1,25 @@
-
-Based on this script below, create a new script to onboard domain service account
-Prompt for to provide if account is GDE, ACU, EXT and use the parameter below
-
-
-GDE
-Platform:WIN_P_DM_GDE_1T_SVC_30D
-logon Domain: GDEACU
-Address: gdeacu.com
-Details: 
-
-
-ACU
-WIN_P_DM_ACU_1T_SVC_30D
-Logon Domain: ACU
-Address: alliantcreditunion.com
-Details:
-
-EXT
-WIN_P_DM_EXTACU_1T_SVC_30D
-Logon Domain: extacu
-Address: extacu.local
-Details
-
-
-Only prompt to provide service account username ,Safe name, and Details, Details represent the Account Details option field in the platforms
-Once onboarded, initiate a reconcile
-
-
-Details
-Account Details
-
-
-
 <#
-Create_IND_Safe_And_Onboard.ps1  (IND_SafeCreation_Identity.ps1)
+Onboard_Domain_Service_Account.ps1
 
 What this script does
-- Logs in using CCP -> Identity Shared Services -> ServiceUser
-- Mode:
-    - CSV   : reads owners from CSV (Samaccountname, employeeID, email).
-    - Single: prompts for one owner and creates a single IND_ safe.
-- Creates/ensures IND_<Samaccountname>_<employeeID> safes with 7-day retention.
-- Adds:
-    - IAM_ACU_CA_Admins with full classic permissions.
-    - Owner (CSV email) with limited permissions.
-- Description:
-    "Individual safe for <sam> (<employeeID>) - Managed By <OwnerNameNoDomain>".
-- After Safe creation, onboards an Admin account (domain mapping).
-- NEW:
-    - Immediately initiates CPM Reconcile on the newly onboarded admin account.
-
-Fixes included
-- MemberType handling for Set-PASSafeMember
-- Row-level try/catch
-- Reconcile call is now version-safe (no dependency on Invoke-PASRestMethod)
+- Logs in using CCP -> Identity Shared Services -> ServiceUser (same method as IND_SafeCreation_Identity.ps1)
+- Prompts for the account domain type: GDE, ACU, or EXT
+    GDE : Platform=WIN_P_DM_GDE_1T_SVC_30D    LogonDomain=GDEACU  Address=gdeacu.com
+    ACU : Platform=WIN_P_DM_ACU_1T_SVC_30D    LogonDomain=ACU     Address=alliantcreditunion.com
+    EXT : Platform=WIN_P_DM_EXTACU_1T_SVC_30D LogonDomain=extacu  Address=extacu.local
+- Prompts ONLY for:
+    1. Service account username
+    2. Safe name
+    3. Details (maps to the platform "Account Details" optional field)
+- Onboards the service account into the given Safe
+- Immediately initiates CPM Reconcile on the newly onboarded account
 #>
 
 [CmdletBinding(SupportsShouldProcess=$true)]
 param(
-    [ValidateSet('CSV','Single')]
-    [string]$Mode       = 'CSV',
-
-    [string]$CsvPath    = "I:\Script\IDENTITY Script New\csv\owners.csv",
-
     # ===== Identity / Privilege Cloud (Shared Services) =====
     [string]$IdentityTenantURL  = "https://aak4521.my.idaptive.app",
     [string]$PrivilegeCloudURL  = "https://alliantcredit.privilegecloud.cyberark.cloud",
-
-    # ===== CPM / Safe settings =====
-    [string]$ManagingCPM        = "HQVECYBARK101",
-    [string]$Location           = "\",
 
     # ===== CCP settings (for API Service User stored in Vault) =====
     [string]$CCPAddress         = "https://aam.alliantcreditunion.com",
@@ -77,7 +27,10 @@ param(
     [string]$CCPAppID           = "ACURestAPI",
     [string]$CCPSafe            = "ACU-VAULT-API",
     [string]$CCPObject          = "Application-CyberArkVaultRestAPI-alliantcredit.cyberark.cloud",
-    [bool]  $CCPWindowsAuth     = $false
+    [bool]  $CCPWindowsAuth     = $false,
+
+    # ===== Platform property name for the "Account Details" optional field =====
+    [string]$DetailsPropertyName = "Details"
 )
 
 # --- Modules & TLS ---
@@ -86,12 +39,12 @@ Import-Module psPAS -ErrorAction Stop
 $ErrorActionPreference = 'Continue'
 
 # --- Pretty log helpers ---
-function Write-Info($m){ Write-Host "🛠  $m" -ForegroundColor Cyan }
-function Write-Ok($m){   Write-Host "✅ $m" -ForegroundColor Green }
-function Write-Warn($m){ Write-Host "⚠️  $m" -ForegroundColor Yellow }
-function Write-Err($m){  Write-Host "❌ $m" -ForegroundColor Red }
+function Write-Info($m){ Write-Host "ðŸ›   $m" -ForegroundColor Cyan }
+function Write-Ok($m){   Write-Host "âœ… $m" -ForegroundColor Green }
+function Write-Warn($m){ Write-Host "âš ï¸  $m" -ForegroundColor Yellow }
+function Write-Err($m){  Write-Host "âŒ $m" -ForegroundColor Red }
 
-# --- GUI input helper (for Single mode & prompts) ---
+# --- GUI input helpers ---
 Add-Type -AssemblyName System.Windows.Forms | Out-Null
 Add-Type -AssemblyName System.Drawing       | Out-Null
 
@@ -179,72 +132,103 @@ function Show-InputDialog {
     }
 }
 
-function Get-AdminAddressDomain {
-    $valid = @('alliantcreditunion.com','gdeacu.com','extacu.local')
-    $msg   = "Enter Address domain for Admin account (" + ($valid -join ' | ') + ")"
+function Show-DomainTypeDialog {
+    <#
+        Radio-button picker for GDE / ACU / EXT.
+        Returns 'GDE', 'ACU', or 'EXT' (or $null on cancel).
+    #>
+    try {
+        $form                 = New-Object System.Windows.Forms.Form
+        $form.Text            = "Service Account Domain Type"
+        $form.StartPosition   = 'CenterScreen'
+        $form.TopMost         = $true
+        $form.Size            = New-Object System.Drawing.Size(480,260)
+        $form.FormBorderStyle = 'FixedDialog'
+        $form.MaximizeBox     = $false
 
-    $domain = Show-InputDialog -Title "Admin Account Address Domain" `
-        -Prompt $msg `
-        -Default "alliantcreditunion.com" `
-        -ValidationHint "Must be one of: alliantcreditunion.com, gdeacu.com, extacu.local" `
-        -ValidateScript {
-            param($x)
-            $t = $x.Trim().ToLower()
-            return ($t -in @('alliantcreditunion.com','gdeacu.com','extacu.local'))
-        }
+        $lbl                  = New-Object System.Windows.Forms.Label
+        $lbl.Text             = "Select the domain for this service account:"
+        $lbl.AutoSize         = $true
+        $lbl.Location         = '12,15'
+        $lbl.Font             = New-Object System.Drawing.Font('Segoe UI',10)
+        $form.Controls.Add($lbl)
 
-    if (-not $domain) { throw "Admin Address domain selection cancelled." }
-    return $domain.Trim().ToLower()
-}
+        $rbACU                = New-Object System.Windows.Forms.RadioButton
+        $rbACU.Text           = "ACU  -  alliantcreditunion.com  (WIN_P_DM_ACU_1T_SVC_30D)"
+        $rbACU.Location       = '20,50'
+        $rbACU.Width          = 430
+        $rbACU.Checked        = $true
+        $form.Controls.Add($rbACU)
 
-# --- Permissions helpers ---
-function Get-AdminPerms {
-    @{
-        UseAccounts                             = $true
-        RetrieveAccounts                        = $true
-        ListAccounts                            = $true
-        AddAccounts                             = $true
-        UpdateAccountContent                    = $true
-        UpdateAccountProperties                 = $true
-        InitiateCPMAccountManagementOperations  = $true
-        SpecifyNextAccountContent               = $true
-        RenameAccounts                          = $true
-        DeleteAccounts                          = $true
-        UnlockAccounts                          = $true
-        ManageSafe                              = $true
-        ManageSafeMembers                       = $true
-        BackupSafe                              = $true
-        ViewAuditLog                            = $true
-        ViewSafeMembers                         = $true
-        AccessWithoutConfirmation               = $true
-        CreateFolders                           = $true
-        DeleteFolders                           = $true
-        MoveAccountsAndFolders                  = $true
+        $rbGDE                = New-Object System.Windows.Forms.RadioButton
+        $rbGDE.Text           = "GDE  -  gdeacu.com  (WIN_P_DM_GDE_1T_SVC_30D)"
+        $rbGDE.Location       = '20,85'
+        $rbGDE.Width          = 430
+        $form.Controls.Add($rbGDE)
+
+        $rbEXT                = New-Object System.Windows.Forms.RadioButton
+        $rbEXT.Text           = "EXT  -  extacu.local  (WIN_P_DM_EXTACU_1T_SVC_30D)"
+        $rbEXT.Location       = '20,120'
+        $rbEXT.Width          = 430
+        $form.Controls.Add($rbEXT)
+
+        $ok                   = New-Object System.Windows.Forms.Button
+        $ok.Text              = 'Continue'
+        $ok.Location          = '272,170'
+        $ok.Width             = 80
+        $ok.DialogResult      = [System.Windows.Forms.DialogResult]::OK
+        $form.AcceptButton    = $ok
+        $form.Controls.Add($ok)
+
+        $cancel               = New-Object System.Windows.Forms.Button
+        $cancel.Text          = 'Cancel'
+        $cancel.Location      = '366,170'
+        $cancel.Width         = 80
+        $cancel.DialogResult  = [System.Windows.Forms.DialogResult]::Cancel
+        $form.CancelButton    = $cancel
+        $form.Controls.Add($cancel)
+
+        $dialog = $form.ShowDialog()
+        if ($dialog -ne [System.Windows.Forms.DialogResult]::OK) { return $null }
+
+        if ($rbGDE.Checked) { return 'GDE' }
+        if ($rbEXT.Checked) { return 'EXT' }
+        return 'ACU'
+    } catch {
+        # Console fallback
+        $val = Read-Host "Enter domain type (GDE / ACU / EXT)"
+        $val = $val.Trim().ToUpper()
+        if ($val -in @('GDE','ACU','EXT')) { return $val }
+        throw "Invalid domain type '$val'. Must be GDE, ACU, or EXT."
     }
 }
 
-function Get-OwnerPerms {
-    @{
-        UseAccounts                             = $true
-        RetrieveAccounts                        = $true
-        ListAccounts                            = $true
-        AddAccounts                             = $false
-        UpdateAccountContent                    = $true
-        UpdateAccountProperties                 = $false
-        InitiateCPMAccountManagementOperations  = $true
-        SpecifyNextAccountContent               = $false
-        RenameAccounts                          = $false
-        DeleteAccounts                          = $false
-        UnlockAccounts                          = $false
-        ManageSafe                              = $false
-        ManageSafeMembers                       = $false
-        BackupSafe                              = $false
-        ViewAuditLog                            = $true
-        ViewSafeMembers                         = $true
-        AccessWithoutConfirmation               = $true
-        CreateFolders                           = $false
-        DeleteFolders                           = $false
-        MoveAccountsAndFolders                  = $false
+# --- Domain type -> platform mapping ---
+function Get-DomainMapping {
+    param([Parameter(Mandatory)][ValidateSet('GDE','ACU','EXT')][string]$DomainType)
+
+    switch ($DomainType) {
+        'GDE' {
+            return @{
+                PlatformID  = 'WIN_P_DM_GDE_1T_SVC_30D'
+                LogonDomain = 'GDEACU'
+                Address     = 'gdeacu.com'
+            }
+        }
+        'ACU' {
+            return @{
+                PlatformID  = 'WIN_P_DM_ACU_1T_SVC_30D'
+                LogonDomain = 'ACU'
+                Address     = 'alliantcreditunion.com'
+            }
+        }
+        'EXT' {
+            return @{
+                PlatformID  = 'WIN_P_DM_EXTACU_1T_SVC_30D'
+                LogonDomain = 'extacu'
+                Address     = 'extacu.local'
+            }
+        }
     }
 }
 
@@ -281,126 +265,6 @@ function Get-ServiceUserCredentialFromCCP {
     return [PSCredential]::new($resp.UserName, $sec)
 }
 
-# --- Version-safe parameter detection ---
-function Test-CommandHasParameter {
-    param(
-        [Parameter(Mandatory)][string]$CommandName,
-        [Parameter(Mandatory)][string]$ParameterName
-    )
-    try {
-        $cmd = Get-Command $CommandName -ErrorAction Stop
-        return ($cmd.Parameters.Keys | Where-Object { $_ -ieq $ParameterName } | Measure-Object).Count -gt 0
-    } catch {
-        return $false
-    }
-}
-
-# --- Safe member ensure helper (no MemberType passed to Set-PASSafeMember) ---
-function Ensure-SafeMember {
-    [CmdletBinding(SupportsShouldProcess=$true)]
-    param(
-        [Parameter(Mandatory)][string]$SafeName,
-        [Parameter(Mandatory)][string]$MemberName,
-        [Parameter()][ValidateSet('User','Group','Role')][string]$MemberType = $null,
-        [Parameter(Mandatory)][hashtable]$PermFlags,
-        [Parameter()][string]$SearchIn = $null
-    )
-
-    Write-Info "Processing member '$MemberName' on '$SafeName'..."
-
-    # Build permission splat
-    $permParams = @{}
-    foreach ($k in $PermFlags.Keys) { $permParams[$k] = $PermFlags[$k] }
-
-    # Detect existing membership
-    $existing = $null
-    try {
-        if (Test-CommandHasParameter -CommandName 'Get-PASSafeMember' -ParameterName 'MemberName') {
-            try { $existing = Get-PASSafeMember -SafeName $SafeName -MemberName $MemberName -ErrorAction Stop } catch {}
-        }
-        if (-not $existing) {
-            $all = Get-PASSafeMember -SafeName $SafeName -ErrorAction Stop
-            $existing = $all | Where-Object {
-                ($_.MemberName -eq $MemberName) -or ($_.memberName -eq $MemberName) -or ($_.UserName -eq $MemberName)
-            } | Select-Object -First 1
-        }
-    } catch {
-        $existing = $null
-    }
-
-    if ($existing) {
-        $setSplat = @{
-            SafeName   = $SafeName
-            MemberName = $MemberName
-        }
-        $setSplat += $permParams
-
-        if ($PSCmdlet.ShouldProcess("$SafeName/$MemberName", "Set-PASSafeMember")) {
-            try {
-                Set-PASSafeMember @setSplat -ErrorAction Stop | Out-Null
-                Write-Ok "Updated '$MemberName' on '$SafeName'."
-                return $true
-            } catch {
-                Write-Err "Update failed for '$MemberName' on '$SafeName': $($_.Exception.Message)"
-                return $false
-            }
-        }
-        return $true
-    }
-
-    $addSupportsSearchIn   = Test-CommandHasParameter -CommandName 'Add-PASSafeMember' -ParameterName 'SearchIn'
-    $addSupportsMemberType = (Test-CommandHasParameter -CommandName 'Add-PASSafeMember' -ParameterName 'memberType') -or
-                             (Test-CommandHasParameter -CommandName 'Add-PASSafeMember' -ParameterName 'MemberType')
-
-    $searchCandidates = New-Object System.Collections.Generic.List[string]
-    if ($SearchIn) {
-        $searchCandidates.Add($SearchIn)
-    } else {
-        $searchCandidates.Add('Vault')
-        if ($MemberName -like '*@*') {
-            $domainPart = ($MemberName.Split('@')[-1]).Trim()
-            if ($domainPart) { $searchCandidates.Add($domainPart) }
-        }
-        $searchCandidates.Add($null)
-    }
-
-    $lastErr = $null
-    foreach ($cand in $searchCandidates) {
-        $addSplat = @{
-            SafeName   = $SafeName
-            MemberName = $MemberName
-        }
-        $addSplat += $permParams
-
-        if ($addSupportsSearchIn -and $cand) {
-            $addSplat['SearchIn'] = $cand
-        }
-        if ($addSupportsMemberType -and $MemberType) {
-            $addSplat['memberType'] = $MemberType
-        }
-
-        $hint = if ($cand) { "SearchIn=$cand" } else { "SearchIn=<none>" }
-        Write-Info "Adding member '$MemberName' to '$SafeName' ($hint)..."
-
-        if ($PSCmdlet.ShouldProcess("$SafeName/$MemberName", "Add-PASSafeMember")) {
-            try {
-                Add-PASSafeMember @addSplat -ErrorAction Stop | Out-Null
-                Write-Ok "Added '$MemberName' to '$SafeName' ($hint)."
-                return $true
-            } catch {
-                $lastErr = $_.Exception.Message
-                Write-Warn "Add attempt failed for '$MemberName' ($hint): $lastErr"
-                continue
-            }
-        } else {
-            return $true
-        }
-    }
-
-    Write-Err "Failed to add '$MemberName' to '$SafeName'. Last error: $lastErr"
-    return $false
-}
-
 # --- Resolve Account ID safely from object / lookup ---
 function Get-PASAccountIdValue {
     [CmdletBinding()]
@@ -420,7 +284,7 @@ function Get-PASAccountIdValue {
     return $null
 }
 
-# --- NEW: Version-safe REST POST using current psPAS session ---
+# --- Version-safe REST POST using current psPAS session ---
 function Invoke-PASNativeRest {
     [CmdletBinding()]
     param(
@@ -431,7 +295,6 @@ function Invoke-PASNativeRest {
     $sess = Get-PASSession
     if (-not $sess) { throw "No PAS session found. Authenticate first." }
 
-    # Try to discover base uri from session, otherwise build it
     $base = $null
     foreach ($p in @('BaseURI','BaseUrl','PVWAURL','Url','URI')) {
         if ($sess.PSObject.Properties[$p]) {
@@ -444,21 +307,18 @@ function Invoke-PASNativeRest {
         $base = ($PrivilegeCloudURL.TrimEnd('/') + '/PasswordVault')
     }
 
-    # Ensure /PasswordVault is present (some sessions store host only)
     if ($base -notmatch '(?i)/PasswordVault(/|$)') {
         $base = $base.TrimEnd('/') + '/PasswordVault'
     }
 
     $fullUri = $base.TrimEnd('/') + '/' + $RelativePath.TrimStart('/')
 
-    # Build headers from session if possible
     $headers = @{ 'Content-Type' = 'application/json' }
 
     if ($sess.PSObject.Properties['Headers'] -and $sess.Headers) {
         foreach ($k in $sess.Headers.Keys) { $headers[$k] = $sess.Headers[$k] }
     }
 
-    # Try common token property names
     $token = $null
     foreach ($p in @('Token','token','Authorization','AuthToken')) {
         if ($sess.PSObject.Properties[$p]) {
@@ -470,7 +330,6 @@ function Invoke-PASNativeRest {
         $headers['Authorization'] = $token
     }
 
-    # Try common websession property names
     $webSession = $null
     foreach ($p in @('WebSession','webSession')) {
         if ($sess.PSObject.Properties[$p]) {
@@ -486,7 +345,7 @@ function Invoke-PASNativeRest {
     return Invoke-RestMethod -Uri $fullUri -Method POST -Headers $headers -Body $BodyJson -ErrorAction Stop
 }
 
-# --- Reconcile helper (FIXED) ---
+# --- Reconcile helper (version-safe) ---
 function Invoke-AccountReconcile {
     [CmdletBinding(SupportsShouldProcess=$true)]
     param(
@@ -504,7 +363,6 @@ function Invoke-AccountReconcile {
 
     if ($PSCmdlet.ShouldProcess("$SafeName/$AccountName [$AccountId]", "POST $rel")) {
         try {
-            # Try newer helper if present; else use native REST fallback
             $cmd = Get-Command -Name 'Invoke-PASRestMethod' -ErrorAction SilentlyContinue
             if ($cmd) {
                 Invoke-PASRestMethod -Uri $rel -Method POST -Body '{}' -ErrorAction Stop | Out-Null
@@ -524,81 +382,69 @@ function Invoke-AccountReconcile {
     return $true
 }
 
-# --- Admin account onboarding helper ---
-function Onboard-AdminAccount {
+# --- Service account onboarding ---
+function Onboard-ServiceAccount {
     [CmdletBinding(SupportsShouldProcess=$true)]
     param(
         [Parameter(Mandatory)][string]$SafeName,
-        [Parameter(Mandatory)][string]$SamAccountName,
-        [Parameter(Mandatory)][string]$OwnerEmail,
-        [Parameter(Mandatory)][string]$AdminAddressDomain
+        [Parameter(Mandatory)][string]$ServiceAccountName,
+        [Parameter(Mandatory)][ValidateSet('GDE','ACU','EXT')][string]$DomainType,
+        [Parameter()][string]$Details = ''
     )
 
-    $sam   = $SamAccountName.Trim()
-    $addr  = $AdminAddressDomain.Trim().ToLower()
+    $svc = $ServiceAccountName.Trim()
+    $map = Get-DomainMapping -DomainType $DomainType
 
-    if (-not $sam -or -not $addr) {
-        Write-Warn "Admin onboarding skipped: missing SamAccountName or AdminAddressDomain."
+    $platformId  = $map.PlatformID
+    $logonDomain = $map.LogonDomain
+    $addr        = $map.Address
+
+    Write-Info ("Preparing to onboard service account '{0}' to Safe '{1}' (Platform={2}, Address={3}, LogonDomain={4})..." -f $svc, $SafeName, $platformId, $addr, $logonDomain)
+
+    # --- Verify the Safe exists before attempting onboard ---
+    $safeExists = $null
+    try { $safeExists = Get-PASSafe -SafeName $SafeName -ErrorAction SilentlyContinue } catch {}
+    if (-not $safeExists) {
+        Write-Err "Safe '$SafeName' was not found. Verify the Safe name and try again."
         return
     }
 
-    $platformId  = $null
-    $logonDomain = $null
-    $adminUser   = $null
-
-    switch ($addr) {
-        'alliantcreditunion.com' {
-            $platformId  = "WIN_P_DM_ACU_ADM_OTP_CICO_30D"
-            $logonDomain = "ACU"
-            $adminUser   = "A_{0}" -f $sam
-        }
-        'extacu.local' {
-            $platformId  = "WIN_P_DM_EXT_ADM_OTP_CICO_30D"
-            $logonDomain = "extacu.local"
-            $adminUser   = $sam
-        }
-        'gdeacu.com' {
-            $platformId  = "WIN_P_DM_GDE_ADM_OTP_CICO_30D"
-            $logonDomain = "gdeacu.com"
-            $adminUser   = $sam
-        }
-        default {
-            Write-Warn "Admin onboarding skipped: unknown AdminAddressDomain '$addr'."
-            return
-        }
-    }
-
-    Write-Info ("Preparing to onboard Admin account '{0}' to Safe '{1}' (Platform={2}, Address={3}, LogonDomain={4})..." -f $adminUser, $SafeName, $platformId, $addr, $logonDomain)
-
+    # --- Skip if the account already exists in this Safe ---
     $existingAcct = $null
     try {
-        $existingAcct = Get-PASAccount -SafeName $SafeName -Search $adminUser -ErrorAction SilentlyContinue |
-                        Where-Object { $_.UserName -eq $adminUser -and $_.Address -eq $addr } |
+        $existingAcct = Get-PASAccount -SafeName $SafeName -Search $svc -ErrorAction SilentlyContinue |
+                        Where-Object { $_.UserName -eq $svc -and $_.Address -eq $addr } |
                         Select-Object -First 1
     } catch {}
 
     if ($existingAcct) {
-        Write-Warn ("Admin account '{0}' already exists in Safe '{1}' with Address '{2}' - skipping onboard and auto-reconcile." -f $adminUser, $SafeName, $addr)
+        Write-Warn ("Service account '{0}' already exists in Safe '{1}' with Address '{2}' - skipping onboard and auto-reconcile." -f $svc, $SafeName, $addr)
         return
     }
 
+    # --- Platform properties (LogonDomain + Account Details field) ---
     $platformProps = @{
-        LogonDomain  = $logonDomain
-        LogonAccount = $logonDomain
+        LogonDomain = $logonDomain
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Details)) {
+        $platformProps[$DetailsPropertyName] = $Details.Trim()
     }
 
     $acctSplat = @{
         SafeName                  = $SafeName
         PlatformID                = $platformId
         Address                   = $addr
-        UserName                  = $adminUser
+        UserName                  = $svc
         PlatformAccountProperties = $platformProps
     }
 
-    if ($PSCmdlet.ShouldProcess(("{0}/{1}" -f $SafeName, $adminUser), "Add-PASAccount")) {
+    if ($PSCmdlet.ShouldProcess(("{0}/{1}" -f $SafeName, $svc), "Add-PASAccount")) {
         try {
             $newAccount = Add-PASAccount @acctSplat -ErrorAction Stop
-            Write-Ok ("Onboarded admin account '{0}' in Safe '{1}' (Platform={2}, Address={3}, LogonDomain={4})." -f $adminUser, $SafeName, $platformId, $addr, $logonDomain)
+            Write-Ok ("Onboarded service account '{0}' in Safe '{1}' (Platform={2}, Address={3}, LogonDomain={4})." -f $svc, $SafeName, $platformId, $addr, $logonDomain)
+            if ($platformProps.ContainsKey($DetailsPropertyName)) {
+                Write-Ok ("Account Details set: '{0}'" -f $platformProps[$DetailsPropertyName])
+            }
 
             $accountId = Get-PASAccountIdValue -AccountObject $newAccount
 
@@ -606,128 +452,29 @@ function Onboard-AdminAccount {
                 Write-Warn "Add-PASAccount did not return an Account ID directly. Performing lookup..."
                 Start-Sleep -Seconds 2
                 try {
-                    $lookup = Get-PASAccount -SafeName $SafeName -Search $adminUser -ErrorAction Stop |
-                              Where-Object { $_.UserName -eq $adminUser -and $_.Address -eq $addr } |
+                    $lookup = Get-PASAccount -SafeName $SafeName -Search $svc -ErrorAction Stop |
+                              Where-Object { $_.UserName -eq $svc -and $_.Address -eq $addr } |
                               Select-Object -First 1
                     $accountId = Get-PASAccountIdValue -AccountObject $lookup
                 } catch {
-                    Write-Warn "Lookup after onboard failed for '$adminUser' in '$SafeName': $($_.Exception.Message)"
+                    Write-Warn "Lookup after onboard failed for '$svc' in '$SafeName': $($_.Exception.Message)"
                 }
             }
 
             if ($accountId) {
-                Invoke-AccountReconcile -AccountId $accountId -AccountName $adminUser -SafeName $SafeName | Out-Null
+                Invoke-AccountReconcile -AccountId $accountId -AccountName $svc -SafeName $SafeName | Out-Null
             } else {
-                Write-Warn "Account '$adminUser' was onboarded, but Account ID could not be resolved. Auto-reconcile was skipped."
+                Write-Warn "Account '$svc' was onboarded, but Account ID could not be resolved. Auto-reconcile was skipped."
             }
         }
         catch {
-            Write-Err ("Failed to onboard admin account '{0}' in Safe '{1}': {2}" -f $adminUser, $SafeName, $_.Exception.Message)
+            Write-Err ("Failed to onboard service account '{0}' in Safe '{1}': {2}" -f $svc, $SafeName, $_.Exception.Message)
         }
     }
-}
-
-# --- Core row processor ---
-function Process-INDRow {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)][string]$SamAccountName,
-        [Parameter(Mandatory)][string]$EmployeeID,
-        [Parameter(Mandatory)][string]$OwnerEmail,
-        [Parameter(Mandatory)][string]$AdminAddressDomain
-    )
-
-    $sam  = $SamAccountName.Trim()
-    $eid  = $EmployeeID.Trim()
-    $mail = $OwnerEmail.Trim()
-
-    if ([string]::IsNullOrWhiteSpace($sam) -or
-        [string]::IsNullOrWhiteSpace($eid) -or
-        [string]::IsNullOrWhiteSpace($mail)) {
-        Write-Warn "Skipping row with missing fields: Sam='$sam' EmployeeID='$eid' Email='$mail'"
-        return
-    }
-
-    $safeName = "IND_{0}_{1}" -f $sam, $eid
-    Write-Info "Processing Safe: $safeName (Owner=$mail)"
-
-    $exists = $null
-    try { $exists = Get-PASSafe -SafeName $safeName -ErrorAction SilentlyContinue } catch {}
-
-    if (-not $exists) {
-        $splat = @{
-            SafeName              = $safeName
-            Description           = "Individual safe for $sam ($eid)"
-            ManagingCPM           = $ManagingCPM
-            NumberOfDaysRetention = 7
-            Location              = $Location
-        }
-        if ($PSCmdlet.ShouldProcess($safeName, "Add-PASSafe")) {
-            try {
-                Add-PASSafe @splat -ErrorAction Stop | Out-Null
-                Write-Ok "Created Safe '$safeName'."
-            } catch {
-                Write-Err "Failed to create Safe '$safeName' : $($_.Exception.Message)"
-                return
-            }
-        }
-    }
-    else {
-        Write-Warn "Safe '$safeName' already exists; ensuring retention & members."
-        try {
-            Set-PASSafe -SafeName $safeName -NumberOfDaysRetention 7 -ErrorAction SilentlyContinue | Out-Null
-            Write-Ok "Ensured 7-day retention on '$safeName'."
-        } catch {
-            Write-Warn "Could not set retention on existing '$safeName': $($_.Exception.Message)"
-        }
-    }
-
-    $permAdmin = Get-AdminPerms
-    $permOwner = Get-OwnerPerms
-
-    $iamUpn = 'IAM_ACU_CA_Admins@alliantcreditunion.com'
-    $iamSam = 'IAM_ACU_CA_Admins'
-
-    Write-Info "Ensuring IAM_ACU_CA_Admins membership on '$safeName'..."
-    $okIam = Ensure-SafeMember -SafeName $safeName -MemberName $iamUpn -MemberType Group -PermFlags $permAdmin
-    if (-not $okIam) {
-        Write-Warn "Retrying IAM group with sAMAccountName '$iamSam'..."
-        $okIam = Ensure-SafeMember -SafeName $safeName -MemberName $iamSam -MemberType Group -PermFlags $permAdmin
-    }
-    if ($okIam) { Write-Ok "IAM_ACU_CA_Admins membership ensured on '$safeName'." }
-    else        { Write-Warn "IAM_ACU_CA_Admins could not be ensured on '$safeName' (continuing...)." }
-
-    Write-Info "Ensuring Owner '$mail' membership on '$safeName'..."
-    $okOwner = Ensure-SafeMember -SafeName $safeName -MemberName $mail -MemberType User -PermFlags $permOwner
-
-    if (-not $okOwner -and $mail -like '*@*') {
-        $ownerSam = $mail.Split('@')[0]
-        Write-Warn "Retrying Owner with sAM '$ownerSam'..."
-        $okOwner = Ensure-SafeMember -SafeName $safeName -MemberName $ownerSam -MemberType User -PermFlags $permOwner
-    }
-
-    if ($okOwner) {
-        $ownerNoDomain = $mail.Split('@')[0]
-        try {
-            $desc = "Individual safe for $sam ($eid) - Managed By $ownerNoDomain"
-            Set-PASSafe -SafeName $safeName -Description $desc -ErrorAction Stop | Out-Null
-            Write-Ok "Description set on '$safeName': '$desc'"
-        } catch {
-            Write-Warn "Could not set description on '$safeName': $($_.Exception.Message)"
-        }
-    } else {
-        Write-Warn "Owner membership could not be ensured on '$safeName' (continuing...)."
-    }
-
-    Onboard-AdminAccount -SafeName $safeName -SamAccountName $sam -OwnerEmail $mail -AdminAddressDomain $AdminAddressDomain
-
-    Write-Ok "Completed processing '$safeName'."
 }
 
 # --- MAIN ---
-$sessionCreated     = $false
-$AdminAddressDomain = $null
-$runSummary         = New-Object System.Collections.Generic.List[object]
+$sessionCreated = $false
 
 try {
     $serviceCred = Get-ServiceUserCredentialFromCCP `
@@ -753,63 +500,39 @@ try {
     $sessionCreated = $true
     Write-Ok "Authenticated to $PrivilegeCloudURL as service user: $($serviceCred.UserName)"
 
-    $AdminAddressDomain = Get-AdminAddressDomain
-    Write-Ok "Admin Address domain set to: $AdminAddressDomain"
+    # --- 1. Domain type (GDE / ACU / EXT) ---
+    $domainType = Show-DomainTypeDialog
+    if (-not $domainType) { Write-Warn "Cancelled (domain type)."; return }
 
-    if ($Mode -eq 'CSV') {
-        Write-Info "Mode = CSV. Loading: $CsvPath"
-        if (-not (Test-Path $CsvPath)) { throw "CSV not found: $CsvPath" }
+    $map = Get-DomainMapping -DomainType $domainType
+    Write-Ok ("Domain type: {0} (Platform={1}, LogonDomain={2}, Address={3})" -f $domainType, $map.PlatformID, $map.LogonDomain, $map.Address)
 
-        $rows = Import-Csv -Path $CsvPath
-        if (-not $rows -or $rows.Count -eq 0) { throw "CSV '$CsvPath' has no rows." }
+    # --- 2. Service account username ---
+    $svcUser = Show-InputDialog -Title "Service Account Onboarding" `
+        -Prompt "Enter service account username (e.g. svc_app01)" `
+        -Default "" `
+        -ValidationHint "Service account username only - no domain prefix" `
+        -ValidateScript { param($x) -not [string]::IsNullOrWhiteSpace($x.Trim()) }
+    if (-not $svcUser) { Write-Warn "Cancelled (service account username)."; return }
 
-        foreach ($row in $rows) {
-            $sam  = ($row.Samaccountname).ToString()
-            $eid  = ($row.employeeID).ToString()
-            $mail = ($row.email).ToString()
+    # --- 3. Safe name ---
+    $safeName = Show-InputDialog -Title "Service Account Onboarding" `
+        -Prompt "Enter target Safe name" `
+        -Default "" `
+        -ValidationHint "Safe must already exist (e.g. APP_SVC_TeamName)" `
+        -ValidateScript { param($x) -not [string]::IsNullOrWhiteSpace($x.Trim()) }
+    if (-not $safeName) { Write-Warn "Cancelled (Safe name)."; return }
 
-            try {
-                Process-INDRow -SamAccountName $sam -EmployeeID $eid -OwnerEmail $mail -AdminAddressDomain $AdminAddressDomain
-                $runSummary.Add([pscustomobject]@{ Sam=$sam; EmployeeID=$eid; Email=$mail; Status='OK'; Error='' }) | Out-Null
-            }
-            catch {
-                $err = $_.Exception.Message
-                Write-Err "Row failed (Sam='$sam', EmployeeID='$eid', Email='$mail'): $err"
-                $runSummary.Add([pscustomobject]@{ Sam=$sam; EmployeeID=$eid; Email=$mail; Status='FAILED'; Error=$err }) | Out-Null
-                continue
-            }
-        }
+    # --- 4. Details (Account Details platform field) ---
+    $details = Show-InputDialog -Title "Service Account Onboarding" `
+        -Prompt "Enter Details (Account Details field)" `
+        -Default "" `
+        -ValidationHint "Description of what this service account is used for" `
+        -ValidateScript { param($x) $true }
+    if ($null -eq $details) { Write-Warn "Cancelled (Details)."; return }
 
-        $okCount  = @($runSummary | Where-Object { $_.Status -eq 'OK' }).Count
-        $badCount = @($runSummary | Where-Object { $_.Status -eq 'FAILED' }).Count
-        Write-Ok "CSV processing completed. OK=$okCount FAILED=$badCount Total=$($runSummary.Count)"
-    }
-    else {
-        Write-Info "Mode = Single. Prompting for one IND_ Safe owner..."
-
-        $sam = Show-InputDialog -Title "IND Safe Owner" `
-            -Prompt "Enter SamAccountName (e.g. jdoe)" `
-            -Default "" `
-            -ValidationHint "SamAccountName only" `
-            -ValidateScript { param($x) -not [string]::IsNullOrWhiteSpace($x.Trim()) }
-        if (-not $sam) { Write-Warn "Cancelled (SamAccountName)."; return }
-
-        $eid = Show-InputDialog -Title "IND Safe Owner" `
-            -Prompt "Enter employeeID" `
-            -Default "" `
-            -ValidationHint "HR/AD employeeID" `
-            -ValidateScript { param($x) -not [string]::IsNullOrWhiteSpace($x.Trim()) }
-        if (-not $eid) { Write-Warn "Cancelled (employeeID)."; return }
-
-        $mail = Show-InputDialog -Title "IND Safe Owner" `
-            -Prompt "Enter owner email (UPN)" `
-            -Default "" `
-            -ValidationHint "Example: user@alliantcreditunion.com" `
-            -ValidateScript { param($x) -not [string]::IsNullOrWhiteSpace($x.Trim()) }
-        if (-not $mail) { Write-Warn "Cancelled (email)."; return }
-
-        Process-INDRow -SamAccountName $sam -EmployeeID $eid -OwnerEmail $mail -AdminAddressDomain $AdminAddressDomain
-    }
+    # --- Onboard + reconcile ---
+    Onboard-ServiceAccount -SafeName $safeName.Trim() -ServiceAccountName $svcUser -DomainType $domainType -Details $details
 }
 catch {
     Write-Err $_.Exception.Message
