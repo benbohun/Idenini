@@ -1,5 +1,5 @@
 <#
-CNA_Create_And_Update_Identity_WebApp_Reauth_NamePrompt_DescriptionOnly_V8.ps1
+CNA_Create_And_Update_Identity_WebApp_Reauth_NamePrompt_SWS_HelperJar_V10.ps1
 
 Purpose
 - Prompt for regular CyberArk Identity credential once
@@ -14,9 +14,9 @@ Purpose
 - No psPAS dependency
 - Optional SWS policy replication from a reference SWS Identity app key
 - Automatic SWS API token creation from service-account JSON stored beside this script
-- Self-contained SWS token generation using private_key_jwt or client_secret_jwt; no Java/JAR dependency; uses CyberArk-documented SWS private_key_jwt flow, with compatibility retries
-- Fixes PowerShell 5.1 empty generic List binding issue during token candidate generation
-- Improved SWS tenant handling: embeds the known long tenant ID eef31a0b-0e67-4024-a644-be08614190db as the default for SWS private_key_jwt
+- Automatic SWS API token creation from the SWS service-account JSON using CyberArk public-api-auth-helper JAR located beside this script
+- Falls back to direct PowerShell private_key_jwt token generation only if the helper JAR flow fails
+- Improved SWS tenant handling: embeds the known long tenant ID eef31a0b-0e67-4024-a644-be08614190db as the default SWS tenant ID
 
 Why this version
 - This is based on the known working version
@@ -1754,11 +1754,99 @@ function Get-SwsAccessTokenFromHelperOutput {
         }
     }
 
-    # Last-resort JWT pattern. This avoids printing the secret and avoids accepting short random text.
+    # Last-resort JWT pattern. This avoids accepting short random text.
     $jwt = [regex]::Match($OutputText, 'eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+')
     if ($jwt.Success) { return $jwt.Value.Trim() }
 
     return $null
+}
+
+function Protect-SwsHelperOutputForLog {
+    param([Parameter()][string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) { return '' }
+
+    $safe = $Text
+    $safe = [regex]::Replace($safe, '(?is)("access_token"\s*:\s*")[^"]+(")', '$1***REDACTED***$2')
+    $safe = [regex]::Replace($safe, "(?is)('access_token'\s*:\s*')[^']+(')", '$1***REDACTED***$2')
+    $safe = [regex]::Replace($safe, '(?im)(access[_ -]?token\s*[:=]\s*)(?:Bearer\s+)?[A-Za-z0-9_\-\.]+', '$1***REDACTED***')
+    $safe = [regex]::Replace($safe, '(?im)Bearer\s+[A-Za-z0-9_\-\.]+', 'Bearer ***REDACTED***')
+    $safe = [regex]::Replace($safe, 'eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+', '***JWT_REDACTED***')
+
+    if ($safe.Length -gt 4000) {
+        $safe = $safe.Substring(0, 4000) + '... [truncated]'
+    }
+
+    return $safe
+}
+
+function Get-JavaExecutablePath {
+    $cmd = Get-Command java.exe -ErrorAction SilentlyContinue
+    if ($null -ne $cmd -and -not [string]::IsNullOrWhiteSpace($cmd.Source)) { return $cmd.Source }
+
+    $cmd = Get-Command java -ErrorAction SilentlyContinue
+    if ($null -ne $cmd -and -not [string]::IsNullOrWhiteSpace($cmd.Source)) { return $cmd.Source }
+
+    throw 'java.exe was not found in PATH. Install Java or add java.exe to PATH, then rerun the script.'
+}
+
+function Invoke-SwsPublicApiAuthHelper {
+    param(
+        [Parameter(Mandatory)][string]$JsonPath,
+        [Parameter(Mandatory)][string]$TenantId
+    )
+
+    $jarPath = Resolve-SwsAuthHelperJarPath
+    $javaPath = Get-JavaExecutablePath
+
+    $tenantCandidates = New-Object System.Collections.Generic.List[string]
+    foreach ($t in @(Get-SwsTenantIdFormatCandidates -TenantId $TenantId)) {
+        Add-UniqueStringValue -List $tenantCandidates -Value $t
+    }
+
+    if ($tenantCandidates.Count -eq 0) {
+        Add-UniqueStringValue -List $tenantCandidates -Value $TenantId
+    }
+
+    Write-Log ("Creating SWS API access token using CyberArk public API auth helper JAR. Jar={0}; JsonFile={1}; TenantCandidateCount={2}" -f (Split-Path -Leaf $jarPath), (Split-Path -Leaf $JsonPath), $tenantCandidates.Count) 'Cyan'
+
+    $attempt = 0
+    $errors = New-Object System.Collections.Generic.List[string]
+
+    foreach ($tenantCandidate in @($tenantCandidates)) {
+        $attempt++
+        try {
+            $javaArgs = @(
+                '-jar', $jarPath,
+                '-t', $tenantCandidate,
+                '-p', $JsonPath
+            )
+
+            Write-Log ("SWS auth helper token attempt #{0}: TenantId={1}; Java={2}" -f $attempt, $tenantCandidate, (Split-Path -Leaf $javaPath)) 'Gray'
+
+            $outputLines = & $javaPath @javaArgs 2>&1
+            $exitCode = $LASTEXITCODE
+            $outputText = ($outputLines | ForEach-Object { [string]$_ }) -join [Environment]::NewLine
+
+            $token = Get-SwsAccessTokenFromHelperOutput -OutputText $outputText
+            if (-not [string]::IsNullOrWhiteSpace($token)) {
+                Write-Log ("SWS API access token created successfully by CyberArk helper. TenantId={0}; HelperExitCode={1}" -f $tenantCandidate, $exitCode) 'Green'
+                Add-SwsReplicationSummary -Step 'Token' -Status 'SUCCESS' -Detail ("Token created by public-api-auth-helper JAR={0}; Json={1}; TenantId={2}; ExitCode={3}" -f (Split-Path -Leaf $jarPath), (Split-Path -Leaf $JsonPath), $tenantCandidate, $exitCode)
+                return $token
+            }
+
+            $safeOutput = Protect-SwsHelperOutputForLog -Text $outputText
+            $msg = ("Attempt={0}; TenantId={1}; ExitCode={2}; Output={3}" -f $attempt, $tenantCandidate, $exitCode, $safeOutput)
+            [void]$errors.Add($msg)
+            Write-Log ("SWS auth helper token attempt #{0} did not return an access_token. ExitCode={1}; SanitizedOutput={2}" -f $attempt, $exitCode, $safeOutput) 'Yellow'
+        } catch {
+            $msg = ("Attempt={0}; TenantId={1}; Error={2}" -f $attempt, $tenantCandidate, $_.Exception.Message)
+            [void]$errors.Add($msg)
+            Write-Log ("SWS auth helper token attempt #{0} failed. TenantId={1}; Error={2}" -f $attempt, $tenantCandidate, $_.Exception.Message) 'Yellow'
+        }
+    }
+
+    throw ("CyberArk public API auth helper failed to return an SWS access token after {0} attempt(s). LastErrors={1}" -f $attempt, (($errors | Select-Object -Last 5) -join ' || '))
 }
 
 function New-SwsAccessTokenFromServiceAccountJson {
@@ -1769,7 +1857,24 @@ function New-SwsAccessTokenFromServiceAccountJson {
     $jsonPath = Resolve-SwsServiceAccountJsonPath
     $tenantId = Resolve-SwsTenantId -JsonPath $jsonPath
 
-    return New-SwsAccessTokenDirectFromServiceAccountJson -JsonPath $jsonPath -TenantId $tenantId
+    # Preferred path now that you placed the CyberArk public API auth helper JAR beside the script.
+    # This exactly mirrors CyberArk's supported helper workflow: java -jar public-api-auth-helper... -t <tenant ID> -p <service-account JSON>.
+    try {
+        return Invoke-SwsPublicApiAuthHelper -JsonPath $jsonPath -TenantId $tenantId
+    } catch {
+        $helperError = $_.Exception.Message
+        Write-Log ("SWS helper JAR token generation failed: {0}" -f $helperError) 'Yellow'
+        Add-SwsReplicationSummary -Step 'Token Helper' -Status 'FAILED' -Detail $helperError
+
+        # Keep a fallback so the script remains useful if Java/helper has a local issue.
+        # If both helper and direct token fail, the final error will include both paths.
+        try {
+            Write-Log 'Falling back to direct PowerShell SWS private_key_jwt token generation...' 'Yellow'
+            return New-SwsAccessTokenDirectFromServiceAccountJson -JsonPath $jsonPath -TenantId $tenantId
+        } catch {
+            throw ("SWS token generation failed using both CyberArk helper JAR and direct PowerShell JWT. HelperError={0}; DirectError={1}" -f $helperError, $_.Exception.Message)
+        }
+    }
 }
 
 function Initialize-SwsAccessToken {
@@ -1796,7 +1901,7 @@ function Initialize-SwsAccessToken {
     $script:SwsAccessTokenToUse = Convert-SecureStringToPlainText -SecureString $secureToken
 
     if ([string]::IsNullOrWhiteSpace($script:SwsAccessTokenToUse)) {
-        throw 'SWS access token is empty. Provide -SwsAccessToken, place the SWS service-account JSON beside this script, or pass -SwsServiceAccountJsonPath. No helper JAR is required.'
+        throw 'SWS access token is empty. Provide -SwsAccessToken, place the SWS service-account JSON and public-api-auth-helper JAR beside this script, or pass -SwsServiceAccountJsonPath and -SwsAuthHelperJarPath.'
     }
 }
 
