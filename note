@@ -13,7 +13,8 @@ Purpose
 - No PAS validation
 - No psPAS dependency
 - Optional SWS policy replication from a reference SWS Identity app key
-- Optional automatic SWS API token creation from service-account JSON stored beside this script
+- Automatic SWS API token creation from service-account JSON stored beside this script
+- Self-contained SWS token generation using private_key_jwt or client_secret_jwt; no Java/JAR dependency
 - Improved SWS tenant detection from -SwsTenantId, SWS_TENANT_ID, JSON, or Identity tenant URL
 
 Why this version
@@ -81,6 +82,7 @@ loginData.order = [
     [string]$SwsAccessToken            = '',
     [string]$SwsServiceAccountJsonPath = '',
     [string]$SwsTenantId               = '',
+    [string]$SwsAuthRealmBaseUrl       = '',
     [string]$SwsAuthHelperJarPath      = '',
     [int]$SwsAuthHelperTimeoutSeconds  = 120,
     [switch]$DisableSwsServiceAccountJsonAutoLogin,
@@ -1069,6 +1071,392 @@ function Resolve-SwsTenantId {
     throw ("Could not determine SWS tenant ID from -SwsTenantId, SWS_TENANT_ID, JSON file, or IdentityApiTenantURL. Re-run with -SwsTenantId '<tenant ID>'. JSON='{0}' IdentityApiTenantURL='{1}'" -f $JsonPath, $IdentityApiTenantURL)
 }
 
+function ConvertTo-Base64UrlString {
+    param([Parameter(Mandatory)][byte[]]$Bytes)
+
+    return ([Convert]::ToBase64String($Bytes).TrimEnd('=') -replace '\+', '-' -replace '/', '_')
+}
+
+function Convert-StringToBase64UrlString {
+    param([Parameter(Mandatory)][string]$Value)
+
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Value)
+    return ConvertTo-Base64UrlString -Bytes $bytes
+}
+
+function Read-DerLength {
+    param(
+        [Parameter(Mandatory)][byte[]]$Data,
+        [Parameter(Mandatory)][ref]$Offset
+    )
+
+    if ($Offset.Value -ge $Data.Length) { throw 'Invalid DER: unexpected end of data while reading length.' }
+    $first = [int]$Data[$Offset.Value]
+    $Offset.Value++
+
+    if (($first -band 0x80) -eq 0) { return $first }
+
+    $count = $first -band 0x7F
+    if ($count -le 0 -or $count -gt 4) { throw ('Invalid DER: unsupported length byte count {0}.' -f $count) }
+    if (($Offset.Value + $count) -gt $Data.Length) { throw 'Invalid DER: length exceeds available data.' }
+
+    $length = 0
+    for ($i = 0; $i -lt $count; $i++) {
+        $length = ($length -shl 8) -bor [int]$Data[$Offset.Value]
+        $Offset.Value++
+    }
+
+    return $length
+}
+
+function Read-DerElementBytes {
+    param(
+        [Parameter(Mandatory)][byte[]]$Data,
+        [Parameter(Mandatory)][ref]$Offset,
+        [Parameter(Mandatory)][byte]$ExpectedTag
+    )
+
+    if ($Offset.Value -ge $Data.Length) { throw 'Invalid DER: unexpected end of data while reading tag.' }
+    $actualTag = [byte]$Data[$Offset.Value]
+    $Offset.Value++
+
+    if ($actualTag -ne $ExpectedTag) {
+        throw ('Invalid DER: expected tag 0x{0:X2}, got 0x{1:X2} at offset {2}.' -f $ExpectedTag, $actualTag, ($Offset.Value - 1))
+    }
+
+    $length = Read-DerLength -Data $Data -Offset $Offset
+    if (($Offset.Value + $length) -gt $Data.Length) { throw 'Invalid DER: element length exceeds available data.' }
+
+    $bytes = New-Object byte[] $length
+    [Array]::Copy($Data, $Offset.Value, $bytes, 0, $length)
+    $Offset.Value += $length
+    return $bytes
+}
+
+function Read-DerIntegerBytes {
+    param(
+        [Parameter(Mandatory)][byte[]]$Data,
+        [Parameter(Mandatory)][ref]$Offset
+    )
+
+    $bytes = Read-DerElementBytes -Data $Data -Offset $Offset -ExpectedTag 0x02
+
+    # DER integers are signed. RSA parameters are unsigned big-endian, so remove a single leading 00 sign byte.
+    while ($bytes.Length -gt 1 -and $bytes[0] -eq 0x00) {
+        $newBytes = New-Object byte[] ($bytes.Length - 1)
+        [Array]::Copy($bytes, 1, $newBytes, 0, $newBytes.Length)
+        $bytes = $newBytes
+    }
+
+    return $bytes
+}
+
+function ConvertFrom-PemToDerBytes {
+    param([Parameter(Mandatory)][string]$PemText)
+
+    $pem = $PemText.Trim()
+    $pem = $pem -replace '\\r', "`r" -replace '\\n', "`n"
+    $base64 = $pem -replace '-----BEGIN [^-]+-----', '' -replace '-----END [^-]+-----', '' -replace '\s', ''
+
+    if ([string]::IsNullOrWhiteSpace($base64)) { throw 'Private key PEM did not contain base64 key material.' }
+
+    try {
+        return [Convert]::FromBase64String($base64)
+    } catch {
+        throw ('Private key PEM could not be base64-decoded: {0}' -f $_.Exception.Message)
+    }
+}
+
+function ConvertFrom-RsaPrivateKeyDerToParameters {
+    param([Parameter(Mandatory)][byte[]]$DerBytes)
+
+    $offset = 0
+    $seqBytes = Read-DerElementBytes -Data $DerBytes -Offset ([ref]$offset) -ExpectedTag 0x30
+    $seqOffset = 0
+
+    $null = Read-DerIntegerBytes -Data $seqBytes -Offset ([ref]$seqOffset) # version
+
+    $rsa = New-Object System.Security.Cryptography.RSAParameters
+    $rsa.Modulus  = Read-DerIntegerBytes -Data $seqBytes -Offset ([ref]$seqOffset)
+    $rsa.Exponent = Read-DerIntegerBytes -Data $seqBytes -Offset ([ref]$seqOffset)
+    $rsa.D        = Read-DerIntegerBytes -Data $seqBytes -Offset ([ref]$seqOffset)
+    $rsa.P        = Read-DerIntegerBytes -Data $seqBytes -Offset ([ref]$seqOffset)
+    $rsa.Q        = Read-DerIntegerBytes -Data $seqBytes -Offset ([ref]$seqOffset)
+    $rsa.DP       = Read-DerIntegerBytes -Data $seqBytes -Offset ([ref]$seqOffset)
+    $rsa.DQ       = Read-DerIntegerBytes -Data $seqBytes -Offset ([ref]$seqOffset)
+    $rsa.InverseQ = Read-DerIntegerBytes -Data $seqBytes -Offset ([ref]$seqOffset)
+
+    return $rsa
+}
+
+function ConvertFrom-Pkcs8PrivateKeyDerToParameters {
+    param([Parameter(Mandatory)][byte[]]$DerBytes)
+
+    $offset = 0
+    $outerSeq = Read-DerElementBytes -Data $DerBytes -Offset ([ref]$offset) -ExpectedTag 0x30
+    $outerOffset = 0
+
+    $null = Read-DerIntegerBytes -Data $outerSeq -Offset ([ref]$outerOffset)          # version
+    $null = Read-DerElementBytes -Data $outerSeq -Offset ([ref]$outerOffset) -ExpectedTag 0x30 # algorithm identifier
+    $privateKeyOctets = Read-DerElementBytes -Data $outerSeq -Offset ([ref]$outerOffset) -ExpectedTag 0x04
+
+    return ConvertFrom-RsaPrivateKeyDerToParameters -DerBytes $privateKeyOctets
+}
+
+function ConvertFrom-PemPrivateKeyToRsaParameters {
+    param([Parameter(Mandatory)][string]$PemText)
+
+    $der = ConvertFrom-PemToDerBytes -PemText $PemText
+
+    if ($PemText -match 'BEGIN\s+RSA\s+PRIVATE\s+KEY') {
+        return ConvertFrom-RsaPrivateKeyDerToParameters -DerBytes $der
+    }
+
+    if ($PemText -match 'BEGIN\s+PRIVATE\s+KEY') {
+        return ConvertFrom-Pkcs8PrivateKeyDerToParameters -DerBytes $der
+    }
+
+    # Best effort: try PKCS#1 first, then PKCS#8.
+    try { return ConvertFrom-RsaPrivateKeyDerToParameters -DerBytes $der } catch {}
+    return ConvertFrom-Pkcs8PrivateKeyDerToParameters -DerBytes $der
+}
+
+function Get-SwsJsonValue {
+    param(
+        [Parameter(Mandatory)]$JsonObject,
+        [Parameter(Mandatory)][string[]]$PropertyNames,
+        [int]$MaxDepth = 8
+    )
+
+    return Get-NestedPropertyValueByName -Object $JsonObject -PropertyNames $PropertyNames -MaxDepth $MaxDepth
+}
+
+function Resolve-SwsServiceAccountClientId {
+    param(
+        [Parameter(Mandatory)]$JsonObject,
+        [Parameter(Mandatory)][string]$TenantId
+    )
+
+    $clientIdValue = Get-SwsJsonValue -JsonObject $JsonObject -PropertyNames @('clientId','clientID','client_id','oauthClientId','oauth_client_id')
+    if ($null -ne $clientIdValue -and -not [string]::IsNullOrWhiteSpace([string]$clientIdValue)) {
+        $clientIdText = [string]$clientIdValue
+        if ($clientIdText -match '\.ExternalServiceAccount$') { return $clientIdText.Trim() }
+    }
+
+    $serviceAccountIdValue = Get-SwsJsonValue -JsonObject $JsonObject -PropertyNames @('serviceAccountId','serviceAccountID','service_account_id','externalServiceAccountId','external_service_account_id')
+    if ($null -eq $serviceAccountIdValue -or [string]::IsNullOrWhiteSpace([string]$serviceAccountIdValue)) {
+        # Last-resort: use a clientId value that did not include the suffix as the service account ID.
+        if ($null -ne $clientIdValue -and -not [string]::IsNullOrWhiteSpace([string]$clientIdValue)) {
+            $serviceAccountIdValue = $clientIdValue
+        }
+    }
+
+    if ($null -eq $serviceAccountIdValue -or [string]::IsNullOrWhiteSpace([string]$serviceAccountIdValue)) {
+        throw 'SWS service-account JSON does not contain serviceAccountId. Expected field serviceAccountId or clientId.'
+    }
+
+    $serviceAccountId = ([string]$serviceAccountIdValue).Trim()
+    return ('{0}.{1}.ExternalServiceAccount' -f $TenantId.Trim(), $serviceAccountId)
+}
+
+function Resolve-SwsAuthEndpoints {
+    param([Parameter(Mandatory)]$JsonObject)
+
+    if (-not [string]::IsNullOrWhiteSpace($SwsAuthRealmBaseUrl)) {
+        $aud = $SwsAuthRealmBaseUrl.TrimEnd('/')
+        return [pscustomobject]@{
+            Audience      = $aud
+            TokenEndpoint = ($aud + '/protocol/openid-connect/token')
+            Source        = '-SwsAuthRealmBaseUrl'
+        }
+    }
+
+    $discoveryValue = Get-SwsJsonValue -JsonObject $JsonObject -PropertyNames @('discoveryURI','discoveryUri','discoveryURL','discoveryUrl','DiscoveryURL','DiscoveryURI','openidConfiguration','openid_configuration')
+    $discoveryUri = $null
+    if ($null -ne $discoveryValue -and -not [string]::IsNullOrWhiteSpace([string]$discoveryValue)) {
+        $discoveryUri = ([string]$discoveryValue).Trim()
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($discoveryUri)) {
+        try {
+            $params = @{
+                Method      = 'GET'
+                Uri         = $discoveryUri
+                ErrorAction = 'Stop'
+            }
+            if (-not [string]::IsNullOrWhiteSpace($SwsProxyAddress)) {
+                $params['Proxy'] = $SwsProxyAddress
+                if ($SwsProxyUseDefaultCredentials.IsPresent) { $params['ProxyUseDefaultCredentials'] = $true }
+            }
+            $oidc = Invoke-RestMethod @params
+            $issuer = [string]$oidc.issuer
+            $tokenEndpoint = [string]$oidc.token_endpoint
+            if (-not [string]::IsNullOrWhiteSpace($issuer) -and -not [string]::IsNullOrWhiteSpace($tokenEndpoint)) {
+                return [pscustomobject]@{
+                    Audience      = $issuer.TrimEnd('/')
+                    TokenEndpoint = $tokenEndpoint
+                    Source        = 'discoveryURI'
+                }
+            }
+        } catch {
+            Write-Log ("Could not retrieve SWS OpenID discovery document; deriving token endpoint from discoveryURI. Error={0}" -f $_.Exception.Message) 'Yellow'
+        }
+
+        $audience = ($discoveryUri -replace '/\.well-known/openid-configuration/?$', '').TrimEnd('/')
+        return [pscustomobject]@{
+            Audience      = $audience
+            TokenEndpoint = ($audience + '/protocol/openid-connect/token')
+            Source        = 'discoveryURI-derived'
+        }
+    }
+
+    # Final fallback based on API host. The service-account JSON normally includes discoveryURI, so this is only for incomplete JSON exports.
+    $apiHost = ''
+    try { $apiHost = ([System.Uri]$SwsApiBaseUrl).Host.ToLowerInvariant() } catch {}
+
+    $audienceFallback = 'https://auth.alero.io/auth/realms/serviceaccounts'
+    if ($apiHost -match 'alero\.eu') { $audienceFallback = 'https://auth.alero.eu/auth/realms/serviceaccounts' }
+    elseif ($apiHost -match 'ca\.alero\.io') { $audienceFallback = 'https://auth.ca.alero.io/auth/realms/serviceaccounts' }
+    elseif ($apiHost -match 'au\.alero\.io') { $audienceFallback = 'https://auth.au.alero.io/auth/realms/serviceaccounts' }
+    elseif ($apiHost -match 'uk\.alero\.io') { $audienceFallback = 'https://auth.uk.alero.io/auth/realms/serviceaccounts' }
+
+    return [pscustomobject]@{
+        Audience      = $audienceFallback
+        TokenEndpoint = ($audienceFallback + '/protocol/openid-connect/token')
+        Source        = 'SwsApiBaseUrl-fallback'
+    }
+}
+
+function New-SwsJwtAssertion {
+    param(
+        [Parameter(Mandatory)]$JsonObject,
+        [Parameter(Mandatory)][string]$TenantId,
+        [Parameter(Mandatory)][string]$Audience
+    )
+
+    $clientId = Resolve-SwsServiceAccountClientId -JsonObject $JsonObject -TenantId $TenantId
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $exp = $now + 300
+    $jti = [guid]::NewGuid().ToString('N')
+
+    $privateKeyValue = Get-SwsJsonValue -JsonObject $JsonObject -PropertyNames @('privateKey','private_key','privateKeyPem','private_key_pem','rsaPrivateKey','rsa_private_key')
+    $clientSecretValue = Get-SwsJsonValue -JsonObject $JsonObject -PropertyNames @('clientSecret','client_secret','secret','clientSecretValue','client_secret_value')
+
+    $alg = 'RS256'
+    if (($null -eq $privateKeyValue -or [string]::IsNullOrWhiteSpace([string]$privateKeyValue)) -and
+        ($null -ne $clientSecretValue -and -not [string]::IsNullOrWhiteSpace([string]$clientSecretValue))) {
+        $alg = 'HS256'
+    }
+
+    $headerJson = (@{ alg = $alg; typ = 'JWT' } | ConvertTo-Json -Compress)
+    $claimJson = (@{
+        aud = $Audience
+        iss = $clientId
+        sub = $clientId
+        nbf = 0
+        exp = $exp
+        iat = $now
+        jti = $jti
+    } | ConvertTo-Json -Compress)
+
+    $encodedHeader = Convert-StringToBase64UrlString -Value $headerJson
+    $encodedClaim  = Convert-StringToBase64UrlString -Value $claimJson
+    $unsignedJwt = ('{0}.{1}' -f $encodedHeader, $encodedClaim)
+    $unsignedBytes = [System.Text.Encoding]::ASCII.GetBytes($unsignedJwt)
+
+    if ($alg -eq 'RS256') {
+        if ($null -eq $privateKeyValue -or [string]::IsNullOrWhiteSpace([string]$privateKeyValue)) {
+            throw 'SWS service-account JSON does not contain privateKey. Expected privateKey for Private Key Signing service account.'
+        }
+
+        $rsaParams = ConvertFrom-PemPrivateKeyToRsaParameters -PemText ([string]$privateKeyValue)
+        $cspParams = New-Object System.Security.Cryptography.CspParameters
+        $cspParams.ProviderType = 24 # PROV_RSA_AES, required for SHA256 signatures on Windows PowerShell 5.1/.NET Framework.
+        $cspParams.KeyContainerName = ('SWS-JWT-{0}' -f ([guid]::NewGuid().ToString('N')))
+
+        $rsa = New-Object System.Security.Cryptography.RSACryptoServiceProvider($cspParams)
+        try {
+            $rsa.PersistKeyInCsp = $false
+            $rsa.ImportParameters($rsaParams)
+            $signatureBytes = $rsa.SignData($unsignedBytes, [System.Security.Cryptography.CryptoConfig]::MapNameToOID('SHA256'))
+        } finally {
+            try { $rsa.Clear() } catch {}
+        }
+    } else {
+        $secretBytes = [System.Text.Encoding]::UTF8.GetBytes([string]$clientSecretValue)
+        $hmac = New-Object System.Security.Cryptography.HMACSHA256 -ArgumentList (,$secretBytes)
+        try { $signatureBytes = $hmac.ComputeHash($unsignedBytes) } finally { try { $hmac.Dispose() } catch {} }
+    }
+
+    $encodedSignature = ConvertTo-Base64UrlString -Bytes $signatureBytes
+    return [pscustomobject]@{
+        Jwt      = ('{0}.{1}' -f $unsignedJwt, $encodedSignature)
+        ClientId = $clientId
+        Alg      = $alg
+        Expires  = $exp
+    }
+}
+
+function New-SwsAccessTokenDirectFromServiceAccountJson {
+    param(
+        [Parameter(Mandatory)][string]$JsonPath,
+        [Parameter(Mandatory)][string]$TenantId
+    )
+
+    $json = Read-SwsServiceAccountJson -JsonPath $JsonPath
+    $endpoints = Resolve-SwsAuthEndpoints -JsonObject $json
+    $assertion = New-SwsJwtAssertion -JsonObject $json -TenantId $TenantId -Audience $endpoints.Audience
+
+    Write-Log ("Creating SWS API access token directly from service-account JSON. JsonFile={0}; TenantId={1}; AuthSource={2}; Alg={3}" -f (Split-Path -Leaf $JsonPath), $TenantId, $endpoints.Source, $assertion.Alg) 'Cyan'
+
+    $body = @{
+        grant_type            = 'client_credentials'
+        client_assertion_type = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer'
+        client_assertion      = $assertion.Jwt
+    }
+
+    $params = @{
+        Method      = 'POST'
+        Uri         = $endpoints.TokenEndpoint
+        ContentType = 'application/x-www-form-urlencoded'
+        Body        = $body
+        ErrorAction = 'Stop'
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($SwsProxyAddress)) {
+        $params['Proxy'] = $SwsProxyAddress
+        if ($SwsProxyUseDefaultCredentials.IsPresent) { $params['ProxyUseDefaultCredentials'] = $true }
+    }
+
+    try {
+        $resp = Invoke-RestMethod @params
+    } catch {
+        $status = $null
+        $responseBody = ''
+        try { $status = [int]$_.Exception.Response.StatusCode.value__ } catch {}
+        try {
+            $stream = $_.Exception.Response.GetResponseStream()
+            if ($null -ne $stream) {
+                $reader = New-Object System.IO.StreamReader($stream)
+                $responseBody = $reader.ReadToEnd()
+            }
+        } catch {}
+        if ([string]::IsNullOrWhiteSpace($responseBody)) { $responseBody = $_.Exception.Message }
+        throw ("SWS direct token request failed. TokenEndpoint={0}; Status={1}; Error={2}" -f $endpoints.TokenEndpoint, $status, $responseBody)
+    }
+
+    $token = [string]$resp.access_token
+    if ([string]::IsNullOrWhiteSpace($token)) {
+        throw ('SWS direct token request succeeded but response did not contain access_token. Response={0}' -f (ConvertTo-CompressedJson -Object $resp))
+    }
+
+    $expiresIn = [string]$resp.expires_in
+    if ([string]::IsNullOrWhiteSpace($expiresIn)) { $expiresIn = 'unknown' }
+    Write-Log ("SWS API access token created successfully from service-account JSON. ExpiresIn={0}s" -f $expiresIn) 'Green'
+    Add-SwsReplicationSummary -Step 'Token' -Status 'SUCCESS' -Detail ("Token created directly using JSON={0}; Alg={1}; ExpiresIn={2}" -f (Split-Path -Leaf $JsonPath), $assertion.Alg, $expiresIn)
+    return $token
+}
+
 function Resolve-SwsAuthHelperJarPath {
     if (-not [string]::IsNullOrWhiteSpace($SwsAuthHelperJarPath)) {
         if (-not (Test-Path -LiteralPath $SwsAuthHelperJarPath)) {
@@ -1145,54 +1533,8 @@ function New-SwsAccessTokenFromServiceAccountJson {
 
     $jsonPath = Resolve-SwsServiceAccountJsonPath
     $tenantId = Resolve-SwsTenantId -JsonPath $jsonPath
-    $jarPath  = Resolve-SwsAuthHelperJarPath
 
-    $javaCommand = Get-Command java.exe -ErrorAction SilentlyContinue
-    if ($null -eq $javaCommand) { $javaCommand = Get-Command java -ErrorAction SilentlyContinue }
-    if ($null -eq $javaCommand) {
-        throw 'Java was not found in PATH. Install OpenJDK/Oracle/Zulu Java or pass -SwsAccessToken manually.'
-    }
-
-    Write-Log ("Creating SWS API access token from service-account JSON. JsonFile={0}; TenantId={1}; HelperJar={2}" -f (Split-Path -Leaf $jsonPath), $tenantId, (Split-Path -Leaf $jarPath)) 'Cyan'
-
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = $javaCommand.Source
-    # Do not quote the option flags themselves. Some Java CLIs do not accept quoted flags reliably.
-    $escapedJarPath  = $jarPath -replace '"', '\"'
-    $escapedTenantId = $tenantId -replace '"', '\"'
-    $escapedJsonPath = $jsonPath -replace '"', '\"'
-    $psi.Arguments = ('-jar "{0}" -t "{1}" -p "{2}"' -f $escapedJarPath, $escapedTenantId, $escapedJsonPath)
-    $psi.UseShellExecute = $false
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
-    $psi.CreateNoWindow = $true
-
-    $process = New-Object System.Diagnostics.Process
-    $process.StartInfo = $psi
-
-    $null = $process.Start()
-    $completed = $process.WaitForExit($SwsAuthHelperTimeoutSeconds * 1000)
-    if (-not $completed) {
-        try { $process.Kill() } catch {}
-        throw ("CyberArk SWS token helper timed out after {0} seconds." -f $SwsAuthHelperTimeoutSeconds)
-    }
-
-    $stdout = $process.StandardOutput.ReadToEnd()
-    $stderr = $process.StandardError.ReadToEnd()
-    $combinedOutput = ($stdout + "`n" + $stderr)
-
-    if ($process.ExitCode -ne 0) {
-        throw ("CyberArk SWS token helper failed. ExitCode={0}; Output={1}" -f $process.ExitCode, $combinedOutput.Trim())
-    }
-
-    $token = Get-SwsAccessTokenFromHelperOutput -OutputText $combinedOutput
-    if ([string]::IsNullOrWhiteSpace($token)) {
-        throw ("CyberArk SWS token helper ran, but no access_token could be parsed from its output. Output={0}" -f $combinedOutput.Trim())
-    }
-
-    Write-Log 'SWS API access token created successfully from service-account JSON.' 'Green'
-    Add-SwsReplicationSummary -Step 'Token' -Status 'SUCCESS' -Detail ("Token created using JSON={0}" -f (Split-Path -Leaf $jsonPath))
-    return $token
+    return New-SwsAccessTokenDirectFromServiceAccountJson -JsonPath $jsonPath -TenantId $tenantId
 }
 
 function Initialize-SwsAccessToken {
@@ -1219,7 +1561,7 @@ function Initialize-SwsAccessToken {
     $script:SwsAccessTokenToUse = Convert-SecureStringToPlainText -SecureString $secureToken
 
     if ([string]::IsNullOrWhiteSpace($script:SwsAccessTokenToUse)) {
-        throw 'SWS access token is empty. Provide -SwsAccessToken, place the SWS service-account JSON and CyberArk token-helper JAR beside this script, or pass -SwsServiceAccountJsonPath and -SwsAuthHelperJarPath.'
+        throw 'SWS access token is empty. Provide -SwsAccessToken, place the SWS service-account JSON beside this script, or pass -SwsServiceAccountJsonPath. No helper JAR is required.'
     }
 }
 
