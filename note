@@ -1,5 +1,5 @@
 <#
-CNA_Create_And_Update_Identity_WebApp_Reauth_NamePrompt_DescriptionOnly.ps1
+CNA_Create_And_Update_Identity_WebApp_Reauth_NamePrompt_DescriptionOnly_V8.ps1
 
 Purpose
 - Prompt for regular CyberArk Identity credential once
@@ -16,7 +16,7 @@ Purpose
 - Automatic SWS API token creation from service-account JSON stored beside this script
 - Self-contained SWS token generation using private_key_jwt or client_secret_jwt; no Java/JAR dependency; uses CyberArk-documented SWS private_key_jwt flow, with compatibility retries
 - Fixes PowerShell 5.1 empty generic List binding issue during token candidate generation
-- Improved SWS tenant detection from -SwsTenantId, SWS_TENANT_ID, JSON, or Identity tenant URL
+- Improved SWS tenant handling: embeds the known long tenant ID eef31a0b-0e67-4024-a644-be08614190db as the default for SWS private_key_jwt
 
 Why this version
 - This is based on the known working version
@@ -82,7 +82,9 @@ loginData.order = [
     [string]$ReferenceSwsAppKey        = '3c696971-5812-430a-88b1-417c6be2628f',
     [string]$SwsAccessToken            = '',
     [string]$SwsServiceAccountJsonPath = '',
-    [string]$SwsTenantId               = '',
+    [string]$SwsTenantId               = 'eef31a0b-0e67-4024-a644-be08614190db',
+    [switch]$DisableSwsTenantIdPrompt,
+    [switch]$AllowSwsShortTenantIdFallback,
     [string]$SwsAuthRealmBaseUrl       = '',
     [string]$SwsAuthHelperJarPath      = '',
     [int]$SwsAuthHelperTimeoutSeconds  = 120,
@@ -1014,62 +1016,150 @@ function Get-StringValuesFromObject {
     return @($values)
 }
 
+
+function Test-IsShortIdentityTenantName {
+    param([Parameter()][string]$Value)
+    return (-not [string]::IsNullOrWhiteSpace($Value) -and $Value.Trim() -match '^[a-z]{3}\d{4}$')
+}
+
+function Test-LooksLikeSwsLongTenantId {
+    param([Parameter()][string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    $v = $Value.Trim()
+    return ($v -match '^[a-fA-F0-9]{32}$' -or $v -match '^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$')
+}
+
+function Normalize-SwsTenantIdForJwt {
+    param([Parameter(Mandatory)][string]$Value)
+    $v = $Value.Trim()
+    if ($v -match '^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$') {
+        return ($v -replace '-', '').ToLower()
+    }
+    return $v
+}
+
+function Read-SwsTenantIdInteractively {
+    param([Parameter()][string]$CurrentValue)
+
+    if ($DisableSwsTenantIdPrompt.IsPresent) { return $CurrentValue }
+
+    Write-Log "SWS token generation needs the long CyberArk/Identity Tenant ID from the portal About page. The short Identity URL prefix will not work for private_key_jwt." 'Yellow'
+    Write-Log "Find it in CyberArk Identity: top-right user/profile icon > About > Tenant details > ID. It usually looks like 32 hex characters." 'Yellow'
+
+    $entered = Read-Host "Enter long SWS/Identity Tenant ID, or press Enter to keep '$CurrentValue'"
+    if (-not [string]::IsNullOrWhiteSpace($entered)) {
+        return $entered.Trim()
+    }
+    return $CurrentValue
+}
+
+function Confirm-SwsTenantIdUsableForJwt {
+    param(
+        [Parameter(Mandatory)][string]$TenantId,
+        [Parameter(Mandatory)][string]$Source
+    )
+
+    $tid = $TenantId.Trim()
+
+    if (Test-LooksLikeSwsLongTenantId -Value $tid) {
+        $normalized = Normalize-SwsTenantIdForJwt -Value $tid
+        if ($normalized -ne $tid) {
+            Write-Log ("Using normalized SWS tenant ID from {0}: {1}" -f $Source, $normalized) 'Gray'
+        }
+        return $normalized
+    }
+
+    if (Test-IsShortIdentityTenantName -Value $tid) {
+        if (-not $AllowSwsShortTenantIdFallback.IsPresent) {
+            $replacement = Read-SwsTenantIdInteractively -CurrentValue $tid
+            if ((-not [string]::IsNullOrWhiteSpace($replacement)) -and $replacement.Trim() -ne $tid -and (Test-LooksLikeSwsLongTenantId -Value $replacement)) {
+                $normalized = Normalize-SwsTenantIdForJwt -Value $replacement
+                Write-Log ("Using SWS tenant ID entered interactively: {0}" -f $normalized) 'Gray'
+                return $normalized
+            }
+
+            throw ("SWS tenant ID '{0}' from {1} is the short Identity URL prefix, not the long Tenant ID required by CyberArk SWS private_key_jwt. Re-run with -SwsTenantId '<long tenant ID from About page>' or set SWS_TENANT_ID. To intentionally try the short value, add -AllowSwsShortTenantIdFallback." -f $tid, $Source)
+        }
+
+        Write-Log ("WARNING: Using short Identity tenant name '{0}' because -AllowSwsShortTenantIdFallback was specified. CyberArk SWS docs show the private_key_jwt client_id as <TenantID>.<ServiceAccountID>.ExternalServiceAccount where TenantID is the long tenant ID." -f $tid) 'Yellow'
+        return $tid
+    }
+
+    if (-not $AllowSwsShortTenantIdFallback.IsPresent) {
+        $replacement = Read-SwsTenantIdInteractively -CurrentValue $tid
+        if ((-not [string]::IsNullOrWhiteSpace($replacement)) -and $replacement.Trim() -ne $tid -and (Test-LooksLikeSwsLongTenantId -Value $replacement)) {
+            $normalized = Normalize-SwsTenantIdForJwt -Value $replacement
+            Write-Log ("Using SWS tenant ID entered interactively: {0}" -f $normalized) 'Gray'
+            return $normalized
+        }
+        throw ("SWS tenant ID '{0}' from {1} does not look like the long CyberArk tenant ID required for SWS private_key_jwt. Re-run with -SwsTenantId '<long tenant ID from About page>' or set SWS_TENANT_ID." -f $tid, $Source)
+    }
+
+    Write-Log ("WARNING: SWS tenant ID '{0}' from {1} does not look like the documented long tenant ID, but -AllowSwsShortTenantIdFallback was specified." -f $tid, $Source) 'Yellow'
+    return $tid
+}
+
 function Resolve-SwsTenantId {
     param([Parameter(Mandatory)][string]$JsonPath)
 
     # 1. Explicit parameter wins.
     if (-not [string]::IsNullOrWhiteSpace($SwsTenantId)) {
         Write-Log ("Using SWS tenant ID from -SwsTenantId: {0}" -f $SwsTenantId) 'Gray'
-        return $SwsTenantId.Trim()
+        return (Confirm-SwsTenantIdUsableForJwt -TenantId $SwsTenantId.Trim() -Source '-SwsTenantId')
     }
 
     # 2. Environment variable is useful for scheduled task / automation runs.
     if (-not [string]::IsNullOrWhiteSpace($env:SWS_TENANT_ID)) {
         Write-Log ("Using SWS tenant ID from environment variable SWS_TENANT_ID: {0}" -f $env:SWS_TENANT_ID) 'Gray'
-        return $env:SWS_TENANT_ID.Trim()
+        return (Confirm-SwsTenantIdUsableForJwt -TenantId $env:SWS_TENANT_ID.Trim() -Source 'SWS_TENANT_ID')
     }
 
     $json = Read-SwsServiceAccountJson -JsonPath $JsonPath
 
-    # 3. Try common JSON property names, including several variants CyberArk/service-account exports may use.
+    # 3. Try common JSON property names. CyberArk's current SWS JSON normally has serviceAccountId/privateKey/discoveryURI only,
+    # but keep this for future exports or customer-wrapped secrets.
     $tenantCandidates = @(
-        'tenantId', 'tenantID', 'tenant_id', 'tenant', 'tenantName', 'tenant_name',
+        'tenantId', 'tenantID', 'tenant_id', 'tenant',
         'swsTenantId', 'swsTenantID', 'sws_tenant_id',
         'cyberArkTenantId', 'cyberarkTenantId', 'cyberark_tenant_id',
-        'customerId', 'customerID', 'customer_id',
-        'accountId', 'accountID', 'account_id',
-        'subdomain', 'tenantSubdomain', 'tenant_subdomain'
+        'identityTenantId', 'identityTenantID', 'identity_tenant_id',
+        'customerId', 'customerID', 'customer_id'
     )
 
     $tenantValue = Get-NestedPropertyValueByName -Object $json -PropertyNames $tenantCandidates -MaxDepth 8
     if ($null -ne $tenantValue -and -not [string]::IsNullOrWhiteSpace([string]$tenantValue)) {
         $tenantText = [string]$tenantValue
         $tenantFromUrl = Get-TenantIdFromUrlOrText -Value $tenantText
-        if (-not [string]::IsNullOrWhiteSpace($tenantFromUrl)) {
-            Write-Log ("Using SWS tenant ID derived from JSON value: {0}" -f $tenantFromUrl) 'Gray'
-            return $tenantFromUrl.Trim()
+        if (-not [string]::IsNullOrWhiteSpace($tenantFromUrl) -and -not (Test-IsShortIdentityTenantName -Value $tenantFromUrl)) {
+            Write-Log ("Using SWS tenant ID derived from JSON URL/value: {0}" -f $tenantFromUrl) 'Gray'
+            return (Confirm-SwsTenantIdUsableForJwt -TenantId $tenantFromUrl.Trim() -Source 'service-account JSON')
         }
         Write-Log ("Using SWS tenant ID from JSON field: {0}" -f $tenantText) 'Gray'
-        return $tenantText.Trim()
+        return (Confirm-SwsTenantIdUsableForJwt -TenantId $tenantText.Trim() -Source 'service-account JSON')
     }
 
-    # 4. Scan all string values in the JSON for either a tenant-looking value or a CyberArk tenant URL.
+    # 4. Scan all string values in the JSON for a long tenant-looking value. Do not treat discoveryURI/auth.alero.io as a tenant ID.
     foreach ($s in (Get-StringValuesFromObject -Object $json -MaxDepth 8)) {
-        $candidate = Get-TenantIdFromUrlOrText -Value $s
-        if (-not [string]::IsNullOrWhiteSpace($candidate)) {
-            Write-Log ("Using SWS tenant ID derived from service-account JSON content: {0}" -f $candidate) 'Gray'
-            return $candidate.Trim()
+        if (Test-LooksLikeSwsLongTenantId -Value $s) {
+            Write-Log ("Using SWS tenant ID discovered in service-account JSON content: {0}" -f $s) 'Gray'
+            return (Confirm-SwsTenantIdUsableForJwt -TenantId $s.Trim() -Source 'service-account JSON content')
         }
     }
 
-    # 5. Last fallback: Identity tenant URL prefix already present in this script, e.g. aat4012 from https://aat4012.id.cyberark.cloud.
+    # 5. Last-resort fallback: Identity URL prefix like aat4012 is NOT the documented JWT tenant ID.
+    # Prompt interactively unless the caller explicitly allows the short fallback.
     $identityTenant = Get-TenantIdFromUrlOrText -Value $IdentityApiTenantURL
     if (-not [string]::IsNullOrWhiteSpace($identityTenant)) {
-        Write-Log ("Using SWS tenant ID derived from IdentityApiTenantURL: {0}" -f $identityTenant) 'Yellow'
-        return $identityTenant.Trim()
+        Write-Log ("IdentityApiTenantURL contains short tenant prefix: {0}" -f $identityTenant) 'Yellow'
+        return (Confirm-SwsTenantIdUsableForJwt -TenantId $identityTenant.Trim() -Source 'IdentityApiTenantURL')
     }
 
-    throw ("Could not determine SWS tenant ID from -SwsTenantId, SWS_TENANT_ID, JSON file, or IdentityApiTenantURL. Re-run with -SwsTenantId '<tenant ID>'. JSON='{0}' IdentityApiTenantURL='{1}'" -f $JsonPath, $IdentityApiTenantURL)
+    $manual = Read-SwsTenantIdInteractively -CurrentValue ''
+    if (-not [string]::IsNullOrWhiteSpace($manual)) {
+        return (Confirm-SwsTenantIdUsableForJwt -TenantId $manual.Trim() -Source 'interactive prompt')
+    }
+
+    throw ("Could not determine the long SWS/Identity Tenant ID needed for private_key_jwt. Re-run with -SwsTenantId '<long tenant ID from About page>' or set SWS_TENANT_ID. JSON='{0}' IdentityApiTenantURL='{1}'" -f $JsonPath, $IdentityApiTenantURL)
 }
 
 function ConvertTo-Base64UrlString {
@@ -1298,7 +1388,7 @@ function Get-SwsServiceAccountClientIdCandidates {
 
     # Scan all strings in the JSON for a fully-qualified ExternalServiceAccount value.
     foreach ($s in (Get-StringValuesFromObject -Object $JsonObject -MaxDepth 8)) {
-        $m = [regex]::Match($s, '(?i)([a-z]{3}\d{4}\.[A-Za-z0-9_-]+\.ExternalServiceAccount)')
+        $m = [regex]::Match($s, '(?i)([A-Za-z0-9-]+\.[A-Za-z0-9_-]+\.ExternalServiceAccount)')
         if ($m.Success) { Add-UniqueStringValue -List $candidates -Value $m.Groups[1].Value }
     }
 
@@ -1527,8 +1617,8 @@ function New-SwsAccessTokenDirectFromServiceAccountJson {
     $attempt = 0
     $errors = New-Object System.Collections.Generic.List[string]
 
-    if ($TenantId -match '^[a-z]{3}\d{4}$') {
-        Write-Log ("WARNING: SWS tenant ID '{0}' looks like the Identity tenant short name. CyberArk SWS private_key_jwt docs show TenantID as a 32-character ID/GUID used in <TenantID>.<ServiceAccountID>.ExternalServiceAccount. If token attempts return 401, get the real SWS/Identity tenant ID and pass -SwsTenantId." -f $TenantId) 'Yellow'
+    if (Test-IsShortIdentityTenantName -Value $TenantId) {
+        Write-Log ("WARNING: SWS tenant ID '{0}' is a short Identity subdomain. This is usually wrong for SWS private_key_jwt unless -AllowSwsShortTenantIdFallback was intentionally used." -f $TenantId) 'Yellow'
     }
 
     foreach ($clientId in $clientIdCandidates) {
