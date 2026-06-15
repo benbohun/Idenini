@@ -14,7 +14,7 @@ Purpose
 - No psPAS dependency
 - Optional SWS policy replication from a reference SWS Identity app key
 - Automatic SWS API token creation from service-account JSON stored beside this script
-- Self-contained SWS token generation using private_key_jwt or client_secret_jwt; no Java/JAR dependency
+- Self-contained SWS token generation using private_key_jwt or client_secret_jwt; no Java/JAR dependency; retries client_id/audience combinations
 - Improved SWS tenant detection from -SwsTenantId, SWS_TENANT_ID, JSON, or Identity tenant URL
 
 Why this version
@@ -1231,42 +1231,86 @@ function Get-SwsJsonValue {
     return Get-NestedPropertyValueByName -Object $JsonObject -PropertyNames $PropertyNames -MaxDepth $MaxDepth
 }
 
-function Resolve-SwsServiceAccountClientId {
+
+function Add-UniqueStringValue {
     param(
-        [Parameter(Mandatory)]$JsonObject,
-        [Parameter(Mandatory)][string]$TenantId
+        [Parameter(Mandatory)][System.Collections.Generic.List[string]]$List,
+        [Parameter()][string]$Value
     )
 
-    $clientIdValue = Get-SwsJsonValue -JsonObject $JsonObject -PropertyNames @('clientId','clientID','client_id','oauthClientId','oauth_client_id')
-    if ($null -ne $clientIdValue -and -not [string]::IsNullOrWhiteSpace([string]$clientIdValue)) {
-        $clientIdText = [string]$clientIdValue
-        if ($clientIdText -match '\.ExternalServiceAccount$') { return $clientIdText.Trim() }
-    }
+    if ([string]::IsNullOrWhiteSpace($Value)) { return }
+    $v = $Value.Trim()
+    if (-not $List.Contains($v)) { [void]$List.Add($v) }
+}
 
-    $serviceAccountIdValue = Get-SwsJsonValue -JsonObject $JsonObject -PropertyNames @('serviceAccountId','serviceAccountID','service_account_id','externalServiceAccountId','external_service_account_id')
-    if ($null -eq $serviceAccountIdValue -or [string]::IsNullOrWhiteSpace([string]$serviceAccountIdValue)) {
-        # Last-resort: use a clientId value that did not include the suffix as the service account ID.
-        if ($null -ne $clientIdValue -and -not [string]::IsNullOrWhiteSpace([string]$clientIdValue)) {
-            $serviceAccountIdValue = $clientIdValue
+function Get-SwsServiceAccountClientIdCandidates {
+    param(
+        [Parameter(Mandatory)]$JsonObject,
+        [Parameter(Mandatory)][string]$TenantId,
+        [Parameter()][string]$JsonPath = ''
+    )
+
+    $candidates = New-Object System.Collections.Generic.List[string]
+
+    $clientIdValue = Get-SwsJsonValue -JsonObject $JsonObject -PropertyNames @(
+        'clientId','clientID','client_id','oauthClientId','oauth_client_id','applicationClientId','application_client_id'
+    )
+    $serviceAccountIdValue = Get-SwsJsonValue -JsonObject $JsonObject -PropertyNames @(
+        'serviceAccountId','serviceAccountID','service_account_id','externalServiceAccountId','external_service_account_id','id','uuid','uid'
+    )
+
+    $rawValues = New-Object System.Collections.Generic.List[string]
+    foreach ($v in @($clientIdValue, $serviceAccountIdValue)) {
+        if ($null -ne $v -and -not [string]::IsNullOrWhiteSpace([string]$v)) {
+            Add-UniqueStringValue -List $rawValues -Value ([string]$v)
         }
     }
 
-    if ($null -eq $serviceAccountIdValue -or [string]::IsNullOrWhiteSpace([string]$serviceAccountIdValue)) {
-        throw 'SWS service-account JSON does not contain serviceAccountId. Expected field serviceAccountId or clientId.'
+    # CyberArk's downloaded JSON is sometimes named by service account ID. Use the file name as a safe last-resort candidate.
+    if (-not [string]::IsNullOrWhiteSpace($JsonPath)) {
+        try {
+            $leafBase = [System.IO.Path]::GetFileNameWithoutExtension($JsonPath)
+            if ($leafBase -match '^[a-fA-F0-9]{32}$' -or $leafBase -match '^[a-fA-F0-9-]{36}$') {
+                Add-UniqueStringValue -List $rawValues -Value $leafBase
+            }
+        } catch {}
     }
 
-    $serviceAccountId = ([string]$serviceAccountIdValue).Trim()
-    return ('{0}.{1}.ExternalServiceAccount' -f $TenantId.Trim(), $serviceAccountId)
+    foreach ($raw in @($rawValues)) {
+        $value = ([string]$raw).Trim()
+        if ([string]::IsNullOrWhiteSpace($value)) { continue }
+
+        # Exact value first. If the JSON already contains a fully-qualified client_id, this is the correct one.
+        Add-UniqueStringValue -List $candidates -Value $value
+
+        if ($value -match '\.ExternalServiceAccount$') { continue }
+
+        # Most common CyberArk SWS service-account client_id shape.
+        Add-UniqueStringValue -List $candidates -Value ('{0}.{1}.ExternalServiceAccount' -f $TenantId.Trim(), $value)
+    }
+
+    # Scan all strings in the JSON for a fully-qualified ExternalServiceAccount value.
+    foreach ($s in (Get-StringValuesFromObject -Object $JsonObject -MaxDepth 8)) {
+        $m = [regex]::Match($s, '(?i)([a-z]{3}\d{4}\.[A-Za-z0-9_-]+\.ExternalServiceAccount)')
+        if ($m.Success) { Add-UniqueStringValue -List $candidates -Value $m.Groups[1].Value }
+    }
+
+    if ($candidates.Count -eq 0) {
+        throw 'SWS service-account JSON does not contain a usable clientId/serviceAccountId. Expected serviceAccountId, clientId, or a JSON file name that matches the service account ID.'
+    }
+
+    return @($candidates)
 }
 
 function Resolve-SwsAuthEndpoints {
     param([Parameter(Mandatory)]$JsonObject)
 
     if (-not [string]::IsNullOrWhiteSpace($SwsAuthRealmBaseUrl)) {
-        $aud = $SwsAuthRealmBaseUrl.TrimEnd('/')
+        $realm = $SwsAuthRealmBaseUrl.TrimEnd('/')
         return [pscustomobject]@{
-            Audience      = $aud
-            TokenEndpoint = ($aud + '/protocol/openid-connect/token')
+            RealmBase     = $realm
+            Issuer        = $realm
+            TokenEndpoint = ($realm + '/protocol/openid-connect/token')
             Source        = '-SwsAuthRealmBaseUrl'
         }
     }
@@ -1293,7 +1337,8 @@ function Resolve-SwsAuthEndpoints {
             $tokenEndpoint = [string]$oidc.token_endpoint
             if (-not [string]::IsNullOrWhiteSpace($issuer) -and -not [string]::IsNullOrWhiteSpace($tokenEndpoint)) {
                 return [pscustomobject]@{
-                    Audience      = $issuer.TrimEnd('/')
+                    RealmBase     = $issuer.TrimEnd('/')
+                    Issuer        = $issuer.TrimEnd('/')
                     TokenEndpoint = $tokenEndpoint
                     Source        = 'discoveryURI'
                 }
@@ -1302,10 +1347,11 @@ function Resolve-SwsAuthEndpoints {
             Write-Log ("Could not retrieve SWS OpenID discovery document; deriving token endpoint from discoveryURI. Error={0}" -f $_.Exception.Message) 'Yellow'
         }
 
-        $audience = ($discoveryUri -replace '/\.well-known/openid-configuration/?$', '').TrimEnd('/')
+        $realm = ($discoveryUri -replace '/\.well-known/openid-configuration/?$', '').TrimEnd('/')
         return [pscustomobject]@{
-            Audience      = $audience
-            TokenEndpoint = ($audience + '/protocol/openid-connect/token')
+            RealmBase     = $realm
+            Issuer        = $realm
+            TokenEndpoint = ($realm + '/protocol/openid-connect/token')
             Source        = 'discoveryURI-derived'
         }
     }
@@ -1314,33 +1360,49 @@ function Resolve-SwsAuthEndpoints {
     $apiHost = ''
     try { $apiHost = ([System.Uri]$SwsApiBaseUrl).Host.ToLowerInvariant() } catch {}
 
-    $audienceFallback = 'https://auth.alero.io/auth/realms/serviceaccounts'
-    if ($apiHost -match 'alero\.eu') { $audienceFallback = 'https://auth.alero.eu/auth/realms/serviceaccounts' }
-    elseif ($apiHost -match 'ca\.alero\.io') { $audienceFallback = 'https://auth.ca.alero.io/auth/realms/serviceaccounts' }
-    elseif ($apiHost -match 'au\.alero\.io') { $audienceFallback = 'https://auth.au.alero.io/auth/realms/serviceaccounts' }
-    elseif ($apiHost -match 'uk\.alero\.io') { $audienceFallback = 'https://auth.uk.alero.io/auth/realms/serviceaccounts' }
+    $realmFallback = 'https://auth.alero.io/auth/realms/serviceaccounts'
+    if ($apiHost -match 'alero\.eu') { $realmFallback = 'https://auth.alero.eu/auth/realms/serviceaccounts' }
+    elseif ($apiHost -match 'ca\.alero\.io') { $realmFallback = 'https://auth.ca.alero.io/auth/realms/serviceaccounts' }
+    elseif ($apiHost -match 'au\.alero\.io') { $realmFallback = 'https://auth.au.alero.io/auth/realms/serviceaccounts' }
+    elseif ($apiHost -match 'uk\.alero\.io') { $realmFallback = 'https://auth.uk.alero.io/auth/realms/serviceaccounts' }
 
     return [pscustomobject]@{
-        Audience      = $audienceFallback
-        TokenEndpoint = ($audienceFallback + '/protocol/openid-connect/token')
+        RealmBase     = $realmFallback
+        Issuer        = $realmFallback
+        TokenEndpoint = ($realmFallback + '/protocol/openid-connect/token')
         Source        = 'SwsApiBaseUrl-fallback'
     }
+}
+
+function Get-SwsAudienceCandidates {
+    param([Parameter(Mandatory)]$Endpoints)
+
+    $audiences = New-Object System.Collections.Generic.List[string]
+
+    # For OAuth private_key_jwt/client_secret_jwt, many authorization servers expect aud = token endpoint.
+    Add-UniqueStringValue -List $audiences -Value ([string]$Endpoints.TokenEndpoint)
+
+    # Some servers accept/expect issuer/realm as audience. Keep these as fallback attempts.
+    Add-UniqueStringValue -List $audiences -Value ([string]$Endpoints.Issuer)
+    Add-UniqueStringValue -List $audiences -Value ([string]$Endpoints.RealmBase)
+
+    return @($audiences)
 }
 
 function New-SwsJwtAssertion {
     param(
         [Parameter(Mandatory)]$JsonObject,
-        [Parameter(Mandatory)][string]$TenantId,
+        [Parameter(Mandatory)][string]$ClientId,
         [Parameter(Mandatory)][string]$Audience
     )
 
-    $clientId = Resolve-SwsServiceAccountClientId -JsonObject $JsonObject -TenantId $TenantId
     $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
     $exp = $now + 300
     $jti = [guid]::NewGuid().ToString('N')
 
     $privateKeyValue = Get-SwsJsonValue -JsonObject $JsonObject -PropertyNames @('privateKey','private_key','privateKeyPem','private_key_pem','rsaPrivateKey','rsa_private_key')
     $clientSecretValue = Get-SwsJsonValue -JsonObject $JsonObject -PropertyNames @('clientSecret','client_secret','secret','clientSecretValue','client_secret_value')
+    $keyIdValue = Get-SwsJsonValue -JsonObject $JsonObject -PropertyNames @('kid','keyId','keyID','key_id','privateKeyId','private_key_id','publicKeyId','public_key_id')
 
     $alg = 'RS256'
     if (($null -eq $privateKeyValue -or [string]::IsNullOrWhiteSpace([string]$privateKeyValue)) -and
@@ -1348,16 +1410,23 @@ function New-SwsJwtAssertion {
         $alg = 'HS256'
     }
 
-    $headerJson = (@{ alg = $alg; typ = 'JWT' } | ConvertTo-Json -Compress)
-    $claimJson = (@{
+    $header = [ordered]@{ alg = $alg; typ = 'JWT' }
+    if ($null -ne $keyIdValue -and -not [string]::IsNullOrWhiteSpace([string]$keyIdValue)) {
+        $header['kid'] = ([string]$keyIdValue).Trim()
+    }
+
+    $claim = [ordered]@{
         aud = $Audience
-        iss = $clientId
-        sub = $clientId
-        nbf = 0
+        iss = $ClientId
+        sub = $ClientId
+        nbf = ($now - 60)
         exp = $exp
         iat = $now
         jti = $jti
-    } | ConvertTo-Json -Compress)
+    }
+
+    $headerJson = ($header | ConvertTo-Json -Compress)
+    $claimJson  = ($claim  | ConvertTo-Json -Compress)
 
     $encodedHeader = Convert-StringToBase64UrlString -Value $headerJson
     $encodedClaim  = Convert-StringToBase64UrlString -Value $claimJson
@@ -1391,33 +1460,29 @@ function New-SwsJwtAssertion {
     $encodedSignature = ConvertTo-Base64UrlString -Bytes $signatureBytes
     return [pscustomobject]@{
         Jwt      = ('{0}.{1}' -f $unsignedJwt, $encodedSignature)
-        ClientId = $clientId
+        ClientId = $ClientId
+        Audience = $Audience
         Alg      = $alg
         Expires  = $exp
     }
 }
 
-function New-SwsAccessTokenDirectFromServiceAccountJson {
+function Invoke-SwsTokenRequest {
     param(
-        [Parameter(Mandatory)][string]$JsonPath,
-        [Parameter(Mandatory)][string]$TenantId
+        [Parameter(Mandatory)][string]$TokenEndpoint,
+        [Parameter(Mandatory)]$Assertion
     )
-
-    $json = Read-SwsServiceAccountJson -JsonPath $JsonPath
-    $endpoints = Resolve-SwsAuthEndpoints -JsonObject $json
-    $assertion = New-SwsJwtAssertion -JsonObject $json -TenantId $TenantId -Audience $endpoints.Audience
-
-    Write-Log ("Creating SWS API access token directly from service-account JSON. JsonFile={0}; TenantId={1}; AuthSource={2}; Alg={3}" -f (Split-Path -Leaf $JsonPath), $TenantId, $endpoints.Source, $assertion.Alg) 'Cyan'
 
     $body = @{
         grant_type            = 'client_credentials'
+        client_id             = $Assertion.ClientId
         client_assertion_type = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer'
-        client_assertion      = $assertion.Jwt
+        client_assertion      = $Assertion.Jwt
     }
 
     $params = @{
         Method      = 'POST'
-        Uri         = $endpoints.TokenEndpoint
+        Uri         = $TokenEndpoint
         ContentType = 'application/x-www-form-urlencoded'
         Body        = $body
         ErrorAction = 'Stop'
@@ -1428,33 +1493,63 @@ function New-SwsAccessTokenDirectFromServiceAccountJson {
         if ($SwsProxyUseDefaultCredentials.IsPresent) { $params['ProxyUseDefaultCredentials'] = $true }
     }
 
-    try {
-        $resp = Invoke-RestMethod @params
-    } catch {
-        $status = $null
-        $responseBody = ''
-        try { $status = [int]$_.Exception.Response.StatusCode.value__ } catch {}
-        try {
-            $stream = $_.Exception.Response.GetResponseStream()
-            if ($null -ne $stream) {
-                $reader = New-Object System.IO.StreamReader($stream)
-                $responseBody = $reader.ReadToEnd()
+    return Invoke-RestMethod @params
+}
+
+function New-SwsAccessTokenDirectFromServiceAccountJson {
+    param(
+        [Parameter(Mandatory)][string]$JsonPath,
+        [Parameter(Mandatory)][string]$TenantId
+    )
+
+    $json = Read-SwsServiceAccountJson -JsonPath $JsonPath
+    $endpoints = Resolve-SwsAuthEndpoints -JsonObject $json
+    $clientIdCandidates = @(Get-SwsServiceAccountClientIdCandidates -JsonObject $json -TenantId $TenantId -JsonPath $JsonPath)
+    $audienceCandidates = @(Get-SwsAudienceCandidates -Endpoints $endpoints)
+
+    Write-Log ("Creating SWS API access token directly from service-account JSON. JsonFile={0}; TenantId={1}; AuthSource={2}; ClientIdCandidates={3}; AudienceCandidates={4}" -f (Split-Path -Leaf $JsonPath), $TenantId, $endpoints.Source, $clientIdCandidates.Count, $audienceCandidates.Count) 'Cyan'
+
+    $attempt = 0
+    $errors = New-Object System.Collections.Generic.List[string]
+
+    foreach ($clientId in $clientIdCandidates) {
+        foreach ($audience in $audienceCandidates) {
+            $attempt++
+            try {
+                $assertion = New-SwsJwtAssertion -JsonObject $json -ClientId $clientId -Audience $audience
+                Write-Log ("SWS token attempt #{0}: Alg={1}; ClientId={2}; Audience={3}" -f $attempt, $assertion.Alg, $clientId, $audience) 'Gray'
+                $resp = Invoke-SwsTokenRequest -TokenEndpoint $endpoints.TokenEndpoint -Assertion $assertion
+
+                $token = [string]$resp.access_token
+                if ([string]::IsNullOrWhiteSpace($token)) {
+                    throw ('Token response did not contain access_token. Response={0}' -f (ConvertTo-CompressedJson -Object $resp))
+                }
+
+                $expiresIn = [string]$resp.expires_in
+                if ([string]::IsNullOrWhiteSpace($expiresIn)) { $expiresIn = 'unknown' }
+                Write-Log ("SWS API access token created successfully from service-account JSON. ExpiresIn={0}s; WinningClientId={1}; WinningAudience={2}" -f $expiresIn, $clientId, $audience) 'Green'
+                Add-SwsReplicationSummary -Step 'Token' -Status 'SUCCESS' -Detail ("Token created directly using JSON={0}; Alg={1}; ExpiresIn={2}; ClientId={3}; Audience={4}" -f (Split-Path -Leaf $JsonPath), $assertion.Alg, $expiresIn, $clientId, $audience)
+                return $token
+            } catch {
+                $status = $null
+                $responseBody = ''
+                try { $status = [int]$_.Exception.Response.StatusCode.value__ } catch {}
+                try {
+                    $stream = $_.Exception.Response.GetResponseStream()
+                    if ($null -ne $stream) {
+                        $reader = New-Object System.IO.StreamReader($stream)
+                        $responseBody = $reader.ReadToEnd()
+                    }
+                } catch {}
+                if ([string]::IsNullOrWhiteSpace($responseBody)) { $responseBody = $_.Exception.Message }
+                $msg = ("Attempt={0}; Status={1}; ClientId={2}; Audience={3}; Error={4}" -f $attempt, $status, $clientId, $audience, $responseBody)
+                $errors.Add($msg)
+                Write-Log ("SWS token attempt #{0} failed. Status={1}; ClientId={2}; Audience={3}; Error={4}" -f $attempt, $status, $clientId, $audience, $responseBody) 'Yellow'
             }
-        } catch {}
-        if ([string]::IsNullOrWhiteSpace($responseBody)) { $responseBody = $_.Exception.Message }
-        throw ("SWS direct token request failed. TokenEndpoint={0}; Status={1}; Error={2}" -f $endpoints.TokenEndpoint, $status, $responseBody)
+        }
     }
 
-    $token = [string]$resp.access_token
-    if ([string]::IsNullOrWhiteSpace($token)) {
-        throw ('SWS direct token request succeeded but response did not contain access_token. Response={0}' -f (ConvertTo-CompressedJson -Object $resp))
-    }
-
-    $expiresIn = [string]$resp.expires_in
-    if ([string]::IsNullOrWhiteSpace($expiresIn)) { $expiresIn = 'unknown' }
-    Write-Log ("SWS API access token created successfully from service-account JSON. ExpiresIn={0}s" -f $expiresIn) 'Green'
-    Add-SwsReplicationSummary -Step 'Token' -Status 'SUCCESS' -Detail ("Token created directly using JSON={0}; Alg={1}; ExpiresIn={2}" -f (Split-Path -Leaf $JsonPath), $assertion.Alg, $expiresIn)
-    return $token
+    throw ("SWS direct token request failed after {0} attempt(s). TokenEndpoint={1}; TenantId={2}; LastErrors={3}" -f $attempt, $endpoints.TokenEndpoint, $TenantId, (($errors | Select-Object -Last 5) -join ' || '))
 }
 
 function Resolve-SwsAuthHelperJarPath {
