@@ -14,6 +14,7 @@ Purpose
 - No psPAS dependency
 - Optional SWS policy replication from a reference SWS Identity app key
 - Optional automatic SWS API token creation from service-account JSON stored beside this script
+- Improved SWS tenant detection from -SwsTenantId, SWS_TENANT_ID, JSON, or Identity tenant URL
 
 Why this version
 - This is based on the known working version
@@ -941,25 +942,131 @@ function Read-SwsServiceAccountJson {
     }
 }
 
+function Get-TenantIdFromUrlOrText {
+    param([Parameter()][string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+
+    # Common CyberArk tenant URL examples:
+    # https://aat4012.id.cyberark.cloud        -> aat4012
+    # https://aat4012.my.idaptive.app          -> aat4012
+    # https://example.cyberark.cloud/.../aat4012 -> best-effort only
+    try {
+        $uri = [System.Uri]$Value
+        if (-not [string]::IsNullOrWhiteSpace($uri.Host)) {
+            $firstLabel = ($uri.Host -split '\.' | Select-Object -First 1)
+            if (-not [string]::IsNullOrWhiteSpace($firstLabel) -and $firstLabel -notin @('api','www','login','auth')) {
+                return [string]$firstLabel
+            }
+        }
+    } catch {}
+
+    # Best-effort tenant-id pattern used by many CyberArk tenants, for example aat4012 / abq4291.
+    $m = [regex]::Match($Value, '(?i)\b[a-z]{3}\d{4}\b')
+    if ($m.Success) { return $m.Value }
+
+    return $null
+}
+
+function Get-StringValuesFromObject {
+    param(
+        [Parameter()]$Object,
+        [int]$MaxDepth = 8
+    )
+
+    $values = New-Object System.Collections.Generic.List[string]
+    if ($null -eq $Object) { return @() }
+
+    $queue = New-Object System.Collections.Queue
+    $queue.Enqueue([pscustomobject]@{ Value = $Object; Depth = 0 })
+
+    while ($queue.Count -gt 0) {
+        $entry = $queue.Dequeue()
+        $current = $entry.Value
+        $depth = [int]$entry.Depth
+
+        if ($null -eq $current -or $depth -gt $MaxDepth) { continue }
+
+        if ($current -is [string]) {
+            if (-not [string]::IsNullOrWhiteSpace($current)) { $values.Add($current) }
+            continue
+        }
+
+        if ($current -is [System.Collections.IDictionary]) {
+            foreach ($k in $current.Keys) {
+                $v = $current[$k]
+                if ($null -ne $v) { $queue.Enqueue([pscustomobject]@{ Value = $v; Depth = ($depth + 1) }) }
+            }
+        } elseif (($current -is [System.Collections.IEnumerable]) -and -not ($current -is [string])) {
+            foreach ($item in $current) {
+                if ($null -ne $item) { $queue.Enqueue([pscustomobject]@{ Value = $item; Depth = ($depth + 1) }) }
+            }
+        } elseif ($current.PSObject) {
+            foreach ($prop in $current.PSObject.Properties) {
+                if ($null -ne $prop.Value) { $queue.Enqueue([pscustomobject]@{ Value = $prop.Value; Depth = ($depth + 1) }) }
+            }
+        }
+    }
+
+    return @($values)
+}
+
 function Resolve-SwsTenantId {
     param([Parameter(Mandatory)][string]$JsonPath)
 
-    if (-not [string]::IsNullOrWhiteSpace($SwsTenantId)) { return $SwsTenantId }
+    # 1. Explicit parameter wins.
+    if (-not [string]::IsNullOrWhiteSpace($SwsTenantId)) {
+        Write-Log ("Using SWS tenant ID from -SwsTenantId: {0}" -f $SwsTenantId) 'Gray'
+        return $SwsTenantId.Trim()
+    }
+
+    # 2. Environment variable is useful for scheduled task / automation runs.
+    if (-not [string]::IsNullOrWhiteSpace($env:SWS_TENANT_ID)) {
+        Write-Log ("Using SWS tenant ID from environment variable SWS_TENANT_ID: {0}" -f $env:SWS_TENANT_ID) 'Gray'
+        return $env:SWS_TENANT_ID.Trim()
+    }
 
     $json = Read-SwsServiceAccountJson -JsonPath $JsonPath
 
+    # 3. Try common JSON property names, including several variants CyberArk/service-account exports may use.
     $tenantCandidates = @(
-        'tenantId', 'tenantID', 'tenant_id', 'tenant',
+        'tenantId', 'tenantID', 'tenant_id', 'tenant', 'tenantName', 'tenant_name',
+        'swsTenantId', 'swsTenantID', 'sws_tenant_id',
+        'cyberArkTenantId', 'cyberarkTenantId', 'cyberark_tenant_id',
         'customerId', 'customerID', 'customer_id',
-        'accountId', 'accountID', 'account_id'
+        'accountId', 'accountID', 'account_id',
+        'subdomain', 'tenantSubdomain', 'tenant_subdomain'
     )
 
-    $tenantValue = Get-NestedPropertyValueByName -Object $json -PropertyNames $tenantCandidates -MaxDepth 6
+    $tenantValue = Get-NestedPropertyValueByName -Object $json -PropertyNames $tenantCandidates -MaxDepth 8
     if ($null -ne $tenantValue -and -not [string]::IsNullOrWhiteSpace([string]$tenantValue)) {
-        return [string]$tenantValue
+        $tenantText = [string]$tenantValue
+        $tenantFromUrl = Get-TenantIdFromUrlOrText -Value $tenantText
+        if (-not [string]::IsNullOrWhiteSpace($tenantFromUrl)) {
+            Write-Log ("Using SWS tenant ID derived from JSON value: {0}" -f $tenantFromUrl) 'Gray'
+            return $tenantFromUrl.Trim()
+        }
+        Write-Log ("Using SWS tenant ID from JSON field: {0}" -f $tenantText) 'Gray'
+        return $tenantText.Trim()
     }
 
-    throw ("Could not determine SWS tenant ID from JSON file '{0}'. Re-run with -SwsTenantId '<tenant ID>' once, or add tenantId to the JSON if your process allows it." -f $JsonPath)
+    # 4. Scan all string values in the JSON for either a tenant-looking value or a CyberArk tenant URL.
+    foreach ($s in (Get-StringValuesFromObject -Object $json -MaxDepth 8)) {
+        $candidate = Get-TenantIdFromUrlOrText -Value $s
+        if (-not [string]::IsNullOrWhiteSpace($candidate)) {
+            Write-Log ("Using SWS tenant ID derived from service-account JSON content: {0}" -f $candidate) 'Gray'
+            return $candidate.Trim()
+        }
+    }
+
+    # 5. Last fallback: Identity tenant URL prefix already present in this script, e.g. aat4012 from https://aat4012.id.cyberark.cloud.
+    $identityTenant = Get-TenantIdFromUrlOrText -Value $IdentityApiTenantURL
+    if (-not [string]::IsNullOrWhiteSpace($identityTenant)) {
+        Write-Log ("Using SWS tenant ID derived from IdentityApiTenantURL: {0}" -f $identityTenant) 'Yellow'
+        return $identityTenant.Trim()
+    }
+
+    throw ("Could not determine SWS tenant ID from -SwsTenantId, SWS_TENANT_ID, JSON file, or IdentityApiTenantURL. Re-run with -SwsTenantId '<tenant ID>'. JSON='{0}' IdentityApiTenantURL='{1}'" -f $JsonPath, $IdentityApiTenantURL)
 }
 
 function Resolve-SwsAuthHelperJarPath {
@@ -1050,14 +1157,11 @@ function New-SwsAccessTokenFromServiceAccountJson {
 
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $javaCommand.Source
-    $psi.Arguments = @(
-        (ConvertTo-CommandLineArgument -Value '-jar'),
-        (ConvertTo-CommandLineArgument -Value $jarPath),
-        (ConvertTo-CommandLineArgument -Value '-t'),
-        (ConvertTo-CommandLineArgument -Value $tenantId),
-        (ConvertTo-CommandLineArgument -Value '-p'),
-        (ConvertTo-CommandLineArgument -Value $jsonPath)
-    ) -join ' '
+    # Do not quote the option flags themselves. Some Java CLIs do not accept quoted flags reliably.
+    $escapedJarPath  = $jarPath -replace '"', '\"'
+    $escapedTenantId = $tenantId -replace '"', '\"'
+    $escapedJsonPath = $jsonPath -replace '"', '\"'
+    $psi.Arguments = ('-jar "{0}" -t "{1}" -p "{2}"' -f $escapedJarPath, $escapedTenantId, $escapedJsonPath)
     $psi.UseShellExecute = $false
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
