@@ -1,5 +1,5 @@
 <#
-CNA_Create_And_Update_Identity_WebApp_Reauth_NamePrompt_SWS_HelperJar_V10.ps1
+CNA_Create_And_Update_Identity_WebApp_Reauth_NamePrompt_SWS_HelperJar_V12_EmbeddedJava.ps1
 
 Purpose
 - Prompt for regular CyberArk Identity credential once
@@ -15,8 +15,10 @@ Purpose
 - Optional SWS policy replication from a reference SWS Identity app key
 - Automatic SWS API token creation from service-account JSON stored beside this script
 - Automatic SWS API token creation from the SWS service-account JSON using CyberArk public-api-auth-helper JAR located beside this script
-- Falls back to direct PowerShell private_key_jwt token generation only if the helper JAR flow fails
+- Uses the provided portable Java path by default and still auto-discovers java.exe from PATH, same-folder portable JRE/JDK, registry, and common install folders
+- Falls back to direct PowerShell private_key_jwt token generation only if the helper JAR flow fails for a non-Java-local issue
 - Improved SWS tenant handling: embeds the known long tenant ID eef31a0b-0e67-4024-a644-be08614190db as the default SWS tenant ID
+- Embeds the provided portable Java path as the default SwsJavaPath
 
 Why this version
 - This is based on the known working version
@@ -87,6 +89,7 @@ loginData.order = [
     [switch]$AllowSwsShortTenantIdFallback,
     [string]$SwsAuthRealmBaseUrl       = '',
     [string]$SwsAuthHelperJarPath      = '',
+    [string]$SwsJavaPath               = 'E:\Installation Media\Script\OnboardScript\SWS_Application_Script\jdk-25.0.3+9\bin\java.exe',
     [int]$SwsAuthHelperTimeoutSeconds  = 120,
     [switch]$DisableSwsServiceAccountJsonAutoLogin,
     [string]$SwsApiBaseUrl             = 'https://api.alero.io/v2-edge',
@@ -1780,14 +1783,131 @@ function Protect-SwsHelperOutputForLog {
     return $safe
 }
 
+function Add-JavaCandidatePath {
+    param(
+        [Parameter(Mandatory)]$List,
+        [Parameter()][string]$Path
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return }
+
+    try {
+        $expanded = [Environment]::ExpandEnvironmentVariables($Path)
+        if ([string]::IsNullOrWhiteSpace($expanded)) { return }
+        if (-not (Test-Path -LiteralPath $expanded -PathType Leaf)) { return }
+
+        $resolved = (Resolve-Path -LiteralPath $expanded -ErrorAction Stop).Path
+        if (-not ($List -contains $resolved)) {
+            [void]$List.Add($resolved)
+        }
+    } catch {}
+}
+
 function Get-JavaExecutablePath {
-    $cmd = Get-Command java.exe -ErrorAction SilentlyContinue
-    if ($null -ne $cmd -and -not [string]::IsNullOrWhiteSpace($cmd.Source)) { return $cmd.Source }
+    $candidates = New-Object System.Collections.Generic.List[string]
 
-    $cmd = Get-Command java -ErrorAction SilentlyContinue
-    if ($null -ne $cmd -and -not [string]::IsNullOrWhiteSpace($cmd.Source)) { return $cmd.Source }
+    # 1) Explicit script parameter
+    if (-not [string]::IsNullOrWhiteSpace($SwsJavaPath)) {
+        Add-JavaCandidatePath -List $candidates -Path $SwsJavaPath
+        if ($candidates.Count -eq 0) {
+            throw ("-SwsJavaPath was provided, but java.exe was not found at: {0}" -f $SwsJavaPath)
+        }
+    }
 
-    throw 'java.exe was not found in PATH. Install Java or add java.exe to PATH, then rerun the script.'
+    # 2) Portable Java beside the script folder
+    $dir = $script:ScriptDirectory
+    if ([string]::IsNullOrWhiteSpace($dir) -or -not (Test-Path -LiteralPath $dir)) {
+        $dir = (Get-Location).Path
+    }
+
+    $sameFolderCandidates = @(
+        (Join-Path $dir 'java.exe'),
+        (Join-Path $dir 'java\bin\java.exe'),
+        (Join-Path $dir 'jre\bin\java.exe'),
+        (Join-Path $dir 'jdk\bin\java.exe'),
+        (Join-Path $dir 'runtime\bin\java.exe')
+    )
+    foreach ($path in $sameFolderCandidates) { Add-JavaCandidatePath -List $candidates -Path $path }
+
+    # 3) PATH lookup
+    foreach ($name in @('java.exe','java')) {
+        try {
+            $cmd = Get-Command $name -ErrorAction SilentlyContinue
+            if ($null -ne $cmd -and -not [string]::IsNullOrWhiteSpace($cmd.Source)) {
+                Add-JavaCandidatePath -List $candidates -Path $cmd.Source
+            }
+        } catch {}
+    }
+
+    # 4) Registry JavaHome lookup
+    $registryKeys = @(
+        'HKLM:\SOFTWARE\JavaSoft\JDK',
+        'HKLM:\SOFTWARE\JavaSoft\Java Development Kit',
+        'HKLM:\SOFTWARE\JavaSoft\Java Runtime Environment',
+        'HKLM:\SOFTWARE\WOW6432Node\JavaSoft\JDK',
+        'HKLM:\SOFTWARE\WOW6432Node\JavaSoft\Java Development Kit',
+        'HKLM:\SOFTWARE\WOW6432Node\JavaSoft\Java Runtime Environment'
+    )
+
+    foreach ($key in $registryKeys) {
+        try {
+            if (-not (Test-Path $key)) { continue }
+            $props = Get-ItemProperty -Path $key -ErrorAction Stop
+            $currentVersion = [string]$props.CurrentVersion
+            if (-not [string]::IsNullOrWhiteSpace($currentVersion)) {
+                $versionKey = Join-Path $key $currentVersion
+                if (Test-Path $versionKey) {
+                    $versionProps = Get-ItemProperty -Path $versionKey -ErrorAction Stop
+                    Add-JavaCandidatePath -List $candidates -Path (Join-Path ([string]$versionProps.JavaHome) 'bin\java.exe')
+                }
+            }
+            Add-JavaCandidatePath -List $candidates -Path (Join-Path ([string]$props.JavaHome) 'bin\java.exe')
+        } catch {}
+    }
+
+    # 5) Common 64-bit install locations. Depth is intentionally low for speed.
+    $roots = @(
+        "$env:ProgramFiles\Java",
+        "$env:ProgramFiles\Eclipse Adoptium",
+        "$env:ProgramFiles\Microsoft",
+        "$env:ProgramFiles\Amazon Corretto",
+        "${env:ProgramFiles(x86)}\Java",
+        "${env:ProgramFiles(x86)}\Eclipse Adoptium"
+    )
+
+    foreach ($root in $roots) {
+        try {
+            if ([string]::IsNullOrWhiteSpace($root) -or -not (Test-Path -LiteralPath $root)) { continue }
+            $found = @(Get-ChildItem -LiteralPath $root -Recurse -Filter java.exe -File -ErrorAction SilentlyContinue | Select-Object -First 10)
+            foreach ($item in $found) { Add-JavaCandidatePath -List $candidates -Path $item.FullName }
+        } catch {}
+    }
+
+    if ($candidates.Count -gt 0) {
+        $javaPath = $candidates[0]
+        try {
+            $versionOutput = & $javaPath -version 2>&1
+            $versionLine = (($versionOutput | ForEach-Object { [string]$_ }) | Select-Object -First 1)
+            if (-not [string]::IsNullOrWhiteSpace($versionLine)) {
+                Write-Log ("Using Java executable: {0}; Version={1}" -f $javaPath, $versionLine) 'Gray'
+            } else {
+                Write-Log ("Using Java executable: {0}" -f $javaPath) 'Gray'
+            }
+        } catch {
+            Write-Log ("Using Java executable: {0}; version check failed: {1}" -f $javaPath, $_.Exception.Message) 'Yellow'
+        }
+        return $javaPath
+    }
+
+    throw @'
+java.exe was not found.
+
+Fix options:
+1. Install Java Runtime/JDK and reopen PowerShell, then run: java -version
+2. Pass the full path with -SwsJavaPath, for example:
+   -SwsJavaPath "C:\Program Files\Eclipse Adoptium\jdk-17\bin\java.exe"
+3. Use a portable Java/JRE by placing it beside the script as .\jre\bin\java.exe or .\java\bin\java.exe
+'@
 }
 
 function Invoke-SwsPublicApiAuthHelper {
@@ -1866,8 +1986,13 @@ function New-SwsAccessTokenFromServiceAccountJson {
         Write-Log ("SWS helper JAR token generation failed: {0}" -f $helperError) 'Yellow'
         Add-SwsReplicationSummary -Step 'Token Helper' -Status 'FAILED' -Detail $helperError
 
-        # Keep a fallback so the script remains useful if Java/helper has a local issue.
-        # If both helper and direct token fail, the final error will include both paths.
+        # If the helper exists but Java is missing, do not fall back to the direct JWT path.
+        # The direct path has already been unreliable in this environment; fail fast with the exact Java fix.
+        if ($helperError -match 'java\.exe was not found|SwsJavaPath was provided') {
+            throw ("SWS helper JAR is present, but Java is not available. Install Java, add java.exe to PATH, place portable Java at .\jre\bin\java.exe, or pass -SwsJavaPath. HelperError={0}" -f $helperError)
+        }
+
+        # Keep a fallback only for non-Java helper failures.
         try {
             Write-Log 'Falling back to direct PowerShell SWS private_key_jwt token generation...' 'Yellow'
             return New-SwsAccessTokenDirectFromServiceAccountJson -JsonPath $jsonPath -TenantId $tenantId
