@@ -14,7 +14,8 @@ Purpose
 - No psPAS dependency
 - Optional SWS policy replication from a reference SWS Identity app key
 - Automatic SWS API token creation from service-account JSON stored beside this script
-- Self-contained SWS token generation using private_key_jwt or client_secret_jwt; no Java/JAR dependency; retries client_id/audience combinations
+- Self-contained SWS token generation using private_key_jwt or client_secret_jwt; no Java/JAR dependency; uses CyberArk-documented SWS private_key_jwt flow, with compatibility retries
+- Fixes PowerShell 5.1 empty generic List binding issue during token candidate generation
 - Improved SWS tenant detection from -SwsTenantId, SWS_TENANT_ID, JSON, or Identity tenant URL
 
 Why this version
@@ -1234,10 +1235,13 @@ function Get-SwsJsonValue {
 
 function Add-UniqueStringValue {
     param(
-        [Parameter(Mandatory)][System.Collections.Generic.List[string]]$List,
+        # PowerShell 5.1 rejects an empty generic List[T] when a parameter is Mandatory.
+        # Do not make this mandatory; this function is specifically used to add the first item to an empty list.
+        [AllowNull()][System.Collections.Generic.List[string]]$List,
         [Parameter()][string]$Value
     )
 
+    if ($null -eq $List) { throw 'Internal error: Add-UniqueStringValue received a null list.' }
     if ([string]::IsNullOrWhiteSpace($Value)) { return }
     $v = $Value.Trim()
     if (-not $List.Contains($v)) { [void]$List.Add($v) }
@@ -1280,13 +1284,16 @@ function Get-SwsServiceAccountClientIdCandidates {
         $value = ([string]$raw).Trim()
         if ([string]::IsNullOrWhiteSpace($value)) { continue }
 
-        # Exact value first. If the JSON already contains a fully-qualified client_id, this is the correct one.
-        Add-UniqueStringValue -List $candidates -Value $value
+        if ($value -match '\.ExternalServiceAccount$') {
+            # JSON already contains the fully-qualified OAuth client_id.
+            Add-UniqueStringValue -List $candidates -Value $value
+            continue
+        }
 
-        if ($value -match '\.ExternalServiceAccount$') { continue }
-
-        # Most common CyberArk SWS service-account client_id shape.
+        # CyberArk docs require iss/sub to be: <TenantID>.<ServiceAccountID>.ExternalServiceAccount.
+        # Try that official shape first, then raw value as a last-resort compatibility attempt.
         Add-UniqueStringValue -List $candidates -Value ('{0}.{1}.ExternalServiceAccount' -f $TenantId.Trim(), $value)
+        Add-UniqueStringValue -List $candidates -Value $value
     }
 
     # Scan all strings in the JSON for a fully-qualified ExternalServiceAccount value.
@@ -1379,12 +1386,13 @@ function Get-SwsAudienceCandidates {
 
     $audiences = New-Object System.Collections.Generic.List[string]
 
-    # For OAuth private_key_jwt/client_secret_jwt, many authorization servers expect aud = token endpoint.
-    Add-UniqueStringValue -List $audiences -Value ([string]$Endpoints.TokenEndpoint)
-
-    # Some servers accept/expect issuer/realm as audience. Keep these as fallback attempts.
-    Add-UniqueStringValue -List $audiences -Value ([string]$Endpoints.Issuer)
+    # CyberArk SWS docs specify aud as the authorization server endpoint, for example:
+    # https://auth.alero.io/auth/realms/serviceaccounts
     Add-UniqueStringValue -List $audiences -Value ([string]$Endpoints.RealmBase)
+    Add-UniqueStringValue -List $audiences -Value ([string]$Endpoints.Issuer)
+
+    # Keep token endpoint as a last-resort compatibility attempt only.
+    Add-UniqueStringValue -List $audiences -Value ([string]$Endpoints.TokenEndpoint)
 
     return @($audiences)
 }
@@ -1419,7 +1427,8 @@ function New-SwsJwtAssertion {
         aud = $Audience
         iss = $ClientId
         sub = $ClientId
-        nbf = ($now - 60)
+        # CyberArk's SWS sample uses nbf = 0. Use the documented value for maximum compatibility.
+        nbf = 0
         exp = $exp
         iat = $now
         jti = $jti
@@ -1470,14 +1479,20 @@ function New-SwsJwtAssertion {
 function Invoke-SwsTokenRequest {
     param(
         [Parameter(Mandatory)][string]$TokenEndpoint,
-        [Parameter(Mandatory)]$Assertion
+        [Parameter(Mandatory)]$Assertion,
+        [switch]$IncludeClientId
     )
 
+    # CyberArk's documented SWS token request body requires only these three fields.
+    # Some OAuth servers tolerate/expect client_id, so the caller can retry with it as a fallback.
     $body = @{
         grant_type            = 'client_credentials'
-        client_id             = $Assertion.ClientId
         client_assertion_type = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer'
         client_assertion      = $Assertion.Jwt
+    }
+
+    if ($IncludeClientId.IsPresent) {
+        $body['client_id'] = $Assertion.ClientId
     }
 
     $params = @{
@@ -1512,39 +1527,50 @@ function New-SwsAccessTokenDirectFromServiceAccountJson {
     $attempt = 0
     $errors = New-Object System.Collections.Generic.List[string]
 
+    if ($TenantId -match '^[a-z]{3}\d{4}$') {
+        Write-Log ("WARNING: SWS tenant ID '{0}' looks like the Identity tenant short name. CyberArk SWS private_key_jwt docs show TenantID as a 32-character ID/GUID used in <TenantID>.<ServiceAccountID>.ExternalServiceAccount. If token attempts return 401, get the real SWS/Identity tenant ID and pass -SwsTenantId." -f $TenantId) 'Yellow'
+    }
+
     foreach ($clientId in $clientIdCandidates) {
         foreach ($audience in $audienceCandidates) {
-            $attempt++
-            try {
-                $assertion = New-SwsJwtAssertion -JsonObject $json -ClientId $clientId -Audience $audience
-                Write-Log ("SWS token attempt #{0}: Alg={1}; ClientId={2}; Audience={3}" -f $attempt, $assertion.Alg, $clientId, $audience) 'Gray'
-                $resp = Invoke-SwsTokenRequest -TokenEndpoint $endpoints.TokenEndpoint -Assertion $assertion
-
-                $token = [string]$resp.access_token
-                if ([string]::IsNullOrWhiteSpace($token)) {
-                    throw ('Token response did not contain access_token. Response={0}' -f (ConvertTo-CompressedJson -Object $resp))
-                }
-
-                $expiresIn = [string]$resp.expires_in
-                if ([string]::IsNullOrWhiteSpace($expiresIn)) { $expiresIn = 'unknown' }
-                Write-Log ("SWS API access token created successfully from service-account JSON. ExpiresIn={0}s; WinningClientId={1}; WinningAudience={2}" -f $expiresIn, $clientId, $audience) 'Green'
-                Add-SwsReplicationSummary -Step 'Token' -Status 'SUCCESS' -Detail ("Token created directly using JSON={0}; Alg={1}; ExpiresIn={2}; ClientId={3}; Audience={4}" -f (Split-Path -Leaf $JsonPath), $assertion.Alg, $expiresIn, $clientId, $audience)
-                return $token
-            } catch {
-                $status = $null
-                $responseBody = ''
-                try { $status = [int]$_.Exception.Response.StatusCode.value__ } catch {}
+            foreach ($includeClientId in @($false, $true)) {
+                $attempt++
                 try {
-                    $stream = $_.Exception.Response.GetResponseStream()
-                    if ($null -ne $stream) {
-                        $reader = New-Object System.IO.StreamReader($stream)
-                        $responseBody = $reader.ReadToEnd()
+                    $assertion = New-SwsJwtAssertion -JsonObject $json -ClientId $clientId -Audience $audience
+                    $cidMode = if ($includeClientId) { 'with-client_id' } else { 'documented-no-client_id' }
+                    Write-Log ("SWS token attempt #{0}: Alg={1}; ClientId={2}; Audience={3}; BodyMode={4}" -f $attempt, $assertion.Alg, $clientId, $audience, $cidMode) 'Gray'
+                    if ($includeClientId) {
+                        $resp = Invoke-SwsTokenRequest -TokenEndpoint $endpoints.TokenEndpoint -Assertion $assertion -IncludeClientId
+                    } else {
+                        $resp = Invoke-SwsTokenRequest -TokenEndpoint $endpoints.TokenEndpoint -Assertion $assertion
                     }
-                } catch {}
-                if ([string]::IsNullOrWhiteSpace($responseBody)) { $responseBody = $_.Exception.Message }
-                $msg = ("Attempt={0}; Status={1}; ClientId={2}; Audience={3}; Error={4}" -f $attempt, $status, $clientId, $audience, $responseBody)
-                $errors.Add($msg)
-                Write-Log ("SWS token attempt #{0} failed. Status={1}; ClientId={2}; Audience={3}; Error={4}" -f $attempt, $status, $clientId, $audience, $responseBody) 'Yellow'
+
+                    $token = [string]$resp.access_token
+                    if ([string]::IsNullOrWhiteSpace($token)) {
+                        throw ('Token response did not contain access_token. Response={0}' -f (ConvertTo-CompressedJson -Object $resp))
+                    }
+
+                    $expiresIn = [string]$resp.expires_in
+                    if ([string]::IsNullOrWhiteSpace($expiresIn)) { $expiresIn = 'unknown' }
+                    Write-Log ("SWS API access token created successfully from service-account JSON. ExpiresIn={0}s; WinningClientId={1}; WinningAudience={2}; BodyMode={3}" -f $expiresIn, $clientId, $audience, $cidMode) 'Green'
+                    Add-SwsReplicationSummary -Step 'Token' -Status 'SUCCESS' -Detail ("Token created directly using JSON={0}; Alg={1}; ExpiresIn={2}; ClientId={3}; Audience={4}; BodyMode={5}" -f (Split-Path -Leaf $JsonPath), $assertion.Alg, $expiresIn, $clientId, $audience, $cidMode)
+                    return $token
+                } catch {
+                    $status = $null
+                    $responseBody = ''
+                    try { $status = [int]$_.Exception.Response.StatusCode.value__ } catch {}
+                    try {
+                        $stream = $_.Exception.Response.GetResponseStream()
+                        if ($null -ne $stream) {
+                            $reader = New-Object System.IO.StreamReader($stream)
+                            $responseBody = $reader.ReadToEnd()
+                        }
+                    } catch {}
+                    if ([string]::IsNullOrWhiteSpace($responseBody)) { $responseBody = $_.Exception.Message }
+                    $msg = ("Attempt={0}; Status={1}; ClientId={2}; Audience={3}; IncludeClientId={4}; Error={5}" -f $attempt, $status, $clientId, $audience, $includeClientId, $responseBody)
+                    [void]$errors.Add($msg)
+                    Write-Log ("SWS token attempt #{0} failed. Status={1}; ClientId={2}; Audience={3}; IncludeClientId={4}; Error={5}" -f $attempt, $status, $clientId, $audience, $includeClientId, $responseBody) 'Yellow'
+                }
             }
         }
     }
