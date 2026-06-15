@@ -12,6 +12,7 @@ Purpose
 - Apply non-script settings and the Browser Extension (advanced) login workflow
 - No PAS validation
 - No psPAS dependency
+- Optional SWS policy replication from a reference SWS Identity app key
 
 Why this version
 - This is based on the known working version
@@ -70,6 +71,23 @@ loginData.order = [
 ];
 '@,
 
+
+    # SWS policy replication
+    # ReferenceSwsAppKey is the existing SWS/Identity app key whose policy settings should be used as the source.
+    [bool]$ReplicateSwsPolicy          = $true,
+    [string]$ReferenceSwsAppKey        = '3c696971-5812-430a-88b1-417c6be2628f',
+    [string]$SwsAccessToken            = '',
+    [string]$SwsApiBaseUrl             = 'https://api.alero.io/v2-edge',
+    [string]$SwsProxyAddress           = '',
+    [switch]$SwsProxyUseDefaultCredentials,
+    [int]$SwsPolicyReadyWaitSeconds    = 600,
+    [int]$SwsPolicyPollIntervalSeconds = 30,
+    [switch]$CopySwsPolicyStatus,
+    [switch]$SkipSwsDefaultSecurityLayerCopy,
+    [switch]$SkipSwsApplicationConfigurationCopy,
+    [switch]$WhatIfSwsCopy,
+    [switch]$FailOnSwsReplicationError,
+
     # Timing / retries
     [int]$PreUpdateDelaySeconds        = 15,
     [int]$UpdateRetryWindowSeconds     = 300,
@@ -87,6 +105,9 @@ $script:IdentityWebSession        = $null
 $script:RegularCredential         = $null
 $script:RegularUserPlainPassword  = $null
 $script:ReportRows                = @()
+
+$script:SwsAccessTokenToUse        = $null
+$script:SwsReplicationSummary      = @()
 
 function Write-Log {
     param(
@@ -672,6 +693,499 @@ function Invoke-PostCreateUpdatePhase {
     }
 }
 
+
+function Add-SwsReplicationSummary {
+    param(
+        [string]$Step,
+        [string]$Status,
+        [string]$Detail
+    )
+
+    $script:SwsReplicationSummary += [pscustomobject]@{
+        Timestamp = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+        Step      = $Step
+        Status    = $Status
+        Detail    = $Detail
+    }
+
+    Add-ReportRow -Step ("SWS - {0}" -f $Step) -Status $Status -Detail $Detail
+}
+
+function Join-UrlPath {
+    param(
+        [Parameter(Mandatory)][string]$BaseUrl,
+        [Parameter(Mandatory)][string]$RelativePath
+    )
+
+    return ($BaseUrl.TrimEnd('/') + '/' + $RelativePath.TrimStart('/'))
+}
+
+function ConvertTo-CompressedJson {
+    param([Parameter()]$Object)
+    if ($null -eq $Object) { return '' }
+    try { return ($Object | ConvertTo-Json -Depth 100 -Compress) } catch { return [string]$Object }
+}
+
+function Get-DirectPropertyValue {
+    param(
+        [Parameter(Mandatory)]$Object,
+        [Parameter(Mandatory)][string[]]$PropertyNames
+    )
+
+    if ($null -eq $Object) { return $null }
+
+    foreach ($name in $PropertyNames) {
+        if ($Object -is [System.Collections.IDictionary]) {
+            if ($Object.Contains($name)) { return $Object[$name] }
+        } elseif ($Object.PSObject -and $Object.PSObject.Properties.Name -contains $name) {
+            return $Object.$name
+        }
+    }
+
+    return $null
+}
+
+function Get-SwsObjectArrayCandidate {
+    param([Parameter()]$Object)
+
+    if ($null -eq $Object) { return @() }
+
+    if ($Object -is [System.Array]) { return @($Object) }
+
+    if (($Object -is [System.Collections.IEnumerable]) -and -not ($Object -is [string]) -and -not ($Object.PSObject.Properties.Name.Count -gt 0)) {
+        return @($Object)
+    }
+
+    $candidateNames = @('policies','items','data','result','results','content','value','applications')
+    foreach ($name in $candidateNames) {
+        $value = Get-DirectPropertyValue -Object $Object -PropertyNames @($name)
+        if ($null -ne $value) {
+            if ($value -is [System.Array]) { return @($value) }
+            if (($value -is [System.Collections.IEnumerable]) -and -not ($value -is [string])) { return @($value) }
+            return @($value)
+        }
+    }
+
+    return @($Object)
+}
+
+function Get-SwsPolicyId {
+    param([Parameter()]$Policy)
+
+    $id = Get-DirectPropertyValue -Object $Policy -PropertyNames @('id','policyId','policyID','policy_id','uuid','policyUuid','policyUUID','_id')
+    if ($null -ne $id -and -not [string]::IsNullOrWhiteSpace([string]$id)) {
+        return [string]$id
+    }
+
+    return $null
+}
+
+function Get-SwsPolicyName {
+    param([Parameter()]$Policy)
+
+    $name = Get-DirectPropertyValue -Object $Policy -PropertyNames @('name','policyName','displayName','title','applicationName','appName')
+    if ($null -ne $name -and -not [string]::IsNullOrWhiteSpace([string]$name)) {
+        return [string]$name
+    }
+
+    return '<unknown>'
+}
+
+function Get-NestedPropertyValueByName {
+    param(
+        [Parameter()]$Object,
+        [Parameter(Mandatory)][string[]]$PropertyNames,
+        [int]$MaxDepth = 8
+    )
+
+    if ($null -eq $Object) { return $null }
+
+    $queue = New-Object System.Collections.Queue
+    $queue.Enqueue([pscustomobject]@{ Value = $Object; Depth = 0 })
+
+    while ($queue.Count -gt 0) {
+        $entry = $queue.Dequeue()
+        $current = $entry.Value
+        $depth = [int]$entry.Depth
+
+        if ($null -eq $current -or $depth -gt $MaxDepth) { continue }
+
+        foreach ($name in $PropertyNames) {
+            $direct = Get-DirectPropertyValue -Object $current -PropertyNames @($name)
+            if ($null -ne $direct) { return $direct }
+        }
+
+        if ($current -is [System.Collections.IDictionary]) {
+            foreach ($k in $current.Keys) {
+                $v = $current[$k]
+                if ($null -ne $v -and -not ($v -is [string]) -and (($v -is [System.Collections.IEnumerable]) -or ($v.PSObject.Properties.Name.Count -gt 0))) {
+                    $queue.Enqueue([pscustomobject]@{ Value = $v; Depth = ($depth + 1) })
+                }
+            }
+        } elseif (($current -is [System.Collections.IEnumerable]) -and -not ($current -is [string])) {
+            foreach ($item in $current) {
+                if ($null -ne $item) {
+                    $queue.Enqueue([pscustomobject]@{ Value = $item; Depth = ($depth + 1) })
+                }
+            }
+        } elseif ($current.PSObject) {
+            foreach ($prop in $current.PSObject.Properties) {
+                $v = $prop.Value
+                if ($null -ne $v -and -not ($v -is [string]) -and (($v -is [System.Collections.IEnumerable]) -or ($v.PSObject.Properties.Name.Count -gt 0))) {
+                    $queue.Enqueue([pscustomobject]@{ Value = $v; Depth = ($depth + 1) })
+                }
+            }
+        }
+    }
+
+    return $null
+}
+
+function Copy-ObjectJsonRoundTrip {
+    param([Parameter()]$Object)
+
+    if ($null -eq $Object) { return $null }
+    return ($Object | ConvertTo-Json -Depth 100 | ConvertFrom-Json)
+}
+
+function Remove-SwsSourceAppKeyProperties {
+    param([Parameter()]$Object)
+
+    if ($null -eq $Object) { return }
+
+    $unsafeNamePattern = '^(appKey|applicationKey|identityAppKey|identityApplicationKey|identityApplicationId|idpAppKey|idpApplicationKey|sourceAppKey|sourceApplicationKey)$'
+
+    if ($Object -is [System.Collections.IDictionary]) {
+        $keys = @($Object.Keys)
+        foreach ($k in $keys) {
+            if ([string]$k -match $unsafeNamePattern) {
+                $Object.Remove($k)
+            } else {
+                Remove-SwsSourceAppKeyProperties -Object $Object[$k]
+            }
+        }
+    } elseif (($Object -is [System.Collections.IEnumerable]) -and -not ($Object -is [string])) {
+        foreach ($item in $Object) { Remove-SwsSourceAppKeyProperties -Object $item }
+    } elseif ($Object.PSObject) {
+        $props = @($Object.PSObject.Properties)
+        foreach ($prop in $props) {
+            if ($prop.Name -match $unsafeNamePattern) {
+                try { $Object.PSObject.Properties.Remove($prop.Name) } catch {}
+            } else {
+                Remove-SwsSourceAppKeyProperties -Object $prop.Value
+            }
+        }
+    }
+}
+
+function Initialize-SwsAccessToken {
+    if (-not [string]::IsNullOrWhiteSpace($script:SwsAccessTokenToUse)) { return }
+
+    if (-not [string]::IsNullOrWhiteSpace($SwsAccessToken)) {
+        $script:SwsAccessTokenToUse = $SwsAccessToken
+        return
+    }
+
+    $secureToken = Read-Host 'Enter SWS API Bearer access token from your SWS service account' -AsSecureString
+    $script:SwsAccessTokenToUse = Convert-SecureStringToPlainText -SecureString $secureToken
+
+    if ([string]::IsNullOrWhiteSpace($script:SwsAccessTokenToUse)) {
+        throw 'SWS access token is empty. Provide -SwsAccessToken or paste a token when prompted.'
+    }
+}
+
+function Invoke-SwsApiRequest {
+    param(
+        [Parameter(Mandatory)][ValidateSet('GET','POST','PUT','DELETE')][string]$Method,
+        [Parameter(Mandatory)][string]$RelativePath,
+        [Parameter()]$Body
+    )
+
+    Initialize-SwsAccessToken
+
+    $uri = Join-UrlPath -BaseUrl $SwsApiBaseUrl -RelativePath $RelativePath
+    $headers = @{
+        Authorization = ('Bearer {0}' -f $script:SwsAccessTokenToUse)
+        Accept        = 'application/json'
+        'Content-Type'= 'application/json'
+    }
+
+    $params = @{
+        Method      = $Method
+        Uri         = $uri
+        Headers     = $headers
+        ErrorAction = 'Stop'
+    }
+
+    if ($null -ne $Body) {
+        $params['ContentType'] = 'application/json'
+        $params['Body'] = ($Body | ConvertTo-Json -Depth 100)
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($SwsProxyAddress)) {
+        $params['Proxy'] = $SwsProxyAddress
+        if ($SwsProxyUseDefaultCredentials.IsPresent) { $params['ProxyUseDefaultCredentials'] = $true }
+    }
+
+    try {
+        return Invoke-RestMethod @params
+    } catch {
+        $status = $null
+        $responseBody = ''
+        try { $status = [int]$_.Exception.Response.StatusCode.value__ } catch {}
+        try {
+            $stream = $_.Exception.Response.GetResponseStream()
+            if ($null -ne $stream) {
+                $reader = New-Object System.IO.StreamReader($stream)
+                $responseBody = $reader.ReadToEnd()
+            }
+        } catch {}
+
+        if ([string]::IsNullOrWhiteSpace($responseBody)) { $responseBody = $_.Exception.Message }
+        throw ("SWS API call failed. Method={0}; Uri={1}; Status={2}; Error={3}" -f $Method, $uri, $status, $responseBody)
+    }
+}
+
+function Get-SwsPolicies {
+    return Invoke-SwsApiRequest -Method GET -RelativePath '/sws/policies'
+}
+
+function Get-SwsPolicyById {
+    param([Parameter(Mandatory)][string]$PolicyId)
+
+    $paths = @(
+        ("/sws/policies/{0}?includeSecurityLayers=true&includeMembers=true&includeApplicationConfiguration=true" -f [uri]::EscapeDataString($PolicyId)),
+        ("/sws/policies/{0}?securityLayers=true&members=true&applicationConfiguration=true" -f [uri]::EscapeDataString($PolicyId)),
+        ("/sws/policies/{0}" -f [uri]::EscapeDataString($PolicyId))
+    )
+
+    $lastError = $null
+    foreach ($path in $paths) {
+        try { return Invoke-SwsApiRequest -Method GET -RelativePath $path } catch { $lastError = $_.Exception.Message }
+    }
+
+    throw $lastError
+}
+
+function Find-SwsPolicyByTextOnce {
+    param(
+        [Parameter(Mandatory)][string[]]$SearchTexts,
+        [switch]$FetchDetails
+    )
+
+    $cleanSearchTexts = @($SearchTexts | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($cleanSearchTexts.Count -eq 0) { throw 'No search text was provided for SWS policy lookup.' }
+
+    $policyListResponse = Get-SwsPolicies
+    $policyItems = @(Get-SwsObjectArrayCandidate -Object $policyListResponse)
+
+    foreach ($item in $policyItems) {
+        $policyId = Get-SwsPolicyId -Policy $item
+        $policyToSearch = $item
+
+        if ($FetchDetails.IsPresent -and -not [string]::IsNullOrWhiteSpace($policyId)) {
+            try { $policyToSearch = Get-SwsPolicyById -PolicyId $policyId } catch {}
+        }
+
+        $json = ConvertTo-CompressedJson -Object $policyToSearch
+        foreach ($text in $cleanSearchTexts) {
+            if ($json -match [regex]::Escape($text)) {
+                if ([string]::IsNullOrWhiteSpace($policyId)) { $policyId = Get-SwsPolicyId -Policy $policyToSearch }
+                return [pscustomobject]@{
+                    PolicyId    = $policyId
+                    Policy      = $policyToSearch
+                    MatchedText = $text
+                    Name        = Get-SwsPolicyName -Policy $policyToSearch
+                }
+            }
+        }
+    }
+
+    if (-not $FetchDetails.IsPresent) {
+        return Find-SwsPolicyByTextOnce -SearchTexts $cleanSearchTexts -FetchDetails
+    }
+
+    return $null
+}
+
+function Wait-SwsPolicyByText {
+    param(
+        [Parameter(Mandatory)][string[]]$SearchTexts,
+        [Parameter(Mandatory)][string]$Purpose,
+        [int]$MaxWaitSeconds = 300,
+        [int]$PollIntervalSeconds = 30
+    )
+
+    $deadline = (Get-Date).AddSeconds($MaxWaitSeconds)
+    $attempt = 0
+    $lastError = $null
+
+    while ((Get-Date) -lt $deadline) {
+        $attempt++
+        try {
+            Write-Log ("SWS lookup for {0}, attempt #{1}..." -f $Purpose, $attempt) 'Gray'
+            $match = Find-SwsPolicyByTextOnce -SearchTexts $SearchTexts
+            if ($null -ne $match) {
+                Write-Log ("SWS lookup for {0} succeeded. PolicyId={1}; Name={2}; MatchedText={3}" -f $Purpose, $match.PolicyId, $match.Name, $match.MatchedText) 'Green'
+                return $match
+            }
+        } catch {
+            $lastError = $_.Exception.Message
+            Write-Log ("SWS lookup for {0} failed on attempt #{1}: {2}" -f $Purpose, $attempt, $lastError) 'Yellow'
+        }
+
+        Start-Sleep -Seconds $PollIntervalSeconds
+    }
+
+    if ([string]::IsNullOrWhiteSpace($lastError)) { $lastError = 'No matching SWS policy was found before timeout.' }
+    throw ("SWS lookup for {0} did not complete within {1} seconds. Last error: {2}" -f $Purpose, $MaxWaitSeconds, $lastError)
+}
+
+function Invoke-SwsPutIfPayloadExists {
+    param(
+        [Parameter(Mandatory)][string]$TargetPolicyId,
+        [Parameter(Mandatory)][string]$RelativePath,
+        [Parameter(Mandatory)][string]$SectionName,
+        [Parameter()]$Payload
+    )
+
+    if ($null -eq $Payload) {
+        Write-Log ("Skipping SWS {0}; source payload section was not found." -f $SectionName) 'Yellow'
+        Add-SwsReplicationSummary -Step $SectionName -Status 'SKIPPED' -Detail 'Source payload section was not found.'
+        return
+    }
+
+    if ($WhatIfSwsCopy.IsPresent) {
+        Write-Log ("WHATIF: Would update SWS {0} on target policy {1}." -f $SectionName, $TargetPolicyId) 'Yellow'
+        Add-SwsReplicationSummary -Step $SectionName -Status 'WHATIF' -Detail ("TargetPolicyId={0}; Payload={1}" -f $TargetPolicyId, (ConvertTo-CompressedJson -Object $Payload))
+        return
+    }
+
+    try {
+        $null = Invoke-SwsApiRequest -Method PUT -RelativePath $RelativePath -Body $Payload
+        Write-Log ("Updated SWS {0} on target policy {1}." -f $SectionName, $TargetPolicyId) 'Green'
+        Add-SwsReplicationSummary -Step $SectionName -Status 'SUCCESS' -Detail ("TargetPolicyId={0}" -f $TargetPolicyId)
+    } catch {
+        Write-Log ("Failed to update SWS {0} on target policy {1}: {2}" -f $SectionName, $TargetPolicyId, $_.Exception.Message) 'Yellow'
+        Add-SwsReplicationSummary -Step $SectionName -Status 'FAILED' -Detail $_.Exception.Message
+        if ($FailOnSwsReplicationError.IsPresent) { throw }
+    }
+}
+
+function Copy-SwsReferencePolicyToTarget {
+    param(
+        [Parameter(Mandatory)]$SourcePolicyMatch,
+        [Parameter(Mandatory)]$TargetPolicyMatch
+    )
+
+    $sourcePolicyId = $SourcePolicyMatch.PolicyId
+    $targetPolicyId = $TargetPolicyMatch.PolicyId
+
+    if ([string]::IsNullOrWhiteSpace($sourcePolicyId)) { throw 'Source SWS policy ID could not be resolved.' }
+    if ([string]::IsNullOrWhiteSpace($targetPolicyId)) { throw 'Target SWS policy ID could not be resolved.' }
+
+    Write-Log ("Preparing to copy SWS policy settings from source PolicyId={0} to target PolicyId={1}." -f $sourcePolicyId, $targetPolicyId) 'Cyan'
+
+    $sourceDetails = Get-SwsPolicyById -PolicyId $sourcePolicyId
+
+    if ($CopySwsPolicyStatus.IsPresent) {
+        $status = Get-NestedPropertyValueByName -Object $sourceDetails -PropertyNames @('status','enabled','active','state') -MaxDepth 3
+        if ($null -ne $status) {
+            $statusPayload = $null
+            $sourceStatusDirectName = $null
+            foreach ($candidate in @('status','enabled','active','state')) {
+                $direct = Get-DirectPropertyValue -Object $sourceDetails -PropertyNames @($candidate)
+                if ($null -ne $direct) { $sourceStatusDirectName = $candidate; break }
+            }
+            if ([string]::IsNullOrWhiteSpace($sourceStatusDirectName)) { $sourceStatusDirectName = 'status' }
+            $statusPayload = @{}
+            $statusPayload[$sourceStatusDirectName] = $status
+
+            Invoke-SwsPutIfPayloadExists `
+                -TargetPolicyId $targetPolicyId `
+                -RelativePath ("/sws/policies/{0}" -f [uri]::EscapeDataString($targetPolicyId)) `
+                -SectionName 'Policy Status' `
+                -Payload $statusPayload
+        } else {
+            Write-Log 'Skipping SWS policy status; source status field was not found.' 'Yellow'
+            Add-SwsReplicationSummary -Step 'Policy Status' -Status 'SKIPPED' -Detail 'Source status field was not found.'
+        }
+    }
+
+    if (-not $SkipSwsDefaultSecurityLayerCopy.IsPresent) {
+        $defaultLayers = Get-NestedPropertyValueByName -Object $sourceDetails -PropertyNames @('defaultSecurityLayers','default_security_layers','defaultLayers','default_security_layers_settings','securityLayersDefault') -MaxDepth 5
+        $defaultLayersPayload = Copy-ObjectJsonRoundTrip -Object $defaultLayers
+
+        Invoke-SwsPutIfPayloadExists `
+            -TargetPolicyId $targetPolicyId `
+            -RelativePath ("/sws/policies/{0}/default-security-layers" -f [uri]::EscapeDataString($targetPolicyId)) `
+            -SectionName 'Default Security Layers' `
+            -Payload $defaultLayersPayload
+    }
+
+    if (-not $SkipSwsApplicationConfigurationCopy.IsPresent) {
+        $appConfig = Get-NestedPropertyValueByName -Object $sourceDetails -PropertyNames @('applicationConfiguration','application_configuration','applicationConfig','appConfiguration','configuration') -MaxDepth 5
+        $appConfigPayload = Copy-ObjectJsonRoundTrip -Object $appConfig
+        Remove-SwsSourceAppKeyProperties -Object $appConfigPayload
+
+        Invoke-SwsPutIfPayloadExists `
+            -TargetPolicyId $targetPolicyId `
+            -RelativePath ("/sws/policies/{0}/configuration" -f [uri]::EscapeDataString($targetPolicyId)) `
+            -SectionName 'Application Configuration' `
+            -Payload $appConfigPayload
+    }
+}
+
+function Invoke-SwsPolicyReplicationForCreatedApp {
+    param([Parameter(Mandatory)][string]$CreatedAppRowKey)
+
+    if (-not $ReplicateSwsPolicy) {
+        Write-Log 'SWS policy replication is disabled.' 'Gray'
+        return
+    }
+
+    if ([string]::IsNullOrWhiteSpace($ReferenceSwsAppKey)) {
+        throw 'ReferenceSwsAppKey is empty. Provide the existing SWS app key to use as the policy reference.'
+    }
+
+    Write-Log ("Starting SWS policy replication. ReferenceSwsAppKey={0}" -f $ReferenceSwsAppKey) 'Cyan'
+    Add-SwsReplicationSummary -Step 'Start' -Status 'INFO' -Detail ("ReferenceSwsAppKey={0}; CreatedRowKey={1}; Name={2}; DisplayName={3}" -f $ReferenceSwsAppKey, $CreatedAppRowKey, $Name, $DisplayName)
+
+    $sourceMatch = Wait-SwsPolicyByText `
+        -SearchTexts @($ReferenceSwsAppKey) `
+        -Purpose 'reference policy by app key' `
+        -MaxWaitSeconds $SwsPolicyReadyWaitSeconds `
+        -PollIntervalSeconds $SwsPolicyPollIntervalSeconds
+
+    $targetSearches = @(
+        @($CreatedAppRowKey),
+        @($Name),
+        @($DisplayName)
+    )
+
+    $targetMatch = $null
+    foreach ($searchGroup in $targetSearches) {
+        try {
+            $targetMatch = Wait-SwsPolicyByText `
+                -SearchTexts $searchGroup `
+                -Purpose ('target policy for created Identity app using search text {0}' -f ($searchGroup -join ',')) `
+                -MaxWaitSeconds $SwsPolicyReadyWaitSeconds `
+                -PollIntervalSeconds $SwsPolicyPollIntervalSeconds
+            if ($null -ne $targetMatch) { break }
+        } catch {
+            Write-Log $_.Exception.Message 'Yellow'
+        }
+    }
+
+    if ($null -eq $targetMatch) {
+        throw 'Target SWS policy for the newly created Identity app could not be found by RowKey, Name, or DisplayName.'
+    }
+
+    Copy-SwsReferencePolicyToTarget -SourcePolicyMatch $sourceMatch -TargetPolicyMatch $targetMatch
+    Add-SwsReplicationSummary -Step 'Overall' -Status 'SUCCESS' -Detail ("SourcePolicyId={0}; TargetPolicyId={1}" -f $sourceMatch.PolicyId, $targetMatch.PolicyId)
+    Write-Log 'SWS policy replication completed.' 'Green'
+}
+
 $createdAppRowKey = $null
 
 try {
@@ -694,6 +1208,9 @@ try {
 
     # Phase 2: fresh session update
     Invoke-PostCreateUpdatePhase -CreatedRowKey $createdAppRowKey
+
+    # Phase 3: optional SWS policy replication from reference app key
+    Invoke-SwsPolicyReplicationForCreatedApp -CreatedAppRowKey $createdAppRowKey
 
     Write-Log ("Create + update completed successfully. Created app row key is '{0}'." -f $createdAppRowKey) 'Green'
     Add-ReportRow -Step 'Overall' -Status 'SUCCESS' -Detail ("CreatedRowKey={0}; FinalName={1}; Description={2}" -f $createdAppRowKey, $Name, $Description)
