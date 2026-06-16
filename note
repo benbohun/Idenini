@@ -1,301 +1,383 @@
 <#
-Test_SWS_TokenGeneration_Only_V6_NoSilentClose.ps1
+Test_SWS_TokenGeneration_Only_V7_AllTenantCandidates.ps1
 
-Purpose
-- ONLY test CyberArk SWS service-account token generation.
+Purpose:
+- Token-generation-only diagnostic for CyberArk Secure Web Sessions (SWS) service accounts.
 - Does NOT create Identity apps.
-- Does NOT update Identity apps.
-- Does NOT call/copy SWS policies.
-- Uses CyberArk public API auth helper JAR.
+- Does NOT call SWS policy APIs unless -ValidateAgainstSwsApi is used.
+- Uses CyberArk public-api-auth-helper*.jar and the SWS service-account JSON.
+- Tries all likely tenant formats, including Identity tenant alias aat4012 and SWS tenant GUID variants.
 - PowerShell 5.1 compatible.
-- Prevents silent-close by logging everything and pausing at the end.
 
-Expected files in same folder as this script:
+Expected files in same folder as script:
 - public-api-auth-helper-*.jar
-- SWS service-account JSON file containing serviceAccountId, privateKey, discoveryURI
-- Portable Java path default below, or pass -JavaPath
+- one SWS service-account JSON file containing serviceAccountId/privateKey/discoveryURI
+- optional portable Java path below, already defaulted for your folder
 #>
 
 [CmdletBinding()]
 param(
-    [string]$TenantId = 'eef31a0b-0e67-4024-a644-be08614190db',
     [string]$JavaPath = 'E:\Installation Media\Script\OnboardScript\SWS_Application_Script\jdk-25.0.3+9\bin\java.exe',
-    [string]$JsonPath = '',
-    [string]$HelperJarPath = '',
-    [int]$TimeoutSeconds = 90,
+    [string]$SwsAuthHelperJarPath = '',
+    [string]$SwsServiceAccountJsonPath = '',
+
+    # Try short Identity tenant alias AND long SWS tenant GUID formats.
+    [string[]]$TenantCandidates = @(
+        'aat4012',
+        'eef31a0b-0e67-4024-a644-be08614190db',
+        'eef31a0b0e674024a644be08614190db'
+    ),
+
+    [int]$TimeoutSeconds = 60,
     [switch]$ShowToken,
+    [switch]$SaveTokenToFile,
+    [switch]$ValidateAgainstSwsApi,
+    [string]$SwsApiBaseUrl = 'https://api.alero.io/v2-edge',
+
+    # Optional Java proxy flags for helper JAR. Leave blank unless needed.
+    # Example: -ProxyAddress 'http://proxy.company.com:8080'
+    [string]$ProxyAddress = '',
+
     [switch]$NoPause
 )
 
-$script:ScriptRoot = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
-$script:LogPath = Join-Path $script:ScriptRoot 'SWS_TokenGeneration_Only_V6.log'
-$script:RunStamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+$ErrorActionPreference = 'Stop'
+$script:HadFatal = $false
+
+function Get-ScriptRootSafe {
+    if ($PSScriptRoot) { return $PSScriptRoot }
+    return (Split-Path -Parent $MyInvocation.MyCommand.Path)
+}
+
+$ScriptRoot = Get-ScriptRootSafe
+$LogPath = Join-Path $ScriptRoot 'SWS_TokenGeneration_Only_V7.log'
 
 function Write-Log {
     param(
         [Parameter(Mandatory)][string]$Message,
         [ValidateSet('White','Gray','Green','Yellow','Red','Cyan')][string]$Color = 'White'
     )
-    $line = "{0} - {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message
+    $line = '{0} - {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message
     try { Write-Host $line -ForegroundColor $Color } catch { Write-Host $line }
-    try { Add-Content -Path $script:LogPath -Value $line -Encoding UTF8 } catch {}
+    try { Add-Content -Path $LogPath -Value $line } catch {}
 }
 
-function Protect-Token {
-    param([string]$Token)
-    if ([string]::IsNullOrWhiteSpace($Token)) { return '<empty>' }
-    if ($Token.Length -le 20) { return ('*' * $Token.Length) }
-    return ('{0}...{1}' -f $Token.Substring(0,10), $Token.Substring($Token.Length-8))
+function Quote-CmdArg {
+    param([Parameter(Mandatory)][string]$Value)
+    return '"' + ($Value -replace '"','\"') + '"'
 }
 
-function Get-FileTextSafe {
-    param([string]$Path)
+function Read-TextFileSafe {
+    param([Parameter(Mandatory)][string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) { return '' }
     try { return [System.IO.File]::ReadAllText($Path) } catch { return '' }
 }
 
-function Get-NewestHelperJar {
-    if (-not [string]::IsNullOrWhiteSpace($HelperJarPath)) {
-        $resolved = if ([System.IO.Path]::IsPathRooted($HelperJarPath)) { $HelperJarPath } else { Join-Path $script:ScriptRoot $HelperJarPath }
-        if (-not (Test-Path -LiteralPath $resolved)) { throw "Helper JAR not found: $resolved" }
-        return (Get-Item -LiteralPath $resolved).FullName
+function Get-MaskedToken {
+    param([string]$Token)
+    if ([string]::IsNullOrWhiteSpace($Token)) { return '<empty>' }
+    if ($Token.Length -le 24) { return ('*' * $Token.Length) }
+    return ($Token.Substring(0,12) + '...' + $Token.Substring($Token.Length - 8))
+}
+
+function Resolve-JavaPath {
+    param([string]$Preferred)
+    $candidates = New-Object System.Collections.Generic.List[string]
+    if (-not [string]::IsNullOrWhiteSpace($Preferred)) { [void]$candidates.Add($Preferred) }
+    [void]$candidates.Add((Join-Path $ScriptRoot 'java.exe'))
+    [void]$candidates.Add((Join-Path $ScriptRoot 'java\bin\java.exe'))
+    [void]$candidates.Add((Join-Path $ScriptRoot 'jre\bin\java.exe'))
+    [void]$candidates.Add((Join-Path $ScriptRoot 'jdk\bin\java.exe'))
+
+    foreach ($c in $candidates) {
+        if (-not [string]::IsNullOrWhiteSpace($c) -and (Test-Path -LiteralPath $c)) {
+            return (Resolve-Path -LiteralPath $c).Path
+        }
     }
 
-    $jars = @(Get-ChildItem -Path $script:ScriptRoot -Filter 'public-api-auth-helper*.jar' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
-    if ($jars.Count -lt 1) { throw "No public-api-auth-helper*.jar found in $script:ScriptRoot" }
+    $cmd = Get-Command java.exe -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+
+    throw 'java.exe was not found. Pass -JavaPath with the full path to java.exe.'
+}
+
+function Test-JavaVersion {
+    param([Parameter(Mandatory)][string]$JavaExe)
+    $stdout = Join-Path $ScriptRoot ('JavaVersion_stdout_{0}.txt' -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+    $stderr = Join-Path $ScriptRoot ('JavaVersion_stderr_{0}.txt' -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $JavaExe
+    $psi.Arguments = '-version'
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $p = New-Object System.Diagnostics.Process
+    $p.StartInfo = $psi
+    [void]$p.Start()
+    $out = $p.StandardOutput.ReadToEnd()
+    $err = $p.StandardError.ReadToEnd()
+    $p.WaitForExit()
+    $combined = (($out + "`n" + $err).Trim())
+    if ($p.ExitCode -ne 0) { throw "java -version failed. ExitCode=$($p.ExitCode); Output=$combined" }
+    if ([string]::IsNullOrWhiteSpace($combined)) { $combined = '<no version text returned>' }
+    Write-Log "Java version output: $combined" 'Gray'
+}
+
+function Resolve-HelperJar {
+    param([string]$Preferred)
+    if (-not [string]::IsNullOrWhiteSpace($Preferred)) {
+        if (-not (Test-Path -LiteralPath $Preferred)) { throw "Specified helper JAR not found: $Preferred" }
+        return (Resolve-Path -LiteralPath $Preferred).Path
+    }
+
+    $jars = @(Get-ChildItem -LiteralPath $ScriptRoot -Filter 'public-api-auth-helper*.jar' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
+    if ($jars.Count -eq 0) { throw "No public-api-auth-helper*.jar found in $ScriptRoot" }
+    if ($jars.Count -gt 1) {
+        Write-Log "Multiple helper JARs found. Using newest: $($jars[0].Name)" 'Yellow'
+        foreach ($j in $jars) { Write-Log "JAR candidate: $($j.Name); LastWriteTime=$($j.LastWriteTime)" 'Gray' }
+    }
     return $jars[0].FullName
 }
 
-function Get-NewestSwsJson {
-    if (-not [string]::IsNullOrWhiteSpace($JsonPath)) {
-        $resolved = if ([System.IO.Path]::IsPathRooted($JsonPath)) { $JsonPath } else { Join-Path $script:ScriptRoot $JsonPath }
-        if (-not (Test-Path -LiteralPath $resolved)) { throw "SWS JSON not found: $resolved" }
-        return (Get-Item -LiteralPath $resolved).FullName
+function Resolve-SwsJson {
+    param([string]$Preferred)
+    if (-not [string]::IsNullOrWhiteSpace($Preferred)) {
+        if (-not (Test-Path -LiteralPath $Preferred)) { throw "Specified SWS JSON not found: $Preferred" }
+        return (Resolve-Path -LiteralPath $Preferred).Path
     }
 
-    $valid = @()
-    $jsonFiles = @(Get-ChildItem -Path $script:ScriptRoot -Filter '*.json' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
+    $valid = New-Object System.Collections.Generic.List[object]
+    $jsonFiles = @(Get-ChildItem -LiteralPath $ScriptRoot -Filter '*.json' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
     foreach ($f in $jsonFiles) {
         try {
-            $raw = Get-Content -LiteralPath $f.FullName -Raw -ErrorAction Stop
-            $obj = $raw | ConvertFrom-Json -ErrorAction Stop
-            $sid = $obj.serviceAccountId
-            $pk  = $obj.privateKey
-            $du  = $obj.discoveryURI
+            $obj = Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json
+            $sid = [string]$obj.serviceAccountId
+            $pk  = [string]$obj.privateKey
+            $du  = [string]$obj.discoveryURI
             if (-not [string]::IsNullOrWhiteSpace($sid) -and -not [string]::IsNullOrWhiteSpace($pk) -and -not [string]::IsNullOrWhiteSpace($du)) {
-                $valid += [pscustomobject]@{
-                    FullName         = $f.FullName
-                    Name             = $f.Name
-                    LastWriteTime    = $f.LastWriteTime
-                    ServiceAccountId = [string]$sid
-                    DiscoveryURI     = [string]$du
-                }
+                $valid.Add([pscustomobject]@{ File=$f; ServiceAccountId=$sid; DiscoveryURI=$du }) | Out-Null
             }
         } catch {}
     }
 
-    if ($valid.Count -lt 1) { throw "No valid SWS service-account JSON found in $script:ScriptRoot. Expected fields: serviceAccountId, privateKey, discoveryURI." }
-
-    Write-Log ("Valid SWS JSON file count={0}" -f $valid.Count) 'Cyan'
+    Write-Log "Valid SWS JSON file count=$($valid.Count)" 'Cyan'
     foreach ($v in $valid) {
-        Write-Log ("JSON candidate: File={0}; ServiceAccountId={1}; LastWriteTime={2}" -f $v.Name, $v.ServiceAccountId, $v.LastWriteTime) 'Gray'
+        Write-Log "JSON candidate: File=$($v.File.Name); ServiceAccountId=$($v.ServiceAccountId); LastWriteTime=$($v.File.LastWriteTime)" 'Gray'
     }
 
-    return $valid[0].FullName
+    if ($valid.Count -eq 0) { throw "No valid SWS service-account JSON found in $ScriptRoot" }
+    return $valid[0].File.FullName
 }
 
-function Get-TenantCandidates {
-    param([Parameter(Mandatory)][string]$Tenant)
-    $items = New-Object System.Collections.Generic.List[string]
-    $raw = $Tenant.Trim()
-    if (-not [string]::IsNullOrWhiteSpace($raw)) { $items.Add($raw) }
-    $normalized = ($raw -replace '-', '').Trim()
-    if (-not [string]::IsNullOrWhiteSpace($normalized) -and -not $items.Contains($normalized)) { $items.Add($normalized) }
-    return @($items.ToArray())
-}
-
-function Test-JavaExecutable {
-    param([Parameter(Mandatory)][string]$Path)
-
-    if (-not (Test-Path -LiteralPath $Path)) { throw "java.exe not found: $Path" }
-    Write-Log "Testing Java executable: $Path" 'Cyan'
-
-    $out = Join-Path $script:ScriptRoot ("SWS_JavaVersion_{0}_stdout.txt" -f $script:RunStamp)
-    $err = Join-Path $script:ScriptRoot ("SWS_JavaVersion_{0}_stderr.txt" -f $script:RunStamp)
-
-    $cmd = '"{0}" -version > "{1}" 2> "{2}"' -f $Path, $out, $err
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = 'cmd.exe'
-    $psi.Arguments = '/d /s /c "' + $cmd + '"'
-    $psi.UseShellExecute = $false
-    $psi.CreateNoWindow = $true
-
-    $p = New-Object System.Diagnostics.Process
-    $p.StartInfo = $psi
-    [void]$p.Start()
-    $ok = $p.WaitForExit(15000)
-    if (-not $ok) {
-        try { & taskkill.exe /PID $p.Id /T /F | Out-Null } catch {}
-        throw "java -version timed out after 15 seconds."
+function Get-JsonSummary {
+    param([Parameter(Mandatory)][string]$JsonPath)
+    $obj = Get-Content -LiteralPath $JsonPath -Raw | ConvertFrom-Json
+    return [pscustomobject]@{
+        ServiceAccountId = [string]$obj.serviceAccountId
+        DiscoveryURI     = [string]$obj.discoveryURI
     }
-
-    $text = ((Get-FileTextSafe $out) + "`n" + (Get-FileTextSafe $err)).Trim()
-    if ([string]::IsNullOrWhiteSpace($text)) { $text = '<no version output captured>' }
-    Write-Log "Java version output: $text" 'Gray'
-    if ($p.ExitCode -ne 0) { throw "java -version returned exit code $($p.ExitCode). See $out and $err" }
 }
 
-function Extract-AccessToken {
+function Get-UniqueTenantCandidates {
+    param([string[]]$InputCandidates)
+    $list = New-Object System.Collections.Generic.List[string]
+    foreach ($t in @($InputCandidates)) {
+        if ([string]::IsNullOrWhiteSpace($t)) { continue }
+        $clean = $t.Trim()
+        if ($clean -match '^https?://([^./]+)\.') {
+            $alias = $Matches[1]
+            if (-not $list.Contains($alias)) { [void]$list.Add($alias) }
+        }
+        if (-not $list.Contains($clean)) { [void]$list.Add($clean) }
+        $dashless = ($clean -replace '-','')
+        if ($dashless -ne $clean -and -not $list.Contains($dashless)) { [void]$list.Add($dashless) }
+    }
+    return @($list)
+}
+
+function Get-AccessTokenFromText {
     param([string]$Text)
     if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
 
-    $patterns = @(
-        '"access_token"\s*:\s*"([^"]+)"',
-        'access_token\s*[=:]\s*"?([A-Za-z0-9_\-\.]+)"?',
-        '(eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+)'
-    )
+    # JSON style: "access_token":"..."
+    $m = [regex]::Match($Text, '"access_token"\s*:\s*"(?<token>[^"\r\n]+)"')
+    if ($m.Success) { return $m.Groups['token'].Value }
 
-    foreach ($pattern in $patterns) {
-        $m = [regex]::Match($Text, $pattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-        if ($m.Success -and $m.Groups.Count -gt 1) { return $m.Groups[1].Value }
-    }
+    # key=value or key: value style
+    $m = [regex]::Match($Text, '(?im)^\s*access_token\s*[:=]\s*(?<token>[^\s]+)\s*$')
+    if ($m.Success) { return $m.Groups['token'].Value }
+
+    # Bare JWT fallback. Access tokens are often JWTs: eyJ...
+    $m = [regex]::Match($Text, '(?<token>eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+)')
+    if ($m.Success) { return $m.Groups['token'].Value }
+
     return $null
 }
 
-function Run-HelperAttempt {
+function Invoke-HelperAttempt {
     param(
-        [Parameter(Mandatory)][string]$Tenant,
-        [Parameter(Mandatory)][string]$Java,
-        [Parameter(Mandatory)][string]$Jar,
-        [Parameter(Mandatory)][string]$Json,
-        [Parameter(Mandatory)][int]$Attempt
+        [Parameter(Mandatory)][string]$JavaExe,
+        [Parameter(Mandatory)][string]$JarPath,
+        [Parameter(Mandatory)][string]$TenantId,
+        [Parameter(Mandatory)][string]$JsonPath,
+        [Parameter(Mandatory)][int]$AttemptNumber
     )
 
-    $stdout = Join-Path $script:ScriptRoot ("SWS_Helper_Attempt_{0}_{1}_stdout.txt" -f $Attempt, $script:RunStamp)
-    $stderr = Join-Path $script:ScriptRoot ("SWS_Helper_Attempt_{0}_{1}_stderr.txt" -f $Attempt, $script:RunStamp)
+    $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $stdout = Join-Path $ScriptRoot ("SWS_Helper_Attempt_{0}_{1}_stdout.txt" -f $AttemptNumber, $stamp)
+    $stderr = Join-Path $ScriptRoot ("SWS_Helper_Attempt_{0}_{1}_stderr.txt" -f $AttemptNumber, $stamp)
 
-    Write-Log ("Helper token attempt #{0}: TenantId={1}" -f $Attempt, $Tenant) 'Cyan'
-    Write-Log ("Helper stdout file: {0}" -f $stdout) 'Gray'
-    Write-Log ("Helper stderr file: {0}" -f $stderr) 'Gray'
+    $javaArgs = New-Object System.Collections.Generic.List[string]
+    if (-not [string]::IsNullOrWhiteSpace($ProxyAddress)) {
+        try {
+            $uri = [Uri]$ProxyAddress
+            if ($uri.Host) {
+                [void]$javaArgs.Add('-Dhttp.proxyHost=' + $uri.Host)
+                [void]$javaArgs.Add('-Dhttps.proxyHost=' + $uri.Host)
+                if ($uri.Port -gt 0) {
+                    [void]$javaArgs.Add('-Dhttp.proxyPort=' + $uri.Port)
+                    [void]$javaArgs.Add('-Dhttps.proxyPort=' + $uri.Port)
+                }
+            }
+        } catch {
+            Write-Log "ProxyAddress could not be parsed for Java proxy flags: $ProxyAddress" 'Yellow'
+        }
+    }
+    [void]$javaArgs.Add('-jar')
+    [void]$javaArgs.Add($JarPath)
+    [void]$javaArgs.Add('-t')
+    [void]$javaArgs.Add($TenantId)
+    [void]$javaArgs.Add('-p')
+    [void]$javaArgs.Add($JsonPath)
 
-    $cmd = '"{0}" -jar "{1}" -t "{2}" -p "{3}" > "{4}" 2> "{5}"' -f $Java, $Jar, $Tenant, $Json, $stdout, $stderr
+    $argString = ($javaArgs | ForEach-Object { Quote-CmdArg $_ }) -join ' '
+
+    Write-Log "Helper token attempt #$AttemptNumber: TenantId=$TenantId" 'Cyan'
+    Write-Log "Helper stdout file: $stdout" 'Gray'
+    Write-Log "Helper stderr file: $stderr" 'Gray'
+    Write-Log "Command preview: $(Split-Path -Leaf $JavaExe) -jar $(Split-Path -Leaf $JarPath) -t $TenantId -p $(Split-Path -Leaf $JsonPath)" 'Gray'
+
     $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = 'cmd.exe'
-    $psi.Arguments = '/d /s /c "' + $cmd + '"'
+    $psi.FileName = $JavaExe
+    $psi.Arguments = $argString
+    $psi.WorkingDirectory = $ScriptRoot
     $psi.UseShellExecute = $false
-    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
 
     $p = New-Object System.Diagnostics.Process
     $p.StartInfo = $psi
     [void]$p.Start()
 
-    $timeoutMs = [Math]::Max(10, $TimeoutSeconds) * 1000
-    $finished = $p.WaitForExit($timeoutMs)
-    if (-not $finished) {
-        Write-Log ("Helper attempt #{0} timed out after {1} seconds. Killing process tree..." -f $Attempt, $TimeoutSeconds) 'Red'
-        try { & taskkill.exe /PID $p.Id /T /F | Out-Null } catch {}
-        return [pscustomobject]@{
-            Success = $false
-            Token = $null
-            ExitCode = $null
-            TimedOut = $true
-            StdoutPath = $stdout
-            StderrPath = $stderr
-            Output = ((Get-FileTextSafe $stdout) + "`n" + (Get-FileTextSafe $stderr)).Trim()
-        }
+    $completed = $p.WaitForExit($TimeoutSeconds * 1000)
+    if (-not $completed) {
+        try { $p.Kill() } catch {}
+        Write-Log "FAILED: Helper attempt #$AttemptNumber timed out after $TimeoutSeconds seconds." 'Red'
+        return [pscustomobject]@{ Success=$false; ExitCode=-999; Token=$null; Output='Timed out'; StdoutPath=$stdout; StderrPath=$stderr }
     }
 
-    $combined = ((Get-FileTextSafe $stdout) + "`n" + (Get-FileTextSafe $stderr)).Trim()
-    $token = Extract-AccessToken -Text $combined
+    $out = $p.StandardOutput.ReadToEnd()
+    $err = $p.StandardError.ReadToEnd()
+    [System.IO.File]::WriteAllText($stdout, $out)
+    [System.IO.File]::WriteAllText($stderr, $err)
 
-    Write-Log ("Helper attempt #{0} completed. ExitCode={1}; OutputLength={2}" -f $Attempt, $p.ExitCode, $combined.Length) 'Gray'
+    $combined = (($out + "`n" + $err).Trim())
+    $token = Get-AccessTokenFromText -Text $combined
+
+    Write-Log "Helper attempt #$AttemptNumber completed. ExitCode=$($p.ExitCode); OutputLength=$($combined.Length)" 'Gray'
 
     if (-not [string]::IsNullOrWhiteSpace($token)) {
-        Write-Log ("SUCCESS: Helper returned access_token. MaskedToken={0}; Length={1}" -f (Protect-Token $token), $token.Length) 'Green'
-        return [pscustomobject]@{
-            Success = $true
-            Token = $token
-            ExitCode = $p.ExitCode
-            TimedOut = $false
-            StdoutPath = $stdout
-            StderrPath = $stderr
-            Output = $combined
-        }
+        Write-Log "SUCCESS: Helper returned access_token. Masked=$(Get-MaskedToken $token); Length=$($token.Length)" 'Green'
+        return [pscustomobject]@{ Success=$true; ExitCode=$p.ExitCode; Token=$token; Output=$combined; StdoutPath=$stdout; StderrPath=$stderr }
     }
 
     $preview = $combined
-    if ($preview.Length -gt 2500) { $preview = $preview.Substring(0,2500) + '...<truncated>' }
-    if ([string]::IsNullOrWhiteSpace($preview)) { $preview = '<no helper output captured>' }
+    if ($preview.Length -gt 1600) { $preview = $preview.Substring(0,1600) + '...' }
+    Write-Log "FAILED: Helper did not return access_token. ExitCode=$($p.ExitCode). OutputPreview=$preview" 'Red'
+    return [pscustomobject]@{ Success=$false; ExitCode=$p.ExitCode; Token=$null; Output=$combined; StdoutPath=$stdout; StderrPath=$stderr }
+}
 
-    Write-Log ("FAILED: Helper did not return access_token. ExitCode={0}. OutputPreview={1}" -f $p.ExitCode, $preview) 'Yellow'
-
-    return [pscustomobject]@{
-        Success = $false
-        Token = $null
-        ExitCode = $p.ExitCode
-        TimedOut = $false
-        StdoutPath = $stdout
-        StderrPath = $stderr
-        Output = $combined
+function Test-SwsApiToken {
+    param([Parameter(Mandatory)][string]$Token)
+    $uri = $SwsApiBaseUrl.TrimEnd('/') + '/sws/policies'
+    Write-Log "Validating generated token with SWS API GET: $uri" 'Cyan'
+    $headers = @{ Authorization = "Bearer $Token"; Accept = 'application/json' }
+    try {
+        $resp = Invoke-RestMethod -Method GET -Uri $uri -Headers $headers -ErrorAction Stop
+        Write-Log "SWS API validation succeeded." 'Green'
+        return $true
+    } catch {
+        $status = $null
+        try { $status = [int]$_.Exception.Response.StatusCode.value__ } catch {}
+        Write-Log "SWS API validation failed. Status=$status; Error=$($_.Exception.Message)" 'Red'
+        return $false
     }
 }
 
-$overallSuccess = $false
 try {
-    Write-Log '===== CyberArk SWS Token Generation ONLY Diagnostic V6 Started =====' 'Cyan'
-    Write-Log "ScriptRoot=$script:ScriptRoot" 'Gray'
-    Write-Log "LogPath=$script:LogPath" 'Gray'
+    Write-Log '===== CyberArk SWS Token Generation ONLY Diagnostic V7 Started =====' 'Cyan'
+    Write-Log "ScriptRoot=$ScriptRoot" 'Gray'
+    Write-Log "LogPath=$LogPath" 'Gray'
 
-    $java = if ([System.IO.Path]::IsPathRooted($JavaPath)) { $JavaPath } else { Join-Path $script:ScriptRoot $JavaPath }
-    Test-JavaExecutable -Path $java
+    $resolvedJava = Resolve-JavaPath -Preferred $JavaPath
+    Write-Log "Testing Java executable: $resolvedJava" 'Cyan'
+    Test-JavaVersion -JavaExe $resolvedJava
 
-    $jar = Get-NewestHelperJar
-    $json = Get-NewestSwsJson
-    Write-Log "Using helper JAR: $jar" 'Cyan'
-    Write-Log "Using SWS service-account JSON: $json" 'Cyan'
+    $resolvedJar = Resolve-HelperJar -Preferred $SwsAuthHelperJarPath
+    Write-Log "Using helper JAR: $resolvedJar" 'Cyan'
 
-    $jsonObj = (Get-Content -LiteralPath $json -Raw -ErrorAction Stop) | ConvertFrom-Json -ErrorAction Stop
-    Write-Log ("JSON summary: ServiceAccountId={0}; DiscoveryURI={1}" -f $jsonObj.serviceAccountId, $jsonObj.discoveryURI) 'Cyan'
+    $resolvedJson = Resolve-SwsJson -Preferred $SwsServiceAccountJsonPath
+    Write-Log "Using SWS service-account JSON: $resolvedJson" 'Cyan'
 
-    $tenants = Get-TenantCandidates -Tenant $TenantId
-    Write-Log ("Tenant candidate count={0}; Candidates={1}" -f $tenants.Count, ($tenants -join ', ')) 'Cyan'
+    $summary = Get-JsonSummary -JsonPath $resolvedJson
+    Write-Log "JSON summary: ServiceAccountId=$($summary.ServiceAccountId); DiscoveryURI=$($summary.DiscoveryURI)" 'Cyan'
+
+    $tenants = Get-UniqueTenantCandidates -InputCandidates $TenantCandidates
+    Write-Log "Tenant candidate count=$($tenants.Count); Candidates=$($tenants -join ', ')" 'Cyan'
 
     $attempt = 0
+    $successToken = $null
     foreach ($tenant in $tenants) {
         $attempt++
-        $result = Run-HelperAttempt -Tenant $tenant -Java $java -Jar $jar -Json $json -Attempt $attempt
+        $result = Invoke-HelperAttempt -JavaExe $resolvedJava -JarPath $resolvedJar -TenantId $tenant -JsonPath $resolvedJson -AttemptNumber $attempt
         if ($result.Success) {
-            $overallSuccess = $true
-            Write-Log 'TOKEN GENERATION SUCCESS.' 'Green'
-            Write-Log ("SuccessfulTenantId={0}" -f $tenant) 'Green'
-            Write-Log ("Token stdout file: {0}" -f $result.StdoutPath) 'Gray'
-            Write-Log ("Token stderr file: {0}" -f $result.StderrPath) 'Gray'
-            if ($ShowToken) {
-                Write-Host ''
-                Write-Host '===== RAW ACCESS TOKEN START =====' -ForegroundColor Green
-                Write-Host $result.Token
-                Write-Host '===== RAW ACCESS TOKEN END =====' -ForegroundColor Green
-                Write-Host ''
-            }
+            $successToken = $result.Token
             break
         }
     }
 
-    if (-not $overallSuccess) {
-        throw 'TOKEN GENERATION FAILED. No access_token was returned by the CyberArk helper. Review the SWS_Helper_Attempt_*_stdout/stderr files created beside this script.'
-    }
-}
-catch {
-    Write-Log ("FATAL ERROR: {0}" -f $_.Exception.Message) 'Red'
-}
-finally {
-    if ($overallSuccess) {
-        Write-Log '===== CyberArk SWS Token Generation ONLY Diagnostic V6 Finished: SUCCESS =====' 'Green'
-    } else {
-        Write-Log '===== CyberArk SWS Token Generation ONLY Diagnostic V6 Finished: FAILED =====' 'Red'
+    if ([string]::IsNullOrWhiteSpace($successToken)) {
+        throw 'TOKEN GENERATION FAILED. No access_token was returned by the CyberArk helper for any tenant candidate. Review SWS_Helper_Attempt_*_stdout/stderr files.'
     }
 
+    Write-Log 'TOKEN GENERATION SUCCESS.' 'Green'
+    if ($ShowToken) {
+        Write-Host ''
+        Write-Host '===== RAW access_token START =====' -ForegroundColor Yellow
+        Write-Host $successToken
+        Write-Host '===== RAW access_token END =====' -ForegroundColor Yellow
+        Write-Host ''
+    }
+    if ($SaveTokenToFile) {
+        $tokenPath = Join-Path $ScriptRoot ('SWS_access_token_{0}.txt' -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+        [System.IO.File]::WriteAllText($tokenPath, $successToken)
+        Write-Log "Token saved to: $tokenPath" 'Yellow'
+    }
+    if ($ValidateAgainstSwsApi) {
+        [void](Test-SwsApiToken -Token $successToken)
+    }
+
+    Write-Log '===== CyberArk SWS Token Generation ONLY Diagnostic V7 Finished: SUCCESS =====' 'Green'
+}
+catch {
+    $script:HadFatal = $true
+    Write-Log ("FATAL ERROR: {0}" -f $_.Exception.Message) 'Red'
+    Write-Log '===== CyberArk SWS Token Generation ONLY Diagnostic V7 Finished: FAILED =====' 'Red'
+}
+finally {
     if (-not $NoPause) {
         try { Read-Host 'Press ENTER to close this token diagnostic window' | Out-Null } catch {}
     }
 }
+
+if ($script:HadFatal) { exit 1 } else { exit 0 }
