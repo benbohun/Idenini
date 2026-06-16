@@ -1,23 +1,37 @@
+ApplicationName,DisplayName,Description
+svc-gcp-app-001,svc-gcp-app-001,
+svc-gcp-app-002,svc-gcp-app-002,
+
+
 <#
-CNA_Create_And_Update_Identity_WebApp_Reauth_NamePrompt_DescriptionOnly.ps1
+CNA_Create_And_Update_Identity_WebApp_Reauth_CsvBatch.ps1
 
 Purpose
 - Prompt for regular CyberArk Identity credential once
-- Prompt for Name of App to be created
+- Read applications to create from a CSV file
+- Create each app from GenericBrowserExtensionScript
 - Dynamically set app Description to:
-  This GCP Application is managed by Service Account ("Name of App")
-- Create app from GenericBrowserExtensionScript
-- Re-establish CyberArk Identity session for the update phase
+  This GCP Application is managed by Service Account ("ApplicationName")
+- Wait 15 seconds by default after each app create before the update phase
+- Re-establish CyberArk Identity session for each app update phase
 - Update the newly created app using the returned _RowKey
 - Apply non-script settings and the Browser Extension (advanced) login workflow
+- Finish create + wait + reauth + update for the current app before starting the next app
 - No PAS validation
 - No psPAS dependency
 
-Why this version
-- This is based on the known working version
-- Only Name prompt and dynamic Description were added
-- No account mapping changes
-- No permission assignment changes
+CSV format
+- Required column: ApplicationName
+- Also accepted for the name column: Name or AppName
+- Optional columns: DisplayName, Description
+- If DisplayName is blank, it defaults to ApplicationName
+- If Description is blank, it defaults to:
+  This GCP Application is managed by Service Account ("ApplicationName")
+
+Sample CSV
+ApplicationName
+svc-gcp-app-001
+svc-gcp-app-002
 #>
 
 [CmdletBinding()]
@@ -26,6 +40,11 @@ param(
 
     [string]$RegularUserName           = '',
     [string]$RegularUserPassword       = '',
+
+    # CSV input
+    [string]$CsvPath                   = 'E:\Installation Media\Script\OnboardScript\data\Identity_Applications_To_Create.csv',
+    [switch]$CreateSampleCsv,
+    [switch]$StopOnFirstFailure,
 
     # Create
     [string]$TemplateId                = 'GenericBrowserExtensionScript',
@@ -87,6 +106,11 @@ $script:IdentityWebSession        = $null
 $script:RegularCredential         = $null
 $script:RegularUserPlainPassword  = $null
 $script:ReportRows                = @()
+$script:CurrentCsvRowNumber       = $null
+$script:CurrentAppName            = $null
+$script:CurrentDisplayName        = $null
+$script:CurrentAppRowKey          = $null
+$script:HadApplicationFailures    = $false
 
 function Write-Log {
     param(
@@ -112,10 +136,27 @@ function Add-ReportRow {
     param(
         [string]$Step,
         [string]$Status,
-        [string]$Detail
+        [string]$Detail,
+        [Nullable[int]]$RowNumber = $null,
+        [string]$AppName = $null,
+        [string]$RowKey = $null
     )
+
+    if ($null -eq $RowNumber -and $null -ne $script:CurrentCsvRowNumber) {
+        $RowNumber = [int]$script:CurrentCsvRowNumber
+    }
+    if ([string]::IsNullOrWhiteSpace($AppName) -and -not [string]::IsNullOrWhiteSpace($script:CurrentAppName)) {
+        $AppName = $script:CurrentAppName
+    }
+    if ([string]::IsNullOrWhiteSpace($RowKey) -and -not [string]::IsNullOrWhiteSpace($script:CurrentAppRowKey)) {
+        $RowKey = $script:CurrentAppRowKey
+    }
+
     $script:ReportRows += [pscustomobject]@{
         Timestamp = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+        RowNumber = $RowNumber
+        AppName   = $AppName
+        RowKey    = $RowKey
         Step      = $Step
         Status    = $Status
         Detail    = $Detail
@@ -182,23 +223,115 @@ function Get-RegularCredential {
     $script:RegularCredential = [pscredential]::new($RegularUserName, $secure)
 }
 
-function Get-ResolvedAppNameAndDescription {
-    $enteredName = Read-Host ("Enter the Name of App to be created [{0}]" -f $Name)
+function Get-PreferredCsvValue {
+    param(
+        [Parameter(Mandatory)]$Row,
+        [Parameter(Mandatory)][string[]]$ColumnNames
+    )
 
-    if (-not [string]::IsNullOrWhiteSpace($enteredName)) {
-        $script:Name = $enteredName.Trim()
+    foreach ($columnName in $ColumnNames) {
+        if ($Row.PSObject -and $Row.PSObject.Properties.Name -contains $columnName) {
+            $value = [string]$Row.$columnName
+            if (-not [string]::IsNullOrWhiteSpace($value)) {
+                return $value.Trim()
+            }
+        }
     }
 
-    if ([string]::IsNullOrWhiteSpace($script:Name)) {
-        throw 'Name cannot be empty.'
+    return $null
+}
+
+function New-SampleApplicationCsv {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $parent = Split-Path -Path $Path -Parent
+    if ($parent -and -not (Test-Path $parent)) {
+        New-Item -Path $parent -ItemType Directory -Force | Out-Null
     }
 
-    $script:Description = 'This GCP Application is managed by Service Account ("{0}")' -f $script:Name
+    @(
+        [pscustomobject]@{ ApplicationName = 'svc-gcp-app-001'; DisplayName = 'svc-gcp-app-001'; Description = '' }
+        [pscustomobject]@{ ApplicationName = 'svc-gcp-app-002'; DisplayName = 'svc-gcp-app-002'; Description = '' }
+    ) | Export-Csv -Path $Path -NoTypeInformation -Force
 
-    Write-Log ("Resolved app Name: '{0}'." -f $script:Name) 'Cyan'
+    Write-Log ("Sample application CSV created: {0}" -f $Path) 'Green'
+}
+
+function Import-AppCreationCsv {
+    param([Parameter(Mandatory)][string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        throw 'CsvPath cannot be empty. Provide a CSV file with an ApplicationName column.'
+    }
+
+    if (-not (Test-Path -Path $Path)) {
+        throw ("CSV file was not found: {0}" -f $Path)
+    }
+
+    $rows = @(Import-Csv -Path $Path)
+    if ($rows.Count -lt 1) {
+        throw ("CSV file contains no rows: {0}" -f $Path)
+    }
+
+    $resolvedRows = @()
+    $rowNumber = 1
+
+    foreach ($row in $rows) {
+        $appName = Get-PreferredCsvValue -Row $row -ColumnNames @('ApplicationName','Name','AppName')
+
+        if ([string]::IsNullOrWhiteSpace($appName)) {
+            Write-Log ("CSV row {0} skipped because ApplicationName/Name/AppName is blank." -f $rowNumber) 'Yellow'
+            Add-ReportRow -Step 'Import CSV Row' -Status 'SKIPPED' -Detail 'Missing ApplicationName/Name/AppName value.' -RowNumber $rowNumber
+            $rowNumber++
+            continue
+        }
+
+        $displayName = Get-PreferredCsvValue -Row $row -ColumnNames @('DisplayName')
+        if ([string]::IsNullOrWhiteSpace($displayName)) {
+            $displayName = $appName
+        }
+
+        $descriptionValue = Get-PreferredCsvValue -Row $row -ColumnNames @('Description')
+        if ([string]::IsNullOrWhiteSpace($descriptionValue)) {
+            $descriptionValue = 'This GCP Application is managed by Service Account ("{0}")' -f $appName
+        }
+
+        $resolvedRows += [pscustomobject]@{
+            RowNumber   = $rowNumber
+            AppName     = $appName
+            DisplayName = $displayName
+            Description = $descriptionValue
+        }
+
+        $rowNumber++
+    }
+
+    if ($resolvedRows.Count -lt 1) {
+        throw 'No valid application rows were found in the CSV.'
+    }
+
+    Write-Log ("Imported {0} valid application row(s) from CSV: {1}" -f $resolvedRows.Count, $Path) 'Green'
+    Add-ReportRow -Step 'Import CSV' -Status 'SUCCESS' -Detail ("ValidRows={0}; CsvPath={1}" -f $resolvedRows.Count, $Path)
+
+    return $resolvedRows
+}
+
+function Set-CurrentAppContext {
+    param([Parameter(Mandatory)]$AppRow)
+
+    $script:CurrentCsvRowNumber = [int]$AppRow.RowNumber
+    $script:CurrentAppName      = [string]$AppRow.AppName
+    $script:CurrentDisplayName  = [string]$AppRow.DisplayName
+    $script:CurrentAppRowKey    = $null
+
+    $script:Name        = [string]$AppRow.AppName
+    $script:DisplayName = [string]$AppRow.DisplayName
+    $script:Description = [string]$AppRow.Description
+
+    Write-Log ("Resolved CSV row {0}: Name='{1}', DisplayName='{2}'." -f $script:CurrentCsvRowNumber, $script:Name, $script:DisplayName) 'Cyan'
     Write-Log ("Resolved app Description: '{0}'." -f $script:Description) 'Cyan'
 
-    Add-ReportRow -Step 'Resolved App Name' -Status 'INFO' -Detail ("Name={0}" -f $script:Name)
+    Add-ReportRow -Step 'Resolved App Name' -Status 'INFO' -Detail ("Name={0}; DisplayName={1}" -f $script:Name, $script:DisplayName)
     Add-ReportRow -Step 'Resolved App Description' -Status 'INFO' -Detail ("Description={0}" -f $script:Description)
 }
 
@@ -672,35 +805,70 @@ function Invoke-PostCreateUpdatePhase {
     }
 }
 
-$createdAppRowKey = $null
-
 try {
     if ([string]::IsNullOrWhiteSpace($TemplateId)) {
         throw 'TemplateId cannot be empty.'
     }
 
-    Get-RegularCredential
-    Get-ResolvedAppNameAndDescription
+    if ($CreateSampleCsv) {
+        New-SampleApplicationCsv -Path $CsvPath
+        Add-ReportRow -Step 'Create Sample CSV' -Status 'SUCCESS' -Detail ("SampleCsvPath={0}" -f $CsvPath)
+        return
+    }
 
-    Write-Log ("Using regular user credential '{0}' for create + reauth + update flow." -f $script:RegularCredential.UserName) 'Cyan'
+    Get-RegularCredential
+
+    Write-Log ("Using regular user credential '{0}' for CSV create + reauth + update flow." -f $script:RegularCredential.UserName) 'Cyan'
     Add-ReportRow -Step 'Credential Mode' -Status 'INFO' -Detail ("Regular user login as {0}" -f $script:RegularCredential.UserName)
 
-    # Phase 1: create
-    Start-IdentityRegularUserSession
-    $createdAppRowKey = Import-AppFromTemplate -ResolvedTemplateId $TemplateId
+    $appRows = @(Import-AppCreationCsv -Path $CsvPath)
 
-    Write-Log ("Waiting {0} second(s) before starting fresh-session update phase..." -f $PreUpdateDelaySeconds) 'Yellow'
-    Start-Sleep -Seconds $PreUpdateDelaySeconds
+    foreach ($appRow in $appRows) {
+        Set-CurrentAppContext -AppRow $appRow
+        Add-ReportRow -Step 'Application Start' -Status 'INFO' -Detail ("Starting create + wait + reauth + update sequence for CSV row {0}." -f $script:CurrentCsvRowNumber)
 
-    # Phase 2: fresh session update
-    Invoke-PostCreateUpdatePhase -CreatedRowKey $createdAppRowKey
+        try {
+            # Phase 1: create for the current app only
+            Reset-IdentitySessionState
+            Start-IdentityRegularUserSession
+            $createdAppRowKey = Import-AppFromTemplate -ResolvedTemplateId $TemplateId
+            $script:CurrentAppRowKey = $createdAppRowKey
 
-    Write-Log ("Create + update completed successfully. Created app row key is '{0}'." -f $createdAppRowKey) 'Green'
-    Add-ReportRow -Step 'Overall' -Status 'SUCCESS' -Detail ("CreatedRowKey={0}; FinalName={1}; Description={2}" -f $createdAppRowKey, $Name, $Description)
+            Write-Log ("Waiting {0} second(s) before starting fresh-session update phase for app '{1}'..." -f $PreUpdateDelaySeconds, $script:Name) 'Yellow'
+            Start-Sleep -Seconds $PreUpdateDelaySeconds
+
+            # Phase 2: fresh session update for the current app only
+            Invoke-PostCreateUpdatePhase -CreatedRowKey $createdAppRowKey
+
+            Write-Log ("Create + update completed successfully for app '{0}'. Created app row key is '{1}'." -f $script:Name, $createdAppRowKey) 'Green'
+            Add-ReportRow -Step 'Overall' -Status 'SUCCESS' -Detail ("CreatedRowKey={0}; FinalName={1}; DisplayName={2}; Description={3}" -f $createdAppRowKey, $script:Name, $script:DisplayName, $script:Description) -RowKey $createdAppRowKey
+        }
+        catch {
+            $script:HadApplicationFailures = $true
+            $msg = $_.Exception.Message
+            Write-Log ("FAILED for CSV row {0}, app '{1}': {2}" -f $script:CurrentCsvRowNumber, $script:Name, $msg) 'Red'
+            Add-ReportRow -Step 'Overall' -Status 'FAILED' -Detail $msg
+
+            if ($StopOnFirstFailure) {
+                throw
+            }
+
+            Write-Log "Continuing to the next CSV application row after failure." 'Yellow'
+        }
+        finally {
+            Reset-IdentitySessionState
+        }
+    }
+
+    if ($script:HadApplicationFailures) {
+        Write-Log 'CSV batch completed with one or more application failures. Review the report CSV for details.' 'Yellow'
+    } else {
+        Write-Log 'CSV batch completed successfully for all applications.' 'Green'
+    }
 }
 catch {
     Write-Log ("FAILED: {0}" -f $_.Exception.Message) 'Red'
-    Add-ReportRow -Step 'Overall' -Status 'FAILED' -Detail $_.Exception.Message
+    Add-ReportRow -Step 'Overall Batch' -Status 'FAILED' -Detail $_.Exception.Message
 }
 finally {
     try {
