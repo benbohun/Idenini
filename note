@@ -1,5 +1,5 @@
 <#
-CNA_Create_And_Update_Identity_WebApp_Reauth_NamePrompt_SWS_HelperJar_V12_EmbeddedJava.ps1
+CNA_Create_And_Update_Identity_WebApp_Reauth_NamePrompt_SWS_HelperJar_V13_TokenGate.ps1
 
 Purpose
 - Prompt for regular CyberArk Identity credential once
@@ -19,6 +19,7 @@ Purpose
 - Falls back to direct PowerShell private_key_jwt token generation only if the helper JAR flow fails for a non-Java-local issue
 - Improved SWS tenant handling: embeds the known long tenant ID eef31a0b-0e67-4024-a644-be08614190db as the default SWS tenant ID
 - Embeds the provided portable Java path as the default SwsJavaPath
+- Hard-gates SWS token generation: validates that an access token was actually generated and works against the SWS API before creating/updating the Identity app
 
 Why this version
 - This is based on the known working version
@@ -91,6 +92,10 @@ loginData.order = [
     [string]$SwsAuthHelperJarPath      = '',
     [string]$SwsJavaPath               = 'E:\Installation Media\Script\OnboardScript\SWS_Application_Script\jdk-25.0.3+9\bin\java.exe',
     [int]$SwsAuthHelperTimeoutSeconds  = 120,
+    [bool]$ValidateSwsTokenBeforeIdentityCreate = $true,
+    [string]$SwsTokenValidationRelativePath = '/sws/policies',
+    [switch]$SkipSwsTokenApiValidation,
+    [switch]$AllowManualSwsTokenPrompt,
     [switch]$DisableSwsServiceAccountJsonAutoLogin,
     [string]$SwsApiBaseUrl             = 'https://api.alero.io/v2-edge',
     [string]$SwsProxyAddress           = '',
@@ -132,6 +137,7 @@ if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) {
 $script:SwsAccessTokenToUse        = $null
 $script:SwsReplicationSummary      = @()
 $script:SwsAutoTokenAttempted      = $false
+$script:SwsAccessTokenValidated    = $false
 
 function Write-Log {
     param(
@@ -2002,19 +2008,182 @@ function New-SwsAccessTokenFromServiceAccountJson {
     }
 }
 
+
+function Get-MaskedSwsAccessToken {
+    param([Parameter(Mandatory)][string]$Token)
+
+    $clean = ($Token -replace '^\s*Bearer\s+', '').Trim()
+    if ($clean.Length -le 16) { return ('Length={0}; Masked=***' -f $clean.Length) }
+    return ('Length={0}; Masked={1}...{2}' -f $clean.Length, $clean.Substring(0, [Math]::Min(10, $clean.Length)), $clean.Substring($clean.Length - 6))
+}
+
+function ConvertFrom-SwsBase64UrlString {
+    param([Parameter(Mandatory)][string]$Value)
+
+    $s = $Value.Replace('-', '+').Replace('_', '/')
+    switch ($s.Length % 4) {
+        2 { $s += '==' }
+        3 { $s += '=' }
+        1 { throw 'Invalid base64url string length.' }
+    }
+
+    $bytes = [Convert]::FromBase64String($s)
+    return [Text.Encoding]::UTF8.GetString($bytes)
+}
+
+function Get-SwsAccessTokenJwtSummary {
+    param([Parameter(Mandatory)][string]$Token)
+
+    $clean = ($Token -replace '^\s*Bearer\s+', '').Trim()
+    $parts = $clean -split '\.'
+    if ($parts.Count -ne 3) {
+        return [pscustomobject]@{
+            IsJwt  = $false
+            Detail = 'Token is not a 3-part JWT. It may be an opaque bearer token.'
+        }
+    }
+
+    try {
+        $headerJson = ConvertFrom-SwsBase64UrlString -Value $parts[0]
+        $payloadJson = ConvertFrom-SwsBase64UrlString -Value $parts[1]
+        $header = $headerJson | ConvertFrom-Json
+        $payload = $payloadJson | ConvertFrom-Json
+
+        $expUtc = $null
+        $iatUtc = $null
+        try { if ($null -ne $payload.exp) { $expUtc = ([DateTimeOffset]::FromUnixTimeSeconds([int64]$payload.exp)).UtcDateTime.ToString('yyyy-MM-dd HH:mm:ssZ') } } catch {}
+        try { if ($null -ne $payload.iat) { $iatUtc = ([DateTimeOffset]::FromUnixTimeSeconds([int64]$payload.iat)).UtcDateTime.ToString('yyyy-MM-dd HH:mm:ssZ') } } catch {}
+
+        return [pscustomobject]@{
+            IsJwt  = $true
+            Alg    = [string]$header.alg
+            Typ    = [string]$header.typ
+            Kid    = [string]$header.kid
+            Iss    = [string]$payload.iss
+            Sub    = [string]$payload.sub
+            Aud    = if ($payload.aud -is [array]) { ($payload.aud -join ',') } else { [string]$payload.aud }
+            IatUtc = $iatUtc
+            ExpUtc = $expUtc
+        }
+    } catch {
+        return [pscustomobject]@{
+            IsJwt  = $false
+            Detail = ('JWT decode failed: {0}' -f $_.Exception.Message)
+        }
+    }
+}
+
+function Assert-SwsAccessTokenBasicFormat {
+    param([Parameter(Mandatory)][string]$Token)
+
+    $clean = ($Token -replace '^\s*Bearer\s+', '').Trim()
+    if ([string]::IsNullOrWhiteSpace($clean)) { throw 'SWS token validation failed: token is empty.' }
+    if ($clean -match '\s') { throw 'SWS token validation failed: token contains whitespace. Paste only the token value, not extra text.' }
+    if ($clean.Length -lt 40) { throw ('SWS token validation failed: token length is too short. Length={0}' -f $clean.Length) }
+    return $clean
+}
+
+function Test-SwsAccessTokenAgainstApi {
+    param([Parameter(Mandatory)][string]$Token)
+
+    $relativePath = $SwsTokenValidationRelativePath
+    if ([string]::IsNullOrWhiteSpace($relativePath)) { $relativePath = '/sws/policies' }
+
+    $uri = Join-UrlPath -BaseUrl $SwsApiBaseUrl -RelativePath $relativePath
+    $headers = @{
+        Authorization = ('Bearer {0}' -f $Token)
+        Accept        = 'application/json'
+        'Content-Type'= 'application/json'
+    }
+
+    $params = @{
+        Method      = 'GET'
+        Uri         = $uri
+        Headers     = $headers
+        ErrorAction = 'Stop'
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($SwsProxyAddress)) {
+        $params['Proxy'] = $SwsProxyAddress
+        if ($SwsProxyUseDefaultCredentials.IsPresent) { $params['ProxyUseDefaultCredentials'] = $true }
+    }
+
+    try {
+        $null = Invoke-RestMethod @params
+        Write-Log ("SWS token API validation succeeded. ValidationGET={0}" -f $uri) 'Green'
+        Add-SwsReplicationSummary -Step 'Token Validation' -Status 'SUCCESS' -Detail ("GET {0} succeeded" -f $uri)
+        return $true
+    } catch {
+        $status = $null
+        $responseBody = ''
+        try { $status = [int]$_.Exception.Response.StatusCode.value__ } catch {}
+        try {
+            $stream = $_.Exception.Response.GetResponseStream()
+            if ($null -ne $stream) {
+                $reader = New-Object System.IO.StreamReader($stream)
+                $responseBody = $reader.ReadToEnd()
+            }
+        } catch {}
+        if ([string]::IsNullOrWhiteSpace($responseBody)) { $responseBody = $_.Exception.Message }
+        throw ("SWS token API validation failed. ValidationGET={0}; Status={1}; Error={2}" -f $uri, $status, $responseBody)
+    }
+}
+
+function Confirm-SwsAccessTokenGeneratedAndUsable {
+    param(
+        [Parameter(Mandatory)][string]$Token,
+        [string]$Source = 'Unknown'
+    )
+
+    $cleanToken = Assert-SwsAccessTokenBasicFormat -Token $Token
+    $mask = Get-MaskedSwsAccessToken -Token $cleanToken
+    Write-Log ("SWS access token was generated/received from {0}. {1}" -f $Source, $mask) 'Green'
+
+    $summary = Get-SwsAccessTokenJwtSummary -Token $cleanToken
+    if ($summary.IsJwt -eq $true) {
+        Write-Log ("SWS token JWT summary: alg={0}; kid={1}; iss={2}; sub={3}; aud={4}; expUtc={5}" -f $summary.Alg, $summary.Kid, $summary.Iss, $summary.Sub, $summary.Aud, $summary.ExpUtc) 'Gray'
+    } else {
+        Write-Log ("SWS token decode note: {0}" -f $summary.Detail) 'Gray'
+    }
+
+    if (-not $SkipSwsTokenApiValidation.IsPresent) {
+        [void](Test-SwsAccessTokenAgainstApi -Token $cleanToken)
+    } else {
+        Write-Log 'SWS token API validation was skipped by -SkipSwsTokenApiValidation. Basic token format was validated only.' 'Yellow'
+        Add-SwsReplicationSummary -Step 'Token Validation' -Status 'SKIPPED' -Detail 'Skipped by -SkipSwsTokenApiValidation.'
+    }
+
+    $script:SwsAccessTokenToUse = $cleanToken
+    $script:SwsAccessTokenValidated = $true
+    return $cleanToken
+}
+
+function Invoke-SwsTokenPreflightIfEnabled {
+    if (-not $ReplicateSwsPolicy) { return }
+    if (-not $ValidateSwsTokenBeforeIdentityCreate) { return }
+
+    Write-Log 'Preflight: generating and validating SWS API token before Identity app creation/update...' 'Cyan'
+    Initialize-SwsAccessToken
+    if (-not $script:SwsAccessTokenValidated) {
+        throw 'SWS preflight failed: token was not validated before Identity app creation/update.'
+    }
+    Write-Log 'Preflight passed: SWS API token is generated and validated. Continuing to Identity app creation.' 'Green'
+}
+
 function Initialize-SwsAccessToken {
-    if (-not [string]::IsNullOrWhiteSpace($script:SwsAccessTokenToUse)) { return }
+    if (-not [string]::IsNullOrWhiteSpace($script:SwsAccessTokenToUse) -and $script:SwsAccessTokenValidated) { return }
 
     if (-not [string]::IsNullOrWhiteSpace($SwsAccessToken)) {
-        $script:SwsAccessTokenToUse = $SwsAccessToken
+        $script:SwsAccessTokenToUse = Confirm-SwsAccessTokenGeneratedAndUsable -Token $SwsAccessToken -Source '-SwsAccessToken parameter'
         return
     }
 
     if (-not $script:SwsAutoTokenAttempted) {
         $script:SwsAutoTokenAttempted = $true
         try {
-            $script:SwsAccessTokenToUse = New-SwsAccessTokenFromServiceAccountJson
-            if (-not [string]::IsNullOrWhiteSpace($script:SwsAccessTokenToUse)) { return }
+            $generatedToken = New-SwsAccessTokenFromServiceAccountJson
+            $script:SwsAccessTokenToUse = Confirm-SwsAccessTokenGeneratedAndUsable -Token $generatedToken -Source 'service-account JSON/helper JAR'
+            return
         } catch {
             Write-Log ("SWS service-account JSON auto-login failed: {0}" -f $_.Exception.Message) 'Yellow'
             Add-SwsReplicationSummary -Step 'Token' -Status 'FAILED' -Detail $_.Exception.Message
@@ -2022,12 +2191,18 @@ function Initialize-SwsAccessToken {
         }
     }
 
-    $secureToken = Read-Host 'Enter SWS API Bearer access token from your SWS service account' -AsSecureString
-    $script:SwsAccessTokenToUse = Convert-SecureStringToPlainText -SecureString $secureToken
+    if (-not $AllowManualSwsTokenPrompt.IsPresent) {
+        throw 'SWS token was not generated/validated automatically. Manual token prompt is disabled by default in this version. Fix the service-account JSON/helper/token issue or rerun with -AllowManualSwsTokenPrompt to paste a token manually.'
+    }
 
-    if ([string]::IsNullOrWhiteSpace($script:SwsAccessTokenToUse)) {
+    $secureToken = Read-Host 'Enter SWS API Bearer access token from your SWS service account' -AsSecureString
+    $manualToken = Convert-SecureStringToPlainText -SecureString $secureToken
+
+    if ([string]::IsNullOrWhiteSpace($manualToken)) {
         throw 'SWS access token is empty. Provide -SwsAccessToken, place the SWS service-account JSON and public-api-auth-helper JAR beside this script, or pass -SwsServiceAccountJsonPath and -SwsAuthHelperJarPath.'
     }
+
+    $script:SwsAccessTokenToUse = Confirm-SwsAccessTokenGeneratedAndUsable -Token $manualToken -Source 'manual prompt'
 }
 
 function Invoke-SwsApiRequest {
@@ -2328,6 +2503,10 @@ try {
     if ([string]::IsNullOrWhiteSpace($TemplateId)) {
         throw 'TemplateId cannot be empty.'
     }
+
+    # SWS hard gate: validate the generated token first so we do not create/update apps
+    # unless the SWS API token exists and is usable.
+    Invoke-SwsTokenPreflightIfEnabled
 
     Get-RegularCredential
     Get-ResolvedAppNameAndDescription
