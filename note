@@ -20,8 +20,11 @@ HOW MATCHING WORKS (handles messy input)
                         (only runs when no exact match was found anywhere)
 
 OUTPUT (written next to the input CSV, timestamped)
-    *_Summary.csv   one row per input value (overall status + best match)
-    *_Detail.csv    one row per individual account match found
+    *_Validation_Results.csv
+      - the CyberArk AccountID from the CSV is carried into the first column
+      - one row per account match found, so a username located in 3 domains
+        produces 3 separate lines
+      - one row for NOT_FOUND / BLANK_OR_INVALID inputs (nothing dropped)
 
 REQUIREMENTS
   - RSAT ActiveDirectory PowerShell module (Get-ADUser).
@@ -41,6 +44,9 @@ param(
 
     # If omitted, the script auto-detects the most likely username column.
     [string]$UsernameColumn,
+
+    # CyberArk unique Account ID column. If omitted, auto-detected; carried into the report.
+    [string]$AccountIdColumn,
 
     # Where reports are written. Defaults to the input CSV's folder.
     [string]$OutputDir,
@@ -176,8 +182,7 @@ if (-not (Test-Path $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir
 
 $stamp        = Get-Date -Format 'yyyyMMdd_HHmmss'
 $baseName     = [System.IO.Path]::GetFileNameWithoutExtension($CsvPath)
-$summaryPath  = Join-Path $OutputDir ("{0}_Validation_Summary_{1}.csv" -f $baseName, $stamp)
-$detailPath   = Join-Path $OutputDir ("{0}_Validation_Detail_{1}.csv"  -f $baseName, $stamp)
+$resultsPath  = Join-Path $OutputDir ("{0}_Validation_Results_{1}.csv" -f $baseName, $stamp)
 
 # --- Load CSV --------------------------------------------------------------
 
@@ -204,6 +209,23 @@ if (-not $UsernameColumn) {
     Write-Info "Auto-detected username column: '$UsernameColumn'"
 } elseif ($columns -notcontains $UsernameColumn) {
     Write-Err "Column '$UsernameColumn' not found. Available columns: $($columns -join ', ')"
+    return
+}
+
+# --- Detect the CyberArk Account ID column (excluding the username column) ---
+if (-not $AccountIdColumn) {
+    $idPreferred = @('accountid','account id','cyberarkid','cyberark id','pasaccountid','pas account id','uniqueid','unique id','objectid','id')
+    foreach ($p in $idPreferred) {
+        $hit = $columns | Where-Object { $_.Trim().ToLower() -eq $p -and $_ -ne $UsernameColumn } | Select-Object -First 1
+        if ($hit) { $AccountIdColumn = $hit; break }
+    }
+    if ($AccountIdColumn) {
+        Write-Info "Auto-detected Account ID column: '$AccountIdColumn'"
+    } else {
+        Write-Warn "No Account ID column detected; AccountID will be blank. Pass -AccountIdColumn '<col>' if you have one."
+    }
+} elseif ($columns -notcontains $AccountIdColumn) {
+    Write-Err "Account ID column '$AccountIdColumn' not found. Available columns: $($columns -join ', ')"
     return
 }
 
@@ -283,35 +305,51 @@ function Find-FuzzyMatches {
     return $found
 }
 
+# --- Result row builder ----------------------------------------------------
+
+function New-ResultRow {
+    param(
+        [string]$AccountId, [string]$InputValue, [string]$Cleaned,
+        [string]$Status, [string]$MatchType, [string]$Domain,
+        [object]$User, [string]$MatchedOn, [int]$MatchCount, [string]$Notes
+    )
+    [pscustomobject]@{
+        AccountID          = $AccountId        # CyberArk unique ID carried from the CSV
+        InputValue         = $InputValue
+        CleanedCandidate   = $Cleaned
+        Status             = $Status
+        MatchType          = $MatchType
+        Domain             = $Domain
+        SamAccountName     = if ($User) { $User.SamAccountName }    else { '' }
+        UserPrincipalName  = if ($User) { $User.UserPrincipalName } else { '' }
+        DisplayName        = if ($User) { $User.DisplayName }       else { '' }
+        Enabled            = if ($User) { $User.Enabled }           else { '' }
+        Description        = if ($User) { $User.Description }        else { '' }
+        WhenCreated        = if ($User) { $User.whenCreated }       else { '' }
+        DistinguishedName  = if ($User) { $User.DistinguishedName } else { '' }
+        MatchedOn          = $MatchedOn
+        MatchCountForInput = $MatchCount
+        Notes              = $Notes
+    }
+}
+
 # --- Main loop -------------------------------------------------------------
 
-$summary = New-Object System.Collections.Generic.List[object]
-$detail  = New-Object System.Collections.Generic.List[object]
+$results = New-Object System.Collections.Generic.List[object]
 $rowNum  = 0
 
 foreach ($row in $rows) {
     $rowNum++
-    $raw = [string]$row.$UsernameColumn
-    Write-Info ("[{0}/{1}] Validating: '{2}'" -f $rowNum, $rows.Count, $raw)
+    $raw    = [string]$row.$UsernameColumn
+    $acctId = if ($AccountIdColumn) { [string]$row.$AccountIdColumn } else { '' }
+    Write-Info ("[{0}/{1}] Validating: '{2}'  (AccountID={3})" -f $rowNum, $rows.Count, $raw, $acctId)
 
     $cand = Get-SearchCandidates -Raw $raw
 
     if ($cand.Exact.Count -eq 0) {
-        $summary.Add([pscustomobject]@{
-            InputValue       = $raw
-            CleanedCandidate = ''
-            OverallStatus    = 'BLANK_OR_INVALID'
-            MatchType        = ''
-            MatchCount       = 0
-            FoundInDomains   = ''
-            BestMatch_Sam    = ''
-            BestMatch_UPN    = ''
-            BestMatch_Domain = ''
-            BestMatch_Enabled= ''
-            BestMatch_DN     = ''
-            CandidatesTried  = ''
-            Notes            = 'Empty or unparseable value'
-        }) | Out-Null
+        $results.Add( (New-ResultRow -AccountId $acctId -InputValue $raw -Cleaned '' `
+            -Status 'BLANK_OR_INVALID' -MatchType '' -Domain '' -User $null `
+            -MatchedOn '' -MatchCount 0 -Notes 'Empty or unparseable value') ) | Out-Null
         continue
     }
 
@@ -344,70 +382,42 @@ foreach ($row in $rows) {
     $matchList = @($allMatches.Values)
     $count     = $matchList.Count
 
-    # Per-match detail rows.
-    foreach ($entry in $matchList) {
-        $u = $entry.Match.User
-        $detail.Add([pscustomobject]@{
-            InputValue        = $raw
-            Domain            = $entry.Domain
-            MatchType         = $entry.Match.MatchType
-            MatchedOn         = $entry.Match.MatchedOn
-            SamAccountName    = $u.SamAccountName
-            UserPrincipalName = $u.UserPrincipalName
-            DisplayName       = $u.DisplayName
-            Enabled           = $u.Enabled
-            Description       = $u.Description
-            WhenCreated       = $u.whenCreated
-            DistinguishedName = $u.DistinguishedName
-        }) | Out-Null
-    }
-
-    # Overall status + best match for the summary row.
     if ($count -eq 0) {
-        $status = 'NOT_FOUND'
-        $best   = $null
-    } elseif ($count -eq 1) {
-        $status = if ($matchType -eq 'Exact') { 'FOUND_UNIQUE' } else { 'FOUND_FUZZY_UNIQUE' }
-        $best   = $matchList[0]
-    } else {
-        $status = if ($matchType -eq 'Exact') { 'FOUND_MULTIPLE' } else { 'FOUND_FUZZY_MULTIPLE' }
-        # Prefer an enabled, exact match as "best".
-        $best = $matchList |
-                Sort-Object @{e={ if ($_.Match.MatchType -eq 'Exact'){0}else{1} }}, @{e={ if ($_.Match.User.Enabled){0}else{1} }} |
-                Select-Object -First 1
+        $results.Add( (New-ResultRow -AccountId $acctId -InputValue $raw -Cleaned $cand.Exact[0] `
+            -Status 'NOT_FOUND' -MatchType '' -Domain '' -User $null `
+            -MatchedOn ($cand.Exact -join ' | ') -MatchCount 0 -Notes 'No match in any domain') ) | Out-Null
+        continue
     }
 
-    $domains = ($matchList | ForEach-Object { $_.Domain } | Select-Object -Unique) -join '; '
+    # One row PER matched account -> a hit in 3 domains becomes 3 separate lines.
+    $domainsHit = ($matchList | ForEach-Object { $_.Domain } | Select-Object -Unique).Count
+    foreach ($entry in $matchList) {
+        $note = ''
+        if ($entry.Match.MatchType -eq 'Fuzzy') {
+            $note = 'Fuzzy suggestion - verify before use'
+        } elseif ($count -gt 1) {
+            $note = "Multiple matches ($count) across $domainsHit domain(s)"
+        }
 
-    $summary.Add([pscustomobject]@{
-        InputValue        = $raw
-        CleanedCandidate  = $cand.Exact[0]
-        OverallStatus     = $status
-        MatchType         = if ($count -gt 0) { $matchType } else { '' }
-        MatchCount        = $count
-        FoundInDomains    = $domains
-        BestMatch_Sam     = if ($best) { $best.Match.User.SamAccountName } else { '' }
-        BestMatch_UPN     = if ($best) { $best.Match.User.UserPrincipalName } else { '' }
-        BestMatch_Domain  = if ($best) { $best.Domain } else { '' }
-        BestMatch_Enabled = if ($best) { $best.Match.User.Enabled } else { '' }
-        BestMatch_DN      = if ($best) { $best.Match.User.DistinguishedName } else { '' }
-        CandidatesTried   = ($cand.Exact -join ' | ')
-        Notes             = if ($count -gt 1) { 'Multiple matches - review Detail report' } elseif ($matchType -eq 'Fuzzy' -and $count -ge 1) { 'Fuzzy suggestion - verify before use' } else { '' }
-    }) | Out-Null
+        $results.Add( (New-ResultRow -AccountId $acctId -InputValue $raw -Cleaned $cand.Exact[0] `
+            -Status 'FOUND' -MatchType $entry.Match.MatchType -Domain $entry.Domain `
+            -User $entry.Match.User -MatchedOn $entry.Match.MatchedOn -MatchCount $count -Notes $note) ) | Out-Null
+    }
 }
 
 # --- Export ----------------------------------------------------------------
 
-$summary | Export-Csv -Path $summaryPath -NoTypeInformation -Encoding UTF8
-$detail  | Export-Csv -Path $detailPath  -NoTypeInformation -Encoding UTF8
+$results | Export-Csv -Path $resultsPath -NoTypeInformation -Encoding UTF8
 
 # --- Console roll-up -------------------------------------------------------
 
-$counts = $summary | Group-Object OverallStatus | Sort-Object Name
 Write-Host ""
 Write-Ok "Validation complete."
 Write-Host "----------------------------------------"
-foreach ($g in $counts) { Write-Host ("  {0,-22} {1}" -f $g.Name, $g.Count) }
+$byStatus = $results | Group-Object Status | Sort-Object Name
+foreach ($g in $byStatus) { Write-Host ("  {0,-18} {1} line(s)" -f $g.Name, $g.Count) }
 Write-Host "----------------------------------------"
-Write-Ok "Summary report: $summaryPath"
-Write-Ok "Detail report:  $detailPath"
+Write-Host ("  CSV rows processed : {0}" -f $rows.Count)
+Write-Host ("  Total result lines : {0}" -f $results.Count)
+Write-Host "----------------------------------------"
+Write-Ok "Results report: $resultsPath"
