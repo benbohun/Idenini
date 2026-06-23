@@ -1,429 +1,736 @@
-based on this script instead of searching in different domain, i have another CSV that contain 4 roles based on below
-Email	Username	Address	Appcode
-SVCCWFDDI@prod.domain.com	SVCCWFDDI	prod.domain.com	CWF
-
-Use this csv as the source 
-
 <#
-Validate_Usernames_AcrossDomains.ps1
+Validate_Usernames_Against_DomainExport.ps1
 
 PURPOSE
-  Take a bulk CSV containing "likely" (often poorly formatted) usernames and:
-    1. Clean / normalize each value into a set of search candidates.
-    2. Search a list of AD domain OUs (SearchBases) to find the real account.
-    3. Report which usernames exist, in WHICH domain, the correct
-       sAMAccountName / UPN, and which ones were not found at all.
+  Compare a first/source CSV containing likely usernames against a second/reference CSV
+  exported from the domain list.
 
-HOW MATCHING WORKS (handles messy input)
-  For every CSV value the script builds candidates by:
-    - stripping a DOMAIN\ prefix and an @upn suffix
-    - trimming whitespace / quotes / stray punctuation
-    - producing space-removed, dotted, underscored, hyphenated variants
-  Then per domain it runs:
-    - PASS 1 (exact)  : sAMAccountName / UPN equals a candidate  -> high confidence
-    - PASS 2 (fuzzy)  : wildcard contains across sAMAccountName,
-                        userPrincipalName, displayName, cn, name   -> suggestions
-                        (only runs when no exact match was found anywhere)
+  FIRST CSV:
+    - Source/CyberArk list.
+    - Script auto-detects username column unless provided.
+    - Script auto-detects AccountID column unless provided.
+    - Carries SourceAccountID into the final report.
 
-OUTPUT (written next to the input CSV, timestamped)
-    *_Validation_Results.csv
-      - the CyberArk AccountID from the CSV is carried into the first column
-      - one row per account match found, so a username located in 3 domains
-        produces 3 separate lines
-      - one row for NOT_FOUND / BLANK_OR_INVALID inputs (nothing dropped)
+  SECOND CSV:
+    - Domain/reference export.
+    - Must contain:
+        Email, Username, Address, Appcode
 
-REQUIREMENTS
-  - RSAT ActiveDirectory PowerShell module (Get-ADUser).
-  - Network/trust path + DNS resolution to each target domain.
-  - Rights to read the target OUs (pass -Credential if needed).
+EXAMPLE SECOND CSV
+  Email,Username,Address,Appcode
+  SVCCWFDDI@prod.domain.com,SVCCWFDDI,prod.domain.com,CWF
+
+OUTPUT INCLUDES
+  SourceAccountID
+  SourceAppcode
+  InputValue
+  CleanedCandidate
+  Status
+  MatchType
+  MatchedEmail
+  MatchedUsername
+  MatchedAddress
+  MatchedAppcode
+  ReferenceRowNumber
+  MatchedOn
+  MatchCountForInput
+  Notes
 
 EXAMPLES
-  .\Validate_Usernames_AcrossDomains.ps1 -CsvPath "C:\temp\accounts.csv"
-  .\Validate_Usernames_AcrossDomains.ps1 -CsvPath ".\accounts.csv" -UsernameColumn "LikelyUser" -Credential (Get-Credential)
-  .\Validate_Usernames_AcrossDomains.ps1 -CsvPath ".\accounts.csv" -NoFuzzy
+  Interactive prompt:
+    .\Validate_Usernames_Against_DomainExport.ps1
+
+  With parameters:
+    .\Validate_Usernames_Against_DomainExport.ps1 `
+      -CsvPath "C:\Temp\CyberArk_Source.csv" `
+      -ReferenceCsvPath "C:\Temp\Domain_Export.csv" `
+      -UsernameColumn "Username" `
+      -AccountIdColumn "AccountID" `
+      -NoFuzzy
 #>
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)]
+    # First/source CSV. If not supplied, script will prompt.
     [string]$CsvPath,
 
-    # If omitted, the script auto-detects the most likely username column.
+    # Second/reference CSV. If not supplied, script will prompt.
+    [string]$ReferenceCsvPath,
+
+    # First/source CSV username column. If omitted, script auto-detects.
     [string]$UsernameColumn,
 
-    # CyberArk unique Account ID column. If omitted, auto-detected; carried into the report.
+    # First/source CSV CyberArk unique Account ID column. If omitted, script auto-detects if present.
     [string]$AccountIdColumn,
 
-    # Where reports are written. Defaults to the input CSV's folder.
+    # Optional first/source CSV Appcode column, if it exists.
+    [string]$SourceAppcodeColumn,
+
+    # Second/reference CSV columns.
+    [string]$RefEmailColumn    = 'Email',
+    [string]$RefUsernameColumn = 'Username',
+    [string]$RefAddressColumn  = 'Address',
+    [string]$RefAppcodeColumn  = 'Appcode',
+
+    # Where reports are written. Defaults to the first/source CSV folder.
     [string]$OutputDir,
 
-    # Optional alternate credentials for AD queries (use if cross-domain auth is needed).
-    [System.Management.Automation.PSCredential]$Credential,
-
-    # Turn off fuzzy/wildcard fallback (exact matching only).
+    # Turn off fuzzy fallback.
     [switch]$NoFuzzy,
 
-    # Safety cap on how many hits a single fuzzy search may return per domain.
-    [int]$MaxFuzzyPerSearch = 25,
-
-    # ============================================================
-    # DOMAIN SEARCH BASES  --  EDIT THESE PLACEHOLDERS
-    # The DNS domain (and thus the -Server) is auto-derived from the
-    # DC=... components of each DN unless you map an explicit server below.
-    # ============================================================
-    [string[]]$DomainSearchBases = @(
-        'OU=Service,OU=Accounts,DC=prod,DC=mtb,DC=com',
-        'OU=Service,OU=Accounts,DC=dev,DC=mtb,DC=com',
-        'OU=Service,OU=Accounts,DC=cert,DC=mtb,DC=com',
-        'OU=Service,OU=Accounts,DC=atmprod,DC=mtb,DC=com',
-        'OU=Service,OU=Accounts,DC=atmcert,DC=mtb,DC=com'
-    ),
-
-    # OPTIONAL: force a specific DC/server for a given DNS domain.
-    #   e.g. @{ 'prod.domain1.com' = 'dc01.prod.domain1.com' }
-    [hashtable]$ServerOverrides = @{}
+    # Safety cap on fuzzy matches per source row.
+    [int]$MaxFuzzyMatchesPerInput = 25
 )
 
 $ErrorActionPreference = 'Continue'
 
-# --- ASCII-only log helpers (PS 5.1 mangles emoji in BOM-less files) ---
 function Write-Info($m){ Write-Host "[INFO]  $m" -ForegroundColor Cyan }
 function Write-Ok($m){   Write-Host "[OK]    $m" -ForegroundColor Green }
 function Write-Warn($m){ Write-Host "[WARN]  $m" -ForegroundColor Yellow }
 function Write-Err($m){  Write-Host "[ERROR] $m" -ForegroundColor Red }
 
-# --- Module check ---
-if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
-    Write-Err "ActiveDirectory module not found. Install RSAT AD PowerShell tools and re-run."
-    return
+function Read-CsvPathPrompt {
+    param(
+        [Parameter(Mandatory)]
+        [string]$PromptMessage
+    )
+
+    while ($true) {
+        Write-Host ""
+        $path = Read-Host $PromptMessage
+
+        if ([string]::IsNullOrWhiteSpace($path)) {
+            Write-Warn "Path cannot be blank. Please enter a valid CSV path."
+            continue
+        }
+
+        $path = $path.Trim().Trim('"',"'").Trim()
+
+        if (-not (Test-Path -Path $path -PathType Leaf)) {
+            Write-Warn "CSV file not found: $path"
+            continue
+        }
+
+        if ([System.IO.Path]::GetExtension($path) -notmatch '(?i)^\.csv$') {
+            Write-Warn "The selected file does not appear to be a CSV file: $path"
+            $continue = Read-Host "Continue anyway? Type Y to continue"
+            if ($continue -ne 'Y') {
+                continue
+            }
+        }
+
+        return (Resolve-Path $path).Path
+    }
 }
-Import-Module ActiveDirectory -ErrorAction Stop
 
-# --- Helpers ---------------------------------------------------------------
+function Get-ObjectValue {
+    param(
+        [Parameter(Mandatory)]
+        [object]$Object,
 
-function ConvertTo-DnsDomain {
-    # OU=...,DC=prod,DC=domain1,DC=com  ->  prod.domain1.com
-    param([Parameter(Mandatory)][string]$DistinguishedName)
-    $dcs = [regex]::Matches($DistinguishedName, '(?i)DC=([^,]+)') | ForEach-Object { $_.Groups[1].Value }
-    return ($dcs -join '.')
+        [string]$PropertyName
+    )
+
+    if ([string]::IsNullOrWhiteSpace($PropertyName)) {
+        return ''
+    }
+
+    $prop = $Object.PSObject.Properties[$PropertyName]
+
+    if ($null -eq $prop) {
+        return ''
+    }
+
+    return [string]$prop.Value
 }
 
-function Get-EscapedLdapValue {
-    # Escape RFC 4515 special characters so messy input can't break the filter.
-    param([Parameter(Mandatory)][string]$Value)
-    $v = $Value
-    $v = $v -replace '\\', '\5c'
-    $v = $v -replace '\*',  '\2a'
-    $v = $v -replace '\(',  '\28'
-    $v = $v -replace '\)',  '\29'
-    $v = $v -replace "`0",  '\00'
-    return $v
+function Get-CleanValue {
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return ''
+    }
+
+    return $Value.Trim().Trim('"',"'").Trim()
+}
+
+function Get-EmailLocalPart {
+    param([string]$Email)
+
+    $e = Get-CleanValue $Email
+
+    if ([string]::IsNullOrWhiteSpace($e)) {
+        return ''
+    }
+
+    if ($e -match '@') {
+        return (($e -split '@')[0]).Trim()
+    }
+
+    return $e
+}
+
+function Get-NormalizedKey {
+    param([string]$Value)
+
+    $v = Get-CleanValue $Value
+
+    if ([string]::IsNullOrWhiteSpace($v)) {
+        return ''
+    }
+
+    return $v.ToLower()
 }
 
 function Get-SearchCandidates {
-    <#
-      Turn one raw CSV value into ordered, de-duplicated search candidates.
-      Returns a hashtable:
-        Exact = @(...)  values to try as an EXACT sAMAccountName/UPN match
-        Fuzzy = @(...)  tokens to wildcard-search when nothing exact is found
-    #>
     param([string]$Raw)
 
     $exact = New-Object System.Collections.Generic.List[string]
     $fuzzy = New-Object System.Collections.Generic.List[string]
 
     if ([string]::IsNullOrWhiteSpace($Raw)) {
-        return @{ Exact = @(); Fuzzy = @() }
+        return @{
+            Exact = @()
+            Fuzzy = @()
+        }
     }
 
-    # 1. Trim and strip wrapping quotes / stray surrounding punctuation.
     $core = $Raw.Trim().Trim('"',"'").Trim()
 
-    # 2. Strip DOMAIN\ prefix.
-    if ($core -match '\\') { $core = ($core -split '\\')[-1] }
+    if ($core -match '\\') {
+        $core = ($core -split '\\')[-1]
+    }
 
-    # 3. Strip @upnsuffix.
-    if ($core -match '@')  { $core = ($core -split '@')[0] }
+    if ($core -match '@') {
+        $core = ($core -split '@')[0]
+    }
 
     $core = $core.Trim()
+
     if ([string]::IsNullOrWhiteSpace($core)) {
-        return @{ Exact = @(); Fuzzy = @() }
+        return @{
+            Exact = @()
+            Fuzzy = @()
+        }
     }
 
-    # Whitespace-normalized variants for EXACT attempts.
     $variants = New-Object System.Collections.Generic.List[string]
+
     [void]$variants.Add($core)
-    [void]$variants.Add(($core -replace '\s+',''))    # remove spaces
-    [void]$variants.Add(($core -replace '\s+','.'))   # spaces -> dot
-    [void]$variants.Add(($core -replace '\s+','_'))   # spaces -> underscore
-    [void]$variants.Add(($core -replace '\s+','-'))   # spaces -> hyphen
+    [void]$variants.Add(($core -replace '\s+',''))
+    [void]$variants.Add(($core -replace '\s+','.'))
+    [void]$variants.Add(($core -replace '\s+','_'))
+    [void]$variants.Add(($core -replace '\s+','-'))
 
     foreach ($v in $variants) {
-        $vv = $v.Trim()
-        if ($vv -and -not $exact.Contains($vv)) { [void]$exact.Add($vv) }
+        $vv = Get-CleanValue $v
+
+        if ($vv -and -not $exact.Contains($vv)) {
+            [void]$exact.Add($vv)
+        }
     }
 
-    # Fuzzy tokens: the space-removed core + each "word" >2 chars.
     $fuzzyRaw = New-Object System.Collections.Generic.List[string]
+
     [void]$fuzzyRaw.Add(($core -replace '\s+',''))
+
     foreach ($w in ($core -split '\s+')) {
         $wt = ($w -replace '[^A-Za-z0-9_\-\.]', '').Trim()
-        if ($wt.Length -gt 2) { [void]$fuzzyRaw.Add($wt) }
-    }
-    foreach ($f in $fuzzyRaw) {
-        $ff = $f.Trim()
-        if ($ff -and -not $fuzzy.Contains($ff)) { [void]$fuzzy.Add($ff) }
+
+        if ($wt.Length -gt 2) {
+            [void]$fuzzyRaw.Add($wt)
+        }
     }
 
-    return @{ Exact = $exact.ToArray(); Fuzzy = $fuzzy.ToArray() }
+    foreach ($f in $fuzzyRaw) {
+        $ff = Get-CleanValue $f
+
+        if ($ff -and -not $fuzzy.Contains($ff)) {
+            [void]$fuzzy.Add($ff)
+        }
+    }
+
+    return @{
+        Exact = $exact.ToArray()
+        Fuzzy = $fuzzy.ToArray()
+    }
 }
 
-# --- Resolve paths ---------------------------------------------------------
+function New-ResultRow {
+    param(
+        [string]$SourceAccountId,
+        [string]$SourceAppcode,
+        [string]$InputValue,
+        [string]$CleanedCandidate,
+        [string]$Status,
+        [string]$MatchType,
+        [object]$ReferenceRecord,
+        [string]$MatchedOn,
+        [int]$MatchCount,
+        [string]$Notes
+    )
 
-if (-not (Test-Path $CsvPath)) { Write-Err "CSV not found: $CsvPath"; return }
+    [pscustomobject]@{
+        SourceAccountID        = $SourceAccountId
+        SourceAppcode          = $SourceAppcode
+        InputValue             = $InputValue
+        CleanedCandidate       = $CleanedCandidate
+        Status                 = $Status
+        MatchType              = $MatchType
+
+        MatchedEmail           = if ($ReferenceRecord) { $ReferenceRecord.Email }    else { '' }
+        MatchedUsername        = if ($ReferenceRecord) { $ReferenceRecord.Username } else { '' }
+        MatchedAddress         = if ($ReferenceRecord) { $ReferenceRecord.Address }  else { '' }
+        MatchedAppcode         = if ($ReferenceRecord) { $ReferenceRecord.Appcode }  else { '' }
+
+        ReferenceRowNumber     = if ($ReferenceRecord) { $ReferenceRecord.RowNumber } else { '' }
+        MatchedOn              = $MatchedOn
+        MatchCountForInput     = $MatchCount
+        Notes                  = $Notes
+    }
+}
+
+# Prompt for CSV paths if not supplied.
+
+if ([string]::IsNullOrWhiteSpace($CsvPath)) {
+    $CsvPath = Read-CsvPathPrompt -PromptMessage "Enter the full path for the FIRST/source CSV"
+}
+else {
+    $CsvPath = $CsvPath.Trim().Trim('"',"'").Trim()
+}
+
+if ([string]::IsNullOrWhiteSpace($ReferenceCsvPath)) {
+    $ReferenceCsvPath = Read-CsvPathPrompt -PromptMessage "Enter the full path for the SECOND/reference/domain-export CSV"
+}
+else {
+    $ReferenceCsvPath = $ReferenceCsvPath.Trim().Trim('"',"'").Trim()
+}
+
+# Path validation.
+
+if (-not (Test-Path $CsvPath)) {
+    Write-Err "First/source CSV not found: $CsvPath"
+    return
+}
+
+if (-not (Test-Path $ReferenceCsvPath)) {
+    Write-Err "Second/reference CSV not found: $ReferenceCsvPath"
+    return
+}
+
 $CsvPath = (Resolve-Path $CsvPath).Path
+$ReferenceCsvPath = (Resolve-Path $ReferenceCsvPath).Path
 
-if (-not $OutputDir) { $OutputDir = Split-Path -Parent $CsvPath }
-if (-not (Test-Path $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null }
+if (-not $OutputDir) {
+    $OutputDir = Split-Path -Parent $CsvPath
+}
 
-$stamp        = Get-Date -Format 'yyyyMMdd_HHmmss'
-$baseName     = [System.IO.Path]::GetFileNameWithoutExtension($CsvPath)
-$resultsPath  = Join-Path $OutputDir ("{0}_Validation_Results_{1}.csv" -f $baseName, $stamp)
+if (-not (Test-Path $OutputDir)) {
+    New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
+}
 
-# --- Load CSV --------------------------------------------------------------
+$stamp       = Get-Date -Format 'yyyyMMdd_HHmmss'
+$baseName    = [System.IO.Path]::GetFileNameWithoutExtension($CsvPath)
+$resultsPath = Join-Path $OutputDir ("{0}_Validation_Results_{1}.csv" -f $baseName, $stamp)
 
-$rows = Import-Csv -Path $CsvPath
-if (-not $rows -or $rows.Count -eq 0) { Write-Err "CSV '$CsvPath' has no data rows."; return }
+# Load first/source CSV.
+
+$rows = @(Import-Csv -Path $CsvPath)
+
+if ($rows.Count -eq 0) {
+    Write-Err "First/source CSV '$CsvPath' has no data rows."
+    return
+}
 
 $columns = $rows[0].PSObject.Properties.Name
 
 if (-not $UsernameColumn) {
-    $preferred = @('samaccountname','username','user name','user','login','logon','account','accountname','name','userid','id')
+    $preferred = @(
+        'samaccountname',
+        'sAMAccountName',
+        'username',
+        'user name',
+        'user',
+        'login',
+        'logon',
+        'account',
+        'accountname',
+        'account name',
+        'name',
+        'userid',
+        'user id',
+        'id'
+    )
+
     foreach ($p in $preferred) {
-        $hit = $columns | Where-Object { $_.Trim().ToLower() -eq $p } | Select-Object -First 1
-        if ($hit) { $UsernameColumn = $hit; break }
+        $hit = $columns |
+            Where-Object { $_.Trim().ToLower() -eq $p.ToLower() } |
+            Select-Object -First 1
+
+        if ($hit) {
+            $UsernameColumn = $hit
+            break
+        }
     }
+
     if (-not $UsernameColumn) {
-        # fall back to first column containing 'user' or 'account' or 'name'
-        $UsernameColumn = $columns | Where-Object { $_ -match '(?i)user|account|name|login|logon' } | Select-Object -First 1
+        $UsernameColumn = $columns |
+            Where-Object { $_ -match '(?i)user|account|name|login|logon' } |
+            Select-Object -First 1
     }
+
     if (-not $UsernameColumn) {
-        Write-Err "Could not auto-detect a username column. Available columns: $($columns -join ', ')"
+        Write-Err "Could not auto-detect a username column in the first/source CSV."
+        Write-Err "Available columns: $($columns -join ', ')"
         Write-Err "Re-run with -UsernameColumn '<columnName>'."
         return
     }
-    Write-Info "Auto-detected username column: '$UsernameColumn'"
-} elseif ($columns -notcontains $UsernameColumn) {
-    Write-Err "Column '$UsernameColumn' not found. Available columns: $($columns -join ', ')"
+
+    Write-Info "Auto-detected source username column: '$UsernameColumn'"
+}
+elseif ($columns -notcontains $UsernameColumn) {
+    Write-Err "Username column '$UsernameColumn' not found in first/source CSV."
+    Write-Err "Available columns: $($columns -join ', ')"
     return
 }
 
-# --- Detect the CyberArk Account ID column (excluding the username column) ---
 if (-not $AccountIdColumn) {
-    $idPreferred = @('accountid','account id','cyberarkid','cyberark id','pasaccountid','pas account id','uniqueid','unique id','objectid','id')
-    foreach ($p in $idPreferred) {
-        $hit = $columns | Where-Object { $_.Trim().ToLower() -eq $p -and $_ -ne $UsernameColumn } | Select-Object -First 1
-        if ($hit) { $AccountIdColumn = $hit; break }
-    }
-    if ($AccountIdColumn) {
-        Write-Info "Auto-detected Account ID column: '$AccountIdColumn'"
-    } else {
-        Write-Warn "No Account ID column detected; AccountID will be blank. Pass -AccountIdColumn '<col>' if you have one."
-    }
-} elseif ($columns -notcontains $AccountIdColumn) {
-    Write-Err "Account ID column '$AccountIdColumn' not found. Available columns: $($columns -join ', ')"
-    return
-}
-
-# --- Build domain target list & test reachability --------------------------
-
-$adProps = @('SamAccountName','UserPrincipalName','DisplayName','Name','Enabled','DistinguishedName','Description','whenCreated')
-
-$targets = New-Object System.Collections.Generic.List[object]
-foreach ($sb in $DomainSearchBases) {
-    if ([string]::IsNullOrWhiteSpace($sb)) { continue }
-    $dns    = ConvertTo-DnsDomain -DistinguishedName $sb
-    $server = if ($ServerOverrides.ContainsKey($dns)) { $ServerOverrides[$dns] } else { $dns }
-
-    $common = @{ Server = $server }
-    if ($Credential) { $common['Credential'] = $Credential }
-
-    $reachable = $false
-    try {
-        # Cheap probe: confirm the search base resolves and we can read it.
-        Get-ADObject -Identity $sb @common -ErrorAction Stop | Out-Null
-        $reachable = $true
-        Write-Ok "Reachable: $dns  (SearchBase OK)"
-    } catch {
-        Write-Warn "Skipping unreachable/unreadable target '$dns' [$sb]: $($_.Exception.Message)"
-    }
-
-    $targets.Add([pscustomobject]@{
-        SearchBase = $sb
-        Dns        = $dns
-        Server     = $server
-        Common     = $common
-        Reachable  = $reachable
-    }) | Out-Null
-}
-
-$liveTargets = @($targets | Where-Object { $_.Reachable })
-if ($liveTargets.Count -eq 0) {
-    Write-Err "No reachable domains. Check the SearchBase placeholders, DNS, trust, and credentials."
-    return
-}
-Write-Info ("Searching {0} reachable domain(s) for {1} input value(s)." -f $liveTargets.Count, $rows.Count)
-
-# --- Search routines -------------------------------------------------------
-
-function Find-ExactMatches {
-    param([string[]]$Candidates, [object]$Target)
-    $found = New-Object System.Collections.Generic.List[object]
-    $c = $Target.Common   # must splat from a plain variable, not a property expression
-    foreach ($cand in $Candidates) {
-        $esc = Get-EscapedLdapValue -Value $cand
-        $filter = "(|(sAMAccountName=$esc)(userPrincipalName=$esc))"
-        try {
-            $res = Get-ADUser -LDAPFilter $filter -SearchBase $Target.SearchBase -Properties $adProps @c -ErrorAction Stop
-            foreach ($u in $res) { $found.Add([pscustomobject]@{ User=$u; MatchedOn=$cand; MatchType='Exact' }) | Out-Null }
-        } catch {
-            Write-Warn "Exact search error in $($Target.Dns) for '$cand': $($_.Exception.Message)"
-        }
-    }
-    return $found
-}
-
-function Find-FuzzyMatches {
-    param([string[]]$Tokens, [object]$Target, [int]$Cap)
-    $found = New-Object System.Collections.Generic.List[object]
-    $c = $Target.Common   # must splat from a plain variable, not a property expression
-    foreach ($tok in $Tokens) {
-        if ($tok.Length -lt 3) { continue }
-        $esc = Get-EscapedLdapValue -Value $tok
-        $filter = "(|(sAMAccountName=*$esc*)(userPrincipalName=*$esc*)(displayName=*$esc*)(cn=*$esc*)(name=*$esc*))"
-        try {
-            $res = Get-ADUser -LDAPFilter $filter -SearchBase $Target.SearchBase -Properties $adProps -ResultSetSize $Cap @c -ErrorAction Stop
-            foreach ($u in $res) { $found.Add([pscustomobject]@{ User=$u; MatchedOn=$tok; MatchType='Fuzzy' }) | Out-Null }
-        } catch {
-            Write-Warn "Fuzzy search error in $($Target.Dns) for '$tok': $($_.Exception.Message)"
-        }
-    }
-    return $found
-}
-
-# --- Result row builder ----------------------------------------------------
-
-function New-ResultRow {
-    param(
-        [string]$AccountId, [string]$InputValue, [string]$Cleaned,
-        [string]$Status, [string]$MatchType, [string]$Domain,
-        [object]$User, [string]$MatchedOn, [int]$MatchCount, [string]$Notes
+    $idPreferred = @(
+        'accountid',
+        'account id',
+        'cyberarkid',
+        'cyberark id',
+        'pasaccountid',
+        'pas account id',
+        'uniqueid',
+        'unique id',
+        'objectid',
+        'object id',
+        'id'
     )
-    [pscustomobject]@{
-        AccountID          = $AccountId        # CyberArk unique ID carried from the CSV
-        InputValue         = $InputValue
-        CleanedCandidate   = $Cleaned
-        Status             = $Status
-        MatchType          = $MatchType
-        Domain             = $Domain
-        SamAccountName     = if ($User) { $User.SamAccountName }    else { '' }
-        UserPrincipalName  = if ($User) { $User.UserPrincipalName } else { '' }
-        DisplayName        = if ($User) { $User.DisplayName }       else { '' }
-        Enabled            = if ($User) { $User.Enabled }           else { '' }
-        Description        = if ($User) { $User.Description }        else { '' }
-        WhenCreated        = if ($User) { $User.whenCreated }       else { '' }
-        DistinguishedName  = if ($User) { $User.DistinguishedName } else { '' }
-        MatchedOn          = $MatchedOn
-        MatchCountForInput = $MatchCount
-        Notes              = $Notes
-    }
-}
 
-# --- Main loop -------------------------------------------------------------
+    foreach ($p in $idPreferred) {
+        $hit = $columns |
+            Where-Object {
+                $_.Trim().ToLower() -eq $p.ToLower() -and
+                $_ -ne $UsernameColumn
+            } |
+            Select-Object -First 1
 
-$results = New-Object System.Collections.Generic.List[object]
-$rowNum  = 0
-
-foreach ($row in $rows) {
-    $rowNum++
-    $raw    = [string]$row.$UsernameColumn
-    $acctId = if ($AccountIdColumn) { [string]$row.$AccountIdColumn } else { '' }
-    Write-Info ("[{0}/{1}] Validating: '{2}'  (AccountID={3})" -f $rowNum, $rows.Count, $raw, $acctId)
-
-    $cand = Get-SearchCandidates -Raw $raw
-
-    if ($cand.Exact.Count -eq 0) {
-        $results.Add( (New-ResultRow -AccountId $acctId -InputValue $raw -Cleaned '' `
-            -Status 'BLANK_OR_INVALID' -MatchType '' -Domain '' -User $null `
-            -MatchedOn '' -MatchCount 0 -Notes 'Empty or unparseable value') ) | Out-Null
-        continue
-    }
-
-    # Collect matches across all live domains, de-duped by DN.
-    $allMatches = @{}   # DN -> match record
-    $matchType  = 'Exact'
-
-    foreach ($t in $liveTargets) {
-        foreach ($m in (Find-ExactMatches -Candidates $cand.Exact -Target $t)) {
-            $dn = $m.User.DistinguishedName
-            if (-not $allMatches.ContainsKey($dn)) {
-                $allMatches[$dn] = [pscustomobject]@{ Match=$m; Domain=$t.Dns }
-            }
+        if ($hit) {
+            $AccountIdColumn = $hit
+            break
         }
     }
 
-    # Fuzzy fallback only if nothing exact and fuzzy enabled.
-    if ($allMatches.Count -eq 0 -and -not $NoFuzzy -and $cand.Fuzzy.Count -gt 0) {
-        $matchType = 'Fuzzy'
-        foreach ($t in $liveTargets) {
-            foreach ($m in (Find-FuzzyMatches -Tokens $cand.Fuzzy -Target $t -Cap $MaxFuzzyPerSearch)) {
-                $dn = $m.User.DistinguishedName
-                if (-not $allMatches.ContainsKey($dn)) {
-                    $allMatches[$dn] = [pscustomobject]@{ Match=$m; Domain=$t.Dns }
+    if ($AccountIdColumn) {
+        Write-Info "Auto-detected source Account ID column: '$AccountIdColumn'"
+    }
+    else {
+        Write-Warn "No Account ID column detected in first/source CSV; SourceAccountID will be blank."
+    }
+}
+elseif ($columns -notcontains $AccountIdColumn) {
+    Write-Err "Account ID column '$AccountIdColumn' not found in first/source CSV."
+    Write-Err "Available columns: $($columns -join ', ')"
+    return
+}
+
+if (-not $SourceAppcodeColumn) {
+    $hitSourceAppcode = $columns |
+        Where-Object { $_.Trim().ToLower() -eq 'appcode' } |
+        Select-Object -First 1
+
+    if ($hitSourceAppcode) {
+        $SourceAppcodeColumn = $hitSourceAppcode
+        Write-Info "Auto-detected source Appcode column: '$SourceAppcodeColumn'"
+    }
+}
+elseif ($columns -notcontains $SourceAppcodeColumn) {
+    Write-Err "Source Appcode column '$SourceAppcodeColumn' not found in first/source CSV."
+    Write-Err "Available columns: $($columns -join ', ')"
+    return
+}
+
+# Load second/reference CSV.
+
+$refRows = @(Import-Csv -Path $ReferenceCsvPath)
+
+if ($refRows.Count -eq 0) {
+    Write-Err "Second/reference CSV '$ReferenceCsvPath' has no data rows."
+    return
+}
+
+$refColumns = $refRows[0].PSObject.Properties.Name
+
+$requiredRefColumns = @(
+    $RefEmailColumn,
+    $RefUsernameColumn,
+    $RefAddressColumn,
+    $RefAppcodeColumn
+)
+
+foreach ($col in $requiredRefColumns) {
+    if ($refColumns -notcontains $col) {
+        Write-Err "Required reference column '$col' not found in second/reference CSV."
+        Write-Err "Available columns: $($refColumns -join ', ')"
+        return
+    }
+}
+
+Write-Info "Loaded $($rows.Count) source row(s) from first CSV."
+Write-Info "Loaded $($refRows.Count) reference row(s) from second CSV."
+Write-Info "Source username column: '$UsernameColumn'"
+Write-Info "Source Account ID column: '$AccountIdColumn'"
+Write-Info "Reference columns: Email='$RefEmailColumn', Username='$RefUsernameColumn', Address='$RefAddressColumn', Appcode='$RefAppcodeColumn'"
+
+# Build reference lookup.
+
+$referenceRecords = New-Object System.Collections.Generic.List[object]
+$exactIndex = @{}
+
+$refRowNum = 0
+
+foreach ($ref in $refRows) {
+    $refRowNum++
+
+    $email    = Get-CleanValue (Get-ObjectValue -Object $ref -PropertyName $RefEmailColumn)
+    $username = Get-CleanValue (Get-ObjectValue -Object $ref -PropertyName $RefUsernameColumn)
+    $address  = Get-CleanValue (Get-ObjectValue -Object $ref -PropertyName $RefAddressColumn)
+    $appcode  = Get-CleanValue (Get-ObjectValue -Object $ref -PropertyName $RefAppcodeColumn)
+
+    $emailLocal = Get-EmailLocalPart $email
+
+    $keys = New-Object System.Collections.Generic.List[string]
+
+    foreach ($candidateKey in @($username, $emailLocal, $email)) {
+        $k = Get-NormalizedKey $candidateKey
+
+        if ($k -and -not $keys.Contains($k)) {
+            [void]$keys.Add($k)
+        }
+    }
+
+    $record = [pscustomobject]@{
+        RowNumber  = $refRowNum
+        Email      = $email
+        Username   = $username
+        Address    = $address
+        Appcode    = $appcode
+        ExactKeys  = $keys.ToArray()
+        SearchText = ("{0} {1} {2} {3}" -f $username, $email, $address, $appcode).ToLower()
+    }
+
+    [void]$referenceRecords.Add($record)
+
+    foreach ($key in $record.ExactKeys) {
+        if (-not $exactIndex.ContainsKey($key)) {
+            $exactIndex[$key] = New-Object System.Collections.Generic.List[object]
+        }
+
+        [void]$exactIndex[$key].Add($record)
+    }
+}
+
+function Find-ExactReferenceMatches {
+    param(
+        [string[]]$Candidates,
+        [hashtable]$Index
+    )
+
+    $found = @{}
+
+    foreach ($cand in $Candidates) {
+        $key = Get-NormalizedKey $cand
+
+        if ([string]::IsNullOrWhiteSpace($key)) {
+            continue
+        }
+
+        if ($Index.ContainsKey($key)) {
+            foreach ($record in $Index[$key]) {
+                $unique = "{0}|{1}|{2}|{3}|{4}" -f `
+                    $record.RowNumber,
+                    $record.Email,
+                    $record.Username,
+                    $record.Address,
+                    $record.Appcode
+
+                if (-not $found.ContainsKey($unique)) {
+                    $found[$unique] = [pscustomobject]@{
+                        Record    = $record
+                        MatchedOn = $cand
+                        MatchType = 'Exact'
+                    }
                 }
             }
         }
     }
 
-    $matchList = @($allMatches.Values)
-    $count     = $matchList.Count
+    return @($found.Values)
+}
 
-    if ($count -eq 0) {
-        $results.Add( (New-ResultRow -AccountId $acctId -InputValue $raw -Cleaned $cand.Exact[0] `
-            -Status 'NOT_FOUND' -MatchType '' -Domain '' -User $null `
-            -MatchedOn ($cand.Exact -join ' | ') -MatchCount 0 -Notes 'No match in any domain') ) | Out-Null
+function Find-FuzzyReferenceMatches {
+    param(
+        [string[]]$Tokens,
+        [object[]]$ReferenceRecords,
+        [int]$Cap
+    )
+
+    $found = @{}
+
+    foreach ($token in $Tokens) {
+        $t = Get-NormalizedKey $token
+
+        if ([string]::IsNullOrWhiteSpace($t) -or $t.Length -lt 3) {
+            continue
+        }
+
+        foreach ($record in $ReferenceRecords) {
+            if ($found.Count -ge $Cap) {
+                break
+            }
+
+            if ($record.SearchText -like "*$t*") {
+                $unique = "{0}|{1}|{2}|{3}|{4}" -f `
+                    $record.RowNumber,
+                    $record.Email,
+                    $record.Username,
+                    $record.Address,
+                    $record.Appcode
+
+                if (-not $found.ContainsKey($unique)) {
+                    $found[$unique] = [pscustomobject]@{
+                        Record    = $record
+                        MatchedOn = $token
+                        MatchType = 'Fuzzy'
+                    }
+                }
+            }
+        }
+
+        if ($found.Count -ge $Cap) {
+            break
+        }
+    }
+
+    return @($found.Values)
+}
+
+# Main validation.
+
+$results = New-Object System.Collections.Generic.List[object]
+$rowNum = 0
+
+foreach ($row in $rows) {
+    $rowNum++
+
+    $raw = Get-ObjectValue -Object $row -PropertyName $UsernameColumn
+
+    $sourceAccountId = ''
+    if ($AccountIdColumn) {
+        $sourceAccountId = Get-ObjectValue -Object $row -PropertyName $AccountIdColumn
+    }
+
+    $sourceAppcode = ''
+    if ($SourceAppcodeColumn) {
+        $sourceAppcode = Get-ObjectValue -Object $row -PropertyName $SourceAppcodeColumn
+    }
+
+    Write-Info ("[{0}/{1}] Validating InputValue='{2}' SourceAccountID='{3}'" -f `
+        $rowNum,
+        $rows.Count,
+        $raw,
+        $sourceAccountId)
+
+    $cand = Get-SearchCandidates -Raw $raw
+
+    if ($cand.Exact.Count -eq 0) {
+        $results.Add((New-ResultRow `
+            -SourceAccountId $sourceAccountId `
+            -SourceAppcode $sourceAppcode `
+            -InputValue $raw `
+            -CleanedCandidate '' `
+            -Status 'BLANK_OR_INVALID' `
+            -MatchType '' `
+            -ReferenceRecord $null `
+            -MatchedOn '' `
+            -MatchCount 0 `
+            -Notes 'Empty or unparseable value')) | Out-Null
+
         continue
     }
 
-    # One row PER matched account -> a hit in 3 domains becomes 3 separate lines.
-    $domainsHit = ($matchList | ForEach-Object { $_.Domain } | Select-Object -Unique).Count
-    foreach ($entry in $matchList) {
+    $matches = @(Find-ExactReferenceMatches `
+        -Candidates $cand.Exact `
+        -Index $exactIndex)
+
+    if ($matches.Count -eq 0 -and -not $NoFuzzy -and $cand.Fuzzy.Count -gt 0) {
+        $matches = @(Find-FuzzyReferenceMatches `
+            -Tokens $cand.Fuzzy `
+            -ReferenceRecords $referenceRecords.ToArray() `
+            -Cap $MaxFuzzyMatchesPerInput)
+    }
+
+    $count = $matches.Count
+
+    if ($count -eq 0) {
+        $results.Add((New-ResultRow `
+            -SourceAccountId $sourceAccountId `
+            -SourceAppcode $sourceAppcode `
+            -InputValue $raw `
+            -CleanedCandidate $cand.Exact[0] `
+            -Status 'NOT_FOUND' `
+            -MatchType '' `
+            -ReferenceRecord $null `
+            -MatchedOn ($cand.Exact -join ' | ') `
+            -MatchCount 0 `
+            -Notes 'No match found in second/reference CSV')) | Out-Null
+
+        continue
+    }
+
+    foreach ($m in $matches) {
         $note = ''
-        if ($entry.Match.MatchType -eq 'Fuzzy') {
+
+        if ($m.MatchType -eq 'Fuzzy') {
             $note = 'Fuzzy suggestion - verify before use'
-        } elseif ($count -gt 1) {
-            $note = "Multiple matches ($count) across $domainsHit domain(s)"
+        }
+        elseif ($count -gt 1) {
+            $note = "Multiple matches found in second/reference CSV"
         }
 
-        $results.Add( (New-ResultRow -AccountId $acctId -InputValue $raw -Cleaned $cand.Exact[0] `
-            -Status 'FOUND' -MatchType $entry.Match.MatchType -Domain $entry.Domain `
-            -User $entry.Match.User -MatchedOn $entry.Match.MatchedOn -MatchCount $count -Notes $note) ) | Out-Null
+        $results.Add((New-ResultRow `
+            -SourceAccountId $sourceAccountId `
+            -SourceAppcode $sourceAppcode `
+            -InputValue $raw `
+            -CleanedCandidate $cand.Exact[0] `
+            -Status 'FOUND' `
+            -MatchType $m.MatchType `
+            -ReferenceRecord $m.Record `
+            -MatchedOn $m.MatchedOn `
+            -MatchCount $count `
+            -Notes $note)) | Out-Null
     }
 }
 
-# --- Export ----------------------------------------------------------------
+# Export.
 
 $results | Export-Csv -Path $resultsPath -NoTypeInformation -Encoding UTF8
-
-# --- Console roll-up -------------------------------------------------------
 
 Write-Host ""
 Write-Ok "Validation complete."
 Write-Host "----------------------------------------"
+
 $byStatus = $results | Group-Object Status | Sort-Object Name
-foreach ($g in $byStatus) { Write-Host ("  {0,-18} {1} line(s)" -f $g.Name, $g.Count) }
+
+foreach ($g in $byStatus) {
+    Write-Host ("  {0,-18} {1} line(s)" -f $g.Name, $g.Count)
+}
+
 Write-Host "----------------------------------------"
-Write-Host ("  CSV rows processed : {0}" -f $rows.Count)
-Write-Host ("  Total result lines : {0}" -f $results.Count)
+Write-Host ("  Source CSV rows processed   : {0}" -f $rows.Count)
+Write-Host ("  Reference CSV rows loaded   : {0}" -f $refRows.Count)
+Write-Host ("  Total result lines          : {0}" -f $results.Count)
 Write-Host "----------------------------------------"
 Write-Ok "Results report: $resultsPath"
