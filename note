@@ -1,472 +1,429 @@
+based on this script instead of searching in different domain, i have another CSV that contain 4 roles based on below
+Email	Username	Address	Appcode
+SVCCWFDDI@prod.domain.com	SVCCWFDDI	prod.domain.com	CWF
+
+Use this csv as the source 
+
 <#
-.SYNOPSIS
-    Verify AD domains / SearchBases before running Validate_Usernames_AcrossDomains.ps1
+Validate_Usernames_AcrossDomains.ps1
 
-.DESCRIPTION
-    This script checks:
-      1. ActiveDirectory PowerShell module availability
-      2. Domain DNS name derived from each SearchBase
-      3. DNS resolution for the derived domain/server
-      4. TCP connectivity to LDAP ports 389 and 636
-      5. AD domain readability
-      6. SearchBase readability using Get-ADObject
+PURPOSE
+  Take a bulk CSV containing "likely" (often poorly formatted) usernames and:
+    1. Clean / normalize each value into a set of search candidates.
+    2. Search a list of AD domain OUs (SearchBases) to find the real account.
+    3. Report which usernames exist, in WHICH domain, the correct
+       sAMAccountName / UPN, and which ones were not found at all.
 
-    Output:
-      - Console summary
-      - Timestamped CSV report
+HOW MATCHING WORKS (handles messy input)
+  For every CSV value the script builds candidates by:
+    - stripping a DOMAIN\ prefix and an @upn suffix
+    - trimming whitespace / quotes / stray punctuation
+    - producing space-removed, dotted, underscored, hyphenated variants
+  Then per domain it runs:
+    - PASS 1 (exact)  : sAMAccountName / UPN equals a candidate  -> high confidence
+    - PASS 2 (fuzzy)  : wildcard contains across sAMAccountName,
+                        userPrincipalName, displayName, cn, name   -> suggestions
+                        (only runs when no exact match was found anywhere)
 
-.REQUIREMENTS
-    - PowerShell 5.1
-    - RSAT ActiveDirectory module
-    - Network/trust/DNS path to target domains
-    - Read permission to the target OUs
+OUTPUT (written next to the input CSV, timestamped)
+    *_Validation_Results.csv
+      - the CyberArk AccountID from the CSV is carried into the first column
+      - one row per account match found, so a username located in 3 domains
+        produces 3 separate lines
+      - one row for NOT_FOUND / BLANK_OR_INVALID inputs (nothing dropped)
 
-.EXAMPLES
-    .\Verify-DomainSearchBases.ps1
+REQUIREMENTS
+  - RSAT ActiveDirectory PowerShell module (Get-ADUser).
+  - Network/trust path + DNS resolution to each target domain.
+  - Rights to read the target OUs (pass -Credential if needed).
 
-    .\Verify-DomainSearchBases.ps1 -Credential (Get-Credential)
-
-    .\Verify-DomainSearchBases.ps1 -OutputDir "C:\Temp\DomainChecks"
+EXAMPLES
+  .\Validate_Usernames_AcrossDomains.ps1 -CsvPath "C:\temp\accounts.csv"
+  .\Validate_Usernames_AcrossDomains.ps1 -CsvPath ".\accounts.csv" -UsernameColumn "LikelyUser" -Credential (Get-Credential)
+  .\Validate_Usernames_AcrossDomains.ps1 -CsvPath ".\accounts.csv" -NoFuzzy
 #>
 
 [CmdletBinding()]
 param(
+    [Parameter(Mandatory)]
+    [string]$CsvPath,
+
+    # If omitted, the script auto-detects the most likely username column.
+    [string]$UsernameColumn,
+
+    # CyberArk unique Account ID column. If omitted, auto-detected; carried into the report.
+    [string]$AccountIdColumn,
+
+    # Where reports are written. Defaults to the input CSV's folder.
+    [string]$OutputDir,
+
+    # Optional alternate credentials for AD queries (use if cross-domain auth is needed).
+    [System.Management.Automation.PSCredential]$Credential,
+
+    # Turn off fuzzy/wildcard fallback (exact matching only).
+    [switch]$NoFuzzy,
+
+    # Safety cap on how many hits a single fuzzy search may return per domain.
+    [int]$MaxFuzzyPerSearch = 25,
+
     # ============================================================
-    # DOMAIN SEARCH BASES -- EDIT THESE TO MATCH YOUR ENVIRONMENT
+    # DOMAIN SEARCH BASES  --  EDIT THESE PLACEHOLDERS
+    # The DNS domain (and thus the -Server) is auto-derived from the
+    # DC=... components of each DN unless you map an explicit server below.
     # ============================================================
     [string[]]$DomainSearchBases = @(
-        'OU=Service,OU=Accounts,DC=prod,DC=domain1,DC=com',
-        'OU=Service,OU=Accounts,DC=prod,DC=domain2,DC=com',
-        'OU=Service,OU=Accounts,DC=prod,DC=domain3,DC=com',
-        'OU=Service,OU=Accounts,DC=prod,DC=domain4,DC=com',
-        'OU=Service,OU=Accounts,DC=prod,DC=domain5,DC=com'
+        'OU=Service,OU=Accounts,DC=prod,DC=mtb,DC=com',
+        'OU=Service,OU=Accounts,DC=dev,DC=mtb,DC=com',
+        'OU=Service,OU=Accounts,DC=cert,DC=mtb,DC=com',
+        'OU=Service,OU=Accounts,DC=atmprod,DC=mtb,DC=com',
+        'OU=Service,OU=Accounts,DC=atmcert,DC=mtb,DC=com'
     ),
 
     # OPTIONAL: force a specific DC/server for a given DNS domain.
-    # Example:
-    # @{
-    #   'prod.domain1.com' = 'dc01.prod.domain1.com'
-    #   'prod.domain2.com' = 'dc01.prod.domain2.com'
-    # }
-    [hashtable]$ServerOverrides = @{},
-
-    # Optional credential for cross-domain validation
-    [System.Management.Automation.PSCredential]$Credential,
-
-    # Where report will be written
-    [string]$OutputDir = $PSScriptRoot,
-
-    # TCP ports to test before AD query
-    [int[]]$TcpPorts = @(389, 636),
-
-    # Skip TCP checks if blocked by firewall policy but AD cmdlets still work
-    [switch]$SkipTcp
+    #   e.g. @{ 'prod.domain1.com' = 'dc01.prod.domain1.com' }
+    [hashtable]$ServerOverrides = @{}
 )
 
 $ErrorActionPreference = 'Continue'
 
+# --- ASCII-only log helpers (PS 5.1 mangles emoji in BOM-less files) ---
 function Write-Info($m){ Write-Host "[INFO]  $m" -ForegroundColor Cyan }
 function Write-Ok($m){   Write-Host "[OK]    $m" -ForegroundColor Green }
 function Write-Warn($m){ Write-Host "[WARN]  $m" -ForegroundColor Yellow }
 function Write-Err($m){  Write-Host "[ERROR] $m" -ForegroundColor Red }
 
-function ConvertTo-DnsDomain {
-    param(
-        [Parameter(Mandatory)]
-        [string]$DistinguishedName
-    )
-
-    $dcs = [regex]::Matches($DistinguishedName, '(?i)DC=([^,]+)') |
-        ForEach-Object { $_.Groups[1].Value }
-
-    if (-not $dcs -or $dcs.Count -eq 0) {
-        return $null
-    }
-
-    return ($dcs -join '.')
-}
-
-function Test-DnsNameBasic {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Name
-    )
-
-    try {
-        $addresses = [System.Net.Dns]::GetHostAddresses($Name)
-        if ($addresses -and $addresses.Count -gt 0) {
-            return @{
-                Success = $true
-                Detail  = ($addresses | ForEach-Object { $_.IPAddressToString }) -join '; '
-            }
-        }
-
-        return @{
-            Success = $false
-            Detail  = 'No IP address returned'
-        }
-    }
-    catch {
-        return @{
-            Success = $false
-            Detail  = $_.Exception.Message
-        }
-    }
-}
-
-function Test-TcpPortBasic {
-    param(
-        [Parameter(Mandatory)]
-        [string]$ComputerName,
-
-        [Parameter(Mandatory)]
-        [int]$Port,
-
-        [int]$TimeoutMs = 3000
-    )
-
-    $client = New-Object System.Net.Sockets.TcpClient
-
-    try {
-        $async = $client.BeginConnect($ComputerName, $Port, $null, $null)
-        $wait = $async.AsyncWaitHandle.WaitOne($TimeoutMs, $false)
-
-        if (-not $wait) {
-            $client.Close()
-            return @{
-                Success = $false
-                Detail  = "Timeout after $TimeoutMs ms"
-            }
-        }
-
-        $client.EndConnect($async)
-        $client.Close()
-
-        return @{
-            Success = $true
-            Detail  = 'Connected'
-        }
-    }
-    catch {
-        try { $client.Close() } catch {}
-        return @{
-            Success = $false
-            Detail  = $_.Exception.Message
-        }
-    }
-}
-
-function New-ResultRow {
-    param(
-        [string]$SearchBase,
-        [string]$DnsDomain,
-        [string]$ServerUsed,
-        [string]$DnValid,
-        [string]$DomainDnsResolved,
-        [string]$DomainDnsDetail,
-        [string]$ServerDnsResolved,
-        [string]$ServerDnsDetail,
-        [string]$Tcp389,
-        [string]$Tcp389Detail,
-        [string]$Tcp636,
-        [string]$Tcp636Detail,
-        [string]$AdDomainReadable,
-        [string]$AdDomainDetail,
-        [string]$SearchBaseReadable,
-        [string]$SearchBaseDetail,
-        [string]$Status,
-        [string]$Notes
-    )
-
-    [pscustomobject]@{
-        SearchBase          = $SearchBase
-        DnsDomain           = $DnsDomain
-        ServerUsed          = $ServerUsed
-        DN_IsValid          = $DnValid
-        DomainDnsResolved   = $DomainDnsResolved
-        DomainDnsDetail     = $DomainDnsDetail
-        ServerDnsResolved   = $ServerDnsResolved
-        ServerDnsDetail     = $ServerDnsDetail
-        Tcp389              = $Tcp389
-        Tcp389Detail        = $Tcp389Detail
-        Tcp636              = $Tcp636
-        Tcp636Detail        = $Tcp636Detail
-        ADDomainReadable    = $AdDomainReadable
-        ADDomainDetail      = $AdDomainDetail
-        SearchBaseReadable  = $SearchBaseReadable
-        SearchBaseDetail    = $SearchBaseDetail
-        Status              = $Status
-        Notes               = $Notes
-    }
-}
-
-Write-Info "Starting AD domain/SearchBase validation."
-
+# --- Module check ---
 if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
     Write-Err "ActiveDirectory module not found. Install RSAT AD PowerShell tools and re-run."
     return
 }
+Import-Module ActiveDirectory -ErrorAction Stop
 
-try {
-    Import-Module ActiveDirectory -ErrorAction Stop
-    Write-Ok "ActiveDirectory module loaded."
+# --- Helpers ---------------------------------------------------------------
+
+function ConvertTo-DnsDomain {
+    # OU=...,DC=prod,DC=domain1,DC=com  ->  prod.domain1.com
+    param([Parameter(Mandatory)][string]$DistinguishedName)
+    $dcs = [regex]::Matches($DistinguishedName, '(?i)DC=([^,]+)') | ForEach-Object { $_.Groups[1].Value }
+    return ($dcs -join '.')
 }
-catch {
-    Write-Err "Failed to import ActiveDirectory module: $($_.Exception.Message)"
+
+function Get-EscapedLdapValue {
+    # Escape RFC 4515 special characters so messy input can't break the filter.
+    param([Parameter(Mandatory)][string]$Value)
+    $v = $Value
+    $v = $v -replace '\\', '\5c'
+    $v = $v -replace '\*',  '\2a'
+    $v = $v -replace '\(',  '\28'
+    $v = $v -replace '\)',  '\29'
+    $v = $v -replace "`0",  '\00'
+    return $v
+}
+
+function Get-SearchCandidates {
+    <#
+      Turn one raw CSV value into ordered, de-duplicated search candidates.
+      Returns a hashtable:
+        Exact = @(...)  values to try as an EXACT sAMAccountName/UPN match
+        Fuzzy = @(...)  tokens to wildcard-search when nothing exact is found
+    #>
+    param([string]$Raw)
+
+    $exact = New-Object System.Collections.Generic.List[string]
+    $fuzzy = New-Object System.Collections.Generic.List[string]
+
+    if ([string]::IsNullOrWhiteSpace($Raw)) {
+        return @{ Exact = @(); Fuzzy = @() }
+    }
+
+    # 1. Trim and strip wrapping quotes / stray surrounding punctuation.
+    $core = $Raw.Trim().Trim('"',"'").Trim()
+
+    # 2. Strip DOMAIN\ prefix.
+    if ($core -match '\\') { $core = ($core -split '\\')[-1] }
+
+    # 3. Strip @upnsuffix.
+    if ($core -match '@')  { $core = ($core -split '@')[0] }
+
+    $core = $core.Trim()
+    if ([string]::IsNullOrWhiteSpace($core)) {
+        return @{ Exact = @(); Fuzzy = @() }
+    }
+
+    # Whitespace-normalized variants for EXACT attempts.
+    $variants = New-Object System.Collections.Generic.List[string]
+    [void]$variants.Add($core)
+    [void]$variants.Add(($core -replace '\s+',''))    # remove spaces
+    [void]$variants.Add(($core -replace '\s+','.'))   # spaces -> dot
+    [void]$variants.Add(($core -replace '\s+','_'))   # spaces -> underscore
+    [void]$variants.Add(($core -replace '\s+','-'))   # spaces -> hyphen
+
+    foreach ($v in $variants) {
+        $vv = $v.Trim()
+        if ($vv -and -not $exact.Contains($vv)) { [void]$exact.Add($vv) }
+    }
+
+    # Fuzzy tokens: the space-removed core + each "word" >2 chars.
+    $fuzzyRaw = New-Object System.Collections.Generic.List[string]
+    [void]$fuzzyRaw.Add(($core -replace '\s+',''))
+    foreach ($w in ($core -split '\s+')) {
+        $wt = ($w -replace '[^A-Za-z0-9_\-\.]', '').Trim()
+        if ($wt.Length -gt 2) { [void]$fuzzyRaw.Add($wt) }
+    }
+    foreach ($f in $fuzzyRaw) {
+        $ff = $f.Trim()
+        if ($ff -and -not $fuzzy.Contains($ff)) { [void]$fuzzy.Add($ff) }
+    }
+
+    return @{ Exact = $exact.ToArray(); Fuzzy = $fuzzy.ToArray() }
+}
+
+# --- Resolve paths ---------------------------------------------------------
+
+if (-not (Test-Path $CsvPath)) { Write-Err "CSV not found: $CsvPath"; return }
+$CsvPath = (Resolve-Path $CsvPath).Path
+
+if (-not $OutputDir) { $OutputDir = Split-Path -Parent $CsvPath }
+if (-not (Test-Path $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null }
+
+$stamp        = Get-Date -Format 'yyyyMMdd_HHmmss'
+$baseName     = [System.IO.Path]::GetFileNameWithoutExtension($CsvPath)
+$resultsPath  = Join-Path $OutputDir ("{0}_Validation_Results_{1}.csv" -f $baseName, $stamp)
+
+# --- Load CSV --------------------------------------------------------------
+
+$rows = Import-Csv -Path $CsvPath
+if (-not $rows -or $rows.Count -eq 0) { Write-Err "CSV '$CsvPath' has no data rows."; return }
+
+$columns = $rows[0].PSObject.Properties.Name
+
+if (-not $UsernameColumn) {
+    $preferred = @('samaccountname','username','user name','user','login','logon','account','accountname','name','userid','id')
+    foreach ($p in $preferred) {
+        $hit = $columns | Where-Object { $_.Trim().ToLower() -eq $p } | Select-Object -First 1
+        if ($hit) { $UsernameColumn = $hit; break }
+    }
+    if (-not $UsernameColumn) {
+        # fall back to first column containing 'user' or 'account' or 'name'
+        $UsernameColumn = $columns | Where-Object { $_ -match '(?i)user|account|name|login|logon' } | Select-Object -First 1
+    }
+    if (-not $UsernameColumn) {
+        Write-Err "Could not auto-detect a username column. Available columns: $($columns -join ', ')"
+        Write-Err "Re-run with -UsernameColumn '<columnName>'."
+        return
+    }
+    Write-Info "Auto-detected username column: '$UsernameColumn'"
+} elseif ($columns -notcontains $UsernameColumn) {
+    Write-Err "Column '$UsernameColumn' not found. Available columns: $($columns -join ', ')"
     return
 }
 
-if (-not $OutputDir) {
-    $OutputDir = $PSScriptRoot
+# --- Detect the CyberArk Account ID column (excluding the username column) ---
+if (-not $AccountIdColumn) {
+    $idPreferred = @('accountid','account id','cyberarkid','cyberark id','pasaccountid','pas account id','uniqueid','unique id','objectid','id')
+    foreach ($p in $idPreferred) {
+        $hit = $columns | Where-Object { $_.Trim().ToLower() -eq $p -and $_ -ne $UsernameColumn } | Select-Object -First 1
+        if ($hit) { $AccountIdColumn = $hit; break }
+    }
+    if ($AccountIdColumn) {
+        Write-Info "Auto-detected Account ID column: '$AccountIdColumn'"
+    } else {
+        Write-Warn "No Account ID column detected; AccountID will be blank. Pass -AccountIdColumn '<col>' if you have one."
+    }
+} elseif ($columns -notcontains $AccountIdColumn) {
+    Write-Err "Account ID column '$AccountIdColumn' not found. Available columns: $($columns -join ', ')"
+    return
 }
 
-if (-not (Test-Path $OutputDir)) {
-    New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
+# --- Build domain target list & test reachability --------------------------
+
+$adProps = @('SamAccountName','UserPrincipalName','DisplayName','Name','Enabled','DistinguishedName','Description','whenCreated')
+
+$targets = New-Object System.Collections.Generic.List[object]
+foreach ($sb in $DomainSearchBases) {
+    if ([string]::IsNullOrWhiteSpace($sb)) { continue }
+    $dns    = ConvertTo-DnsDomain -DistinguishedName $sb
+    $server = if ($ServerOverrides.ContainsKey($dns)) { $ServerOverrides[$dns] } else { $dns }
+
+    $common = @{ Server = $server }
+    if ($Credential) { $common['Credential'] = $Credential }
+
+    $reachable = $false
+    try {
+        # Cheap probe: confirm the search base resolves and we can read it.
+        Get-ADObject -Identity $sb @common -ErrorAction Stop | Out-Null
+        $reachable = $true
+        Write-Ok "Reachable: $dns  (SearchBase OK)"
+    } catch {
+        Write-Warn "Skipping unreachable/unreadable target '$dns' [$sb]: $($_.Exception.Message)"
+    }
+
+    $targets.Add([pscustomobject]@{
+        SearchBase = $sb
+        Dns        = $dns
+        Server     = $server
+        Common     = $common
+        Reachable  = $reachable
+    }) | Out-Null
 }
 
-$stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-$reportPath = Join-Path $OutputDir ("DomainSearchBase_Verification_{0}.csv" -f $stamp)
+$liveTargets = @($targets | Where-Object { $_.Reachable })
+if ($liveTargets.Count -eq 0) {
+    Write-Err "No reachable domains. Check the SearchBase placeholders, DNS, trust, and credentials."
+    return
+}
+Write-Info ("Searching {0} reachable domain(s) for {1} input value(s)." -f $liveTargets.Count, $rows.Count)
+
+# --- Search routines -------------------------------------------------------
+
+function Find-ExactMatches {
+    param([string[]]$Candidates, [object]$Target)
+    $found = New-Object System.Collections.Generic.List[object]
+    $c = $Target.Common   # must splat from a plain variable, not a property expression
+    foreach ($cand in $Candidates) {
+        $esc = Get-EscapedLdapValue -Value $cand
+        $filter = "(|(sAMAccountName=$esc)(userPrincipalName=$esc))"
+        try {
+            $res = Get-ADUser -LDAPFilter $filter -SearchBase $Target.SearchBase -Properties $adProps @c -ErrorAction Stop
+            foreach ($u in $res) { $found.Add([pscustomobject]@{ User=$u; MatchedOn=$cand; MatchType='Exact' }) | Out-Null }
+        } catch {
+            Write-Warn "Exact search error in $($Target.Dns) for '$cand': $($_.Exception.Message)"
+        }
+    }
+    return $found
+}
+
+function Find-FuzzyMatches {
+    param([string[]]$Tokens, [object]$Target, [int]$Cap)
+    $found = New-Object System.Collections.Generic.List[object]
+    $c = $Target.Common   # must splat from a plain variable, not a property expression
+    foreach ($tok in $Tokens) {
+        if ($tok.Length -lt 3) { continue }
+        $esc = Get-EscapedLdapValue -Value $tok
+        $filter = "(|(sAMAccountName=*$esc*)(userPrincipalName=*$esc*)(displayName=*$esc*)(cn=*$esc*)(name=*$esc*))"
+        try {
+            $res = Get-ADUser -LDAPFilter $filter -SearchBase $Target.SearchBase -Properties $adProps -ResultSetSize $Cap @c -ErrorAction Stop
+            foreach ($u in $res) { $found.Add([pscustomobject]@{ User=$u; MatchedOn=$tok; MatchType='Fuzzy' }) | Out-Null }
+        } catch {
+            Write-Warn "Fuzzy search error in $($Target.Dns) for '$tok': $($_.Exception.Message)"
+        }
+    }
+    return $found
+}
+
+# --- Result row builder ----------------------------------------------------
+
+function New-ResultRow {
+    param(
+        [string]$AccountId, [string]$InputValue, [string]$Cleaned,
+        [string]$Status, [string]$MatchType, [string]$Domain,
+        [object]$User, [string]$MatchedOn, [int]$MatchCount, [string]$Notes
+    )
+    [pscustomobject]@{
+        AccountID          = $AccountId        # CyberArk unique ID carried from the CSV
+        InputValue         = $InputValue
+        CleanedCandidate   = $Cleaned
+        Status             = $Status
+        MatchType          = $MatchType
+        Domain             = $Domain
+        SamAccountName     = if ($User) { $User.SamAccountName }    else { '' }
+        UserPrincipalName  = if ($User) { $User.UserPrincipalName } else { '' }
+        DisplayName        = if ($User) { $User.DisplayName }       else { '' }
+        Enabled            = if ($User) { $User.Enabled }           else { '' }
+        Description        = if ($User) { $User.Description }        else { '' }
+        WhenCreated        = if ($User) { $User.whenCreated }       else { '' }
+        DistinguishedName  = if ($User) { $User.DistinguishedName } else { '' }
+        MatchedOn          = $MatchedOn
+        MatchCountForInput = $MatchCount
+        Notes              = $Notes
+    }
+}
+
+# --- Main loop -------------------------------------------------------------
 
 $results = New-Object System.Collections.Generic.List[object]
+$rowNum  = 0
 
-foreach ($sb in $DomainSearchBases) {
-    Write-Host ""
-    Write-Info "Validating SearchBase: $sb"
+foreach ($row in $rows) {
+    $rowNum++
+    $raw    = [string]$row.$UsernameColumn
+    $acctId = if ($AccountIdColumn) { [string]$row.$AccountIdColumn } else { '' }
+    Write-Info ("[{0}/{1}] Validating: '{2}'  (AccountID={3})" -f $rowNum, $rows.Count, $raw, $acctId)
 
-    $dnsDomain = ''
-    $server = ''
-    $dnValid = 'No'
-    $domainDnsResolved = 'No'
-    $domainDnsDetail = ''
-    $serverDnsResolved = 'No'
-    $serverDnsDetail = ''
-    $tcp389 = 'Skipped'
-    $tcp389Detail = ''
-    $tcp636 = 'Skipped'
-    $tcp636Detail = ''
-    $adDomainReadable = 'No'
-    $adDomainDetail = ''
-    $searchBaseReadable = 'No'
-    $searchBaseDetail = ''
-    $status = 'FAIL'
-    $notes = New-Object System.Collections.Generic.List[string]
+    $cand = Get-SearchCandidates -Raw $raw
 
-    if ([string]::IsNullOrWhiteSpace($sb)) {
-        [void]$notes.Add('Blank SearchBase entry')
-        Write-Warn "Blank SearchBase entry skipped."
-
-        $results.Add((New-ResultRow `
-            -SearchBase $sb `
-            -DnsDomain $dnsDomain `
-            -ServerUsed $server `
-            -DnValid $dnValid `
-            -DomainDnsResolved $domainDnsResolved `
-            -DomainDnsDetail $domainDnsDetail `
-            -ServerDnsResolved $serverDnsResolved `
-            -ServerDnsDetail $serverDnsDetail `
-            -Tcp389 $tcp389 `
-            -Tcp389Detail $tcp389Detail `
-            -Tcp636 $tcp636 `
-            -Tcp636Detail $tcp636Detail `
-            -AdDomainReadable $adDomainReadable `
-            -AdDomainDetail $adDomainDetail `
-            -SearchBaseReadable $searchBaseReadable `
-            -SearchBaseDetail $searchBaseDetail `
-            -Status $status `
-            -Notes ($notes -join ' | '))) | Out-Null
-
+    if ($cand.Exact.Count -eq 0) {
+        $results.Add( (New-ResultRow -AccountId $acctId -InputValue $raw -Cleaned '' `
+            -Status 'BLANK_OR_INVALID' -MatchType '' -Domain '' -User $null `
+            -MatchedOn '' -MatchCount 0 -Notes 'Empty or unparseable value') ) | Out-Null
         continue
     }
 
-    $dnsDomain = ConvertTo-DnsDomain -DistinguishedName $sb
+    # Collect matches across all live domains, de-duped by DN.
+    $allMatches = @{}   # DN -> match record
+    $matchType  = 'Exact'
 
-    if ([string]::IsNullOrWhiteSpace($dnsDomain)) {
-        [void]$notes.Add('Could not derive DNS domain from DC= components')
-        Write-Warn "Invalid DN/SearchBase. Could not derive DNS domain."
-
-        $results.Add((New-ResultRow `
-            -SearchBase $sb `
-            -DnsDomain $dnsDomain `
-            -ServerUsed $server `
-            -DnValid $dnValid `
-            -DomainDnsResolved $domainDnsResolved `
-            -DomainDnsDetail $domainDnsDetail `
-            -ServerDnsResolved $serverDnsResolved `
-            -ServerDnsDetail $serverDnsDetail `
-            -Tcp389 $tcp389 `
-            -Tcp389Detail $tcp389Detail `
-            -Tcp636 $tcp636 `
-            -Tcp636Detail $tcp636Detail `
-            -AdDomainReadable $adDomainReadable `
-            -AdDomainDetail $adDomainDetail `
-            -SearchBaseReadable $searchBaseReadable `
-            -SearchBaseDetail $searchBaseDetail `
-            -Status $status `
-            -Notes ($notes -join ' | '))) | Out-Null
-
-        continue
-    }
-
-    $dnValid = 'Yes'
-
-    if ($ServerOverrides.ContainsKey($dnsDomain)) {
-        $server = $ServerOverrides[$dnsDomain]
-        [void]$notes.Add("Server override used")
-    }
-    else {
-        $server = $dnsDomain
-    }
-
-    Write-Info "Derived DNS domain: $dnsDomain"
-    Write-Info "Server used: $server"
-
-    # DNS check for derived domain
-    $domainDns = Test-DnsNameBasic -Name $dnsDomain
-    if ($domainDns.Success) {
-        $domainDnsResolved = 'Yes'
-        $domainDnsDetail = $domainDns.Detail
-        Write-Ok "DNS resolved for domain: $dnsDomain"
-    }
-    else {
-        $domainDnsResolved = 'No'
-        $domainDnsDetail = $domainDns.Detail
-        [void]$notes.Add("Domain DNS resolution failed")
-        Write-Warn "DNS resolution failed for domain '$dnsDomain': $domainDnsDetail"
-    }
-
-    # DNS check for server/DC
-    $serverDns = Test-DnsNameBasic -Name $server
-    if ($serverDns.Success) {
-        $serverDnsResolved = 'Yes'
-        $serverDnsDetail = $serverDns.Detail
-        Write-Ok "DNS resolved for server: $server"
-    }
-    else {
-        $serverDnsResolved = 'No'
-        $serverDnsDetail = $serverDns.Detail
-        [void]$notes.Add("Server DNS resolution failed")
-        Write-Warn "DNS resolution failed for server '$server': $serverDnsDetail"
-    }
-
-    # TCP port checks
-    if (-not $SkipTcp) {
-        foreach ($port in $TcpPorts) {
-            $tcp = Test-TcpPortBasic -ComputerName $server -Port $port
-
-            if ($port -eq 389) {
-                $tcp389 = if ($tcp.Success) { 'Open' } else { 'Closed/Blocked' }
-                $tcp389Detail = $tcp.Detail
-            }
-
-            if ($port -eq 636) {
-                $tcp636 = if ($tcp.Success) { 'Open' } else { 'Closed/Blocked' }
-                $tcp636Detail = $tcp.Detail
-            }
-
-            if ($tcp.Success) {
-                Write-Ok "TCP $port open to $server"
-            }
-            else {
-                [void]$notes.Add("TCP $port failed")
-                Write-Warn "TCP $port failed to $server`: $($tcp.Detail)"
+    foreach ($t in $liveTargets) {
+        foreach ($m in (Find-ExactMatches -Candidates $cand.Exact -Target $t)) {
+            $dn = $m.User.DistinguishedName
+            if (-not $allMatches.ContainsKey($dn)) {
+                $allMatches[$dn] = [pscustomobject]@{ Match=$m; Domain=$t.Dns }
             }
         }
     }
-    else {
-        [void]$notes.Add('TCP checks skipped by switch')
-        Write-Warn "TCP checks skipped."
+
+    # Fuzzy fallback only if nothing exact and fuzzy enabled.
+    if ($allMatches.Count -eq 0 -and -not $NoFuzzy -and $cand.Fuzzy.Count -gt 0) {
+        $matchType = 'Fuzzy'
+        foreach ($t in $liveTargets) {
+            foreach ($m in (Find-FuzzyMatches -Tokens $cand.Fuzzy -Target $t -Cap $MaxFuzzyPerSearch)) {
+                $dn = $m.User.DistinguishedName
+                if (-not $allMatches.ContainsKey($dn)) {
+                    $allMatches[$dn] = [pscustomobject]@{ Match=$m; Domain=$t.Dns }
+                }
+            }
+        }
     }
 
-    # Common AD parameters
-    $common = @{
-        Server = $server
+    $matchList = @($allMatches.Values)
+    $count     = $matchList.Count
+
+    if ($count -eq 0) {
+        $results.Add( (New-ResultRow -AccountId $acctId -InputValue $raw -Cleaned $cand.Exact[0] `
+            -Status 'NOT_FOUND' -MatchType '' -Domain '' -User $null `
+            -MatchedOn ($cand.Exact -join ' | ') -MatchCount 0 -Notes 'No match in any domain') ) | Out-Null
+        continue
     }
 
-    if ($Credential) {
-        $common['Credential'] = $Credential
-    }
+    # One row PER matched account -> a hit in 3 domains becomes 3 separate lines.
+    $domainsHit = ($matchList | ForEach-Object { $_.Domain } | Select-Object -Unique).Count
+    foreach ($entry in $matchList) {
+        $note = ''
+        if ($entry.Match.MatchType -eq 'Fuzzy') {
+            $note = 'Fuzzy suggestion - verify before use'
+        } elseif ($count -gt 1) {
+            $note = "Multiple matches ($count) across $domainsHit domain(s)"
+        }
 
-    # AD domain readability
-    try {
-        $domainObj = Get-ADDomain @common -ErrorAction Stop
-        $adDomainReadable = 'Yes'
-        $adDomainDetail = "NetBIOS=$($domainObj.NetBIOSName); DNSRoot=$($domainObj.DNSRoot)"
-        Write-Ok "AD domain readable: $($domainObj.DNSRoot)"
+        $results.Add( (New-ResultRow -AccountId $acctId -InputValue $raw -Cleaned $cand.Exact[0] `
+            -Status 'FOUND' -MatchType $entry.Match.MatchType -Domain $entry.Domain `
+            -User $entry.Match.User -MatchedOn $entry.Match.MatchedOn -MatchCount $count -Notes $note) ) | Out-Null
     }
-    catch {
-        $adDomainReadable = 'No'
-        $adDomainDetail = $_.Exception.Message
-        [void]$notes.Add('Get-ADDomain failed')
-        Write-Warn "Get-ADDomain failed for '$server': $adDomainDetail"
-    }
-
-    # SearchBase readability
-    try {
-        Get-ADObject -Identity $sb @common -ErrorAction Stop | Out-Null
-        $searchBaseReadable = 'Yes'
-        $searchBaseDetail = 'SearchBase exists and is readable'
-        Write-Ok "SearchBase readable."
-    }
-    catch {
-        $searchBaseReadable = 'No'
-        $searchBaseDetail = $_.Exception.Message
-        [void]$notes.Add('SearchBase unreadable or does not exist')
-        Write-Warn "SearchBase check failed: $searchBaseDetail"
-    }
-
-    if ($searchBaseReadable -eq 'Yes') {
-        $status = 'PASS'
-    }
-    elseif ($adDomainReadable -eq 'Yes') {
-        $status = 'WARN'
-        [void]$notes.Add('Domain is reachable, but SearchBase failed')
-    }
-    else {
-        $status = 'FAIL'
-    }
-
-    $results.Add((New-ResultRow `
-        -SearchBase $sb `
-        -DnsDomain $dnsDomain `
-        -ServerUsed $server `
-        -DnValid $dnValid `
-        -DomainDnsResolved $domainDnsResolved `
-        -DomainDnsDetail $domainDnsDetail `
-        -ServerDnsResolved $serverDnsResolved `
-        -ServerDnsDetail $serverDnsDetail `
-        -Tcp389 $tcp389 `
-        -Tcp389Detail $tcp389Detail `
-        -Tcp636 $tcp636 `
-        -Tcp636Detail $tcp636Detail `
-        -AdDomainReadable $adDomainReadable `
-        -AdDomainDetail $adDomainDetail `
-        -SearchBaseReadable $searchBaseReadable `
-        -SearchBaseDetail $searchBaseDetail `
-        -Status $status `
-        -Notes ($notes -join ' | '))) | Out-Null
 }
 
-$results | Export-Csv -Path $reportPath -NoTypeInformation -Encoding UTF8
+# --- Export ----------------------------------------------------------------
+
+$results | Export-Csv -Path $resultsPath -NoTypeInformation -Encoding UTF8
+
+# --- Console roll-up -------------------------------------------------------
 
 Write-Host ""
-Write-Ok "Domain/SearchBase validation complete."
+Write-Ok "Validation complete."
 Write-Host "----------------------------------------"
-
-$summary = $results | Group-Object Status | Sort-Object Name
-foreach ($item in $summary) {
-    Write-Host ("  {0,-8} {1} target(s)" -f $item.Name, $item.Count)
-}
-
+$byStatus = $results | Group-Object Status | Sort-Object Name
+foreach ($g in $byStatus) { Write-Host ("  {0,-18} {1} line(s)" -f $g.Name, $g.Count) }
 Write-Host "----------------------------------------"
-Write-Host ("  Total SearchBases : {0}" -f $results.Count)
-Write-Host ("  Report            : {0}" -f $reportPath)
+Write-Host ("  CSV rows processed : {0}" -f $rows.Count)
+Write-Host ("  Total result lines : {0}" -f $results.Count)
 Write-Host "----------------------------------------"
-
-$failed = @($results | Where-Object { $_.Status -ne 'PASS' })
-
-if ($failed.Count -gt 0) {
-    Write-Warn "One or more domains/SearchBases did not fully pass. Review the CSV before running the username validation script."
-}
-else {
-    Write-Ok "All domains/SearchBases passed. You can proceed with the username validation script."
-}
+Write-Ok "Results report: $resultsPath"
