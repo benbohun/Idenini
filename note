@@ -7,22 +7,26 @@
     - Uses source Account ID 2889_5 as the template
     - Bulk onboards accounts from CSV
     - Allows target SafeName per CSV row
-    - Copies template address, secret type, platform properties, management settings, and remote machine settings
-    - Changes username, password, platform, and safe per CSV row
-    - Explicitly links:
-        ExtraPasswordIndex 1 = logonAccount
-        ExtraPasswordIndex 2 = ApplicationAccount
-        ExtraPasswordIndex 3 = ReconcileAccount
+    - Copies source/template account values:
+        Address
+        SecretType
+        PlatformAccountProperties
+        SecretManagement settings
+        RemoteMachinesAccess settings
+    - Changes only:
+        SafeName from CSV
+        UserName from CSV
+        Secret/Password from CSV
+        PlatformID to MicrosoftAzureConferenceRoom
+    - Resolves linked account by Account ID 2883_3
+    - Applies linked account 2883_3 as:
+        extraPasswordIndex 1 = logonAccount
+        extraPasswordIndex 2 = ApplicationAccount
+        extraPasswordIndex 3 = ReconcileAccount
 
 .NOTES
     Required CSV columns:
         SafeName,Username,Password
-
-    Optional CSV columns:
-        LinkedAccountSafe,LinkedAccountName,LinkedAccountFolder
-
-    Default linked account object:
-        portal.azure.com-AzureCyberArkCPM
 
     This script does not print passwords to screen or log.
 #>
@@ -46,12 +50,10 @@ param(
     [string]$SourceAccountID   = '2889_5',
     [string]$TargetPlatformID  = 'MicrosoftAzureConferenceRoom',
 
-    # ===== Default linked account settings =====
-    [string]$DefaultLinkedAccountName   = 'portal.azure.com-AzureCyberArkCPM',
+    # ===== Linked account settings =====
+    [string]$LinkedAccountID   = '2883_3',
     [string]$DefaultLinkedAccountFolder = 'Root',
-
-    # If blank, the script uses the CSV SafeName as the linked account safe.
-    [string]$DefaultLinkedAccountSafe   = '',
+    [bool]$ContinueIfLinkedAccountFails = $true,
 
     # ===== Input / Output =====
     [string]$InputCsvPath      = 'E:\Installation Media\Script\OnboardScript\AzureBulkAccountOnboard\AzureBulkOnboard.csv',
@@ -202,7 +204,7 @@ function ConvertTo-PlainHashtable {
 }
 
 # ============================================
-# Helper: Remove account-name and linked-account properties from create body
+# Helper: Clean platformAccountProperties before create
 # ============================================
 
 function Clean-PlatformAccountProperties {
@@ -317,6 +319,16 @@ if (-not (Get-Command Set-PASLinkedAccount -ErrorAction SilentlyContinue)) {
     throw "Set-PASLinkedAccount cmdlet not found."
 }
 
+if (-not (Get-Command Use-PASSession -ErrorAction SilentlyContinue)) {
+    Write-Log "ERROR: Use-PASSession cmdlet was not found. Confirm psPAS module is installed correctly." 'Red'
+    throw "Use-PASSession cmdlet not found."
+}
+
+if (-not (Get-Command Get-PASSession -ErrorAction SilentlyContinue)) {
+    Write-Log "ERROR: Get-PASSession cmdlet was not found. Confirm psPAS module is installed correctly." 'Red'
+    throw "Get-PASSession cmdlet not found."
+}
+
 # ============================================
 # Login Method: CCP + psPAS Identity Header
 # ============================================
@@ -406,29 +418,86 @@ function Start-PASSessionFromCCP {
 }
 
 # ============================================
-# Get source/template account by Account ID
+# Get account by Account ID
 # ============================================
 
-function Get-TemplateAccountById {
+function Get-AccountById {
     param(
         [Parameter(Mandatory)]
-        [string]$AccountID
+        [string]$AccountID,
+
+        [string]$Purpose = 'account'
     )
 
-    Write-Log ("Retrieving source/template account by Account ID: {0}" -f $AccountID) 'Cyan'
+    Write-Log ("Retrieving {0} by Account ID: {1}" -f $Purpose, $AccountID) 'Cyan'
 
     try {
-        $template = Get-PASAccount -id $AccountID -ErrorAction Stop
+        $account = Get-PASAccount -id $AccountID -ErrorAction Stop
 
-        if ($null -eq $template) {
+        if ($null -eq $account) {
             throw "No account details returned for Account ID $AccountID."
         }
 
-        return $template
+        return $account
     } catch {
         $msg = Get-FriendlyErrorMessage -ErrorRecord $_
-        Write-Log ("ERROR: Failed to retrieve template account {0}. {1}" -f $AccountID, $msg) 'Red'
+        Write-Log ("ERROR: Failed to retrieve {0} {1}. {2}" -f $Purpose, $AccountID, $msg) 'Red'
         throw
+    }
+}
+
+# ============================================
+# Resolve linked account details from linked Account ID
+# ============================================
+
+function Resolve-LinkedAccountByID {
+    param(
+        [Parameter(Mandatory)]
+        [string]$LinkedAccountID
+    )
+
+    $linked = Get-AccountById -AccountID $LinkedAccountID -Purpose 'linked account'
+
+    $linkedSafe = Get-ObjectPropertyValue -InputObject $linked -PropertyNames @(
+        'safeName',
+        'SafeName',
+        'safe',
+        'Safe'
+    )
+
+    $linkedName = Get-ObjectPropertyValue -InputObject $linked -PropertyNames @(
+        'name',
+        'Name',
+        'accountName',
+        'AccountName',
+        'ObjectName',
+        'objectName'
+    )
+
+    $linkedFolder = Get-ObjectPropertyValue -InputObject $linked -PropertyNames @(
+        'folder',
+        'Folder'
+    )
+
+    if ([string]::IsNullOrWhiteSpace([string]$linkedFolder)) {
+        $linkedFolder = $DefaultLinkedAccountFolder
+    }
+
+    if ([string]::IsNullOrWhiteSpace([string]$linkedSafe)) {
+        throw "Could not resolve SafeName for linked AccountID '$LinkedAccountID'."
+    }
+
+    if ([string]::IsNullOrWhiteSpace([string]$linkedName)) {
+        throw "Could not resolve object name for linked AccountID '$LinkedAccountID'."
+    }
+
+    Write-Log ("Resolved linked account. AccountID='{0}', Safe='{1}', Name='{2}', Folder='{3}'." -f $LinkedAccountID, $linkedSafe, $linkedName, $linkedFolder) 'Green'
+
+    return [PSCustomObject]@{
+        AccountID = [string]$LinkedAccountID
+        Safe      = [string]$linkedSafe
+        Name      = [string]$linkedName
+        Folder    = [string]$linkedFolder
     }
 }
 
@@ -586,7 +655,7 @@ function Add-BulkAzureAccount {
 }
 
 # ============================================
-# Resolve new account ID when Add-PASAccount does not return it
+# Resolve new account ID if Add-PASAccount does not return it
 # ============================================
 
 function Resolve-NewAccountID {
@@ -622,15 +691,42 @@ function Resolve-NewAccountID {
     Write-Log "Add-PASAccount did not return AccountID. Attempting to locate newly created account..." 'Yellow'
 
     try {
-        $searchText = $Username
-        $matches = @(Get-PASAccount -search $searchText -ErrorAction Stop)
+        $matches = @(Get-PASAccount -search $Username -ErrorAction Stop)
 
         foreach ($match in $matches) {
-            $matchId = Get-ObjectPropertyValue -InputObject $match -PropertyNames @('id','Id','accountId','AccountID','AccountId')
-            $matchSafe = Get-ObjectPropertyValue -InputObject $match -PropertyNames @('safeName','SafeName','safe','Safe')
-            $matchUser = Get-ObjectPropertyValue -InputObject $match -PropertyNames @('userName','UserName','username','Username')
-            $matchAddress = Get-ObjectPropertyValue -InputObject $match -PropertyNames @('address','Address')
-            $matchPlatform = Get-ObjectPropertyValue -InputObject $match -PropertyNames @('platformId','PlatformId','PlatformID','PolicyID')
+            $matchId = Get-ObjectPropertyValue -InputObject $match -PropertyNames @(
+                'id',
+                'Id',
+                'accountId',
+                'AccountID',
+                'AccountId'
+            )
+
+            $matchSafe = Get-ObjectPropertyValue -InputObject $match -PropertyNames @(
+                'safeName',
+                'SafeName',
+                'safe',
+                'Safe'
+            )
+
+            $matchUser = Get-ObjectPropertyValue -InputObject $match -PropertyNames @(
+                'userName',
+                'UserName',
+                'username',
+                'Username'
+            )
+
+            $matchAddress = Get-ObjectPropertyValue -InputObject $match -PropertyNames @(
+                'address',
+                'Address'
+            )
+
+            $matchPlatform = Get-ObjectPropertyValue -InputObject $match -PropertyNames @(
+                'platformId',
+                'PlatformId',
+                'PlatformID',
+                'PolicyID'
+            )
 
             if (
                 [string]$matchSafe -ieq [string]$SafeName -and
@@ -650,22 +746,16 @@ function Resolve-NewAccountID {
 }
 
 # ============================================
-# Link fixed Azure linked accounts
+# Apply linked account as Logon, Application, and Reconcile
 # ============================================
 
-function Set-FixedAzureLinkedAccounts {
+function Set-AzureLinkedAccounts {
     param(
         [Parameter(Mandatory)]
         [string]$NewAccountID,
 
         [Parameter(Mandatory)]
-        [string]$LinkedAccountSafe,
-
-        [Parameter(Mandatory)]
-        [string]$LinkedAccountName,
-
-        [Parameter(Mandatory)]
-        [string]$LinkedAccountFolder
+        [object]$ResolvedLinkedAccount
     )
 
     $copied = New-Object System.Collections.Generic.List[string]
@@ -687,17 +777,17 @@ function Set-FixedAzureLinkedAccounts {
     )
 
     foreach ($link in $links) {
-        $description = "$($link.Label): Index=$($link.Index); Safe=$LinkedAccountSafe; Name=$LinkedAccountName; Folder=$LinkedAccountFolder"
+        $description = "$($link.Label): Index=$($link.Index); LinkedAccountID=$($ResolvedLinkedAccount.AccountID); Safe=$($ResolvedLinkedAccount.Safe); Name=$($ResolvedLinkedAccount.Name); Folder=$($ResolvedLinkedAccount.Folder)"
 
         try {
             Write-Log ("Linking {0} to new AccountID='{1}'..." -f $description, $NewAccountID) 'Cyan'
 
             Set-PASLinkedAccount `
                 -AccountID $NewAccountID `
-                -safe $LinkedAccountSafe `
+                -safe $ResolvedLinkedAccount.Safe `
                 -extraPasswordIndex $link.Index `
-                -name $LinkedAccountName `
-                -folder $LinkedAccountFolder `
+                -name $ResolvedLinkedAccount.Name `
+                -folder $ResolvedLinkedAccount.Folder `
                 -Confirm:$false `
                 -ErrorAction Stop | Out-Null
 
@@ -707,6 +797,10 @@ function Set-FixedAzureLinkedAccounts {
             $errorText = "$description | Error=$($_.Exception.Message)"
             $failed.Add($errorText)
             Write-Log ("WARNING: Failed to link {0}" -f $errorText) 'Yellow'
+
+            if ($ContinueIfLinkedAccountFails -ne $true) {
+                throw $errorText
+            }
         }
     }
 
@@ -733,9 +827,7 @@ Write-Log ("CCP Safe                  : {0}" -f $CCPSafe) 'Gray'
 Write-Log ("CCP Object                : {0}" -f $CCPObject) 'Gray'
 Write-Log ("Source Account ID         : {0}" -f $SourceAccountID) 'Gray'
 Write-Log ("Target Platform ID        : {0}" -f $TargetPlatformID) 'Gray'
-Write-Log ("Default Linked Name       : {0}" -f $DefaultLinkedAccountName) 'Gray'
-Write-Log ("Default Linked Safe       : {0}" -f $DefaultLinkedAccountSafe) 'Gray'
-Write-Log ("Default Linked Folder     : {0}" -f $DefaultLinkedAccountFolder) 'Gray'
+Write-Log ("Linked Account ID         : {0}" -f $LinkedAccountID) 'Gray'
 Write-Log ("Input CSV                 : {0}" -f $InputCsvPath) 'Gray'
 Write-Log ("Result CSV                : {0}" -f $ResultCsvPath) 'Gray'
 Write-Log ("DryRun                    : {0}" -f $DryRun.IsPresent) 'Gray'
@@ -780,7 +872,7 @@ try {
 # ============================================
 
 try {
-    $TemplateAccount = Get-TemplateAccountById -AccountID $SourceAccountID
+    $TemplateAccount = Get-AccountById -AccountID $SourceAccountID -Purpose 'source/template account'
 
     $templateSafe = Get-ObjectPropertyValue -InputObject $TemplateAccount -PropertyNames @(
         'safeName',
@@ -815,6 +907,22 @@ try {
     Write-Log ("Template Platform ID : {0}" -f $templatePlatform) 'Gray'
 } catch {
     Write-Log ("FATAL: Could not continue without source/template account. {0}" -f $_.Exception.Message) 'Red'
+
+    try {
+        Close-PASSession | Out-Null
+    } catch {}
+
+    exit 1
+}
+
+# ============================================
+# Resolve linked account from Account ID 2883_3
+# ============================================
+
+try {
+    $ResolvedLinkedAccount = Resolve-LinkedAccountByID -LinkedAccountID $LinkedAccountID
+} catch {
+    Write-Log ("FATAL: Could not resolve linked account ID '{0}'. {1}" -f $LinkedAccountID, $_.Exception.Message) 'Red'
 
     try {
         Close-PASSession | Out-Null
@@ -861,33 +969,9 @@ foreach ($row in $CsvRows) {
         'secret'
     )
 
-    $csvLinkedSafe = Get-ObjectPropertyValue -InputObject $row -PropertyNames @(
-        'LinkedAccountSafe',
-        'linkedAccountSafe',
-        'LinkedSafe',
-        'linkedSafe'
-    )
-
-    $csvLinkedName = Get-ObjectPropertyValue -InputObject $row -PropertyNames @(
-        'LinkedAccountName',
-        'linkedAccountName',
-        'LinkedName',
-        'linkedName'
-    )
-
-    $csvLinkedFolder = Get-ObjectPropertyValue -InputObject $row -PropertyNames @(
-        'LinkedAccountFolder',
-        'linkedAccountFolder',
-        'LinkedFolder',
-        'linkedFolder'
-    )
-
     $targetSafeName = [string]$targetSafeName
     $newUsername = [string]$newUsername
     $newPassword = [string]$newPassword
-    $csvLinkedSafe = [string]$csvLinkedSafe
-    $csvLinkedName = [string]$csvLinkedName
-    $csvLinkedFolder = [string]$csvLinkedFolder
 
     if ([string]::IsNullOrWhiteSpace($targetSafeName)) {
         $skippedCount++
@@ -903,8 +987,9 @@ foreach ($row in $CsvRows) {
             Username             = $newUsername
             Address              = [string]$templateAddress
             PlatformID           = $TargetPlatformID
-            LinkedAccountSafe    = ''
-            LinkedAccountName    = ''
+            LinkedAccountID      = $LinkedAccountID
+            LinkedAccountSafe    = $ResolvedLinkedAccount.Safe
+            LinkedAccountName    = $ResolvedLinkedAccount.Name
             LinkedAccountsCopied = 0
             LinkedAccountsFailed = 0
             LinkedAccountDetails = ''
@@ -930,8 +1015,9 @@ foreach ($row in $CsvRows) {
             Username             = ''
             Address              = [string]$templateAddress
             PlatformID           = $TargetPlatformID
-            LinkedAccountSafe    = ''
-            LinkedAccountName    = ''
+            LinkedAccountID      = $LinkedAccountID
+            LinkedAccountSafe    = $ResolvedLinkedAccount.Safe
+            LinkedAccountName    = $ResolvedLinkedAccount.Name
             LinkedAccountsCopied = 0
             LinkedAccountsFailed = 0
             LinkedAccountDetails = ''
@@ -957,8 +1043,9 @@ foreach ($row in $CsvRows) {
             Username             = $newUsername
             Address              = [string]$templateAddress
             PlatformID           = $TargetPlatformID
-            LinkedAccountSafe    = ''
-            LinkedAccountName    = ''
+            LinkedAccountID      = $LinkedAccountID
+            LinkedAccountSafe    = $ResolvedLinkedAccount.Safe
+            LinkedAccountName    = $ResolvedLinkedAccount.Name
             LinkedAccountsCopied = 0
             LinkedAccountsFailed = 0
             LinkedAccountDetails = ''
@@ -970,32 +1057,8 @@ foreach ($row in $CsvRows) {
         continue
     }
 
-    $linkedSafeToUse = ''
-    $linkedNameToUse = ''
-    $linkedFolderToUse = ''
-
-    if (-not [string]::IsNullOrWhiteSpace($csvLinkedSafe)) {
-        $linkedSafeToUse = $csvLinkedSafe
-    } elseif (-not [string]::IsNullOrWhiteSpace($DefaultLinkedAccountSafe)) {
-        $linkedSafeToUse = $DefaultLinkedAccountSafe
-    } else {
-        $linkedSafeToUse = $targetSafeName
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($csvLinkedName)) {
-        $linkedNameToUse = $csvLinkedName
-    } else {
-        $linkedNameToUse = $DefaultLinkedAccountName
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($csvLinkedFolder)) {
-        $linkedFolderToUse = $csvLinkedFolder
-    } else {
-        $linkedFolderToUse = $DefaultLinkedAccountFolder
-    }
-
     Write-Log ("[{0}/{1}] Preparing onboarding for SafeName='{2}', Username='{3}'..." -f $currentRow, $totalRows, $targetSafeName, $newUsername) 'Cyan'
-    Write-Log ("[{0}/{1}] Linked account target: Safe='{2}', Name='{3}', Folder='{4}'." -f $currentRow, $totalRows, $linkedSafeToUse, $linkedNameToUse, $linkedFolderToUse) 'Gray'
+    Write-Log ("[{0}/{1}] Linked account source: AccountID='{2}', Safe='{3}', Name='{4}', Folder='{5}'." -f $currentRow, $totalRows, $ResolvedLinkedAccount.AccountID, $ResolvedLinkedAccount.Safe, $ResolvedLinkedAccount.Name, $ResolvedLinkedAccount.Folder) 'Gray'
 
     try {
         $addParams = New-AddPASAccountParamsFromTemplate `
@@ -1007,7 +1070,7 @@ foreach ($row in $CsvRows) {
 
         if ($DryRun.IsPresent) {
             Write-Log ("[{0}/{1}] DRYRUN: Would create account for Username='{2}' in Safe='{3}' Platform='{4}'." -f $currentRow, $totalRows, $newUsername, $targetSafeName, $TargetPlatformID) 'Yellow'
-            Write-Log ("[{0}/{1}] DRYRUN: Would link logonAccount/ApplicationAccount/ReconcileAccount to '{2}' in safe '{3}'." -f $currentRow, $totalRows, $linkedNameToUse, $linkedSafeToUse) 'Yellow'
+            Write-Log ("[{0}/{1}] DRYRUN: Would link AccountID='{2}' as logonAccount/ApplicationAccount/ReconcileAccount." -f $currentRow, $totalRows, $LinkedAccountID) 'Yellow'
 
             $Results.Add([PSCustomObject]@{
                 RowNumber            = $currentRow
@@ -1017,8 +1080,9 @@ foreach ($row in $CsvRows) {
                 Username             = $newUsername
                 Address              = [string]$templateAddress
                 PlatformID           = $TargetPlatformID
-                LinkedAccountSafe    = $linkedSafeToUse
-                LinkedAccountName    = $linkedNameToUse
+                LinkedAccountID      = $LinkedAccountID
+                LinkedAccountSafe    = $ResolvedLinkedAccount.Safe
+                LinkedAccountName    = $ResolvedLinkedAccount.Name
                 LinkedAccountsCopied = 0
                 LinkedAccountsFailed = 0
                 LinkedAccountDetails = ''
@@ -1045,11 +1109,9 @@ foreach ($row in $CsvRows) {
 
         Write-Log ("[{0}/{1}] SUCCESS: Created account for Username='{2}'. New AccountID='{3}'." -f $currentRow, $totalRows, $newUsername, $newAccountId) 'Green'
 
-        $linkCopyResult = Set-FixedAzureLinkedAccounts `
+        $linkCopyResult = Set-AzureLinkedAccounts `
             -NewAccountID ([string]$newAccountId) `
-            -LinkedAccountSafe $linkedSafeToUse `
-            -LinkedAccountName $linkedNameToUse `
-            -LinkedAccountFolder $linkedFolderToUse
+            -ResolvedLinkedAccount $ResolvedLinkedAccount
 
         $linkedCopySuccessTotal += $linkCopyResult.CopiedCount
         $linkedCopyFailedTotal += $linkCopyResult.FailedCount
@@ -1070,8 +1132,9 @@ foreach ($row in $CsvRows) {
             Username             = $newUsername
             Address              = [string]$templateAddress
             PlatformID           = $TargetPlatformID
-            LinkedAccountSafe    = $linkedSafeToUse
-            LinkedAccountName    = $linkedNameToUse
+            LinkedAccountID      = $LinkedAccountID
+            LinkedAccountSafe    = $ResolvedLinkedAccount.Safe
+            LinkedAccountName    = $ResolvedLinkedAccount.Name
             LinkedAccountsCopied = $linkCopyResult.CopiedCount
             LinkedAccountsFailed = $linkCopyResult.FailedCount
             LinkedAccountDetails = $linkCopyResult.CopiedLinks
@@ -1093,8 +1156,9 @@ foreach ($row in $CsvRows) {
             Username             = $newUsername
             Address              = [string]$templateAddress
             PlatformID           = $TargetPlatformID
-            LinkedAccountSafe    = $linkedSafeToUse
-            LinkedAccountName    = $linkedNameToUse
+            LinkedAccountID      = $LinkedAccountID
+            LinkedAccountSafe    = $ResolvedLinkedAccount.Safe
+            LinkedAccountName    = $ResolvedLinkedAccount.Name
             LinkedAccountsCopied = 0
             LinkedAccountsFailed = 0
             LinkedAccountDetails = ''
@@ -1145,6 +1209,7 @@ Write-Log "CNA Bulk Azure Account Onboarding completed." 'Green'
 Write-Log ("Authenticated User              : {0}" -f $AuthenticatedUser) 'Gray'
 Write-Log ("Source Account ID               : {0}" -f $SourceAccountID) 'Gray'
 Write-Log ("Target Platform ID              : {0}" -f $TargetPlatformID) 'Gray'
+Write-Log ("Linked Account ID               : {0}" -f $LinkedAccountID) 'Gray'
 Write-Log ("Total CSV Rows                  : {0}" -f $totalRows) 'Gray'
 Write-Log ("Success Count                   : {0}" -f $successCount) 'Green'
 Write-Log ("Failed Count                    : {0}" -f $failedCount) 'Red'
