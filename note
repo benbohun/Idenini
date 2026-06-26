@@ -1,31 +1,24 @@
-Username,Password
-newazureuser1@cna.com,"PasswordValue1"
-newazureuser2@cna.com,"PasswordValue2"
-
-
 <#
 .SYNOPSIS
-    CNA Privilege Cloud Bulk Azure Account Onboarding by Duplicating Template Account
+    CNA Privilege Cloud Bulk Azure Account Onboarding by Duplicating Existing Account
 
 .DESCRIPTION
     - Authenticates to CNA Privilege Cloud using CCP + psPAS Identity Header
     - Reads an existing source/template account by Account ID
-    - Bulk onboards new accounts from CSV
-    - Copies source account fields:
+    - Bulk onboards new Azure accounts from CSV
+    - Copies source account values including:
         SafeName
         Address
         SecretType
         PlatformAccountProperties
-        SecretManagement create-safe fields
-        RemoteMachinesAccess
-    - Changes:
+        Automatic management setting
+        Manual management reason
+        Remote machine access settings
+    - Changes only:
         UserName from CSV
         Secret/Password from CSV
         PlatformID to MicrosoftAzureConferenceRoom
-    - Ignores:
-        Source Account ID
-        Source Account Name / platform account name
-        timestamps/status/system fields
+    - Does NOT set platform account name / account name so CyberArk can generate it automatically.
 
 .NOTES
     CSV must contain:
@@ -54,25 +47,13 @@ param(
     [string]$TargetPlatformID  = 'MicrosoftAzureConferenceRoom',
 
     # ===== Input / Output =====
-    [string]$InputCsvPath      = 'E:\Installation Media\Script\OnboardScript\data\AzureBulkOnboard.csv',
-    [string]$OutputFolder      = 'E:\Installation Media\Script\OnboardScript\data',
+    [string]$InputCsvPath      = 'E:\Installation Media\Script\OnboardScript\AzureBulkAccountOnboard\AzureBulkOnboard.csv',
+    [string]$OutputFolder      = 'E:\Installation Media\Script\OnboardScript\AzureBulkAccountOnboard',
     [string]$ResultCsvName     = 'AzureBulkOnboard_Results.csv',
     [string]$LogFileName       = 'AzureBulkOnboard.log',
 
     # ===== Safety =====
-    [switch]$DryRun,
-
-    # These platform properties are ignored because CyberArk/platform naming should generate the account name automatically.
-    [string[]]$PlatformPropertiesToIgnore = @(
-        'name',
-        'Name',
-        'accountName',
-        'AccountName',
-        'platformAccountName',
-        'PlatformAccountName',
-        'objectName',
-        'ObjectName'
-    )
+    [switch]$DryRun
 )
 
 # ============================================
@@ -174,7 +155,7 @@ function ConvertTo-PlainHashtable {
     }
 
     if ($InputObject -is [System.Collections.IDictionary]) {
-        $hash = [ordered]@{}
+        $hash = @{}
 
         foreach ($key in $InputObject.Keys) {
             $hash[$key] = ConvertTo-PlainHashtable -InputObject $InputObject[$key]
@@ -193,14 +174,15 @@ function ConvertTo-PlainHashtable {
         return $array
     }
 
-    if ($InputObject.PSObject.Properties.Count -gt 0 -and
+    if (
+        $InputObject.PSObject.Properties.Count -gt 0 -and
         -not ($InputObject -is [string]) -and
         -not ($InputObject -is [int]) -and
         -not ($InputObject -is [long]) -and
         -not ($InputObject -is [bool]) -and
-        -not ($InputObject -is [datetime])) {
-
-        $hash = [ordered]@{}
+        -not ($InputObject -is [datetime])
+    ) {
+        $hash = @{}
 
         foreach ($prop in $InputObject.PSObject.Properties) {
             $hash[$prop.Name] = ConvertTo-PlainHashtable -InputObject $prop.Value
@@ -213,113 +195,57 @@ function ConvertTo-PlainHashtable {
 }
 
 # ============================================
-# Helper: Remove hashtable keys case-insensitively
+# Helper: Remove account-name style properties
 # ============================================
 
-function Remove-HashtableKeysCaseInsensitive {
+function Remove-AccountNameProperties {
     param(
-        [Parameter(Mandatory)]
-        [hashtable]$Hashtable,
-
-        [Parameter(Mandatory)]
-        [string[]]$KeysToRemove
+        [hashtable]$PlatformProperties
     )
 
-    foreach ($removeKey in $KeysToRemove) {
-        $actualKeys = @($Hashtable.Keys)
+    if ($null -eq $PlatformProperties) {
+        return $null
+    }
+
+    $ignoreKeys = @(
+        'name',
+        'Name',
+        'accountName',
+        'AccountName',
+        'platformAccountName',
+        'PlatformAccountName',
+        'objectName',
+        'ObjectName'
+    )
+
+    foreach ($ignoreKey in $ignoreKeys) {
+        $actualKeys = @($PlatformProperties.Keys)
 
         foreach ($actualKey in $actualKeys) {
-            if ([string]$actualKey -ieq [string]$removeKey) {
-                $Hashtable.Remove($actualKey)
+            if ([string]$actualKey -ieq [string]$ignoreKey) {
+                $PlatformProperties.Remove($actualKey)
             }
         }
     }
 
-    return $Hashtable
+    return $PlatformProperties
 }
 
 # ============================================
-# Helper: Build clean secretManagement create body
+# Helper: Convert plain password to SecureString
 # ============================================
 
-function Get-CreateSecretManagementObject {
+function ConvertTo-SafeSecureString {
     param(
-        [object]$TemplateSecretManagement
+        [Parameter(Mandatory)]
+        [string]$PlainText
     )
 
-    if ($null -eq $TemplateSecretManagement) {
-        return $null
-    }
-
-    $secretManagement = [ordered]@{}
-
-    $automaticManagementEnabled = Get-ObjectPropertyValue -InputObject $TemplateSecretManagement -PropertyNames @(
-        'automaticManagementEnabled',
-        'AutomaticManagementEnabled'
-    )
-
-    $manualManagementReason = Get-ObjectPropertyValue -InputObject $TemplateSecretManagement -PropertyNames @(
-        'manualManagementReason',
-        'ManualManagementReason'
-    )
-
-    if ($null -ne $automaticManagementEnabled) {
-        $secretManagement['automaticManagementEnabled'] = [bool]$automaticManagementEnabled
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace([string]$manualManagementReason)) {
-        $secretManagement['manualManagementReason'] = [string]$manualManagementReason
-    }
-
-    if ($secretManagement.Count -eq 0) {
-        return $null
-    }
-
-    return $secretManagement
+    return ConvertTo-SecureString $PlainText -AsPlainText -Force
 }
 
 # ============================================
-# Helper: Build clean remoteMachinesAccess create body
-# ============================================
-
-function Get-CreateRemoteMachinesAccessObject {
-    param(
-        [object]$TemplateRemoteMachinesAccess
-    )
-
-    if ($null -eq $TemplateRemoteMachinesAccess) {
-        return $null
-    }
-
-    $remoteMachinesAccess = [ordered]@{}
-
-    $remoteMachines = Get-ObjectPropertyValue -InputObject $TemplateRemoteMachinesAccess -PropertyNames @(
-        'remoteMachines',
-        'RemoteMachines'
-    )
-
-    $accessRestricted = Get-ObjectPropertyValue -InputObject $TemplateRemoteMachinesAccess -PropertyNames @(
-        'accessRestrictedToRemoteMachines',
-        'AccessRestrictedToRemoteMachines'
-    )
-
-    if (-not [string]::IsNullOrWhiteSpace([string]$remoteMachines)) {
-        $remoteMachinesAccess['remoteMachines'] = [string]$remoteMachines
-    }
-
-    if ($null -ne $accessRestricted) {
-        $remoteMachinesAccess['accessRestrictedToRemoteMachines'] = [bool]$accessRestricted
-    }
-
-    if ($remoteMachinesAccess.Count -eq 0) {
-        return $null
-    }
-
-    return $remoteMachinesAccess
-}
-
-# ============================================
-# Helper: Friendly REST error
+# Helper: Friendly error message
 # ============================================
 
 function Get-FriendlyErrorMessage {
@@ -356,7 +282,7 @@ try {
 }
 
 # ============================================
-# Validate IdentityCommand / Get-IdentityHeader
+# Validate Required Cmdlets
 # ============================================
 
 if (-not (Get-Command Get-IdentityHeader -ErrorAction SilentlyContinue)) {
@@ -364,9 +290,14 @@ if (-not (Get-Command Get-IdentityHeader -ErrorAction SilentlyContinue)) {
     throw "Get-IdentityHeader cmdlet not found."
 }
 
-if (-not (Get-Command Invoke-PASRestMethod -ErrorAction SilentlyContinue)) {
-    Write-Log "ERROR: Invoke-PASRestMethod cmdlet was not found. Confirm psPAS module version supports Invoke-PASRestMethod." 'Red'
-    throw "Invoke-PASRestMethod cmdlet not found."
+if (-not (Get-Command Get-PASAccount -ErrorAction SilentlyContinue)) {
+    Write-Log "ERROR: Get-PASAccount cmdlet was not found. Confirm psPAS module is installed correctly." 'Red'
+    throw "Get-PASAccount cmdlet not found."
+}
+
+if (-not (Get-Command Add-PASAccount -ErrorAction SilentlyContinue)) {
+    Write-Log "ERROR: Add-PASAccount cmdlet was not found. Confirm psPAS module is installed correctly." 'Red'
+    throw "Add-PASAccount cmdlet not found."
 }
 
 # ============================================
@@ -467,16 +398,10 @@ function Get-TemplateAccountById {
         [string]$AccountID
     )
 
-    $encodedId = [System.Uri]::EscapeDataString($AccountID)
-    $uri = "Accounts/$encodedId/"
-
     Write-Log ("Retrieving source/template account by Account ID: {0}" -f $AccountID) 'Cyan'
 
     try {
-        $template = Invoke-PASRestMethod `
-            -Uri $uri `
-            -Method GET `
-            -ErrorAction Stop
+        $template = Get-PASAccount -id $AccountID -ErrorAction Stop
 
         if ($null -eq $template) {
             throw "No account details returned for Account ID $AccountID."
@@ -491,10 +416,10 @@ function Get-TemplateAccountById {
 }
 
 # ============================================
-# Build create body from template + CSV row
+# Build Add-PASAccount parameters
 # ============================================
 
-function New-AccountCreateBodyFromTemplate {
+function New-AddPASAccountParamsFromTemplate {
     param(
         [Parameter(Mandatory)]
         [object]$TemplateAccount,
@@ -511,7 +436,9 @@ function New-AccountCreateBodyFromTemplate {
 
     $safeName = Get-ObjectPropertyValue -InputObject $TemplateAccount -PropertyNames @(
         'safeName',
-        'SafeName'
+        'SafeName',
+        'safe',
+        'Safe'
     )
 
     $address = Get-ObjectPropertyValue -InputObject $TemplateAccount -PropertyNames @(
@@ -529,95 +456,118 @@ function New-AccountCreateBodyFromTemplate {
     }
 
     if ([string]::IsNullOrWhiteSpace([string]$secretType)) {
-        $secretType = 'password'
+        $secretType = 'Password'
     }
 
-    $body = [ordered]@{
+    if ([string]$secretType -ieq 'password') {
+        $secretType = 'Password'
+    } elseif ([string]$secretType -ieq 'key') {
+        $secretType = 'Key'
+    } else {
+        $secretType = 'Password'
+    }
+
+    $secureSecret = ConvertTo-SafeSecureString -PlainText $NewPassword
+
+    $params = @{
         userName   = $NewUsername
-        platformId = $NewPlatformID
-        safeName   = [string]$safeName
+        platformID = $NewPlatformID
+        SafeName   = [string]$safeName
         secretType = [string]$secretType
-        secret     = $NewPassword
+        secret     = $secureSecret
     }
 
     if (-not [string]::IsNullOrWhiteSpace([string]$address)) {
-        $body['address'] = [string]$address
+        $params['address'] = [string]$address
     }
 
-    # Copy all platform account properties except account-name style properties.
+    # Copy platform properties such as logon/reconcile/application properties if returned by Get-PASAccount.
     $templatePlatformProperties = Get-ObjectPropertyValue -InputObject $TemplateAccount -PropertyNames @(
         'platformAccountProperties',
-        'PlatformAccountProperties'
+        'PlatformAccountProperties',
+        'properties',
+        'Properties'
     )
 
     if ($null -ne $templatePlatformProperties) {
         $platformProps = ConvertTo-PlainHashtable -InputObject $templatePlatformProperties
 
         if ($null -ne $platformProps -and $platformProps -is [hashtable]) {
-            $platformProps = Remove-HashtableKeysCaseInsensitive `
-                -Hashtable $platformProps `
-                -KeysToRemove $PlatformPropertiesToIgnore
+            $platformProps = Remove-AccountNameProperties -PlatformProperties $platformProps
 
             if ($platformProps.Count -gt 0) {
-                $body['platformAccountProperties'] = $platformProps
+                $params['platformAccountProperties'] = $platformProps
             }
         }
     }
 
-    # Copy only create-safe secretManagement fields.
+    # Copy CPM automatic management setting if present.
     $templateSecretManagement = Get-ObjectPropertyValue -InputObject $TemplateAccount -PropertyNames @(
         'secretManagement',
         'SecretManagement'
     )
 
-    $secretManagement = Get-CreateSecretManagementObject -TemplateSecretManagement $templateSecretManagement
+    if ($null -ne $templateSecretManagement) {
+        $automaticManagementEnabled = Get-ObjectPropertyValue -InputObject $templateSecretManagement -PropertyNames @(
+            'automaticManagementEnabled',
+            'AutomaticManagementEnabled'
+        )
 
-    if ($null -ne $secretManagement) {
-        $body['secretManagement'] = $secretManagement
+        $manualManagementReason = Get-ObjectPropertyValue -InputObject $templateSecretManagement -PropertyNames @(
+            'manualManagementReason',
+            'ManualManagementReason'
+        )
+
+        if ($null -ne $automaticManagementEnabled) {
+            $params['automaticManagementEnabled'] = [bool]$automaticManagementEnabled
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace([string]$manualManagementReason)) {
+            $params['manualManagementReason'] = [string]$manualManagementReason
+        }
     }
 
-    # Copy remote machine restrictions if present.
+    # Copy remote machine settings if present.
     $templateRemoteMachinesAccess = Get-ObjectPropertyValue -InputObject $TemplateAccount -PropertyNames @(
         'remoteMachinesAccess',
         'RemoteMachinesAccess'
     )
 
-    $remoteMachinesAccess = Get-CreateRemoteMachinesAccessObject -TemplateRemoteMachinesAccess $templateRemoteMachinesAccess
+    if ($null -ne $templateRemoteMachinesAccess) {
+        $remoteMachines = Get-ObjectPropertyValue -InputObject $templateRemoteMachinesAccess -PropertyNames @(
+            'remoteMachines',
+            'RemoteMachines'
+        )
 
-    if ($null -ne $remoteMachinesAccess) {
-        $body['remoteMachinesAccess'] = $remoteMachinesAccess
+        $accessRestricted = Get-ObjectPropertyValue -InputObject $templateRemoteMachinesAccess -PropertyNames @(
+            'accessRestrictedToRemoteMachines',
+            'AccessRestrictedToRemoteMachines'
+        )
+
+        if (-not [string]::IsNullOrWhiteSpace([string]$remoteMachines)) {
+            $params['remoteMachines'] = [string]$remoteMachines
+        }
+
+        if ($null -ne $accessRestricted) {
+            $params['accessRestrictedToRemoteMachines'] = [bool]$accessRestricted
+        }
     }
 
-    # Do NOT include:
-    # - id
-    # - name
-    # - createdTime
-    # - modified time
-    # - status
-    # - source username
-    # - source password/secret
-    return $body
+    return $params
 }
 
 # ============================================
-# Create account
+# Add account
 # ============================================
 
 function Add-BulkAzureAccount {
     param(
         [Parameter(Mandatory)]
-        [object]$CreateBody
+        [hashtable]$AddAccountParams
     )
 
-    $jsonBody = $CreateBody | ConvertTo-Json -Depth 20
-
     try {
-        $response = Invoke-PASRestMethod `
-            -Uri 'Accounts/' `
-            -Method POST `
-            -Body $jsonBody `
-            -ErrorAction Stop
-
+        $response = Add-PASAccount @AddAccountParams -ErrorAction Stop
         return $response
     } catch {
         $msg = Get-FriendlyErrorMessage -ErrorRecord $_
@@ -686,10 +636,31 @@ try {
 try {
     $TemplateAccount = Get-TemplateAccountById -AccountID $SourceAccountID
 
-    $templateSafe = Get-ObjectPropertyValue -InputObject $TemplateAccount -PropertyNames @('safeName','SafeName')
-    $templateAddress = Get-ObjectPropertyValue -InputObject $TemplateAccount -PropertyNames @('address','Address')
-    $templateUser = Get-ObjectPropertyValue -InputObject $TemplateAccount -PropertyNames @('userName','UserName','username','Username')
-    $templatePlatform = Get-ObjectPropertyValue -InputObject $TemplateAccount -PropertyNames @('platformId','PlatformId','PlatformID')
+    $templateSafe = Get-ObjectPropertyValue -InputObject $TemplateAccount -PropertyNames @(
+        'safeName',
+        'SafeName',
+        'safe',
+        'Safe'
+    )
+
+    $templateAddress = Get-ObjectPropertyValue -InputObject $TemplateAccount -PropertyNames @(
+        'address',
+        'Address'
+    )
+
+    $templateUser = Get-ObjectPropertyValue -InputObject $TemplateAccount -PropertyNames @(
+        'userName',
+        'UserName',
+        'username',
+        'Username'
+    )
+
+    $templatePlatform = Get-ObjectPropertyValue -InputObject $TemplateAccount -PropertyNames @(
+        'platformId',
+        'PlatformId',
+        'PlatformID',
+        'PolicyID'
+    )
 
     Write-Log "Template account resolved successfully." 'Green'
     Write-Log ("Template Safe        : {0}" -f $templateSafe) 'Gray'
@@ -783,7 +754,7 @@ foreach ($row in $CsvRows) {
     Write-Log ("[{0}/{1}] Preparing onboarding for Username='{2}'..." -f $currentRow, $totalRows, $newUsername) 'Cyan'
 
     try {
-        $createBody = New-AccountCreateBodyFromTemplate `
+        $addParams = New-AddPASAccountParamsFromTemplate `
             -TemplateAccount $TemplateAccount `
             -NewUsername $newUsername `
             -NewPassword $newPassword `
@@ -807,7 +778,7 @@ foreach ($row in $CsvRows) {
             continue
         }
 
-        $response = Add-BulkAzureAccount -CreateBody $createBody
+        $response = Add-BulkAzureAccount -AddAccountParams $addParams
 
         $newAccountId = Get-ObjectPropertyValue -InputObject $response -PropertyNames @(
             'id',
@@ -854,9 +825,9 @@ foreach ($row in $CsvRows) {
             ErrorMessage    = $errorMessage
         })
     } finally {
-        # Remove password variable content from current loop as much as PowerShell allows.
         $newPassword = $null
-        $createBody = $null
+        $addParams = $null
+        $response = $null
     }
 }
 
