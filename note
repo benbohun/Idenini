@@ -1,16 +1,37 @@
+Username,Password
+newazureuser1@cna.com,"PasswordValue1"
+newazureuser2@cna.com,"PasswordValue2"
+
+
 <#
 .SYNOPSIS
-    CNA Privilege Cloud Account Report with Account ID
+    CNA Privilege Cloud Bulk Azure Account Onboarding by Duplicating Template Account
 
 .DESCRIPTION
     - Authenticates to CNA Privilege Cloud using CCP + psPAS Identity Header
-    - Retrieves all accounts visible to the service account
-    - Exports account inventory report
-    - Places CyberArk Account ID directly in the CSV output
+    - Reads an existing source/template account by Account ID
+    - Bulk onboards new accounts from CSV
+    - Copies source account fields:
+        SafeName
+        Address
+        SecretType
+        PlatformAccountProperties
+        SecretManagement create-safe fields
+        RemoteMachinesAccess
+    - Changes:
+        UserName from CSV
+        Secret/Password from CSV
+        PlatformID to MicrosoftAzureConferenceRoom
+    - Ignores:
+        Source Account ID
+        Source Account Name / platform account name
+        timestamps/status/system fields
 
 .NOTES
-    This script is report-only.
-    It does not retrieve, change, rotate, verify, reconcile, add, update, or remove accounts.
+    CSV must contain:
+        Username,Password
+
+    This script does not print passwords to screen or log.
 #>
 
 [CmdletBinding()]
@@ -28,13 +49,30 @@ param(
     [string]$CCPObject         = 'cna-prod.cyberark.cloud-cnarestbot',
     [bool]$CCPWindowsAuth      = $false,
 
-    # ===== Output paths =====
-    [string]$OutputFolder      = 'E:\Installation Media\Script\OnboardScript\data',
-    [string]$AccountCsvName    = 'AccountReport_WithAccountID.csv',
-    [string]$LogFileName       = 'AccountReport_WithAccountID.log',
+    # ===== Duplicate / Onboard settings =====
+    [string]$SourceAccountID   = '2889_5',
+    [string]$TargetPlatformID  = 'MicrosoftAzureConferenceRoom',
 
-    # ===== Retrieval settings =====
-    [int]$PageLimit            = 1000
+    # ===== Input / Output =====
+    [string]$InputCsvPath      = 'E:\Installation Media\Script\OnboardScript\data\AzureBulkOnboard.csv',
+    [string]$OutputFolder      = 'E:\Installation Media\Script\OnboardScript\data',
+    [string]$ResultCsvName     = 'AzureBulkOnboard_Results.csv',
+    [string]$LogFileName       = 'AzureBulkOnboard.log',
+
+    # ===== Safety =====
+    [switch]$DryRun,
+
+    # These platform properties are ignored because CyberArk/platform naming should generate the account name automatically.
+    [string[]]$PlatformPropertiesToIgnore = @(
+        'name',
+        'Name',
+        'accountName',
+        'AccountName',
+        'platformAccountName',
+        'PlatformAccountName',
+        'objectName',
+        'ObjectName'
+    )
 )
 
 # ============================================
@@ -53,8 +91,8 @@ if (-not (Test-Path -Path $OutputFolder)) {
     New-Item -ItemType Directory -Path $OutputFolder -Force | Out-Null
 }
 
-$LogFile        = Join-Path $OutputFolder $LogFileName
-$AccountCsvPath = Join-Path $OutputFolder $AccountCsvName
+$LogFile       = Join-Path $OutputFolder $LogFileName
+$ResultCsvPath = Join-Path $OutputFolder $ResultCsvName
 
 New-Item -ItemType File -Force -Path $LogFile | Out-Null
 
@@ -123,103 +161,180 @@ function Get-ObjectPropertyValue {
 }
 
 # ============================================
-# Helper: Safely get nested object property
+# Helper: Convert object to hashtable recursively
 # ============================================
 
-function Get-NestedPropertyValue {
+function ConvertTo-PlainHashtable {
     param(
-        [Parameter(Mandatory)]
-        [object]$InputObject,
-
-        [Parameter(Mandatory)]
-        [string]$ParentProperty,
-
-        [Parameter(Mandatory)]
-        [string[]]$ChildProperties
+        [object]$InputObject
     )
 
     if ($null -eq $InputObject) {
         return $null
     }
 
-    if (-not ($InputObject.PSObject.Properties.Name -contains $ParentProperty)) {
-        return $null
-    }
+    if ($InputObject -is [System.Collections.IDictionary]) {
+        $hash = [ordered]@{}
 
-    $parent = $InputObject.$ParentProperty
-
-    if ($null -eq $parent) {
-        return $null
-    }
-
-    foreach ($child in $ChildProperties) {
-        if ($parent.PSObject.Properties.Name -contains $child) {
-            return $parent.$child
+        foreach ($key in $InputObject.Keys) {
+            $hash[$key] = ConvertTo-PlainHashtable -InputObject $InputObject[$key]
         }
+
+        return $hash
     }
 
-    return $null
+    if ($InputObject -is [System.Array]) {
+        $array = @()
+
+        foreach ($item in $InputObject) {
+            $array += ConvertTo-PlainHashtable -InputObject $item
+        }
+
+        return $array
+    }
+
+    if ($InputObject.PSObject.Properties.Count -gt 0 -and
+        -not ($InputObject -is [string]) -and
+        -not ($InputObject -is [int]) -and
+        -not ($InputObject -is [long]) -and
+        -not ($InputObject -is [bool]) -and
+        -not ($InputObject -is [datetime])) {
+
+        $hash = [ordered]@{}
+
+        foreach ($prop in $InputObject.PSObject.Properties) {
+            $hash[$prop.Name] = ConvertTo-PlainHashtable -InputObject $prop.Value
+        }
+
+        return $hash
+    }
+
+    return $InputObject
 }
 
 # ============================================
-# Helper: Convert values to report-safe text
+# Helper: Remove hashtable keys case-insensitively
 # ============================================
 
-function Convert-ToReportValue {
+function Remove-HashtableKeysCaseInsensitive {
     param(
-        [object]$Value
+        [Parameter(Mandatory)]
+        [hashtable]$Hashtable,
+
+        [Parameter(Mandatory)]
+        [string[]]$KeysToRemove
     )
 
-    if ($null -eq $Value) {
-        return ''
+    foreach ($removeKey in $KeysToRemove) {
+        $actualKeys = @($Hashtable.Keys)
+
+        foreach ($actualKey in $actualKeys) {
+            if ([string]$actualKey -ieq [string]$removeKey) {
+                $Hashtable.Remove($actualKey)
+            }
+        }
     }
 
-    if ($Value -is [string]) {
-        return $Value
-    }
-
-    if ($Value -is [bool]) {
-        return $Value
-    }
-
-    if ($Value -is [int] -or $Value -is [long] -or $Value -is [decimal]) {
-        return $Value
-    }
-
-    try {
-        return ($Value | ConvertTo-Json -Compress -Depth 10)
-    } catch {
-        return [string]$Value
-    }
+    return $Hashtable
 }
 
 # ============================================
-# Helper: Convert CyberArk epoch time if possible
+# Helper: Build clean secretManagement create body
 # ============================================
 
-function Convert-CyberArkTime {
+function Get-CreateSecretManagementObject {
     param(
-        [object]$Value
+        [object]$TemplateSecretManagement
     )
 
-    if ($null -eq $Value -or [string]::IsNullOrWhiteSpace([string]$Value)) {
-        return ''
+    if ($null -eq $TemplateSecretManagement) {
+        return $null
     }
 
-    try {
-        $raw = [Int64]$Value
+    $secretManagement = [ordered]@{}
 
-        # CyberArk APIs may return epoch seconds or milliseconds depending on field/version.
-        if ($raw -gt 999999999999) {
-            $dt = [DateTimeOffset]::FromUnixTimeMilliseconds($raw).LocalDateTime
-        } else {
-            $dt = [DateTimeOffset]::FromUnixTimeSeconds($raw).LocalDateTime
-        }
+    $automaticManagementEnabled = Get-ObjectPropertyValue -InputObject $TemplateSecretManagement -PropertyNames @(
+        'automaticManagementEnabled',
+        'AutomaticManagementEnabled'
+    )
 
-        return $dt.ToString('yyyy-MM-dd HH:mm:ss')
-    } catch {
-        return [string]$Value
+    $manualManagementReason = Get-ObjectPropertyValue -InputObject $TemplateSecretManagement -PropertyNames @(
+        'manualManagementReason',
+        'ManualManagementReason'
+    )
+
+    if ($null -ne $automaticManagementEnabled) {
+        $secretManagement['automaticManagementEnabled'] = [bool]$automaticManagementEnabled
     }
+
+    if (-not [string]::IsNullOrWhiteSpace([string]$manualManagementReason)) {
+        $secretManagement['manualManagementReason'] = [string]$manualManagementReason
+    }
+
+    if ($secretManagement.Count -eq 0) {
+        return $null
+    }
+
+    return $secretManagement
+}
+
+# ============================================
+# Helper: Build clean remoteMachinesAccess create body
+# ============================================
+
+function Get-CreateRemoteMachinesAccessObject {
+    param(
+        [object]$TemplateRemoteMachinesAccess
+    )
+
+    if ($null -eq $TemplateRemoteMachinesAccess) {
+        return $null
+    }
+
+    $remoteMachinesAccess = [ordered]@{}
+
+    $remoteMachines = Get-ObjectPropertyValue -InputObject $TemplateRemoteMachinesAccess -PropertyNames @(
+        'remoteMachines',
+        'RemoteMachines'
+    )
+
+    $accessRestricted = Get-ObjectPropertyValue -InputObject $TemplateRemoteMachinesAccess -PropertyNames @(
+        'accessRestrictedToRemoteMachines',
+        'AccessRestrictedToRemoteMachines'
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace([string]$remoteMachines)) {
+        $remoteMachinesAccess['remoteMachines'] = [string]$remoteMachines
+    }
+
+    if ($null -ne $accessRestricted) {
+        $remoteMachinesAccess['accessRestrictedToRemoteMachines'] = [bool]$accessRestricted
+    }
+
+    if ($remoteMachinesAccess.Count -eq 0) {
+        return $null
+    }
+
+    return $remoteMachinesAccess
+}
+
+# ============================================
+# Helper: Friendly REST error
+# ============================================
+
+function Get-FriendlyErrorMessage {
+    param(
+        [Parameter(Mandatory)]
+        [System.Management.Automation.ErrorRecord]$ErrorRecord
+    )
+
+    $message = $ErrorRecord.Exception.Message
+
+    if ($ErrorRecord.ErrorDetails -and -not [string]::IsNullOrWhiteSpace($ErrorRecord.ErrorDetails.Message)) {
+        $message = "$message | Details: $($ErrorRecord.ErrorDetails.Message)"
+    }
+
+    return $message
 }
 
 # ============================================
@@ -247,6 +362,11 @@ try {
 if (-not (Get-Command Get-IdentityHeader -ErrorAction SilentlyContinue)) {
     Write-Log "ERROR: Get-IdentityHeader cmdlet was not found. Confirm IdentityCommand module is installed and available." 'Red'
     throw "Get-IdentityHeader cmdlet not found."
+}
+
+if (-not (Get-Command Invoke-PASRestMethod -ErrorAction SilentlyContinue)) {
+    Write-Log "ERROR: Invoke-PASRestMethod cmdlet was not found. Confirm psPAS module version supports Invoke-PASRestMethod." 'Red'
+    throw "Invoke-PASRestMethod cmdlet not found."
 }
 
 # ============================================
@@ -338,93 +458,170 @@ function Start-PASSessionFromCCP {
 }
 
 # ============================================
-# Retrieve All Accounts
+# Get source/template account by Account ID
 # ============================================
 
-function Get-AllPASAccounts {
+function Get-TemplateAccountById {
     param(
-        [int]$Limit = 1000
+        [Parameter(Mandatory)]
+        [string]$AccountID
     )
 
-    $allAccounts = New-Object System.Collections.Generic.List[object]
+    $encodedId = [System.Uri]::EscapeDataString($AccountID)
+    $uri = "Accounts/$encodedId/"
 
-    # Preferred method: direct psPAS REST pagination
-    if (Get-Command Invoke-PASRestMethod -ErrorAction SilentlyContinue) {
-        Write-Log "Using Invoke-PASRestMethod with paginated /Accounts API retrieval..." 'Cyan'
+    Write-Log ("Retrieving source/template account by Account ID: {0}" -f $AccountID) 'Cyan'
 
-        $offset = 0
-        $pageNumber = 0
+    try {
+        $template = Invoke-PASRestMethod `
+            -Uri $uri `
+            -Method GET `
+            -ErrorAction Stop
 
-        while ($true) {
-            $pageNumber++
-
-            $relativeUri = "Accounts?limit=$Limit&offset=$offset"
-
-            Write-Log ("Retrieving account page {0}. Offset={1}, Limit={2}" -f $pageNumber, $offset, $Limit) 'Gray'
-
-            try {
-                $response = Invoke-PASRestMethod `
-                    -Uri $relativeUri `
-                    -Method GET `
-                    -ErrorAction Stop
-            } catch {
-                Write-Log ("WARNING: Invoke-PASRestMethod account retrieval failed. Falling back to Get-PASAccount. Error: {0}" -f $_.Exception.Message) 'Yellow'
-                $allAccounts.Clear()
-                break
-            }
-
-            $batch = @()
-
-            if ($null -ne $response) {
-                if ($response.PSObject.Properties.Name -contains 'value') {
-                    $batch = @($response.value)
-                } elseif ($response.PSObject.Properties.Name -contains 'accounts') {
-                    $batch = @($response.accounts)
-                } elseif ($response -is [array]) {
-                    $batch = @($response)
-                } else {
-                    $batch = @($response)
-                }
-            }
-
-            if ($null -eq $batch) {
-                $batch = @()
-            }
-
-            foreach ($account in $batch) {
-                if ($null -ne $account) {
-                    $allAccounts.Add($account)
-                }
-            }
-
-            Write-Log ("Retrieved {0} account(s) from page {1}." -f $batch.Count, $pageNumber) 'Green'
-
-            if ($batch.Count -lt $Limit) {
-                break
-            }
-
-            $offset += $Limit
+        if ($null -eq $template) {
+            throw "No account details returned for Account ID $AccountID."
         }
 
-        if ($allAccounts.Count -gt 0) {
-            return @($allAccounts)
+        return $template
+    } catch {
+        $msg = Get-FriendlyErrorMessage -ErrorRecord $_
+        Write-Log ("ERROR: Failed to retrieve template account {0}. {1}" -f $AccountID, $msg) 'Red'
+        throw
+    }
+}
+
+# ============================================
+# Build create body from template + CSV row
+# ============================================
+
+function New-AccountCreateBodyFromTemplate {
+    param(
+        [Parameter(Mandatory)]
+        [object]$TemplateAccount,
+
+        [Parameter(Mandatory)]
+        [string]$NewUsername,
+
+        [Parameter(Mandatory)]
+        [string]$NewPassword,
+
+        [Parameter(Mandatory)]
+        [string]$NewPlatformID
+    )
+
+    $safeName = Get-ObjectPropertyValue -InputObject $TemplateAccount -PropertyNames @(
+        'safeName',
+        'SafeName'
+    )
+
+    $address = Get-ObjectPropertyValue -InputObject $TemplateAccount -PropertyNames @(
+        'address',
+        'Address'
+    )
+
+    $secretType = Get-ObjectPropertyValue -InputObject $TemplateAccount -PropertyNames @(
+        'secretType',
+        'SecretType'
+    )
+
+    if ([string]::IsNullOrWhiteSpace([string]$safeName)) {
+        throw "Template account is missing SafeName."
+    }
+
+    if ([string]::IsNullOrWhiteSpace([string]$secretType)) {
+        $secretType = 'password'
+    }
+
+    $body = [ordered]@{
+        userName   = $NewUsername
+        platformId = $NewPlatformID
+        safeName   = [string]$safeName
+        secretType = [string]$secretType
+        secret     = $NewPassword
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace([string]$address)) {
+        $body['address'] = [string]$address
+    }
+
+    # Copy all platform account properties except account-name style properties.
+    $templatePlatformProperties = Get-ObjectPropertyValue -InputObject $TemplateAccount -PropertyNames @(
+        'platformAccountProperties',
+        'PlatformAccountProperties'
+    )
+
+    if ($null -ne $templatePlatformProperties) {
+        $platformProps = ConvertTo-PlainHashtable -InputObject $templatePlatformProperties
+
+        if ($null -ne $platformProps -and $platformProps -is [hashtable]) {
+            $platformProps = Remove-HashtableKeysCaseInsensitive `
+                -Hashtable $platformProps `
+                -KeysToRemove $PlatformPropertiesToIgnore
+
+            if ($platformProps.Count -gt 0) {
+                $body['platformAccountProperties'] = $platformProps
+            }
         }
     }
 
-    # Fallback method: Get-PASAccount
-    Write-Log "Using Get-PASAccount fallback method..." 'Cyan'
+    # Copy only create-safe secretManagement fields.
+    $templateSecretManagement = Get-ObjectPropertyValue -InputObject $TemplateAccount -PropertyNames @(
+        'secretManagement',
+        'SecretManagement'
+    )
+
+    $secretManagement = Get-CreateSecretManagementObject -TemplateSecretManagement $templateSecretManagement
+
+    if ($null -ne $secretManagement) {
+        $body['secretManagement'] = $secretManagement
+    }
+
+    # Copy remote machine restrictions if present.
+    $templateRemoteMachinesAccess = Get-ObjectPropertyValue -InputObject $TemplateAccount -PropertyNames @(
+        'remoteMachinesAccess',
+        'RemoteMachinesAccess'
+    )
+
+    $remoteMachinesAccess = Get-CreateRemoteMachinesAccessObject -TemplateRemoteMachinesAccess $templateRemoteMachinesAccess
+
+    if ($null -ne $remoteMachinesAccess) {
+        $body['remoteMachinesAccess'] = $remoteMachinesAccess
+    }
+
+    # Do NOT include:
+    # - id
+    # - name
+    # - createdTime
+    # - modified time
+    # - status
+    # - source username
+    # - source password/secret
+    return $body
+}
+
+# ============================================
+# Create account
+# ============================================
+
+function Add-BulkAzureAccount {
+    param(
+        [Parameter(Mandatory)]
+        [object]$CreateBody
+    )
+
+    $jsonBody = $CreateBody | ConvertTo-Json -Depth 20
 
     try {
-        $accounts = Get-PASAccount -ErrorAction Stop
+        $response = Invoke-PASRestMethod `
+            -Uri 'Accounts/' `
+            -Method POST `
+            -Body $jsonBody `
+            -ErrorAction Stop
 
-        if ($null -eq $accounts) {
-            return @()
-        }
-
-        return @($accounts)
+        return $response
     } catch {
-        Write-Log ("ERROR: Get-PASAccount fallback failed. {0}" -f $_.Exception.Message) 'Red'
-        throw
+        $msg = Get-FriendlyErrorMessage -ErrorRecord $_
+        throw $msg
     }
 }
 
@@ -433,7 +630,7 @@ function Get-AllPASAccounts {
 # ============================================
 
 Write-Log "============================================================" 'Gray'
-Write-Log "CNA Account Report with Account ID started." 'Cyan'
+Write-Log "CNA Bulk Azure Account Onboarding started." 'Cyan'
 Write-Log ("Identity Tenant URL : {0}" -f $IdentityTenantURL) 'Gray'
 Write-Log ("Privilege Cloud URL : {0}" -f $PrivilegeCloudURL) 'Gray'
 Write-Log ("PCloud Subdomain    : {0}" -f $PCloudSubdomain) 'Gray'
@@ -441,8 +638,35 @@ Write-Log ("CCP Address         : {0}" -f $CCPAddress) 'Gray'
 Write-Log ("CCP AppID           : {0}" -f $CCPAppID) 'Gray'
 Write-Log ("CCP Safe            : {0}" -f $CCPSafe) 'Gray'
 Write-Log ("CCP Object          : {0}" -f $CCPObject) 'Gray'
-Write-Log ("Account CSV         : {0}" -f $AccountCsvPath) 'Gray'
+Write-Log ("Source Account ID   : {0}" -f $SourceAccountID) 'Gray'
+Write-Log ("Target Platform ID  : {0}" -f $TargetPlatformID) 'Gray'
+Write-Log ("Input CSV           : {0}" -f $InputCsvPath) 'Gray'
+Write-Log ("Result CSV          : {0}" -f $ResultCsvPath) 'Gray'
+Write-Log ("DryRun              : {0}" -f $DryRun.IsPresent) 'Gray'
 Write-Log "============================================================" 'Gray'
+
+# ============================================
+# Validate CSV
+# ============================================
+
+if (-not (Test-Path -Path $InputCsvPath)) {
+    Write-Log ("FATAL: Input CSV was not found: {0}" -f $InputCsvPath) 'Red'
+    exit 1
+}
+
+try {
+    $CsvRows = Import-Csv -Path $InputCsvPath -ErrorAction Stop
+    $CsvRows = @($CsvRows)
+
+    if ($CsvRows.Count -eq 0) {
+        throw "CSV contains no rows."
+    }
+
+    Write-Log ("Imported {0} row(s) from CSV." -f $CsvRows.Count) 'Green'
+} catch {
+    Write-Log ("FATAL: Failed to import CSV. {0}" -f $_.Exception.Message) 'Red'
+    exit 1
+}
 
 # ============================================
 # Authenticate
@@ -456,23 +680,24 @@ try {
 }
 
 # ============================================
-# Retrieve Accounts
+# Retrieve source/template account
 # ============================================
 
-Write-Log "Retrieving all visible accounts..." 'Yellow'
-
 try {
-    $Accounts = Get-AllPASAccounts -Limit $PageLimit
+    $TemplateAccount = Get-TemplateAccountById -AccountID $SourceAccountID
 
-    if ($null -eq $Accounts) {
-        $Accounts = @()
-    } else {
-        $Accounts = @($Accounts)
-    }
+    $templateSafe = Get-ObjectPropertyValue -InputObject $TemplateAccount -PropertyNames @('safeName','SafeName')
+    $templateAddress = Get-ObjectPropertyValue -InputObject $TemplateAccount -PropertyNames @('address','Address')
+    $templateUser = Get-ObjectPropertyValue -InputObject $TemplateAccount -PropertyNames @('userName','UserName','username','Username')
+    $templatePlatform = Get-ObjectPropertyValue -InputObject $TemplateAccount -PropertyNames @('platformId','PlatformId','PlatformID')
 
-    Write-Log ("Retrieved {0} account(s)." -f $Accounts.Count) 'Green'
+    Write-Log "Template account resolved successfully." 'Green'
+    Write-Log ("Template Safe        : {0}" -f $templateSafe) 'Gray'
+    Write-Log ("Template Address     : {0}" -f $templateAddress) 'Gray'
+    Write-Log ("Template Username    : {0}" -f $templateUser) 'Gray'
+    Write-Log ("Template Platform ID : {0}" -f $templatePlatform) 'Gray'
 } catch {
-    Write-Log ("FATAL: Failed to retrieve accounts. {0}" -f $_.Exception.Message) 'Red'
+    Write-Log ("FATAL: Could not continue without source/template account. {0}" -f $_.Exception.Message) 'Red'
 
     try {
         Close-PASSession | Out-Null
@@ -482,182 +707,173 @@ try {
 }
 
 # ============================================
-# Build Account Report
+# Process bulk onboarding
 # ============================================
 
-$AccountReport = New-Object System.Collections.Generic.List[object]
+$Results = New-Object System.Collections.Generic.List[object]
 
-$currentIndex = 0
-$totalAccounts = $Accounts.Count
+$totalRows = $CsvRows.Count
+$currentRow = 0
+$successCount = 0
+$failedCount = 0
+$skippedCount = 0
 
-foreach ($Account in $Accounts) {
-    $currentIndex++
+foreach ($row in $CsvRows) {
+    $currentRow++
 
-    $accountId = Get-ObjectPropertyValue -InputObject $Account -PropertyNames @(
-        'id',
-        'Id',
-        'accountId',
-        'AccountId',
-        'AccountID'
-    )
-
-    $accountName = Get-ObjectPropertyValue -InputObject $Account -PropertyNames @(
-        'name',
-        'Name',
-        'accountName',
-        'AccountName'
-    )
-
-    $safeName = Get-ObjectPropertyValue -InputObject $Account -PropertyNames @(
-        'safeName',
-        'SafeName',
-        'safe',
-        'Safe'
-    )
-
-    $userName = Get-ObjectPropertyValue -InputObject $Account -PropertyNames @(
-        'userName',
+    $newUsername = Get-ObjectPropertyValue -InputObject $row -PropertyNames @(
+        'Username',
         'UserName',
-        'username',
-        'Username'
+        'userName',
+        'username'
     )
 
-    $address = Get-ObjectPropertyValue -InputObject $Account -PropertyNames @(
-        'address',
-        'Address'
+    $newPassword = Get-ObjectPropertyValue -InputObject $row -PropertyNames @(
+        'Password',
+        'password',
+        'Secret',
+        'secret'
     )
 
-    $platformId = Get-ObjectPropertyValue -InputObject $Account -PropertyNames @(
-        'platformId',
-        'PlatformId',
-        'platformID',
-        'PlatformID'
-    )
+    $newUsername = [string]$newUsername
+    $newPassword = [string]$newPassword
 
-    $secretType = Get-ObjectPropertyValue -InputObject $Account -PropertyNames @(
-        'secretType',
-        'SecretType'
-    )
+    if ([string]::IsNullOrWhiteSpace($newUsername)) {
+        $skippedCount++
+        $msg = "Missing Username value."
 
-    $createdTime = Get-ObjectPropertyValue -InputObject $Account -PropertyNames @(
-        'createdTime',
-        'CreatedTime',
-        'creationTime',
-        'CreationTime'
-    )
+        Write-Log ("[{0}/{1}] SKIPPED: {2}" -f $currentRow, $totalRows, $msg) 'Yellow'
 
-    $modifiedTime = Get-ObjectPropertyValue -InputObject $Account -PropertyNames @(
-        'modifiedTime',
-        'ModifiedTime',
-        'lastModifiedTime',
-        'LastModifiedTime'
-    )
+        $Results.Add([PSCustomObject]@{
+            RowNumber       = $currentRow
+            SourceAccountID = $SourceAccountID
+            NewAccountID    = ''
+            Username        = ''
+            SafeName        = [string]$templateSafe
+            Address         = [string]$templateAddress
+            PlatformID      = $TargetPlatformID
+            Status          = 'Skipped'
+            ErrorMessage    = $msg
+        })
 
-    $automaticManagementEnabled = Get-NestedPropertyValue `
-        -InputObject $Account `
-        -ParentProperty 'secretManagement' `
-        -ChildProperties @(
-            'automaticManagementEnabled',
-            'AutomaticManagementEnabled'
+        continue
+    }
+
+    if ([string]::IsNullOrWhiteSpace($newPassword)) {
+        $skippedCount++
+        $msg = "Missing Password value."
+
+        Write-Log ("[{0}/{1}] SKIPPED: Username='{2}'. {3}" -f $currentRow, $totalRows, $newUsername, $msg) 'Yellow'
+
+        $Results.Add([PSCustomObject]@{
+            RowNumber       = $currentRow
+            SourceAccountID = $SourceAccountID
+            NewAccountID    = ''
+            Username        = $newUsername
+            SafeName        = [string]$templateSafe
+            Address         = [string]$templateAddress
+            PlatformID      = $TargetPlatformID
+            Status          = 'Skipped'
+            ErrorMessage    = $msg
+        })
+
+        continue
+    }
+
+    Write-Log ("[{0}/{1}] Preparing onboarding for Username='{2}'..." -f $currentRow, $totalRows, $newUsername) 'Cyan'
+
+    try {
+        $createBody = New-AccountCreateBodyFromTemplate `
+            -TemplateAccount $TemplateAccount `
+            -NewUsername $newUsername `
+            -NewPassword $newPassword `
+            -NewPlatformID $TargetPlatformID
+
+        if ($DryRun.IsPresent) {
+            Write-Log ("[{0}/{1}] DRYRUN: Would create account for Username='{2}' in Safe='{3}' Platform='{4}'." -f $currentRow, $totalRows, $newUsername, $templateSafe, $TargetPlatformID) 'Yellow'
+
+            $Results.Add([PSCustomObject]@{
+                RowNumber       = $currentRow
+                SourceAccountID = $SourceAccountID
+                NewAccountID    = ''
+                Username        = $newUsername
+                SafeName        = [string]$templateSafe
+                Address         = [string]$templateAddress
+                PlatformID      = $TargetPlatformID
+                Status          = 'DryRun'
+                ErrorMessage    = ''
+            })
+
+            continue
+        }
+
+        $response = Add-BulkAzureAccount -CreateBody $createBody
+
+        $newAccountId = Get-ObjectPropertyValue -InputObject $response -PropertyNames @(
+            'id',
+            'Id',
+            'accountId',
+            'AccountID',
+            'AccountId'
         )
 
-    $manualManagementReason = Get-NestedPropertyValue `
-        -InputObject $Account `
-        -ParentProperty 'secretManagement' `
-        -ChildProperties @(
-            'manualManagementReason',
-            'ManualManagementReason'
-        )
+        if ([string]::IsNullOrWhiteSpace([string]$newAccountId)) {
+            $newAccountId = ''
+        }
 
-    $cpmStatus = Get-NestedPropertyValue `
-        -InputObject $Account `
-        -ParentProperty 'secretManagement' `
-        -ChildProperties @(
-            'status',
-            'Status',
-            'cpmStatus',
-            'CPMStatus'
-        )
+        Write-Log ("[{0}/{1}] SUCCESS: Created account for Username='{2}'. New AccountID='{3}'." -f $currentRow, $totalRows, $newUsername, $newAccountId) 'Green'
 
-    $lastModifiedByCPM = Get-NestedPropertyValue `
-        -InputObject $Account `
-        -ParentProperty 'secretManagement' `
-        -ChildProperties @(
-            'lastModifiedTime',
-            'LastModifiedTime'
-        )
+        $successCount++
 
-    $lastSuccessfulChange = Get-NestedPropertyValue `
-        -InputObject $Account `
-        -ParentProperty 'secretManagement' `
-        -ChildProperties @(
-            'lastSuccessfulChange',
-            'LastSuccessfulChange'
-        )
+        $Results.Add([PSCustomObject]@{
+            RowNumber       = $currentRow
+            SourceAccountID = $SourceAccountID
+            NewAccountID    = [string]$newAccountId
+            Username        = $newUsername
+            SafeName        = [string]$templateSafe
+            Address         = [string]$templateAddress
+            PlatformID      = $TargetPlatformID
+            Status          = 'Success'
+            ErrorMessage    = ''
+        })
+    } catch {
+        $failedCount++
+        $errorMessage = $_.Exception.Message
 
-    $lastSuccessfulVerification = Get-NestedPropertyValue `
-        -InputObject $Account `
-        -ParentProperty 'secretManagement' `
-        -ChildProperties @(
-            'lastSuccessfulVerification',
-            'LastSuccessfulVerification'
-        )
+        Write-Log ("[{0}/{1}] FAILED: Username='{2}'. {3}" -f $currentRow, $totalRows, $newUsername, $errorMessage) 'Red'
 
-    $platformAccountProperties = Get-ObjectPropertyValue -InputObject $Account -PropertyNames @(
-        'platformAccountProperties',
-        'PlatformAccountProperties'
-    )
-
-    $remoteMachinesAccess = Get-ObjectPropertyValue -InputObject $Account -PropertyNames @(
-        'remoteMachinesAccess',
-        'RemoteMachinesAccess'
-    )
-
-    $AccountReport.Add([PSCustomObject]@{
-        AccountID                   = Convert-ToReportValue $accountId
-        SafeName                    = Convert-ToReportValue $safeName
-        AccountName                 = Convert-ToReportValue $accountName
-        UserName                    = Convert-ToReportValue $userName
-        Address                     = Convert-ToReportValue $address
-        PlatformID                  = Convert-ToReportValue $platformId
-        SecretType                  = Convert-ToReportValue $secretType
-        CPMStatus                   = Convert-ToReportValue $cpmStatus
-        AutomaticManagementEnabled  = Convert-ToReportValue $automaticManagementEnabled
-        ManualManagementReason      = Convert-ToReportValue $manualManagementReason
-        CreatedTime                 = Convert-CyberArkTime $createdTime
-        ModifiedTime                = Convert-CyberArkTime $modifiedTime
-        CPMLastModifiedTime         = Convert-CyberArkTime $lastModifiedByCPM
-        LastSuccessfulChange        = Convert-CyberArkTime $lastSuccessfulChange
-        LastSuccessfulVerification  = Convert-CyberArkTime $lastSuccessfulVerification
-        PlatformAccountProperties   = Convert-ToReportValue $platformAccountProperties
-        RemoteMachinesAccess        = Convert-ToReportValue $remoteMachinesAccess
-    })
-
-    if (($currentIndex % 500) -eq 0) {
-        Write-Log ("Processed {0}/{1} account(s) into report..." -f $currentIndex, $totalAccounts) 'Gray'
+        $Results.Add([PSCustomObject]@{
+            RowNumber       = $currentRow
+            SourceAccountID = $SourceAccountID
+            NewAccountID    = ''
+            Username        = $newUsername
+            SafeName        = [string]$templateSafe
+            Address         = [string]$templateAddress
+            PlatformID      = $TargetPlatformID
+            Status          = 'Failed'
+            ErrorMessage    = $errorMessage
+        })
+    } finally {
+        # Remove password variable content from current loop as much as PowerShell allows.
+        $newPassword = $null
+        $createBody = $null
     }
 }
 
 # ============================================
-# Export Account Report
+# Export Results
 # ============================================
 
 try {
-    Write-Log "Exporting account report with Account ID..." 'Yellow'
+    Write-Log "Exporting onboarding results..." 'Yellow'
 
-    $AccountReport |
-        Sort-Object SafeName, AccountName, UserName, Address |
-        Export-Csv -Path $AccountCsvPath -NoTypeInformation -Encoding UTF8
+    $Results |
+        Sort-Object RowNumber |
+        Export-Csv -Path $ResultCsvPath -NoTypeInformation -Encoding UTF8
 
-    Write-Log ("Account report exported to: {0}" -f $AccountCsvPath) 'Green'
+    Write-Log ("Results exported to: {0}" -f $ResultCsvPath) 'Green'
 } catch {
-    Write-Log ("ERROR: Failed to export account report CSV. {0}" -f $_.Exception.Message) 'Red'
-
-    try {
-        Close-PASSession | Out-Null
-    } catch {}
-
-    exit 1
+    Write-Log ("ERROR: Failed to export results CSV. {0}" -f $_.Exception.Message) 'Red'
 }
 
 # ============================================
@@ -676,8 +892,14 @@ try {
 # ============================================
 
 Write-Log "============================================================" 'Gray'
-Write-Log "CNA Account Report with Account ID completed." 'Green'
-Write-Log ("Authenticated User      : {0}" -f $AuthenticatedUser) 'Gray'
-Write-Log ("Total Accounts Exported : {0}" -f $AccountReport.Count) 'Green'
-Write-Log ("Account Report          : {0}" -f $AccountCsvPath) 'Gray'
+Write-Log "CNA Bulk Azure Account Onboarding completed." 'Green'
+Write-Log ("Authenticated User : {0}" -f $AuthenticatedUser) 'Gray'
+Write-Log ("Source Account ID  : {0}" -f $SourceAccountID) 'Gray'
+Write-Log ("Target Platform ID : {0}" -f $TargetPlatformID) 'Gray'
+Write-Log ("Total CSV Rows     : {0}" -f $totalRows) 'Gray'
+Write-Log ("Success Count      : {0}" -f $successCount) 'Green'
+Write-Log ("Failed Count       : {0}" -f $failedCount) 'Red'
+Write-Log ("Skipped Count      : {0}" -f $skippedCount) 'Yellow'
+Write-Log ("Result CSV         : {0}" -f $ResultCsvPath) 'Gray'
+Write-Log ("Log File           : {0}" -f $LogFile) 'Gray'
 Write-Log "============================================================" 'Gray'
