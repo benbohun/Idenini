@@ -1,984 +1,537 @@
 <#
-Validate_Usernames_Against_DomainExport.ps1
+.SYNOPSIS
+    CNA Privilege Cloud Safe Membership Report
 
-PURPOSE
-  Compare a first/source CSV containing likely usernames against a second/reference CSV
-  exported from the domain list.
+.DESCRIPTION
+    - Authenticates to CNA Privilege Cloud using CCP + psPAS Identity Header
+    - Retrieves all safes visible to the service account
+    - Retrieves safe members and permissions
+    - Exports detailed safe membership report
+    - Exports summary report showing whether required members exist on each safe
 
-FIRST CSV
-  Recommended columns:
-    AccountID,Username,Address
-
-  Example:
-    AccountID,Username,Address
-    12345,(PROD) SVCCWFDDI,prod.domain.com
-    12346,(DEV) SVCCWFDDI,dev.domain.com
-
-SECOND CSV
-  Required columns:
-    Email,Username,Address,Appcode
-
-  Example:
-    Email,Username,Address,Appcode
-    SVCCWFDDI@prod.domain.com,SVCCWFDDI,prod.domain.com,CWF
-    SVCCWFDDI@dev.domain.com,SVCCWFDDI,dev.domain.com,CWF
-
-MATCHING LOGIC
-  - First CSV remains the source.
-  - Second CSV is the validation/reference source.
-  - If SourceAddress exists in the first CSV and a matching address exists in the second CSV,
-    only that matching address is returned.
-  - AccountID can still appear multiple times if it legitimately maps to different accounts/domains.
-  - Duplicate output rows for the same SourceAccountID + SourceAddress + MatchedUsername + MatchedAddress
-    are removed.
-
-OUTPUT
-  *_Validation_Results_yyyyMMdd_HHmmss.csv
+.NOTES
+    This script is report-only. It does not add, update, or remove safe members.
 #>
 
 [CmdletBinding()]
 param(
-    # First/source CSV. If not supplied, script prompts.
-    [string]$CsvPath,
+    # ===== CNA Identity / Privilege Cloud =====
+    [string]$IdentityTenantURL = 'https://aat4012.id.cyberark.cloud',
+    [string]$PCloudSubdomain   = 'cna-prod',
+    [string]$PrivilegeCloudURL = 'https://cna-prod.privilegecloud.cyberark.cloud',
 
-    # Second/reference/domain export CSV. If not supplied, script prompts.
-    [string]$ReferenceCsvPath,
+    # ===== CCP settings CNA =====
+    [string]$CCPAddress        = 'https://vskau1p1231.cna.com',
+    [string]$CCPLocation       = 'AIMWebService',
+    [string]$CCPAppID          = 'PAMDiscovery',
+    [string]$CCPSafe           = 'CA_PCloud_Admins',
+    [string]$CCPObject         = 'cna-prod.cyberark.cloud-cnarestbot',
+    [bool]$CCPWindowsAuth      = $false,
 
-    # First/source CSV username column. If omitted, script auto-detects.
-    [string]$UsernameColumn,
+    # ===== Members to evaluate in summary report =====
+    [string]$AdminGroup        = 'CA_PCloud_Admins@cna.com',
+    [string]$AdminMember       = 'cna_pas_admin@cyberark.cloud.6679',
+    [string]$IdentityMember    = 'identity-privilege-integration-user$@cyberark.cloud.6679',
 
-    # First/source CSV Account ID column. If omitted, script auto-detects.
-    [string]$AccountIdColumn,
-
-    # Optional first/source CSV Address/domain column. If omitted, script auto-detects.
-    [string]$SourceAddressColumn,
-
-    # Optional first/source CSV Appcode column.
-    [string]$SourceAppcodeColumn,
-
-    # Second/reference CSV columns.
-    [string]$RefEmailColumn    = 'Email',
-    [string]$RefUsernameColumn = 'Username',
-    [string]$RefAddressColumn  = 'Address',
-    [string]$RefAppcodeColumn  = 'Appcode',
-
-    # Where reports are written. Defaults to first/source CSV folder.
-    [string]$OutputDir,
-
-    # Turn off fuzzy fallback.
-    [switch]$NoFuzzy,
-
-    # Safety cap on fuzzy matches per source row.
-    [int]$MaxFuzzyMatchesPerInput = 25,
-
-    # If supplied, script will keep repeated identical output rows.
-    # Default behavior removes duplicate result rows.
-    [switch]$KeepDuplicateOutputRows
+    # ===== Output paths =====
+    [string]$OutputFolder      = 'E:\Installation Media\Script\OnboardScript\data',
+    [string]$DetailCsvName     = 'SafeMembershipReport.csv',
+    [string]$SummaryCsvName    = 'SafeMembershipSummary.csv',
+    [string]$LogFileName       = 'SafeMembershipReport.log'
 )
 
-$ErrorActionPreference = 'Continue'
+# ============================================
+# Runtime Settings
+# ============================================
 
-function Write-Info($m){ Write-Host "[INFO]  $m" -ForegroundColor Cyan }
-function Write-Ok($m){   Write-Host "[OK]    $m" -ForegroundColor Green }
-function Write-Warn($m){ Write-Host "[WARN]  $m" -ForegroundColor Yellow }
-function Write-Err($m){  Write-Host "[ERROR] $m" -ForegroundColor Red }
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$ErrorActionPreference = 'Stop'
+$ProgressPreference    = 'SilentlyContinue'
 
-function Read-CsvPathPrompt {
+# ============================================
+# Paths
+# ============================================
+
+if (-not (Test-Path -Path $OutputFolder)) {
+    New-Item -ItemType Directory -Path $OutputFolder -Force | Out-Null
+}
+
+$LogFile        = Join-Path $OutputFolder $LogFileName
+$DetailCsvPath  = Join-Path $OutputFolder $DetailCsvName
+$SummaryCsvPath = Join-Path $OutputFolder $SummaryCsvName
+
+New-Item -ItemType File -Force -Path $LogFile | Out-Null
+
+# ============================================
+# Logger
+# ============================================
+
+function Write-Log {
     param(
         [Parameter(Mandatory)]
-        [string]$PromptMessage
+        [string]$Message,
+
+        [ConsoleColor]$Color = 'White'
     )
 
-    while ($true) {
-        Write-Host ""
-        $path = Read-Host $PromptMessage
+    $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $line = "$ts - $Message"
 
-        if ([string]::IsNullOrWhiteSpace($path)) {
-            Write-Warn "Path cannot be blank. Please enter a valid CSV path."
-            continue
-        }
-
-        $path = $path.Trim().Trim('"',"'").Trim()
-
-        if (-not (Test-Path -Path $path -PathType Leaf)) {
-            Write-Warn "CSV file not found: $path"
-            continue
-        }
-
-        if ([System.IO.Path]::GetExtension($path) -notmatch '(?i)^\.csv$') {
-            Write-Warn "The selected file does not appear to be a CSV file: $path"
-            $continue = Read-Host "Continue anyway? Type Y to continue"
-            if ($continue -ne 'Y') {
-                continue
-            }
-        }
-
-        return (Resolve-Path $path).Path
-    }
+    Write-Host $line -ForegroundColor $Color
+    Add-Content -Path $LogFile -Value $line
 }
 
-function Get-ObjectValue {
+# ============================================
+# Helper: Normalize Identity Tenant URL
+# ============================================
+
+function Get-NormalizedIdentityTenant {
     param(
         [Parameter(Mandatory)]
-        [object]$Object,
-
-        [string]$PropertyName
+        [string]$TenantUrl
     )
 
-    if ([string]::IsNullOrWhiteSpace($PropertyName)) {
-        return ''
+    $normalized = $TenantUrl.Trim()
+
+    if ($normalized -notmatch '^https?://') {
+        $normalized = "https://$normalized"
     }
 
-    $prop = $Object.PSObject.Properties[$PropertyName]
-
-    if ($null -eq $prop) {
-        return ''
-    }
-
-    return [string]$prop.Value
+    return $normalized.TrimEnd('/')
 }
 
-function Get-CleanValue {
-    param([string]$Value)
+# ============================================
+# Helper: Safely get object property
+# ============================================
 
-    if ([string]::IsNullOrWhiteSpace($Value)) {
-        return ''
-    }
-
-    return $Value.Trim().Trim('"',"'").Trim()
-}
-
-function Remove-EnvironmentPrefix {
-    param([string]$Value)
-
-    $v = Get-CleanValue $Value
-
-    if ([string]::IsNullOrWhiteSpace($v)) {
-        return ''
-    }
-
-    # Remove common environment markers at the beginning:
-    # (DEV) SVCACCOUNT
-    # (PROD) SVCACCOUNT
-    # [DEV] SVCACCOUNT
-    # DEV - SVCACCOUNT
-    # PROD_SVCACCOUNT
-    # PROD: SVCACCOUNT
-
-    $envWords = 'DEV|PROD|PRD|CERT|QA|QAT|UAT|TEST|TST|STAGE|STG|NONPROD|NP|DR|ATMDEV|ATMPROD|ATMCERT'
-
-    do {
-        $old = $v
-
-        $v = $v -replace "^(?i)\s*[\(\[]\s*($envWords)\s*[\)\]]\s*", ''
-        $v = $v -replace "^(?i)\s*($envWords)\s*[-_:]\s*", ''
-        $v = $v -replace "^(?i)\s*($envWords)\s+", ''
-
-        $v = $v.Trim()
-    } while ($v -ne $old)
-
-    return $v
-}
-
-function Get-EmailLocalPart {
-    param([string]$Email)
-
-    $e = Get-CleanValue $Email
-
-    if ([string]::IsNullOrWhiteSpace($e)) {
-        return ''
-    }
-
-    if ($e -match '@') {
-        return (($e -split '@')[0]).Trim()
-    }
-
-    return $e
-}
-
-function Get-NormalizedKey {
-    param([string]$Value)
-
-    $v = Get-CleanValue $Value
-
-    if ([string]::IsNullOrWhiteSpace($v)) {
-        return ''
-    }
-
-    return $v.ToLower()
-}
-
-function Get-NormalizedAddress {
-    param([string]$Value)
-
-    $v = Get-CleanValue $Value
-
-    if ([string]::IsNullOrWhiteSpace($v)) {
-        return ''
-    }
-
-    return $v.ToLower()
-}
-
-function Get-SearchCandidates {
-    param([string]$Raw)
-
-    $exact = New-Object System.Collections.Generic.List[string]
-    $fuzzy = New-Object System.Collections.Generic.List[string]
-
-    if ([string]::IsNullOrWhiteSpace($Raw)) {
-        return @{
-            Exact = @()
-            Fuzzy = @()
-            Cleaned = ''
-        }
-    }
-
-    $core = $Raw.Trim().Trim('"',"'").Trim()
-
-    # Strip DOMAIN\ prefix.
-    if ($core -match '\\') {
-        $core = ($core -split '\\')[-1]
-    }
-
-    # Strip @upnsuffix.
-    if ($core -match '@') {
-        $core = ($core -split '@')[0]
-    }
-
-    # Remove environment prefixes like (DEV), (PROD), DEV -, PROD_, etc.
-    $core = Remove-EnvironmentPrefix $core
-    $core = $core.Trim()
-
-    if ([string]::IsNullOrWhiteSpace($core)) {
-        return @{
-            Exact = @()
-            Fuzzy = @()
-            Cleaned = ''
-        }
-    }
-
-    $variants = New-Object System.Collections.Generic.List[string]
-
-    [void]$variants.Add($core)
-    [void]$variants.Add(($core -replace '\s+',''))
-    [void]$variants.Add(($core -replace '\s+','.'))
-    [void]$variants.Add(($core -replace '\s+','_'))
-    [void]$variants.Add(($core -replace '\s+','-'))
-
-    foreach ($v in $variants) {
-        $vv = Get-CleanValue $v
-
-        if ($vv -and -not $exact.Contains($vv)) {
-            [void]$exact.Add($vv)
-        }
-    }
-
-    $fuzzyRaw = New-Object System.Collections.Generic.List[string]
-
-    [void]$fuzzyRaw.Add(($core -replace '\s+',''))
-
-    foreach ($w in ($core -split '\s+')) {
-        $wt = ($w -replace '[^A-Za-z0-9_\-\.]', '').Trim()
-
-        if ($wt.Length -gt 2) {
-            [void]$fuzzyRaw.Add($wt)
-        }
-    }
-
-    foreach ($f in $fuzzyRaw) {
-        $ff = Get-CleanValue $f
-
-        if ($ff -and -not $fuzzy.Contains($ff)) {
-            [void]$fuzzy.Add($ff)
-        }
-    }
-
-    return @{
-        Exact = $exact.ToArray()
-        Fuzzy = $fuzzy.ToArray()
-        Cleaned = $core
-    }
-}
-
-function New-ResultRow {
+function Get-ObjectPropertyValue {
     param(
-        [string]$SourceAccountId,
-        [string]$SourceAppcode,
-        [string]$SourceAddress,
-        [string]$InputValue,
-        [string]$CleanedCandidate,
-        [string]$Status,
-        [string]$MatchType,
-        [object]$ReferenceRecord,
-        [string]$MatchedOn,
-        [int]$MatchCount,
-        [string]$Notes
+        [Parameter(Mandatory)]
+        [object]$InputObject,
+
+        [Parameter(Mandatory)]
+        [string[]]$PropertyNames
     )
 
-    [pscustomobject]@{
-        SourceAccountID        = $SourceAccountId
-        SourceAppcode          = $SourceAppcode
-        SourceAddress          = $SourceAddress
-        InputValue             = $InputValue
-        CleanedCandidate       = $CleanedCandidate
-        Status                 = $Status
-        MatchType              = $MatchType
-
-        MatchedEmail           = if ($ReferenceRecord) { $ReferenceRecord.Email }    else { '' }
-        MatchedUsername        = if ($ReferenceRecord) { $ReferenceRecord.Username } else { '' }
-        MatchedAddress         = if ($ReferenceRecord) { $ReferenceRecord.Address }  else { '' }
-        MatchedAppcode         = if ($ReferenceRecord) { $ReferenceRecord.Appcode }  else { '' }
-
-        ReferenceRowNumber     = if ($ReferenceRecord) { $ReferenceRecord.RowNumber } else { '' }
-        MatchedOn              = $MatchedOn
-        MatchCountForInput     = $MatchCount
-        Notes                  = $Notes
+    foreach ($propName in $PropertyNames) {
+        if ($InputObject.PSObject.Properties.Name -contains $propName) {
+            return $InputObject.$propName
+        }
     }
+
+    return $null
 }
 
-function Add-ResultIfNeeded {
+# ============================================
+# Helper: Normalize member comparison
+# ============================================
+
+function Test-MemberExists {
     param(
-        [System.Collections.Generic.List[object]]$Results,
-        [hashtable]$WrittenKeys,
-        [object]$ResultRow,
-        [switch]$KeepDuplicateOutputRows
+        [Parameter(Mandatory)]
+        [array]$Members,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedMember
     )
 
-    if ($KeepDuplicateOutputRows) {
-        $Results.Add($ResultRow) | Out-Null
-        return
-    }
+    foreach ($member in $Members) {
+        $memberName = Get-ObjectPropertyValue -InputObject $member -PropertyNames @(
+            'MemberName',
+            'memberName',
+            'UserName',
+            'username',
+            'Name',
+            'name'
+        )
 
-    # This allows the same AccountID to appear multiple times across different addresses,
-    # but prevents the same AccountID + SourceAddress + MatchedUsername + MatchedAddress
-    # from being written repeatedly.
-    $key = "{0}|{1}|{2}|{3}|{4}|{5}" -f `
-        $ResultRow.SourceAccountID,
-        $ResultRow.SourceAddress,
-        $ResultRow.InputValue,
-        $ResultRow.MatchedUsername,
-        $ResultRow.MatchedAddress,
-        $ResultRow.MatchedAppcode
-
-    $key = $key.ToLower()
-
-    if (-not $WrittenKeys.ContainsKey($key)) {
-        $WrittenKeys[$key] = $true
-        $Results.Add($ResultRow) | Out-Null
-    }
-}
-
-# Prompt for CSV paths if not supplied.
-
-if ([string]::IsNullOrWhiteSpace($CsvPath)) {
-    $CsvPath = Read-CsvPathPrompt -PromptMessage "Enter the full path for the FIRST/source CSV"
-}
-else {
-    $CsvPath = $CsvPath.Trim().Trim('"',"'").Trim()
-}
-
-if ([string]::IsNullOrWhiteSpace($ReferenceCsvPath)) {
-    $ReferenceCsvPath = Read-CsvPathPrompt -PromptMessage "Enter the full path for the SECOND/reference/domain-export CSV"
-}
-else {
-    $ReferenceCsvPath = $ReferenceCsvPath.Trim().Trim('"',"'").Trim()
-}
-
-if (-not (Test-Path $CsvPath)) {
-    Write-Err "First/source CSV not found: $CsvPath"
-    return
-}
-
-if (-not (Test-Path $ReferenceCsvPath)) {
-    Write-Err "Second/reference CSV not found: $ReferenceCsvPath"
-    return
-}
-
-$CsvPath = (Resolve-Path $CsvPath).Path
-$ReferenceCsvPath = (Resolve-Path $ReferenceCsvPath).Path
-
-if (-not $OutputDir) {
-    $OutputDir = Split-Path -Parent $CsvPath
-}
-
-if (-not (Test-Path $OutputDir)) {
-    New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
-}
-
-$stamp       = Get-Date -Format 'yyyyMMdd_HHmmss'
-$baseName    = [System.IO.Path]::GetFileNameWithoutExtension($CsvPath)
-$resultsPath = Join-Path $OutputDir ("{0}_Validation_Results_{1}.csv" -f $baseName, $stamp)
-
-# Load first/source CSV.
-
-$rows = @(Import-Csv -Path $CsvPath)
-
-if ($rows.Count -eq 0) {
-    Write-Err "First/source CSV '$CsvPath' has no data rows."
-    return
-}
-
-$columns = $rows[0].PSObject.Properties.Name
-
-# Auto-detect Username column.
-
-if (-not $UsernameColumn) {
-    $preferred = @(
-        'samaccountname',
-        'sAMAccountName',
-        'username',
-        'user name',
-        'user',
-        'login',
-        'logon',
-        'account',
-        'accountname',
-        'account name',
-        'name',
-        'userid',
-        'user id',
-        'id'
-    )
-
-    foreach ($p in $preferred) {
-        $hit = $columns |
-            Where-Object { $_.Trim().ToLower() -eq $p.ToLower() } |
-            Select-Object -First 1
-
-        if ($hit) {
-            $UsernameColumn = $hit
-            break
-        }
-    }
-
-    if (-not $UsernameColumn) {
-        $UsernameColumn = $columns |
-            Where-Object { $_ -match '(?i)user|account|name|login|logon' } |
-            Select-Object -First 1
-    }
-
-    if (-not $UsernameColumn) {
-        Write-Err "Could not auto-detect username column in first/source CSV."
-        Write-Err "Available columns: $($columns -join ', ')"
-        return
-    }
-
-    Write-Info "Auto-detected source username column: '$UsernameColumn'"
-}
-elseif ($columns -notcontains $UsernameColumn) {
-    Write-Err "Username column '$UsernameColumn' not found in first/source CSV."
-    Write-Err "Available columns: $($columns -join ', ')"
-    return
-}
-
-# Auto-detect AccountID column.
-
-if (-not $AccountIdColumn) {
-    $idPreferred = @(
-        'accountid',
-        'account id',
-        'cyberarkid',
-        'cyberark id',
-        'pasaccountid',
-        'pas account id',
-        'uniqueid',
-        'unique id',
-        'objectid',
-        'object id'
-    )
-
-    foreach ($p in $idPreferred) {
-        $hit = $columns |
-            Where-Object {
-                $_.Trim().ToLower() -eq $p.ToLower() -and
-                $_ -ne $UsernameColumn
-            } |
-            Select-Object -First 1
-
-        if ($hit) {
-            $AccountIdColumn = $hit
-            break
-        }
-    }
-
-    if ($AccountIdColumn) {
-        Write-Info "Auto-detected source Account ID column: '$AccountIdColumn'"
-    }
-    else {
-        Write-Warn "No Account ID column detected in first/source CSV; SourceAccountID will be blank."
-    }
-}
-elseif ($columns -notcontains $AccountIdColumn) {
-    Write-Err "Account ID column '$AccountIdColumn' not found in first/source CSV."
-    Write-Err "Available columns: $($columns -join ', ')"
-    return
-}
-
-# Auto-detect source Address column.
-
-if (-not $SourceAddressColumn) {
-    $addressPreferred = @(
-        'address',
-        'domain',
-        'dnsdomain',
-        'dns domain',
-        'targetaddress',
-        'target address',
-        'platformaddress',
-        'platform address'
-    )
-
-    foreach ($p in $addressPreferred) {
-        $hit = $columns |
-            Where-Object { $_.Trim().ToLower() -eq $p.ToLower() } |
-            Select-Object -First 1
-
-        if ($hit) {
-            $SourceAddressColumn = $hit
-            break
-        }
-    }
-
-    if ($SourceAddressColumn) {
-        Write-Info "Auto-detected source Address column: '$SourceAddressColumn'"
-    }
-    else {
-        Write-Warn "No source Address column detected. The script will return all matching domains from the reference CSV."
-        Write-Warn "To force address-aware matching, use -SourceAddressColumn '<columnName>'."
-    }
-}
-elseif ($columns -notcontains $SourceAddressColumn) {
-    Write-Err "Source Address column '$SourceAddressColumn' not found in first/source CSV."
-    Write-Err "Available columns: $($columns -join ', ')"
-    return
-}
-
-# Auto-detect optional source Appcode column.
-
-if (-not $SourceAppcodeColumn) {
-    $hitSourceAppcode = $columns |
-        Where-Object { $_.Trim().ToLower() -eq 'appcode' } |
-        Select-Object -First 1
-
-    if ($hitSourceAppcode) {
-        $SourceAppcodeColumn = $hitSourceAppcode
-        Write-Info "Auto-detected source Appcode column: '$SourceAppcodeColumn'"
-    }
-}
-elseif ($columns -notcontains $SourceAppcodeColumn) {
-    Write-Err "Source Appcode column '$SourceAppcodeColumn' not found in first/source CSV."
-    Write-Err "Available columns: $($columns -join ', ')"
-    return
-}
-
-# Load second/reference CSV.
-
-$refRows = @(Import-Csv -Path $ReferenceCsvPath)
-
-if ($refRows.Count -eq 0) {
-    Write-Err "Second/reference CSV '$ReferenceCsvPath' has no data rows."
-    return
-}
-
-$refColumns = $refRows[0].PSObject.Properties.Name
-
-$requiredRefColumns = @(
-    $RefEmailColumn,
-    $RefUsernameColumn,
-    $RefAddressColumn,
-    $RefAppcodeColumn
-)
-
-foreach ($col in $requiredRefColumns) {
-    if ($refColumns -notcontains $col) {
-        Write-Err "Required reference column '$col' not found in second/reference CSV."
-        Write-Err "Available columns: $($refColumns -join ', ')"
-        return
-    }
-}
-
-Write-Info "Loaded $($rows.Count) source row(s) from first CSV."
-Write-Info "Loaded $($refRows.Count) reference row(s) from second CSV."
-Write-Info "Source username column: '$UsernameColumn'"
-Write-Info "Source Account ID column: '$AccountIdColumn'"
-Write-Info "Source Address column: '$SourceAddressColumn'"
-Write-Info "Reference columns: Email='$RefEmailColumn', Username='$RefUsernameColumn', Address='$RefAddressColumn', Appcode='$RefAppcodeColumn'"
-
-# Build second/reference lookup.
-
-$referenceRecords = New-Object System.Collections.Generic.List[object]
-$exactIndex = @{}
-
-$refRowNum = 0
-
-foreach ($ref in $refRows) {
-    $refRowNum++
-
-    $email    = Get-CleanValue (Get-ObjectValue -Object $ref -PropertyName $RefEmailColumn)
-    $username = Get-CleanValue (Get-ObjectValue -Object $ref -PropertyName $RefUsernameColumn)
-    $address  = Get-CleanValue (Get-ObjectValue -Object $ref -PropertyName $RefAddressColumn)
-    $appcode  = Get-CleanValue (Get-ObjectValue -Object $ref -PropertyName $RefAppcodeColumn)
-
-    $emailLocal = Get-EmailLocalPart $email
-
-    $keys = New-Object System.Collections.Generic.List[string]
-
-    foreach ($candidateKey in @($username, $emailLocal, $email)) {
-        $cleanKey = Remove-EnvironmentPrefix $candidateKey
-        $k = Get-NormalizedKey $cleanKey
-
-        if ($k -and -not $keys.Contains($k)) {
-            [void]$keys.Add($k)
-        }
-    }
-
-    $record = [pscustomobject]@{
-        RowNumber         = $refRowNum
-        Email             = $email
-        Username          = $username
-        Address           = $address
-        NormalizedAddress = Get-NormalizedAddress $address
-        Appcode           = $appcode
-        ExactKeys         = $keys.ToArray()
-        SearchText        = ("{0} {1} {2} {3}" -f $username, $email, $address, $appcode).ToLower()
-    }
-
-    [void]$referenceRecords.Add($record)
-
-    foreach ($key in $record.ExactKeys) {
-        if (-not $exactIndex.ContainsKey($key)) {
-            $exactIndex[$key] = New-Object System.Collections.Generic.List[object]
-        }
-
-        [void]$exactIndex[$key].Add($record)
-    }
-}
-
-function Find-ExactReferenceMatches {
-    param(
-        [string[]]$Candidates,
-        [hashtable]$Index
-    )
-
-    $found = @{}
-
-    foreach ($cand in $Candidates) {
-        $key = Get-NormalizedKey $cand
-
-        if ([string]::IsNullOrWhiteSpace($key)) {
-            continue
-        }
-
-        if ($Index.ContainsKey($key)) {
-            foreach ($record in $Index[$key]) {
-                $unique = "{0}|{1}|{2}|{3}|{4}" -f `
-                    $record.RowNumber,
-                    $record.Email,
-                    $record.Username,
-                    $record.Address,
-                    $record.Appcode
-
-                if (-not $found.ContainsKey($unique)) {
-                    $found[$unique] = [pscustomobject]@{
-                        Record    = $record
-                        MatchedOn = $cand
-                        MatchType = 'Exact'
-                    }
-                }
+        if (-not [string]::IsNullOrWhiteSpace($memberName)) {
+            if ($memberName.Trim().Equals($ExpectedMember.Trim(), [System.StringComparison]::OrdinalIgnoreCase)) {
+                return $true
             }
         }
     }
 
-    return @($found.Values)
+    return $false
 }
 
-function Find-FuzzyReferenceMatches {
+# ============================================
+# Import psPAS
+# ============================================
+
+try {
+    Import-Module psPAS -Force -ErrorAction Stop
+    $psPASModule = Get-Module psPAS
+
+    if ($psPASModule) {
+        Write-Log ("psPAS module loaded. Version: {0}" -f $psPASModule.Version) 'Green'
+    } else {
+        Write-Log "psPAS module loaded." 'Green'
+    }
+} catch {
+    Write-Log ("ERROR: Failed to import psPAS module. {0}" -f $_.Exception.Message) 'Red'
+    throw
+}
+
+# ============================================
+# Validate IdentityCommand / Get-IdentityHeader
+# ============================================
+
+if (-not (Get-Command Get-IdentityHeader -ErrorAction SilentlyContinue)) {
+    Write-Log "ERROR: Get-IdentityHeader cmdlet was not found. Confirm IdentityCommand module is installed and available." 'Red'
+    throw "Get-IdentityHeader cmdlet not found."
+}
+
+# ============================================
+# Login Method: CCP + psPAS Identity Header
+# ============================================
+
+function Start-PASSessionFromCCP {
     param(
-        [string[]]$Tokens,
-        [object[]]$ReferenceRecords,
-        [int]$Cap
+        [Parameter(Mandatory)]
+        [string]$ObjectName
     )
 
-    $found = @{}
+    $headers = @{
+        'Content-Type' = 'application/json'
+    }
 
-    foreach ($token in $Tokens) {
-        $t = Get-NormalizedKey $token
+    $ccpUrl = "$CCPAddress/$CCPLocation/api/Accounts?AppID=$CCPAppID&Safe=$CCPSafe&Object=$ObjectName"
 
-        if ([string]::IsNullOrWhiteSpace($t) -or $t.Length -lt 3) {
-            continue
+    Write-Log ("Retrieving CyberArk API credentials from CCP using Object='{0}'..." -f $ObjectName) 'Cyan'
+    Write-Log ("CCP URL: {0}" -f $ccpUrl) 'Gray'
+
+    try {
+        $resp = Invoke-RestMethod `
+            -Uri $ccpUrl `
+            -Method GET `
+            -Headers $headers `
+            -UseDefaultCredentials:$CCPWindowsAuth `
+            -ErrorAction Stop
+
+        if (-not $resp -or -not $resp.Content) {
+            throw 'Empty CCP response or missing Content field.'
+        }
+    } catch {
+        Write-Log ("ERROR: CCP credential fetch failed. {0}" -f $_.Exception.Message) 'Red'
+        throw
+    }
+
+    $resolvedUser = $null
+
+    if ($resp.PSObject.Properties.Name -contains 'Username') {
+        $resolvedUser = [string]$resp.Username
+    } elseif ($resp.PSObject.Properties.Name -contains 'UserName') {
+        $resolvedUser = [string]$resp.UserName
+    }
+
+    if ([string]::IsNullOrWhiteSpace($resolvedUser)) {
+        throw 'CCP returned password but no Username/UserName field.'
+    }
+
+    Write-Log ("Successfully retrieved CCP credential for user: {0}" -f $resolvedUser) 'Green'
+
+    try {
+        $normalizedTenant = Get-NormalizedIdentityTenant -TenantUrl $IdentityTenantURL
+
+        $securePass = ConvertTo-SecureString $resp.Content -AsPlainText -Force
+        $credential = [PSCredential]::new($resolvedUser, $securePass)
+
+        Write-Log ("Requesting CyberArk PAS authentication using psPAS Identity header as {0}..." -f $resolvedUser) 'Cyan'
+        Write-Log ("IdentityTenantURL passed to Get-IdentityHeader: {0}" -f $normalizedTenant) 'Gray'
+        Write-Log ("Privilege Cloud Subdomain: {0}" -f $PCloudSubdomain) 'Gray'
+
+        $header = Get-IdentityHeader `
+            -IdentityTenantURL $normalizedTenant `
+            -psPASFormat `
+            -PCloudSubdomain $PCloudSubdomain `
+            -UPCreds $credential
+
+        Use-PASSession $header | Out-Null
+
+        if (-not (Get-PASSession)) {
+            throw 'psPAS session not established.'
         }
 
-        foreach ($record in $ReferenceRecords) {
-            if ($found.Count -ge $Cap) {
-                break
-            }
-
-            if ($record.SearchText -like "*$t*") {
-                $unique = "{0}|{1}|{2}|{3}|{4}" -f `
-                    $record.RowNumber,
-                    $record.Email,
-                    $record.Username,
-                    $record.Address,
-                    $record.Appcode
-
-                if (-not $found.ContainsKey($unique)) {
-                    $found[$unique] = [pscustomobject]@{
-                        Record    = $record
-                        MatchedOn = $token
-                        MatchType = 'Fuzzy'
-                    }
-                }
-            }
+        Write-Log ("Authentication successful. PAS session established as {0}." -f $resolvedUser) 'Green'
+    } catch {
+        Write-Log ("ERROR: Failed to authenticate via psPAS Identity header. {0}" -f $_.Exception.Message) 'Red'
+        throw
+    } finally {
+        if ($resp.PSObject.Properties.Name -contains 'Content') {
+            $resp.Content = $null
         }
 
-        if ($found.Count -ge $Cap) {
-            break
+        if ($securePass) {
+            $securePass.Dispose()
         }
     }
 
-    return @($found.Values)
+    return $resolvedUser
 }
 
-function Select-AddressPreferredMatches {
-    param(
-        [object[]]$Matches,
-        [string]$SourceAddress
-    )
+# ============================================
+# Start Script
+# ============================================
 
-    $normalizedSourceAddress = Get-NormalizedAddress $SourceAddress
+Write-Log "============================================================" 'Gray'
+Write-Log "CNA Safe Membership Report started." 'Cyan'
+Write-Log ("Identity Tenant URL : {0}" -f $IdentityTenantURL) 'Gray'
+Write-Log ("Privilege Cloud URL : {0}" -f $PrivilegeCloudURL) 'Gray'
+Write-Log ("PCloud Subdomain    : {0}" -f $PCloudSubdomain) 'Gray'
+Write-Log ("CCP Address         : {0}" -f $CCPAddress) 'Gray'
+Write-Log ("CCP AppID           : {0}" -f $CCPAppID) 'Gray'
+Write-Log ("CCP Safe            : {0}" -f $CCPSafe) 'Gray'
+Write-Log ("CCP Object          : {0}" -f $CCPObject) 'Gray'
+Write-Log ("Detail CSV          : {0}" -f $DetailCsvPath) 'Gray'
+Write-Log ("Summary CSV         : {0}" -f $SummaryCsvPath) 'Gray'
+Write-Log "============================================================" 'Gray'
 
-    if ([string]::IsNullOrWhiteSpace($normalizedSourceAddress)) {
-        return @{
-            Matches = $Matches
-            AddressPreferenceApplied = $false
-            AddressMatched = $false
-        }
-    }
+# ============================================
+# Authenticate
+# ============================================
 
-    $addressMatches = @(
-        $Matches | Where-Object {
-            $_.Record.NormalizedAddress -eq $normalizedSourceAddress
-        }
-    )
-
-    if ($addressMatches.Count -gt 0) {
-        return @{
-            Matches = $addressMatches
-            AddressPreferenceApplied = $true
-            AddressMatched = $true
-        }
-    }
-
-    return @{
-        Matches = $Matches
-        AddressPreferenceApplied = $true
-        AddressMatched = $false
-    }
+try {
+    $AuthenticatedUser = Start-PASSessionFromCCP -ObjectName $CCPObject
+} catch {
+    Write-Log ("FATAL: Authentication failed. {0}" -f $_.Exception.Message) 'Red'
+    exit 1
 }
 
-function Remove-DuplicateMatchesForSourceRow {
-    param(
-        [object[]]$Matches
-    )
+# ============================================
+# Retrieve All Safes
+# ============================================
 
-    $unique = @{}
+Write-Log "Retrieving list of safes..." 'Yellow'
 
-    foreach ($m in $Matches) {
-        # One row per unique account/address/appcode/email match.
-        # This removes duplicate reference rows but still allows the same username
-        # to appear in another domain/address.
-        $key = "{0}|{1}|{2}|{3}" -f `
-            $m.Record.Username,
-            $m.Record.Address,
-            $m.Record.Appcode,
-            $m.Record.Email
+try {
+    $Safes = Get-PASSafe -ErrorAction Stop
 
-        $key = $key.ToLower()
-
-        if (-not $unique.ContainsKey($key)) {
-            $unique[$key] = $m
-        }
+    if ($null -eq $Safes) {
+        $Safes = @()
+    } else {
+        $Safes = @($Safes)
     }
 
-    return @($unique.Values)
+    Write-Log ("Retrieved {0} safe(s)." -f $Safes.Count) 'Green'
+} catch {
+    Write-Log ("ERROR: Failed to retrieve safes. {0}" -f $_.Exception.Message) 'Red'
+    exit 1
 }
 
-# Main validation.
+# ============================================
+# Prepare Reports
+# ============================================
 
-$results = New-Object System.Collections.Generic.List[object]
-$writtenOutputKeys = @{}
-$rowNum = 0
+$SafeMembersReport = New-Object System.Collections.Generic.List[object]
+$SafeSummaryReport = New-Object System.Collections.Generic.List[object]
 
-foreach ($row in $rows) {
-    $rowNum++
+$RequiredMembers = @(
+    $AdminGroup,
+    $AdminMember,
+    $IdentityMember
+) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
 
-    $raw = Get-ObjectValue -Object $row -PropertyName $UsernameColumn
+# ============================================
+# Retrieve Safe Members & Permissions
+# ============================================
 
-    $sourceAccountId = ''
-    if ($AccountIdColumn) {
-        $sourceAccountId = Get-ObjectValue -Object $row -PropertyName $AccountIdColumn
-    }
+$totalSafes   = $Safes.Count
+$currentIndex = 0
+$successCount = 0
+$failedCount  = 0
 
-    $sourceAppcode = ''
-    if ($SourceAppcodeColumn) {
-        $sourceAppcode = Get-ObjectValue -Object $row -PropertyName $SourceAppcodeColumn
-    }
+foreach ($Safe in $Safes) {
+    $currentIndex++
 
-    $sourceAddress = ''
-    if ($SourceAddressColumn) {
-        $sourceAddress = Get-ObjectValue -Object $row -PropertyName $SourceAddressColumn
-    }
+    $SafeName = Get-ObjectPropertyValue -InputObject $Safe -PropertyNames @(
+        'safeName',
+        'SafeName',
+        'Safe',
+        'Name'
+    )
 
-    Write-Info ("[{0}/{1}] Validating InputValue='{2}' SourceAccountID='{3}' SourceAddress='{4}'" -f `
-        $rowNum,
-        $rows.Count,
-        $raw,
-        $sourceAccountId,
-        $sourceAddress)
-
-    $cand = Get-SearchCandidates -Raw $raw
-
-    if ($cand.Exact.Count -eq 0) {
-        $resultRow = New-ResultRow `
-            -SourceAccountId $sourceAccountId `
-            -SourceAppcode $sourceAppcode `
-            -SourceAddress $sourceAddress `
-            -InputValue $raw `
-            -CleanedCandidate '' `
-            -Status 'BLANK_OR_INVALID' `
-            -MatchType '' `
-            -ReferenceRecord $null `
-            -MatchedOn '' `
-            -MatchCount 0 `
-            -Notes 'Empty or unparseable value'
-
-        Add-ResultIfNeeded `
-            -Results $results `
-            -WrittenKeys $writtenOutputKeys `
-            -ResultRow $resultRow `
-            -KeepDuplicateOutputRows:$KeepDuplicateOutputRows
-
+    if ([string]::IsNullOrWhiteSpace($SafeName)) {
+        Write-Log ("[{0}/{1}] WARNING: Could not resolve safe name. Skipping item." -f $currentIndex, $totalSafes) 'Yellow'
         continue
     }
 
-    # Exact search first.
-    $matches = @(Find-ExactReferenceMatches `
-        -Candidates $cand.Exact `
-        -Index $exactIndex)
+    Write-Log ("[{0}/{1}] Retrieving members for safe: {2}" -f $currentIndex, $totalSafes, $SafeName) 'Cyan'
 
-    # Fuzzy search only when exact search found nothing.
-    if ($matches.Count -eq 0 -and -not $NoFuzzy -and $cand.Fuzzy.Count -gt 0) {
-        $matches = @(Find-FuzzyReferenceMatches `
-            -Tokens $cand.Fuzzy `
-            -ReferenceRecords $referenceRecords.ToArray() `
-            -Cap $MaxFuzzyMatchesPerInput)
-    }
+    try {
+        $SafeMembers = Get-PASSafeMember -SafeName $SafeName -ErrorAction Stop
 
-    # Prefer matching SourceAddress if available.
-    if ($matches.Count -gt 0) {
-        $addressSelection = Select-AddressPreferredMatches `
-            -Matches $matches `
-            -SourceAddress $sourceAddress
-
-        $matches = @($addressSelection.Matches)
-    }
-    else {
-        $addressSelection = @{
-            AddressPreferenceApplied = $false
-            AddressMatched = $false
-        }
-    }
-
-    # Remove duplicate reference matches for this source row.
-    $matches = @(Remove-DuplicateMatchesForSourceRow -Matches $matches)
-
-    $count = $matches.Count
-
-    if ($count -eq 0) {
-        $note = 'No match found in second/reference CSV'
-
-        $resultRow = New-ResultRow `
-            -SourceAccountId $sourceAccountId `
-            -SourceAppcode $sourceAppcode `
-            -SourceAddress $sourceAddress `
-            -InputValue $raw `
-            -CleanedCandidate $cand.Cleaned `
-            -Status 'NOT_FOUND' `
-            -MatchType '' `
-            -ReferenceRecord $null `
-            -MatchedOn ($cand.Exact -join ' | ') `
-            -MatchCount 0 `
-            -Notes $note
-
-        Add-ResultIfNeeded `
-            -Results $results `
-            -WrittenKeys $writtenOutputKeys `
-            -ResultRow $resultRow `
-            -KeepDuplicateOutputRows:$KeepDuplicateOutputRows
-
-        continue
-    }
-
-    foreach ($m in $matches) {
-        $noteParts = New-Object System.Collections.Generic.List[string]
-
-        if ($m.MatchType -eq 'Fuzzy') {
-            [void]$noteParts.Add('Fuzzy suggestion - verify before use')
+        if ($null -eq $SafeMembers) {
+            $SafeMembers = @()
+        } else {
+            $SafeMembers = @($SafeMembers)
         }
 
-        if ($addressSelection.AddressPreferenceApplied -eq $true -and $addressSelection.AddressMatched -eq $true) {
-            [void]$noteParts.Add('SourceAddress matched; other domain matches suppressed')
+        $hasAdminGroup     = Test-MemberExists -Members $SafeMembers -ExpectedMember $AdminGroup
+        $hasAdminMember    = Test-MemberExists -Members $SafeMembers -ExpectedMember $AdminMember
+        $hasIdentityMember = Test-MemberExists -Members $SafeMembers -ExpectedMember $IdentityMember
+
+        $missingMembers = New-Object System.Collections.Generic.List[string]
+
+        if (-not $hasAdminGroup) {
+            $missingMembers.Add($AdminGroup)
         }
 
-        if ($addressSelection.AddressPreferenceApplied -eq $true -and $addressSelection.AddressMatched -eq $false) {
-            [void]$noteParts.Add('No matching SourceAddress found; showing available reference match')
+        if (-not $hasAdminMember) {
+            $missingMembers.Add($AdminMember)
         }
 
-        if ($count -gt 1) {
-            [void]$noteParts.Add('Multiple unique reference matches found')
+        if (-not $hasIdentityMember) {
+            $missingMembers.Add($IdentityMember)
         }
 
-        $note = ($noteParts -join '; ')
+        foreach ($Member in $SafeMembers) {
+            $perm = $Member.Permissions
 
-        $resultRow = New-ResultRow `
-            -SourceAccountId $sourceAccountId `
-            -SourceAppcode $sourceAppcode `
-            -SourceAddress $sourceAddress `
-            -InputValue $raw `
-            -CleanedCandidate $cand.Cleaned `
-            -Status 'FOUND' `
-            -MatchType $m.MatchType `
-            -ReferenceRecord $m.Record `
-            -MatchedOn $m.MatchedOn `
-            -MatchCount $count `
-            -Notes $note
+            $memberName = Get-ObjectPropertyValue -InputObject $Member -PropertyNames @(
+                'MemberName',
+                'memberName',
+                'UserName',
+                'username',
+                'Name',
+                'name'
+            )
 
-        Add-ResultIfNeeded `
-            -Results $results `
-            -WrittenKeys $writtenOutputKeys `
-            -ResultRow $resultRow `
-            -KeepDuplicateOutputRows:$KeepDuplicateOutputRows
+            $memberType = Get-ObjectPropertyValue -InputObject $Member -PropertyNames @(
+                'MemberType',
+                'memberType',
+                'Type',
+                'type'
+            )
+
+            $isRequiredMember = $false
+
+            foreach ($requiredMember in $RequiredMembers) {
+                if (-not [string]::IsNullOrWhiteSpace($memberName)) {
+                    if ($memberName.Trim().Equals($requiredMember.Trim(), [System.StringComparison]::OrdinalIgnoreCase)) {
+                        $isRequiredMember = $true
+                        break
+                    }
+                }
+            }
+
+            $SafeMembersReport.Add([PSCustomObject]@{
+                SafeName                               = $SafeName
+                Member                                 = $memberName
+                MemberType                             = $memberType
+                IsRequiredMember                       = $isRequiredMember
+
+                UseAccounts                            = $perm.useAccounts
+                RetrieveAccounts                       = $perm.retrieveAccounts
+                ListAccounts                           = $perm.listAccounts
+                AddAccounts                            = $perm.addAccounts
+                UpdateAccountContent                   = $perm.updateAccountContent
+                UpdateAccountProperties                = $perm.updateAccountProperties
+                InitiateCPMAccountManagementOperations = $perm.initiateCPMAccountManagementOperations
+                SpecifyNextAccountContent              = $perm.specifyNextAccountContent
+                RenameAccounts                         = $perm.renameAccounts
+                DeleteAccounts                         = $perm.deleteAccounts
+                UnlockAccounts                         = $perm.unlockAccounts
+                ManageSafe                             = $perm.manageSafe
+                ManageSafeMembers                      = $perm.manageSafeMembers
+                BackupSafe                             = $perm.backupSafe
+                ViewAuditLog                           = $perm.viewAuditLog
+                ViewSafeMembers                        = $perm.viewSafeMembers
+                AccessWithoutConfirmation              = $perm.accessWithoutConfirmation
+                CreateFolders                          = $perm.createFolders
+                DeleteFolders                          = $perm.deleteFolders
+                MoveAccountsAndFolders                 = $perm.moveAccountsAndFolders
+                RequestsAuthorizationLevel1            = $perm.requestsAuthorizationLevel1
+                RequestsAuthorizationLevel2            = $perm.requestsAuthorizationLevel2
+            })
+        }
+
+        $summaryStatus = if ($missingMembers.Count -eq 0) { 'Compliant' } else { 'MissingRequiredMember' }
+
+        $SafeSummaryReport.Add([PSCustomObject]@{
+            SafeName               = $SafeName
+            TotalMemberCount       = $SafeMembers.Count
+            HasAdminGroup          = $hasAdminGroup
+            HasAdminMember         = $hasAdminMember
+            HasIdentityMember      = $hasIdentityMember
+            MissingRequiredMembers = ($missingMembers -join '; ')
+            Status                 = $summaryStatus
+            ErrorMessage           = ''
+        })
+
+        Write-Log ("Retrieved {0} member(s) for safe: {1}" -f $SafeMembers.Count, $SafeName) 'Green'
+        $successCount++
+    } catch {
+        $failedCount++
+
+        $errorMessage = $_.Exception.Message
+
+        Write-Log ("ERROR: Failed to retrieve members for safe '{0}'. {1}" -f $SafeName, $errorMessage) 'Red'
+
+        $SafeSummaryReport.Add([PSCustomObject]@{
+            SafeName               = $SafeName
+            TotalMemberCount       = 0
+            HasAdminGroup          = $false
+            HasAdminMember         = $false
+            HasIdentityMember      = $false
+            MissingRequiredMembers = ($RequiredMembers -join '; ')
+            Status                 = 'FailedToRetrieveMembers'
+            ErrorMessage           = $errorMessage
+        })
     }
 }
 
-# Export.
+# ============================================
+# Export Reports
+# ============================================
 
-$results | Export-Csv -Path $resultsPath -NoTypeInformation -Encoding UTF8
+try {
+    Write-Log "Exporting detailed safe membership report..." 'Yellow'
 
-Write-Host ""
-Write-Ok "Validation complete."
-Write-Host "----------------------------------------"
+    $SafeMembersReport |
+        Sort-Object SafeName, Member |
+        Export-Csv -Path $DetailCsvPath -NoTypeInformation -Encoding UTF8
 
-$byStatus = $results | Group-Object Status | Sort-Object Name
-
-foreach ($g in $byStatus) {
-    Write-Host ("  {0,-18} {1} line(s)" -f $g.Name, $g.Count)
+    Write-Log ("Detailed safe membership report exported to: {0}" -f $DetailCsvPath) 'Green'
+} catch {
+    Write-Log ("ERROR: Failed to export detailed CSV. {0}" -f $_.Exception.Message) 'Red'
+    exit 1
 }
 
-Write-Host "----------------------------------------"
-Write-Host ("  Source CSV rows processed      : {0}" -f $rows.Count)
-Write-Host ("  Reference CSV rows loaded      : {0}" -f $refRows.Count)
-Write-Host ("  Total result lines exported    : {0}" -f $results.Count)
-Write-Host "----------------------------------------"
-Write-Ok "Results report: $resultsPath"
+try {
+    Write-Log "Exporting safe membership summary report..." 'Yellow'
+
+    $SafeSummaryReport |
+        Sort-Object SafeName |
+        Export-Csv -Path $SummaryCsvPath -NoTypeInformation -Encoding UTF8
+
+    Write-Log ("Safe membership summary report exported to: {0}" -f $SummaryCsvPath) 'Green'
+} catch {
+    Write-Log ("ERROR: Failed to export summary CSV. {0}" -f $_.Exception.Message) 'Red'
+    exit 1
+}
+
+# ============================================
+# Close Session
+# ============================================
+
+try {
+    Close-PASSession | Out-Null
+    Write-Log "PAS session closed." 'Gray'
+} catch {
+    Write-Log ("WARNING: Could not close PAS session cleanly. {0}" -f $_.Exception.Message) 'Yellow'
+}
+
+# ============================================
+# Completion
+# ============================================
+
+Write-Log "============================================================" 'Gray'
+Write-Log "CNA Safe Membership Report completed." 'Green'
+Write-Log ("Authenticated User      : {0}" -f $AuthenticatedUser) 'Gray'
+Write-Log ("Total Safes Processed   : {0}" -f $totalSafes) 'Gray'
+Write-Log ("Successful Safe Reads   : {0}" -f $successCount) 'Green'
+Write-Log ("Failed Safe Reads       : {0}" -f $failedCount) 'Red'
+Write-Log ("Detailed Report         : {0}" -f $DetailCsvPath) 'Gray'
+Write-Log ("Summary Report          : {0}" -f $SummaryCsvPath) 'Gray'
+Write-Log "============================================================" 'Gray'
