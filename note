@@ -1,19 +1,16 @@
-Using samelike login pattern, i want to generate account report with their Account ID in-place
-
-
 <#
 .SYNOPSIS
-    CNA Privilege Cloud Safe Membership Report
+    CNA Privilege Cloud Account Report with Account ID
 
 .DESCRIPTION
     - Authenticates to CNA Privilege Cloud using CCP + psPAS Identity Header
-    - Retrieves all safes visible to the service account
-    - Retrieves safe members and permissions
-    - Exports detailed safe membership report
-    - Exports summary report showing whether required members exist on each safe
+    - Retrieves all accounts visible to the service account
+    - Exports account inventory report
+    - Places CyberArk Account ID directly in the CSV output
 
 .NOTES
-    This script is report-only. It does not add, update, or remove safe members.
+    This script is report-only.
+    It does not retrieve, change, rotate, verify, reconcile, add, update, or remove accounts.
 #>
 
 [CmdletBinding()]
@@ -31,16 +28,13 @@ param(
     [string]$CCPObject         = 'cna-prod.cyberark.cloud-cnarestbot',
     [bool]$CCPWindowsAuth      = $false,
 
-    # ===== Members to evaluate in summary report =====
-    [string]$AdminGroup        = 'CA_PCloud_Admins@cna.com',
-    [string]$AdminMember       = 'cna_pas_admin@cyberark.cloud.6679',
-    [string]$IdentityMember    = 'identity-privilege-integration-user$@cyberark.cloud.6679',
-
     # ===== Output paths =====
     [string]$OutputFolder      = 'E:\Installation Media\Script\OnboardScript\data',
-    [string]$DetailCsvName     = 'SafeMembershipReport.csv',
-    [string]$SummaryCsvName    = 'SafeMembershipSummary.csv',
-    [string]$LogFileName       = 'SafeMembershipReport.log'
+    [string]$AccountCsvName    = 'AccountReport_WithAccountID.csv',
+    [string]$LogFileName       = 'AccountReport_WithAccountID.log',
+
+    # ===== Retrieval settings =====
+    [int]$PageLimit            = 1000
 )
 
 # ============================================
@@ -60,8 +54,7 @@ if (-not (Test-Path -Path $OutputFolder)) {
 }
 
 $LogFile        = Join-Path $OutputFolder $LogFileName
-$DetailCsvPath  = Join-Path $OutputFolder $DetailCsvName
-$SummaryCsvPath = Join-Path $OutputFolder $SummaryCsvName
+$AccountCsvPath = Join-Path $OutputFolder $AccountCsvName
 
 New-Item -ItemType File -Force -Path $LogFile | Out-Null
 
@@ -116,6 +109,10 @@ function Get-ObjectPropertyValue {
         [string[]]$PropertyNames
     )
 
+    if ($null -eq $InputObject) {
+        return $null
+    }
+
     foreach ($propName in $PropertyNames) {
         if ($InputObject.PSObject.Properties.Name -contains $propName) {
             return $InputObject.$propName
@@ -126,36 +123,103 @@ function Get-ObjectPropertyValue {
 }
 
 # ============================================
-# Helper: Normalize member comparison
+# Helper: Safely get nested object property
 # ============================================
 
-function Test-MemberExists {
+function Get-NestedPropertyValue {
     param(
         [Parameter(Mandatory)]
-        [array]$Members,
+        [object]$InputObject,
 
         [Parameter(Mandatory)]
-        [string]$ExpectedMember
+        [string]$ParentProperty,
+
+        [Parameter(Mandatory)]
+        [string[]]$ChildProperties
     )
 
-    foreach ($member in $Members) {
-        $memberName = Get-ObjectPropertyValue -InputObject $member -PropertyNames @(
-            'MemberName',
-            'memberName',
-            'UserName',
-            'username',
-            'Name',
-            'name'
-        )
+    if ($null -eq $InputObject) {
+        return $null
+    }
 
-        if (-not [string]::IsNullOrWhiteSpace($memberName)) {
-            if ($memberName.Trim().Equals($ExpectedMember.Trim(), [System.StringComparison]::OrdinalIgnoreCase)) {
-                return $true
-            }
+    if (-not ($InputObject.PSObject.Properties.Name -contains $ParentProperty)) {
+        return $null
+    }
+
+    $parent = $InputObject.$ParentProperty
+
+    if ($null -eq $parent) {
+        return $null
+    }
+
+    foreach ($child in $ChildProperties) {
+        if ($parent.PSObject.Properties.Name -contains $child) {
+            return $parent.$child
         }
     }
 
-    return $false
+    return $null
+}
+
+# ============================================
+# Helper: Convert values to report-safe text
+# ============================================
+
+function Convert-ToReportValue {
+    param(
+        [object]$Value
+    )
+
+    if ($null -eq $Value) {
+        return ''
+    }
+
+    if ($Value -is [string]) {
+        return $Value
+    }
+
+    if ($Value -is [bool]) {
+        return $Value
+    }
+
+    if ($Value -is [int] -or $Value -is [long] -or $Value -is [decimal]) {
+        return $Value
+    }
+
+    try {
+        return ($Value | ConvertTo-Json -Compress -Depth 10)
+    } catch {
+        return [string]$Value
+    }
+}
+
+# ============================================
+# Helper: Convert CyberArk epoch time if possible
+# ============================================
+
+function Convert-CyberArkTime {
+    param(
+        [object]$Value
+    )
+
+    if ($null -eq $Value -or [string]::IsNullOrWhiteSpace([string]$Value)) {
+        return ''
+    }
+
+    try {
+        $raw = [Int64]$Value
+
+        # CyberArk APIs may return epoch seconds or milliseconds depending on field/version.
+        if ($raw -gt 999999999999) {
+            $dt = [DateTimeOffset]::FromUnixTimeMilliseconds($raw).LocalDateTime
+        } else {
+            $dt = [DateTimeOffset]::FromUnixTimeSeconds($raw).LocalDateTime
+        }
+
+        return $dt.ToString('yyyy-MM-dd HH:mm:ss')
+    } catch {
+        return [string]$Value
+    }
 }
 
 # ============================================
@@ -274,11 +338,102 @@ function Start-PASSessionFromCCP {
 }
 
 # ============================================
+# Retrieve All Accounts
+# ============================================
+
+function Get-AllPASAccounts {
+    param(
+        [int]$Limit = 1000
+    )
+
+    $allAccounts = New-Object System.Collections.Generic.List[object]
+
+    # Preferred method: direct psPAS REST pagination
+    if (Get-Command Invoke-PASRestMethod -ErrorAction SilentlyContinue) {
+        Write-Log "Using Invoke-PASRestMethod with paginated /Accounts API retrieval..." 'Cyan'
+
+        $offset = 0
+        $pageNumber = 0
+
+        while ($true) {
+            $pageNumber++
+
+            $relativeUri = "Accounts?limit=$Limit&offset=$offset"
+
+            Write-Log ("Retrieving account page {0}. Offset={1}, Limit={2}" -f $pageNumber, $offset, $Limit) 'Gray'
+
+            try {
+                $response = Invoke-PASRestMethod `
+                    -Uri $relativeUri `
+                    -Method GET `
+                    -ErrorAction Stop
+            } catch {
+                Write-Log ("WARNING: Invoke-PASRestMethod account retrieval failed. Falling back to Get-PASAccount. Error: {0}" -f $_.Exception.Message) 'Yellow'
+                $allAccounts.Clear()
+                break
+            }
+
+            $batch = @()
+
+            if ($null -ne $response) {
+                if ($response.PSObject.Properties.Name -contains 'value') {
+                    $batch = @($response.value)
+                } elseif ($response.PSObject.Properties.Name -contains 'accounts') {
+                    $batch = @($response.accounts)
+                } elseif ($response -is [array]) {
+                    $batch = @($response)
+                } else {
+                    $batch = @($response)
+                }
+            }
+
+            if ($null -eq $batch) {
+                $batch = @()
+            }
+
+            foreach ($account in $batch) {
+                if ($null -ne $account) {
+                    $allAccounts.Add($account)
+                }
+            }
+
+            Write-Log ("Retrieved {0} account(s) from page {1}." -f $batch.Count, $pageNumber) 'Green'
+
+            if ($batch.Count -lt $Limit) {
+                break
+            }
+
+            $offset += $Limit
+        }
+
+        if ($allAccounts.Count -gt 0) {
+            return @($allAccounts)
+        }
+    }
+
+    # Fallback method: Get-PASAccount
+    Write-Log "Using Get-PASAccount fallback method..." 'Cyan'
+
+    try {
+        $accounts = Get-PASAccount -ErrorAction Stop
+
+        if ($null -eq $accounts) {
+            return @()
+        }
+
+        return @($accounts)
+    } catch {
+        Write-Log ("ERROR: Get-PASAccount fallback failed. {0}" -f $_.Exception.Message) 'Red'
+        throw
+    }
+}
+
+# ============================================
 # Start Script
 # ============================================
 
 Write-Log "============================================================" 'Gray'
-Write-Log "CNA Safe Membership Report started." 'Cyan'
+Write-Log "CNA Account Report with Account ID started." 'Cyan'
 Write-Log ("Identity Tenant URL : {0}" -f $IdentityTenantURL) 'Gray'
 Write-Log ("Privilege Cloud URL : {0}" -f $PrivilegeCloudURL) 'Gray'
 Write-Log ("PCloud Subdomain    : {0}" -f $PCloudSubdomain) 'Gray'
@@ -286,8 +441,7 @@ Write-Log ("CCP Address         : {0}" -f $CCPAddress) 'Gray'
 Write-Log ("CCP AppID           : {0}" -f $CCPAppID) 'Gray'
 Write-Log ("CCP Safe            : {0}" -f $CCPSafe) 'Gray'
 Write-Log ("CCP Object          : {0}" -f $CCPObject) 'Gray'
-Write-Log ("Detail CSV          : {0}" -f $DetailCsvPath) 'Gray'
-Write-Log ("Summary CSV         : {0}" -f $SummaryCsvPath) 'Gray'
+Write-Log ("Account CSV         : {0}" -f $AccountCsvPath) 'Gray'
 Write-Log "============================================================" 'Gray'
 
 # ============================================
@@ -302,215 +456,207 @@ try {
 }
 
 # ============================================
-# Retrieve All Safes
+# Retrieve Accounts
 # ============================================
 
-Write-Log "Retrieving list of safes..." 'Yellow'
+Write-Log "Retrieving all visible accounts..." 'Yellow'
 
 try {
-    $Safes = Get-PASSafe -ErrorAction Stop
+    $Accounts = Get-AllPASAccounts -Limit $PageLimit
 
-    if ($null -eq $Safes) {
-        $Safes = @()
+    if ($null -eq $Accounts) {
+        $Accounts = @()
     } else {
-        $Safes = @($Safes)
+        $Accounts = @($Accounts)
     }
 
-    Write-Log ("Retrieved {0} safe(s)." -f $Safes.Count) 'Green'
+    Write-Log ("Retrieved {0} account(s)." -f $Accounts.Count) 'Green'
 } catch {
-    Write-Log ("ERROR: Failed to retrieve safes. {0}" -f $_.Exception.Message) 'Red'
-    exit 1
-}
-
-# ============================================
-# Prepare Reports
-# ============================================
-
-$SafeMembersReport = New-Object System.Collections.Generic.List[object]
-$SafeSummaryReport = New-Object System.Collections.Generic.List[object]
-
-$RequiredMembers = @(
-    $AdminGroup,
-    $AdminMember,
-    $IdentityMember
-) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-
-# ============================================
-# Retrieve Safe Members & Permissions
-# ============================================
-
-$totalSafes   = $Safes.Count
-$currentIndex = 0
-$successCount = 0
-$failedCount  = 0
-
-foreach ($Safe in $Safes) {
-    $currentIndex++
-
-    $SafeName = Get-ObjectPropertyValue -InputObject $Safe -PropertyNames @(
-        'safeName',
-        'SafeName',
-        'Safe',
-        'Name'
-    )
-
-    if ([string]::IsNullOrWhiteSpace($SafeName)) {
-        Write-Log ("[{0}/{1}] WARNING: Could not resolve safe name. Skipping item." -f $currentIndex, $totalSafes) 'Yellow'
-        continue
-    }
-
-    Write-Log ("[{0}/{1}] Retrieving members for safe: {2}" -f $currentIndex, $totalSafes, $SafeName) 'Cyan'
+    Write-Log ("FATAL: Failed to retrieve accounts. {0}" -f $_.Exception.Message) 'Red'
 
     try {
-        $SafeMembers = Get-PASSafeMember -SafeName $SafeName -ErrorAction Stop
+        Close-PASSession | Out-Null
+    } catch {}
 
-        if ($null -eq $SafeMembers) {
-            $SafeMembers = @()
-        } else {
-            $SafeMembers = @($SafeMembers)
-        }
+    exit 1
+}
 
-        $hasAdminGroup     = Test-MemberExists -Members $SafeMembers -ExpectedMember $AdminGroup
-        $hasAdminMember    = Test-MemberExists -Members $SafeMembers -ExpectedMember $AdminMember
-        $hasIdentityMember = Test-MemberExists -Members $SafeMembers -ExpectedMember $IdentityMember
+# ============================================
+# Build Account Report
+# ============================================
 
-        $missingMembers = New-Object System.Collections.Generic.List[string]
+$AccountReport = New-Object System.Collections.Generic.List[object]
 
-        if (-not $hasAdminGroup) {
-            $missingMembers.Add($AdminGroup)
-        }
+$currentIndex = 0
+$totalAccounts = $Accounts.Count
 
-        if (-not $hasAdminMember) {
-            $missingMembers.Add($AdminMember)
-        }
+foreach ($Account in $Accounts) {
+    $currentIndex++
 
-        if (-not $hasIdentityMember) {
-            $missingMembers.Add($IdentityMember)
-        }
+    $accountId = Get-ObjectPropertyValue -InputObject $Account -PropertyNames @(
+        'id',
+        'Id',
+        'accountId',
+        'AccountId',
+        'AccountID'
+    )
 
-        foreach ($Member in $SafeMembers) {
-            $perm = $Member.Permissions
+    $accountName = Get-ObjectPropertyValue -InputObject $Account -PropertyNames @(
+        'name',
+        'Name',
+        'accountName',
+        'AccountName'
+    )
 
-            $memberName = Get-ObjectPropertyValue -InputObject $Member -PropertyNames @(
-                'MemberName',
-                'memberName',
-                'UserName',
-                'username',
-                'Name',
-                'name'
-            )
+    $safeName = Get-ObjectPropertyValue -InputObject $Account -PropertyNames @(
+        'safeName',
+        'SafeName',
+        'safe',
+        'Safe'
+    )
 
-            $memberType = Get-ObjectPropertyValue -InputObject $Member -PropertyNames @(
-                'MemberType',
-                'memberType',
-                'Type',
-                'type'
-            )
+    $userName = Get-ObjectPropertyValue -InputObject $Account -PropertyNames @(
+        'userName',
+        'UserName',
+        'username',
+        'Username'
+    )
 
-            $isRequiredMember = $false
+    $address = Get-ObjectPropertyValue -InputObject $Account -PropertyNames @(
+        'address',
+        'Address'
+    )
 
-            foreach ($requiredMember in $RequiredMembers) {
-                if (-not [string]::IsNullOrWhiteSpace($memberName)) {
-                    if ($memberName.Trim().Equals($requiredMember.Trim(), [System.StringComparison]::OrdinalIgnoreCase)) {
-                        $isRequiredMember = $true
-                        break
-                    }
-                }
-            }
+    $platformId = Get-ObjectPropertyValue -InputObject $Account -PropertyNames @(
+        'platformId',
+        'PlatformId',
+        'platformID',
+        'PlatformID'
+    )
 
-            $SafeMembersReport.Add([PSCustomObject]@{
-                SafeName                               = $SafeName
-                Member                                 = $memberName
-                MemberType                             = $memberType
-                IsRequiredMember                       = $isRequiredMember
+    $secretType = Get-ObjectPropertyValue -InputObject $Account -PropertyNames @(
+        'secretType',
+        'SecretType'
+    )
 
-                UseAccounts                            = $perm.useAccounts
-                RetrieveAccounts                       = $perm.retrieveAccounts
-                ListAccounts                           = $perm.listAccounts
-                AddAccounts                            = $perm.addAccounts
-                UpdateAccountContent                   = $perm.updateAccountContent
-                UpdateAccountProperties                = $perm.updateAccountProperties
-                InitiateCPMAccountManagementOperations = $perm.initiateCPMAccountManagementOperations
-                SpecifyNextAccountContent              = $perm.specifyNextAccountContent
-                RenameAccounts                         = $perm.renameAccounts
-                DeleteAccounts                         = $perm.deleteAccounts
-                UnlockAccounts                         = $perm.unlockAccounts
-                ManageSafe                             = $perm.manageSafe
-                ManageSafeMembers                      = $perm.manageSafeMembers
-                BackupSafe                             = $perm.backupSafe
-                ViewAuditLog                           = $perm.viewAuditLog
-                ViewSafeMembers                        = $perm.viewSafeMembers
-                AccessWithoutConfirmation              = $perm.accessWithoutConfirmation
-                CreateFolders                          = $perm.createFolders
-                DeleteFolders                          = $perm.deleteFolders
-                MoveAccountsAndFolders                 = $perm.moveAccountsAndFolders
-                RequestsAuthorizationLevel1            = $perm.requestsAuthorizationLevel1
-                RequestsAuthorizationLevel2            = $perm.requestsAuthorizationLevel2
-            })
-        }
+    $createdTime = Get-ObjectPropertyValue -InputObject $Account -PropertyNames @(
+        'createdTime',
+        'CreatedTime',
+        'creationTime',
+        'CreationTime'
+    )
 
-        $summaryStatus = if ($missingMembers.Count -eq 0) { 'Compliant' } else { 'MissingRequiredMember' }
+    $modifiedTime = Get-ObjectPropertyValue -InputObject $Account -PropertyNames @(
+        'modifiedTime',
+        'ModifiedTime',
+        'lastModifiedTime',
+        'LastModifiedTime'
+    )
 
-        $SafeSummaryReport.Add([PSCustomObject]@{
-            SafeName               = $SafeName
-            TotalMemberCount       = $SafeMembers.Count
-            HasAdminGroup          = $hasAdminGroup
-            HasAdminMember         = $hasAdminMember
-            HasIdentityMember      = $hasIdentityMember
-            MissingRequiredMembers = ($missingMembers -join '; ')
-            Status                 = $summaryStatus
-            ErrorMessage           = ''
-        })
+    $automaticManagementEnabled = Get-NestedPropertyValue `
+        -InputObject $Account `
+        -ParentProperty 'secretManagement' `
+        -ChildProperties @(
+            'automaticManagementEnabled',
+            'AutomaticManagementEnabled'
+        )
 
-        Write-Log ("Retrieved {0} member(s) for safe: {1}" -f $SafeMembers.Count, $SafeName) 'Green'
-        $successCount++
-    } catch {
-        $failedCount++
+    $manualManagementReason = Get-NestedPropertyValue `
+        -InputObject $Account `
+        -ParentProperty 'secretManagement' `
+        -ChildProperties @(
+            'manualManagementReason',
+            'ManualManagementReason'
+        )
 
-        $errorMessage = $_.Exception.Message
+    $cpmStatus = Get-NestedPropertyValue `
+        -InputObject $Account `
+        -ParentProperty 'secretManagement' `
+        -ChildProperties @(
+            'status',
+            'Status',
+            'cpmStatus',
+            'CPMStatus'
+        )
 
-        Write-Log ("ERROR: Failed to retrieve members for safe '{0}'. {1}" -f $SafeName, $errorMessage) 'Red'
+    $lastModifiedByCPM = Get-NestedPropertyValue `
+        -InputObject $Account `
+        -ParentProperty 'secretManagement' `
+        -ChildProperties @(
+            'lastModifiedTime',
+            'LastModifiedTime'
+        )
 
-        $SafeSummaryReport.Add([PSCustomObject]@{
-            SafeName               = $SafeName
-            TotalMemberCount       = 0
-            HasAdminGroup          = $false
-            HasAdminMember         = $false
-            HasIdentityMember      = $false
-            MissingRequiredMembers = ($RequiredMembers -join '; ')
-            Status                 = 'FailedToRetrieveMembers'
-            ErrorMessage           = $errorMessage
-        })
+    $lastSuccessfulChange = Get-NestedPropertyValue `
+        -InputObject $Account `
+        -ParentProperty 'secretManagement' `
+        -ChildProperties @(
+            'lastSuccessfulChange',
+            'LastSuccessfulChange'
+        )
+
+    $lastSuccessfulVerification = Get-NestedPropertyValue `
+        -InputObject $Account `
+        -ParentProperty 'secretManagement' `
+        -ChildProperties @(
+            'lastSuccessfulVerification',
+            'LastSuccessfulVerification'
+        )
+
+    $platformAccountProperties = Get-ObjectPropertyValue -InputObject $Account -PropertyNames @(
+        'platformAccountProperties',
+        'PlatformAccountProperties'
+    )
+
+    $remoteMachinesAccess = Get-ObjectPropertyValue -InputObject $Account -PropertyNames @(
+        'remoteMachinesAccess',
+        'RemoteMachinesAccess'
+    )
+
+    $AccountReport.Add([PSCustomObject]@{
+        AccountID                   = Convert-ToReportValue $accountId
+        SafeName                    = Convert-ToReportValue $safeName
+        AccountName                 = Convert-ToReportValue $accountName
+        UserName                    = Convert-ToReportValue $userName
+        Address                     = Convert-ToReportValue $address
+        PlatformID                  = Convert-ToReportValue $platformId
+        SecretType                  = Convert-ToReportValue $secretType
+        CPMStatus                   = Convert-ToReportValue $cpmStatus
+        AutomaticManagementEnabled  = Convert-ToReportValue $automaticManagementEnabled
+        ManualManagementReason      = Convert-ToReportValue $manualManagementReason
+        CreatedTime                 = Convert-CyberArkTime $createdTime
+        ModifiedTime                = Convert-CyberArkTime $modifiedTime
+        CPMLastModifiedTime         = Convert-CyberArkTime $lastModifiedByCPM
+        LastSuccessfulChange        = Convert-CyberArkTime $lastSuccessfulChange
+        LastSuccessfulVerification  = Convert-CyberArkTime $lastSuccessfulVerification
+        PlatformAccountProperties   = Convert-ToReportValue $platformAccountProperties
+        RemoteMachinesAccess        = Convert-ToReportValue $remoteMachinesAccess
+    })
+
+    if (($currentIndex % 500) -eq 0) {
+        Write-Log ("Processed {0}/{1} account(s) into report..." -f $currentIndex, $totalAccounts) 'Gray'
     }
 }
 
 # ============================================
-# Export Reports
+# Export Account Report
 # ============================================
 
 try {
-    Write-Log "Exporting detailed safe membership report..." 'Yellow'
+    Write-Log "Exporting account report with Account ID..." 'Yellow'
 
-    $SafeMembersReport |
-        Sort-Object SafeName, Member |
-        Export-Csv -Path $DetailCsvPath -NoTypeInformation -Encoding UTF8
+    $AccountReport |
+        Sort-Object SafeName, AccountName, UserName, Address |
+        Export-Csv -Path $AccountCsvPath -NoTypeInformation -Encoding UTF8
 
-    Write-Log ("Detailed safe membership report exported to: {0}" -f $DetailCsvPath) 'Green'
+    Write-Log ("Account report exported to: {0}" -f $AccountCsvPath) 'Green'
 } catch {
-    Write-Log ("ERROR: Failed to export detailed CSV. {0}" -f $_.Exception.Message) 'Red'
-    exit 1
-}
+    Write-Log ("ERROR: Failed to export account report CSV. {0}" -f $_.Exception.Message) 'Red'
 
-try {
-    Write-Log "Exporting safe membership summary report..." 'Yellow'
+    try {
+        Close-PASSession | Out-Null
+    } catch {}
 
-    $SafeSummaryReport |
-        Sort-Object SafeName |
-        Export-Csv -Path $SummaryCsvPath -NoTypeInformation -Encoding UTF8
-
-    Write-Log ("Safe membership summary report exported to: {0}" -f $SummaryCsvPath) 'Green'
-} catch {
-    Write-Log ("ERROR: Failed to export summary CSV. {0}" -f $_.Exception.Message) 'Red'
     exit 1
 }
 
@@ -530,11 +676,8 @@ try {
 # ============================================
 
 Write-Log "============================================================" 'Gray'
-Write-Log "CNA Safe Membership Report completed." 'Green'
+Write-Log "CNA Account Report with Account ID completed." 'Green'
 Write-Log ("Authenticated User      : {0}" -f $AuthenticatedUser) 'Gray'
-Write-Log ("Total Safes Processed   : {0}" -f $totalSafes) 'Gray'
-Write-Log ("Successful Safe Reads   : {0}" -f $successCount) 'Green'
-Write-Log ("Failed Safe Reads       : {0}" -f $failedCount) 'Red'
-Write-Log ("Detailed Report         : {0}" -f $DetailCsvPath) 'Gray'
-Write-Log ("Summary Report          : {0}" -f $SummaryCsvPath) 'Gray'
+Write-Log ("Total Accounts Exported : {0}" -f $AccountReport.Count) 'Green'
+Write-Log ("Account Report          : {0}" -f $AccountCsvPath) 'Gray'
 Write-Log "============================================================" 'Gray'
