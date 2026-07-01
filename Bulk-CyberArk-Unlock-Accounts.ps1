@@ -1,6 +1,3 @@
-
-
-
 <#
 .SYNOPSIS
   Bulk unlock / release CyberArk vaulted accounts by AccountID.
@@ -23,28 +20,24 @@
   Dry run:
     .\Bulk-CyberArk-Unlock-Accounts.ps1 `
       -CsvFile .\accountids.csv `
-      -ApiBase "https://yourtenant.privilegecloud.cyberark.cloud/PasswordVault/API"
+      -ApiBase "https://mtbank.privilegecloud.cyberark.cloud/PasswordVault/API" `
+      -DebugHttp
 
   Live run:
     .\Bulk-CyberArk-Unlock-Accounts.ps1 `
       -CsvFile .\accountids.csv `
-      -ApiBase "https://yourtenant.privilegecloud.cyberark.cloud/PasswordVault/API" `
-      -LiveRun
+      -ApiBase "https://mtbank.privilegecloud.cyberark.cloud/PasswordVault/API" `
+      -LiveRun `
+      -DebugHttp
 
-  If your API user does not have List Accounts but has Unlock permission:
+  With proxy:
     .\Bulk-CyberArk-Unlock-Accounts.ps1 `
       -CsvFile .\accountids.csv `
-      -ApiBase "https://yourtenant.privilegecloud.cyberark.cloud/PasswordVault/API" `
-      -SkipAccountDetails `
-      -LiveRun
-
-.NOTES
-  Required CyberArk Safe permissions generally include:
-    - Unlock accounts / Unlock an account locked by others
-    - Edit account may also be required in newer Privilege Cloud Gen2 flows
-
-  Run with care. Releasing an account locked by CPM while CPM is actively changing/verifying/reconciling
-  the account may create process/audit inconsistency. Confirm the CPM operation is stale or failed first.
+      -ApiBase "https://mtbank.privilegecloud.cyberark.cloud/PasswordVault/API" `
+      -Proxy "http://proxy.company.com:8080" `
+      -ProxyUseDefaultCredentials `
+      -LiveRun `
+      -DebugHttp
 #>
 
 [CmdletBinding()]
@@ -56,6 +49,7 @@ param(
     [string]$ApiBase,
 
     [Parameter(Mandatory = $false)]
+    [ValidateSet("CyberArk", "LDAP", "RADIUS", "Windows")]
     [string]$AuthType = "CyberArk",
 
     [Parameter(Mandatory = $false)]
@@ -68,7 +62,19 @@ param(
     [switch]$SkipAccountDetails,
 
     [Parameter(Mandatory = $false)]
-    [switch]$SkipCertificateCheck
+    [switch]$SkipCertificateCheck,
+
+    [Parameter(Mandatory = $false)]
+    [int]$TimeoutSec = 45,
+
+    [Parameter(Mandatory = $false)]
+    [string]$Proxy,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$ProxyUseDefaultCredentials,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$DebugHttp
 )
 
 $ErrorActionPreference = "Stop"
@@ -92,7 +98,13 @@ function Ensure-Folder {
 }
 
 function Enable-Tls12 {
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        [System.Net.ServicePointManager]::Expect100Continue = $false
+    }
+    catch {
+        Write-Log "Unable to force TLS 1.2. Error=$($_.Exception.Message)" "WARN"
+    }
 }
 
 function Enable-SkipCertificateCheck {
@@ -173,7 +185,7 @@ function Get-HttpErrorBody {
     }
 }
 
-function Invoke-CyberArkRest {
+function Get-RestParams {
     param(
         [ValidateSet("GET", "POST", "DELETE")]
         [string]$Method,
@@ -185,27 +197,94 @@ function Invoke-CyberArkRest {
         [object]$Body = $null
     )
 
+    $params = @{
+        Method      = $Method
+        Uri         = $Uri
+        Headers     = $Headers
+        TimeoutSec  = $TimeoutSec
+        ErrorAction = "Stop"
+    }
+
+    if ($Method -ne "GET") {
+        $params["ContentType"] = "application/json"
+    }
+
+    if ($null -ne $Body) {
+        $params["Body"] = ($Body | ConvertTo-Json -Depth 20)
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($Proxy)) {
+        $params["Proxy"] = $Proxy
+
+        if ($ProxyUseDefaultCredentials) {
+            $params["ProxyUseDefaultCredentials"] = $true
+        }
+    }
+
+    return $params
+}
+
+function Invoke-CyberArkRest {
+    param(
+        [ValidateSet("GET", "POST", "DELETE")]
+        [string]$Method,
+
+        [string]$Uri,
+
+        [hashtable]$Headers,
+
+        [object]$Body = $null,
+
+        [string]$Purpose = "CyberArk REST call"
+    )
+
+    if ($DebugHttp) {
+        Write-Log "$Purpose"
+        Write-Log "HTTP Method: $Method"
+        Write-Log "HTTP URI: $Uri"
+
+        if (-not [string]::IsNullOrWhiteSpace($Proxy)) {
+            Write-Log "Proxy: $Proxy"
+        }
+
+        Write-Log "TimeoutSec: $TimeoutSec"
+    }
+
     try {
-        $params = @{
-            Method      = $Method
-            Uri         = $Uri
-            Headers     = $Headers
-            ErrorAction = "Stop"
-        }
-
-        if ($Method -ne "GET") {
-            $params["ContentType"] = "application/json"
-        }
-
-        if ($null -ne $Body) {
-            $params["Body"] = ($Body | ConvertTo-Json -Depth 20)
-        }
+        $params = Get-RestParams `
+            -Method $Method `
+            -Uri $Uri `
+            -Headers $Headers `
+            -Body $Body
 
         return Invoke-RestMethod @params
     }
     catch {
         $body = Get-HttpErrorBody -ErrorRecord $_
-        throw "CyberArk REST call failed. Method=$Method Uri=$Uri Error=$body"
+        throw "$Purpose failed. Method=$Method Uri=$Uri Error=$body"
+    }
+}
+
+function Test-CyberArkConnectivity {
+    param([string]$ApiBase)
+
+    try {
+        $uriObj = [Uri]$ApiBase
+        $hostName = $uriObj.Host
+
+        Write-Log "Testing TCP connectivity to $hostName on port 443..."
+
+        $test = Test-NetConnection -ComputerName $hostName -Port 443 -WarningAction SilentlyContinue
+
+        if ($test.TcpTestSucceeded -eq $true) {
+            Write-Log "TCP 443 connectivity successful to $hostName."
+        }
+        else {
+            Write-Log "TCP 443 connectivity failed to $hostName. Check firewall, DNS, proxy, or route." "WARN"
+        }
+    }
+    catch {
+        Write-Log "Connectivity test failed. Error=$($_.Exception.Message)" "WARN"
     }
 }
 
@@ -222,6 +301,9 @@ function Connect-CyberArk {
     try {
         $logonUri = "$ApiBase/Auth/$AuthType/Logon"
 
+        Write-Log "CyberArk logon URL: $logonUri"
+        Write-Log "Attempting CyberArk API logon with AuthType=$AuthType"
+
         $body = @{
             username          = $username
             password          = $plainPassword
@@ -232,13 +314,12 @@ function Connect-CyberArk {
             "Content-Type" = "application/json"
         }
 
-        Write-Log "Logging into CyberArk API using AuthType=$AuthType"
-
         $response = Invoke-CyberArkRest `
             -Method POST `
             -Uri $logonUri `
             -Headers $headers `
-            -Body $body
+            -Body $body `
+            -Purpose "CyberArk logon"
 
         $token = $null
 
@@ -256,8 +337,10 @@ function Connect-CyberArk {
         }
 
         if ([string]::IsNullOrWhiteSpace($token)) {
-            throw "CyberArk logon succeeded but no token was returned."
+            throw "CyberArk logon response did not contain a token."
         }
+
+        Write-Log "CyberArk API logon successful."
 
         return $token
     }
@@ -281,7 +364,8 @@ function Disconnect-CyberArk {
             -Method POST `
             -Uri $logoffUri `
             -Headers $Headers `
-            -Body @{} | Out-Null
+            -Body @{} `
+            -Purpose "CyberArk logoff" | Out-Null
 
         Write-Log "CyberArk API session logged off."
     }
@@ -303,7 +387,8 @@ function Get-CyberArkAccountDetails {
     return Invoke-CyberArkRest `
         -Method GET `
         -Uri $uri `
-        -Headers $Headers
+        -Headers $Headers `
+        -Purpose "Get CyberArk account details for AccountID=$AccountID"
 }
 
 function Unlock-CyberArkAccount {
@@ -320,7 +405,8 @@ function Unlock-CyberArkAccount {
         -Method POST `
         -Uri $uri `
         -Headers $Headers `
-        -Body @{}
+        -Body @{} `
+        -Purpose "Unlock CyberArk account AccountID=$AccountID"
 }
 
 function Get-ObjectPropertyValue {
@@ -370,6 +456,10 @@ $ApiBase = Normalize-ApiBase -Value $ApiBase
 if ([string]::IsNullOrWhiteSpace($ApiBase)) {
     throw "CyberArk API base URL is required."
 }
+
+Write-Log "Using CyberArk API base: $ApiBase"
+
+Test-CyberArkConnectivity -ApiBase $ApiBase
 
 Ensure-Folder -Path $ReportFolder
 
@@ -425,15 +515,15 @@ try {
             $skipped++
 
             $results.Add([PSCustomObject]@{
-                AccountID      = $accountId
-                SafeName       = $null
-                UserName       = $null
-                Address        = $null
-                PlatformID     = $null
-                Action         = "Skipped"
-                Result         = "Missing AccountID"
-                Error          = $null
-                TimeStamp      = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                AccountID = $accountId
+                SafeName  = $null
+                UserName  = $null
+                Address   = $null
+                PlatformID = $null
+                Action    = "Skipped"
+                Result    = "Missing AccountID"
+                Error     = $null
+                TimeStamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
             })
 
             Write-Log "[$total/$($rows.Count)] Skipped blank AccountID." "WARN"
@@ -474,15 +564,15 @@ try {
                 $unlocked++
 
                 $results.Add([PSCustomObject]@{
-                    AccountID      = $accountId
-                    SafeName       = $safeName
-                    UserName       = $userName
-                    Address        = $address
-                    PlatformID     = $platformId
-                    Action         = "Unlocked"
-                    Result         = "CyberArk account unlock/release API call completed"
-                    Error          = $null
-                    TimeStamp      = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                    AccountID = $accountId
+                    SafeName  = $safeName
+                    UserName  = $userName
+                    Address   = $address
+                    PlatformID = $platformId
+                    Action    = "Unlocked"
+                    Result    = "CyberArk account unlock/release API call completed"
+                    Error     = $null
+                    TimeStamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
                 })
 
                 Write-Log "[$total/$($rows.Count)] Released CyberArk lock for AccountID=$accountId" "INFO"
@@ -491,15 +581,15 @@ try {
                 $wouldUnlock++
 
                 $results.Add([PSCustomObject]@{
-                    AccountID      = $accountId
-                    SafeName       = $safeName
-                    UserName       = $userName
-                    Address        = $address
-                    PlatformID     = $platformId
-                    Action         = "WouldUnlock"
-                    Result         = "DryRun only. Use -LiveRun to release CyberArk lock."
-                    Error          = $null
-                    TimeStamp      = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                    AccountID = $accountId
+                    SafeName  = $safeName
+                    UserName  = $userName
+                    Address   = $address
+                    PlatformID = $platformId
+                    Action    = "WouldUnlock"
+                    Result    = "DryRun only. Use -LiveRun to release CyberArk lock."
+                    Error     = $null
+                    TimeStamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
                 })
 
                 Write-Log "[$total/$($rows.Count)] Would release CyberArk lock for AccountID=$accountId" "WARN"
@@ -509,15 +599,15 @@ try {
             $errors++
 
             $results.Add([PSCustomObject]@{
-                AccountID      = $accountId
-                SafeName       = $safeName
-                UserName       = $userName
-                Address        = $address
-                PlatformID     = $platformId
-                Action         = "Error"
-                Result         = "Failed"
-                Error          = $_.Exception.Message
-                TimeStamp      = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                AccountID = $accountId
+                SafeName  = $safeName
+                UserName  = $userName
+                Address   = $address
+                PlatformID = $platformId
+                Action    = "Error"
+                Result    = "Failed"
+                Error     = $_.Exception.Message
+                TimeStamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
             })
 
             Write-Log "[$total/$($rows.Count)] Failed AccountID=$accountId. $($_.Exception.Message)" "ERROR"
