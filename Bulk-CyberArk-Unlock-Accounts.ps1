@@ -1,6 +1,9 @@
-# Bulk_Release_CyberArk_Locked_Accounts.ps1
-# Purpose: Release/unlock CyberArk accounts by AccountID using psPAS.
-# Input file: account_ids.txt, one AccountID per line.
+# Bulk_Release_And_Enable_CPM_CyberArk_Accounts.ps1
+# Purpose:
+#   1. Read CyberArk AccountIDs from account_ids.txt
+#   2. Try to release/unlock each account
+#   3. If already unlocked or unlock fails, still attempt to enable CPM management
+#   4. Export report
 
 $ErrorActionPreference = "Stop"
 
@@ -8,15 +11,18 @@ $ErrorActionPreference = "Stop"
 
 $TenantSubdomain = "mtbank"
 $AccountIdFile   = "account_ids.txt"
-$ReportFile      = ".\CyberArk_Unlock_Report_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss")
+$ReportFile      = ".\CyberArk_Unlock_EnableCPM_Report_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss")
 
 # Proxy
 [System.Net.WebRequest]::DefaultWebProxy = New-Object System.Net.WebProxy("http://proxy.prod.mtb.com:8080")
 [System.Net.WebRequest]::DefaultWebProxy.UseDefaultCredentials = $true
 
-# Optional behavior
+# Behavior
 $TryCheckInFallback = $true
-$ReEnableAutomaticManagementAfterUnlock = $false
+
+# This is the key change:
+# CPM will be enabled even if the account is already unlocked or unlock fails.
+$EnableCPMAfterUnlockAttempt = $true
 
 # ---------------- FUNCTIONS ----------------
 
@@ -50,7 +56,7 @@ function Add-Result {
 
 # ---------------- MAIN ----------------
 
-Write-Log "CyberArk bulk account release script starting."
+Write-Log "CyberArk bulk release and CPM enable script starting."
 
 if (-not (Get-Command New-PASSession -ErrorAction SilentlyContinue)) {
     throw "psPAS module is not loaded or installed. Run: Import-Module psPAS"
@@ -84,45 +90,82 @@ try {
     foreach ($id in $accountIds) {
         Write-Log "Processing AccountID: $id"
 
-        $released = $false
+        $unlockSucceeded = $false
+        $checkInSucceeded = $false
+        $unlockAttempted = $false
+        $unlockMessage = ""
+
+        # ---------------- TRY RELEASE / UNLOCK ----------------
 
         try {
-            # This is the actual CyberArk release/unlock action.
+            $unlockAttempted = $true
+
             Unlock-PASAccount -AccountID $id -Unlock -ErrorAction Stop
 
-            Write-Log "SUCCESS: Released/unlocked AccountID $id" "SUCCESS"
-            Add-Result -Results $results -AccountID $id -Action "Unlock" -Status "Success" -Message "Account released/unlocked successfully."
+            $unlockSucceeded = $true
+            $unlockMessage = "Account released/unlocked successfully."
 
-            $released = $true
+            Write-Log "SUCCESS: Released/unlocked AccountID $id" "SUCCESS"
+
+            Add-Result `
+                -Results $results `
+                -AccountID $id `
+                -Action "Unlock" `
+                -Status "Success" `
+                -Message $unlockMessage
         }
         catch {
-            $unlockError = $_.Exception.Message
-            Write-Log "Unlock failed for AccountID $id. Error: $unlockError" "WARN"
+            $unlockMessage = $_.Exception.Message
+
+            Write-Log "Unlock did not complete for AccountID $id. Message: $unlockMessage" "WARN"
+
+            Add-Result `
+                -Results $results `
+                -AccountID $id `
+                -Action "Unlock" `
+                -Status "FailedOrNotRequired" `
+                -Message $unlockMessage
 
             if ($TryCheckInFallback) {
                 try {
-                    # Fallback for exclusive-access / checked-out accounts.
-                    # Default Unlock-PASAccount behavior checks in the account.
+                    Write-Log "Trying CheckIn fallback for AccountID $id"
+
+                    # Fallback for exclusive access / checked-out accounts.
                     Unlock-PASAccount -AccountID $id -ErrorAction Stop
 
-                    Write-Log "SUCCESS: Check-in fallback completed for AccountID $id" "SUCCESS"
-                    Add-Result -Results $results -AccountID $id -Action "CheckInFallback" -Status "Success" -Message "Unlock failed, but check-in fallback succeeded. Original unlock error: $unlockError"
+                    $checkInSucceeded = $true
 
-                    $released = $true
+                    Write-Log "SUCCESS: CheckIn fallback completed for AccountID $id" "SUCCESS"
+
+                    Add-Result `
+                        -Results $results `
+                        -AccountID $id `
+                        -Action "CheckInFallback" `
+                        -Status "Success" `
+                        -Message "CheckIn fallback completed."
                 }
                 catch {
                     $checkInError = $_.Exception.Message
-                    Write-Log "FAILED: AccountID $id. Unlock and CheckIn both failed. Error: $checkInError" "ERROR"
-                    Add-Result -Results $results -AccountID $id -Action "UnlockAndCheckIn" -Status "Failed" -Message "Unlock error: $unlockError | CheckIn error: $checkInError"
+
+                    Write-Log "CheckIn fallback did not complete for AccountID $id. Message: $checkInError" "WARN"
+
+                    Add-Result `
+                        -Results $results `
+                        -AccountID $id `
+                        -Action "CheckInFallback" `
+                        -Status "FailedOrNotRequired" `
+                        -Message $checkInError
                 }
-            }
-            else {
-                Add-Result -Results $results -AccountID $id -Action "Unlock" -Status "Failed" -Message $unlockError
             }
         }
 
-        if ($released -and $ReEnableAutomaticManagementAfterUnlock) {
+        # ---------------- ENABLE CPM MANAGEMENT ----------------
+        # This will run even if the account was already unlocked or unlock failed.
+
+        if ($EnableCPMAfterUnlockAttempt) {
             try {
+                Write-Log "Enabling CPM automatic management for AccountID $id"
+
                 [array]$operations = @(
                     @{
                         op    = "replace"
@@ -138,17 +181,32 @@ try {
 
                 Set-PASAccount -ID $id -operations $operations -ErrorAction Stop
 
-                Write-Log "Automatic management re-enabled for AccountID $id" "INFO"
-                Add-Result -Results $results -AccountID $id -Action "ReEnableAutomaticManagement" -Status "Success" -Message "automaticManagementEnabled set to true."
+                Write-Log "SUCCESS: CPM automatic management enabled for AccountID $id" "SUCCESS"
+
+                Add-Result `
+                    -Results $results `
+                    -AccountID $id `
+                    -Action "EnableCPM" `
+                    -Status "Success" `
+                    -Message "CPM automatic management enabled and manual management reason cleared."
             }
             catch {
-                Write-Log "Failed to re-enable automatic management for AccountID $id. Error: $($_.Exception.Message)" "WARN"
-                Add-Result -Results $results -AccountID $id -Action "ReEnableAutomaticManagement" -Status "Failed" -Message $_.Exception.Message
+                $enableError = $_.Exception.Message
+
+                Write-Log "FAILED: Could not enable CPM management for AccountID $id. Error: $enableError" "ERROR"
+
+                Add-Result `
+                    -Results $results `
+                    -AccountID $id `
+                    -Action "EnableCPM" `
+                    -Status "Failed" `
+                    -Message $enableError
             }
         }
     }
 
     $results | Export-Csv -Path $ReportFile -NoTypeInformation -Encoding UTF8
+
     Write-Log "Report exported to: $ReportFile"
 }
 finally {
