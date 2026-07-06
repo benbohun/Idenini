@@ -1,2 +1,473 @@
-AccountID,TargetSafeName,TargetPlatformID,TargetName,TargetAddress,TargetUserName,credentialType,mtbAppCode,AutomaticManagementEnabled,DisableAutomaticManagement,ManualManagementReason,Prop:LogonDomain,Prop:Port,Prop:Domain,Prop:Database,Prop:Instance,Prop:URL
-4655_9,Target-Windows-Safe,WIN-DOMAIN-E-PL12PC2NBNF-NRA,server01-administrator,server01.company.com,administrator,WindowsAdmin,ABC,true,,Device type migration with custom fields,COMPANY,3389,,,,
+<#
+.SYNOPSIS
+    Exports CyberArk Windows regular platforms and their required/optional properties.
+
+.DESCRIPTION
+    Read-only exporter using the same login/config pattern as the account field updater:
+      1. Load shared .env and selected env\<dev|prod>.env.
+      2. Apply proxy settings.
+      3. Prompt for CyberArk Identity service-user credentials.
+      4. Request OAuth bearer token from /oauth2/platformtoken.
+      5. Keep token only in memory and log only a SHA256 fingerprint prefix.
+      6. Load CyberArk regular platform inventory.
+      7. Filter Windows platforms.
+      8. Export platform details and required/optional property matrix CSV reports.
+
+.OUTPUTS
+    reports\CyberArk_WindowsPlatforms_Detail_*.csv
+    reports\CyberArk_WindowsPlatformProperties_Matrix_*.csv
+    logs\Export-WindowsPlatforms_*.log
+
+.NOTES
+    Designed for Windows PowerShell 5.1.
+    No CyberArk changes are made.
+#>
+
+#requires -Version 5.1
+[CmdletBinding()]
+param(
+    [ValidateSet('dev','prod')]
+    [string]$Environment = 'dev',
+
+    [string]$EnvFolder = (Join-Path $PSScriptRoot 'env'),
+
+    # Default matches platforms where general.systemType/name/id contains Windows.
+    [string]$SystemTypeRegex = 'Windows',
+
+    # Optional platform ID/name/systemType filter, for example WIN-DOMAIN.
+    [string]$PlatformSearch = '',
+
+    [switch]$ProxyUseDefaultCredentials,
+
+    [string]$ReportFolder = (Join-Path $PSScriptRoot 'reports'),
+    [string]$LogFolder = (Join-Path $PSScriptRoot 'logs'),
+    [string]$LogId = ''
+)
+
+$ErrorActionPreference = 'Stop'
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+$proxyUri = 'Placehold'
+if ($proxyUri -and $proxyUri.Trim() -notmatch '^(Placehold|Placeholder|YOUR-|<.*>|CHANGEME)$') {
+    $proxy = New-Object System.Net.WebProxy($proxyUri, $true)
+    [System.Net.WebRequest]::DefaultWebProxy = $proxy
+    [System.Net.WebRequest]::DefaultWebProxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials
+    [System.Net.WebRequest]::DefaultWebProxy.Address | Out-Null
+}
+
+$script:LogFile = $null
+$script:DetailReportFile = $null
+$script:MatrixReportFile = $null
+$script:PropertyDetailReportFile = $null
+$script:Config = $null
+
+function Test-BlankValue {
+    param([object]$Value)
+    if ($null -eq $Value) { return $true }
+    $text = $Value.ToString().Trim()
+    if ($text.Length -eq 0) { return $true }
+    if ($text -match '^(Placehold|Placeholder|YOUR-|<.*>|CHANGEME)$') { return $true }
+    return $false
+}
+
+function New-RunLog {
+    if (-not (Test-Path $LogFolder)) { New-Item -Path $LogFolder -ItemType Directory -Force | Out-Null }
+    if (-not (Test-Path $ReportFolder)) { New-Item -Path $ReportFolder -ItemType Directory -Force | Out-Null }
+
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $suffix = if (Test-BlankValue $LogId) { '' } else { "_$LogId" }
+    $script:LogFile = Join-Path $LogFolder "Export-WindowsPlatforms_$stamp$suffix.log"
+    $script:DetailReportFile = Join-Path $ReportFolder "CyberArk_WindowsPlatforms_Detail_$stamp$suffix.csv"
+    $script:MatrixReportFile = Join-Path $ReportFolder "CyberArk_WindowsPlatformProperties_Matrix_$stamp$suffix.csv"
+    $script:PropertyDetailReportFile = Join-Path $ReportFolder "CyberArk_WindowsPlatformProperties_Detail_$stamp$suffix.csv"
+    Set-Content -Path $script:LogFile -Value "$(Get-Date -Format s) source=New-RunLog [INFO] Starting run"
+}
+
+function Write-RunLog {
+    param(
+        [string]$Source,
+        [string]$Message,
+        [ValidateSet('DEBUG','INFO','WARN','ERROR')]
+        [string]$Level = 'INFO'
+    )
+    $line = "$(Get-Date -Format s) source=$Source [$Level] $Message"
+    Add-Content -Path $script:LogFile -Value $line
+    if ($Level -eq 'ERROR') { Write-Host $line -ForegroundColor Red }
+    elseif ($Level -eq 'WARN') { Write-Host $line -ForegroundColor Yellow }
+    else { Write-Host $line }
+}
+
+function Read-DotEnvFile {
+    param([string]$Path)
+    $result = @{}
+    if (-not (Test-Path $Path)) { return $result }
+
+    foreach ($line in (Get-Content -Path $Path -ErrorAction Stop)) {
+        $trimmed = $line.Trim()
+        if ($trimmed.Length -eq 0) { continue }
+        if ($trimmed.StartsWith('#')) { continue }
+        if ($trimmed -notmatch '=') { continue }
+        $parts = $trimmed.Split('=', 2)
+        $key = $parts[0].Trim()
+        $value = $parts[1].Trim()
+        if ($value.Length -ge 2) {
+            if (($value.StartsWith('"') -and $value.EndsWith('"')) -or ($value.StartsWith("'") -and $value.EndsWith("'"))) {
+                $value = $value.Substring(1, $value.Length - 2)
+            }
+        }
+        if (-not (Test-BlankValue $key)) { $result[$key] = $value }
+    }
+    return $result
+}
+
+function Join-EnvValues {
+    param([hashtable[]]$Maps)
+    $merged = @{}
+    foreach ($map in $Maps) {
+        foreach ($key in $map.Keys) { $merged[$key] = $map[$key] }
+    }
+    return $merged
+}
+
+function Normalize-PvwaApiBase {
+    param([string]$PvwaValue)
+    $base = $PvwaValue.Trim().TrimEnd('/')
+    $base = $base -replace '/PrivilegeCloud$', ''
+    $base = $base -replace '/PasswordVault/API/Platforms/?$', '/PasswordVault/API'
+    $base = $base -replace '/PasswordVault/API/.+$', '/PasswordVault/API'
+    if ($base -match '/PasswordVault/API$') { return $base }
+    if ($base -match '/PasswordVault$') { return "$base/API" }
+    return "$base/PasswordVault/API"
+}
+
+function Resolve-IdentityBase {
+    param([hashtable]$Settings)
+    $tenant = $Settings['TENANT_ID']
+    if (Test-BlankValue $tenant) { throw 'TENANT_ID is missing in .env.' }
+    $tenant = $tenant.Trim().TrimEnd('/')
+    if ($tenant -match '^https?://') { return $tenant }
+    if ($tenant -match '\.id\.cyberark\.cloud$') { return "https://$tenant" }
+    if ($tenant -match '\.') { return "https://$tenant" }
+    return "https://$tenant.id.cyberark.cloud"
+}
+
+function Get-ProxyFromSettings {
+    param([hashtable]$Settings)
+    $proxy = $Settings['PROXY']
+    if (-not (Test-BlankValue $proxy)) { return $proxy.Trim() }
+
+    $proxyAddress = $Settings['PROXY_ADDRESS']
+    if (Test-BlankValue $proxyAddress) { $proxyAddress = $Settings['ROXY_ADDRESS'] }
+    $proxyPort = $Settings['PROXY_PORT']
+    if ((Test-BlankValue $proxyAddress) -or (Test-BlankValue $proxyPort)) { return $null }
+    $proxyAddress = $proxyAddress.Trim().TrimEnd('/')
+    if ($proxyAddress -notmatch '^https?://') { $proxyAddress = "http://$proxyAddress" }
+    return "$proxyAddress`:$($proxyPort.Trim())"
+}
+
+function Import-RunConfig {
+    $baseFile = Join-Path $PSScriptRoot '.env'
+    $envFile1 = Join-Path $EnvFolder "$Environment.env"
+    $envFile2 = Join-Path $PSScriptRoot "$Environment.env"
+    $base = Read-DotEnvFile -Path $baseFile
+    $envSpecific = @{}
+    if (Test-Path $envFile1) { $envSpecific = Read-DotEnvFile -Path $envFile1 }
+    elseif (Test-Path $envFile2) { $envSpecific = Read-DotEnvFile -Path $envFile2 }
+    else { throw "Could not find environment file for '$Environment'. Expected $envFile1 or $envFile2" }
+
+    $settings = Join-EnvValues -Maps @($base, $envSpecific)
+    if (Test-BlankValue $settings['PVWA']) {
+        if (Test-BlankValue $settings['SUB_DOMAIN']) { throw 'PVWA is missing and SUB_DOMAIN is not set.' }
+        $settings['PVWA'] = "https://$($settings['SUB_DOMAIN']).privilegecloud.cyberark.cloud"
+    }
+
+    $identityBase = Resolve-IdentityBase -Settings $settings
+    $apiBase = Normalize-PvwaApiBase -PvwaValue $settings['PVWA']
+    $proxyFromEnv = Get-ProxyFromSettings -Settings $settings
+
+    if (-not (Test-BlankValue $proxyFromEnv)) {
+        $webProxy = New-Object System.Net.WebProxy($proxyFromEnv, $true)
+        if ($ProxyUseDefaultCredentials) { $webProxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials }
+        [System.Net.WebRequest]::DefaultWebProxy = $webProxy
+    }
+
+    $script:Config = [pscustomobject]@{
+        Environment = $Environment
+        IdentityBase = $identityBase
+        TokenUrl = "$identityBase/oauth2/platformtoken"
+        ApiBase = $apiBase
+        Proxy = $proxyFromEnv
+    }
+    Write-RunLog 'Import-RunConfig' "Environment=$Environment IdentityBase=$identityBase ApiBase=$apiBase ProxyConfigured=$([bool]$proxyFromEnv)" 'INFO'
+}
+
+function ConvertTo-FormBody {
+    param([hashtable]$Body)
+    $pairs = @()
+    foreach ($key in $Body.Keys) {
+        $k = [System.Uri]::EscapeDataString([string]$key)
+        $v = [System.Uri]::EscapeDataString([string]$Body[$key])
+        $pairs += "$k=$v"
+    }
+    return ($pairs -join '&')
+}
+
+function Get-Sha256Fingerprint {
+    param([string]$Text)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
+        $hash = $sha.ComputeHash($bytes)
+        return (($hash | ForEach-Object { $_.ToString('x2') }) -join '')
+    }
+    finally { $sha.Dispose() }
+}
+
+function Get-WebErrorText {
+    param([System.Management.Automation.ErrorRecord]$ErrorRecord)
+    $msg = $ErrorRecord.Exception.Message
+    $response = $ErrorRecord.Exception.Response
+    if ($null -ne $response) {
+        try {
+            $stream = $response.GetResponseStream()
+            if ($null -ne $stream) {
+                $reader = New-Object System.IO.StreamReader($stream)
+                $body = $reader.ReadToEnd()
+                if (-not (Test-BlankValue $body)) { $msg = "$msg | Response: $body" }
+            }
+        } catch {}
+    }
+    return $msg
+}
+
+function Get-IdentityBearerToken {
+    Write-RunLog 'Get-IdentityBearerToken' 'Prompting for CyberArk Identity service-user credentials' 'INFO'
+    $credential = Get-Credential -Message 'Enter CyberArk Identity service-user credentials'
+    $body = ConvertTo-FormBody -Body @{
+        grant_type = 'client_credentials'
+        client_id = $credential.UserName
+        client_secret = $credential.GetNetworkCredential().Password
+    }
+    $params = @{
+        Method = 'Post'
+        Uri = $script:Config.TokenUrl
+        Body = $body
+        ContentType = 'application/x-www-form-urlencoded'
+        Headers = @{ Accept = 'application/json' }
+        ErrorAction = 'Stop'
+    }
+    if (-not (Test-BlankValue $script:Config.Proxy)) { $params['Proxy'] = $script:Config.Proxy }
+    if ($ProxyUseDefaultCredentials) { $params['ProxyUseDefaultCredentials'] = $true }
+    try { $response = Invoke-RestMethod @params }
+    catch { throw "Identity token request failed. $(Get-WebErrorText -ErrorRecord $_)" }
+    if ($null -eq $response.access_token) { throw 'Identity token response did not include access_token.' }
+    $token = [string]$response.access_token
+    $fingerprint = Get-Sha256Fingerprint -Text $token
+    Write-RunLog 'Get-IdentityBearerToken' "Token acquired. SHA256 fingerprint=$($fingerprint.Substring(0,16))... ExpiresIn=$($response.expires_in)" 'INFO'
+    return $token
+}
+
+function Invoke-CyberArkRest {
+    param(
+        [ValidateSet('GET','POST','PATCH','DELETE')]
+        [string]$Method,
+        [string]$Path,
+        [string]$Token,
+        [object]$Body = $null,
+        [string]$ContentType = 'application/json'
+    )
+    if ($Path -match '^https?://') { $uri = $Path }
+    else { $uri = "$($script:Config.ApiBase)/$($Path.TrimStart('/'))" }
+    $params = @{
+        Method = $Method
+        Uri = $uri
+        Headers = @{ Authorization = "Bearer $Token" }
+        ErrorAction = 'Stop'
+    }
+    if ($Method -ne 'GET' -and $Method -ne 'DELETE') { $params['ContentType'] = $ContentType }
+    if ($null -ne $Body) {
+        if ($Body -is [string]) { $params['Body'] = $Body }
+        else { $params['Body'] = ($Body | ConvertTo-Json -Depth 30 -Compress) }
+    }
+    if (-not (Test-BlankValue $script:Config.Proxy)) { $params['Proxy'] = $script:Config.Proxy }
+    if ($ProxyUseDefaultCredentials) { $params['ProxyUseDefaultCredentials'] = $true }
+    try { return Invoke-RestMethod @params }
+    catch { throw "REST call failed. Method=$Method Uri=$uri $(Get-WebErrorText -ErrorRecord $_)" }
+}
+
+function Get-PlatformPropertyNames {
+    param([object[]]$Items)
+    $names = @()
+    foreach ($item in @($Items)) {
+        if ($null -eq $item) { continue }
+        $name = $null
+        if ($item.PSObject.Properties['name']) { $name = $item.name }
+        elseif ($item.PSObject.Properties['Name']) { $name = $item.Name }
+        if (-not (Test-BlankValue $name)) { $names += $name.ToString() }
+    }
+    return @($names | Sort-Object -Unique)
+}
+
+function Get-PropertyDetailRows {
+    param(
+        [object]$Platform,
+        [object[]]$Items,
+        [string]$Requirement
+    )
+    $rows = @()
+    foreach ($item in @($Items)) {
+        if ($null -eq $item) { continue }
+        $name = ''
+        $displayName = ''
+        $type = ''
+        $description = ''
+        if ($item.PSObject.Properties['name']) { $name = [string]$item.name }
+        if ($item.PSObject.Properties['displayName']) { $displayName = [string]$item.displayName }
+        if ($item.PSObject.Properties['type']) { $type = [string]$item.type }
+        if ($item.PSObject.Properties['description']) { $description = [string]$item.description }
+        if (Test-BlankValue $name) { continue }
+        $rows += [pscustomobject]@{
+            PlatformID = [string]$Platform.general.id
+            PlatformName = Get-PlatformDisplayName -Platform $Platform
+            SystemType = [string]$Platform.general.systemType
+            Requirement = $Requirement
+            PropertyName = $name
+            DisplayName = $displayName
+            Type = $type
+            Description = $description
+        }
+    }
+    return $rows
+}
+
+function Get-AllowedSafes {
+    param([object]$Platform)
+    if ($null -ne $Platform.credentialsManagement -and $Platform.credentialsManagement.PSObject.Properties['allowedSafes']) {
+        return [string]$Platform.credentialsManagement.allowedSafes
+    }
+    return ''
+}
+
+function Get-PlatformDisplayName {
+    param([object]$Platform)
+    foreach ($field in @('name','Name','id','ID')) {
+        if ($Platform.general.PSObject.Properties[$field]) {
+            $value = $Platform.general.$field
+            if (-not (Test-BlankValue $value)) { return [string]$value }
+        }
+    }
+    return ''
+}
+
+function Get-WindowsPlatforms {
+    param([string]$Token)
+    Write-RunLog 'Get-WindowsPlatforms' 'Loading CyberArk regular platform inventory' 'INFO'
+    $response = Invoke-CyberArkRest -Method GET -Path 'Platforms?PlatformType=Regular' -Token $Token
+    $platforms = @($response.Platforms)
+    if ($platforms.Count -eq 0) { throw 'No regular platforms were returned. Check API permissions.' }
+    $filtered = @()
+    foreach ($platform in $platforms) {
+        if ($null -eq $platform.general) { continue }
+        $platformId = [string]$platform.general.id
+        $platformName = Get-PlatformDisplayName -Platform $platform
+        $systemType = [string]$platform.general.systemType
+        $include = $false
+        if (-not (Test-BlankValue $systemType) -and $systemType -match $SystemTypeRegex) { $include = $true }
+        elseif (-not (Test-BlankValue $platformId) -and $platformId -match $SystemTypeRegex) { $include = $true }
+        elseif (-not (Test-BlankValue $platformName) -and $platformName -match $SystemTypeRegex) { $include = $true }
+        if (-not (Test-BlankValue $PlatformSearch)) {
+            $search = [regex]::Escape($PlatformSearch)
+            $searchHit = ($platformId -match $search -or $platformName -match $search -or $systemType -match $search)
+            if (-not $searchHit) { $include = $false }
+        }
+        if ($include) { $filtered += $platform }
+    }
+    Write-RunLog 'Get-WindowsPlatforms' "Loaded $($platforms.Count) regular platform(s). Matched $($filtered.Count) using SystemTypeRegex='$SystemTypeRegex' PlatformSearch='$PlatformSearch'." 'INFO'
+    return @($filtered | Sort-Object { $_.general.id })
+}
+
+function Export-DetailReport {
+    param([array]$Platforms)
+    $rows = @()
+    foreach ($platform in $Platforms) {
+        $required = Get-PlatformPropertyNames -Items @($platform.properties.required)
+        $optional = Get-PlatformPropertyNames -Items @($platform.properties.optional)
+        $all = @($required + $optional | Sort-Object -Unique)
+        $rows += [pscustomobject]@{
+            PlatformID = [string]$platform.general.id
+            PlatformName = Get-PlatformDisplayName -Platform $platform
+            Active = [string]$platform.general.active
+            SystemType = [string]$platform.general.systemType
+            PlatformType = [string]$platform.general.platformType
+            AllowedSafes = Get-AllowedSafes -Platform $platform
+            RequiredPropertyCount = $required.Count
+            OptionalPropertyCount = $optional.Count
+            RequiredProperties = ($required -join '; ')
+            OptionalProperties = ($optional -join '; ')
+            AllProperties = ($all -join '; ')
+        }
+    }
+    $rows | Export-Csv -Path $script:DetailReportFile -NoTypeInformation
+    Write-RunLog 'Export-DetailReport' "Detail report created: $script:DetailReportFile" 'INFO'
+}
+
+function Export-PropertyDetailReport {
+    param([array]$Platforms)
+    $rows = @()
+    foreach ($platform in $Platforms) {
+        $rows += Get-PropertyDetailRows -Platform $platform -Items @($platform.properties.required) -Requirement 'Required'
+        $rows += Get-PropertyDetailRows -Platform $platform -Items @($platform.properties.optional) -Requirement 'Optional'
+    }
+    $rows | Export-Csv -Path $script:PropertyDetailReportFile -NoTypeInformation
+    Write-RunLog 'Export-PropertyDetailReport' "Property detail report created: $script:PropertyDetailReportFile" 'INFO'
+}
+
+function Export-MatrixReport {
+    param([array]$Platforms)
+    $propertyNames = @()
+    foreach ($platform in $Platforms) {
+        $propertyNames += Get-PlatformPropertyNames -Items @($platform.properties.required)
+        $propertyNames += Get-PlatformPropertyNames -Items @($platform.properties.optional)
+    }
+    $propertyNames = @($propertyNames | Sort-Object -Unique)
+    $rows = @()
+    foreach ($platform in $Platforms) {
+        $required = Get-PlatformPropertyNames -Items @($platform.properties.required)
+        $optional = Get-PlatformPropertyNames -Items @($platform.properties.optional)
+        $row = [ordered]@{
+            PlatformID = [string]$platform.general.id
+            PlatformName = Get-PlatformDisplayName -Platform $platform
+            Active = [string]$platform.general.active
+            SystemType = [string]$platform.general.systemType
+            PlatformType = [string]$platform.general.platformType
+            AllowedSafes = Get-AllowedSafes -Platform $platform
+        }
+        foreach ($propertyName in $propertyNames) {
+            if ($required -contains $propertyName) { $row[$propertyName] = 'Required' }
+            elseif ($optional -contains $propertyName) { $row[$propertyName] = 'Optional' }
+            else { $row[$propertyName] = '' }
+        }
+        $rows += [pscustomobject]$row
+    }
+    $rows | Export-Csv -Path $script:MatrixReportFile -NoTypeInformation
+    Write-RunLog 'Export-MatrixReport' "Matrix report created: $script:MatrixReportFile" 'INFO'
+}
+
+function Start-WindowsPlatformExport {
+    New-RunLog
+    Import-RunConfig
+    $token = Get-IdentityBearerToken
+    $platforms = Get-WindowsPlatforms -Token $token
+    if ($platforms.Count -eq 0) {
+        Write-RunLog 'Start-WindowsPlatformExport' 'No platforms matched the filter. Reports will contain no platform rows.' 'WARN'
+    }
+    Export-DetailReport -Platforms $platforms
+    Export-PropertyDetailReport -Platforms $platforms
+    Export-MatrixReport -Platforms $platforms
+    Write-RunLog 'Start-WindowsPlatformExport' "Run completed. DetailReport=$script:DetailReportFile" 'INFO'
+    Write-RunLog 'Start-WindowsPlatformExport' "Run completed. PropertyDetailReport=$script:PropertyDetailReportFile" 'INFO'
+    Write-RunLog 'Start-WindowsPlatformExport' "Run completed. MatrixReport=$script:MatrixReportFile" 'INFO'
+    Write-RunLog 'Start-WindowsPlatformExport' "Log=$script:LogFile" 'INFO'
+}
+
+Start-WindowsPlatformExport
