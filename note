@@ -1,7 +1,3 @@
-In addition to the platform report below, will like to extend to show active platform that are assigned account or not
-
-
-
 <# 
 Single Platform Report (CSV)
 AUTH: CCP -> Get-IdentityHeader (psPASFormat) -> Use-PASSession
@@ -15,6 +11,10 @@ UPDATED:
   - Includes ReconcileAccountName
   - Includes LogonAccountSafe
   - Includes LogonAccountName
+  - Includes HasAssignedAccounts
+  - Includes AssignedAccountCount
+  - Includes AssignedAccountSample
+  - Includes PlatformAssignmentStatus
 
 NOTES:
   - Get-Platforms returns summary fields only.
@@ -22,6 +22,8 @@ NOTES:
   - If values are still blank there, this script falls back to Export Platform ZIP
     and parses the CPM INI / PVWA XML.
   - Export Platform requires Vault Admin rights.
+  - Account assignment check pulls all accounts once, groups them by platformId,
+    then joins the result back to each platform.
 #>
 
 # ---- Execution policy & unblock psPAS (silent) ----
@@ -41,6 +43,10 @@ $OutDir    = "E:\Installation Media\Script\OnboardScript\data"
 $CsvFile   = Join-Path $OutDir "CyberArk_Platforms.csv"
 $DebugFile = Join-Path $OutDir "CyberArk_Platforms_Raw.json"
 $LogFile   = Join-Path $OutDir "CyberArk_PlatformReportLog.txt"
+
+# Account lookup settings
+$AccountPageLimit  = 1000
+$AccountSampleLimit = 10
 
 # ---------------- LOGGING ----------------
 function Write-Log {
@@ -117,6 +123,89 @@ function Join-PropNames {
     }
 }
 
+function Get-CaseInsensitiveMemberValue {
+    param(
+        [Parameter(Mandatory)]$InputObject,
+        [Parameter(Mandatory)][string[]]$Names
+    )
+
+    if ($null -eq $InputObject) { return $null }
+
+    if ($InputObject -is [System.Collections.IDictionary]) {
+        foreach ($n in $Names) {
+            foreach ($k in $InputObject.Keys) {
+                if ([string]$k -ieq $n) {
+                    return $InputObject[$k]
+                }
+            }
+        }
+        return $null
+    }
+
+    $propNames = @($InputObject.PSObject.Properties.Name)
+    foreach ($n in $Names) {
+        $match = $propNames | Where-Object { $_ -ieq $n } | Select-Object -First 1
+        if ($match) {
+            return $InputObject.$match
+        }
+    }
+
+    return $null
+}
+
+function ConvertTo-BoolSafe {
+    param($Value)
+
+    if ($null -eq $Value) { return $false }
+
+    $s = [string]$Value
+    return ($s -match '^(true|1|yes)$')
+}
+
+function Format-AssignedAccountSample {
+    param(
+        [Parameter()]$Accounts,
+        [Parameter()][int]$Limit = 10
+    )
+
+    if (-not $Accounts) { return "" }
+
+    $sample = @($Accounts | Select-Object -First $Limit | ForEach-Object {
+        $safeName = [string](Get-CaseInsensitiveMemberValue -InputObject $_ -Names @('safeName','SafeName','safe'))
+        $name     = [string](Get-CaseInsensitiveMemberValue -InputObject $_ -Names @('name','Name'))
+        $userName = [string](Get-CaseInsensitiveMemberValue -InputObject $_ -Names @('userName','UserName','username'))
+        $address  = [string](Get-CaseInsensitiveMemberValue -InputObject $_ -Names @('address','Address'))
+
+        $left = ""
+        if (-not [string]::IsNullOrWhiteSpace($safeName) -and -not [string]::IsNullOrWhiteSpace($name)) {
+            $left = "{0}\{1}" -f $safeName, $name
+        }
+        elseif (-not [string]::IsNullOrWhiteSpace($name)) {
+            $left = $name
+        }
+        elseif (-not [string]::IsNullOrWhiteSpace($userName)) {
+            $left = $userName
+        }
+        else {
+            $left = "UnknownAccount"
+        }
+
+        $rightParts = @()
+        if (-not [string]::IsNullOrWhiteSpace($userName)) { $rightParts += $userName }
+        if (-not [string]::IsNullOrWhiteSpace($address))  { $rightParts += $address }
+
+        if ($rightParts.Count -gt 0) {
+            "{0} ({1})" -f $left, ($rightParts -join "@")
+        }
+        else {
+            $left
+        }
+    })
+
+    return ($sample -join "; ")
+}
+
+# ---------------- AUTH ----------------
 function Start-PASSessionFromCCP {
     param(
         [Parameter(Mandatory)][string]$ObjectName,
@@ -163,6 +252,7 @@ function Start-PASSessionFromCCP {
     Write-Log ("PAS session established ({0})." -f $UPUser) "Green"
 }
 
+# ---------------- PLATFORM API ----------------
 function Get-Platforms {
     param([string]$QueryString)
 
@@ -197,7 +287,6 @@ function Get-PlatformDetails {
 
     $encodedPlatformID = [uri]::EscapeDataString($PlatformID)
 
-    # Trailing slash helps when the platform name contains dots
     $u1 = "https://{0}.privilegecloud.cyberark.cloud/PasswordVault/API/Platforms/{1}/" -f $PCloudSubdomain, $encodedPlatformID
     $u2 = "https://{0}.privilegecloud.cyberark.cloud/PasswordVault/api/Platforms/{1}/" -f $PCloudSubdomain, $encodedPlatformID
 
@@ -206,7 +295,7 @@ function Get-PlatformDetails {
         return Invoke-RestMethod -Uri $u1 -Method GET -WebSession $s.WebSession -ErrorAction Stop
     }
     catch {
-        Write-Log ("Platform details (uppercase path) failed for [{0}], trying lowercase path. Reason: {1}" -f $PlatformID, $_.Exception.Message) "Yellow"
+        Write-Log ("Platform details uppercase path failed for [{0}], trying lowercase path. Reason: {1}" -f $PlatformID, $_.Exception.Message) "Yellow"
         Write-Log ("Calling platform details: {0}" -f $u2) "Gray"
         return Invoke-RestMethod -Uri $u2 -Method GET -WebSession $s.WebSession -ErrorAction Stop
     }
@@ -236,7 +325,7 @@ function Get-PlatformExportZip {
         Invoke-WebRequest -Uri $u1 -Method POST -WebSession $s.WebSession -OutFile $zipPath -ErrorAction Stop | Out-Null
     }
     catch {
-        Write-Log ("Platform export (uppercase path) failed for [{0}], trying lowercase path. Reason: {1}" -f $PlatformID, $_.Exception.Message) "Yellow"
+        Write-Log ("Platform export uppercase path failed for [{0}], trying lowercase path. Reason: {1}" -f $PlatformID, $_.Exception.Message) "Yellow"
         Write-Log ("Exporting platform package: {0}" -f $u2) "Gray"
         Invoke-WebRequest -Uri $u2 -Method POST -WebSession $s.WebSession -OutFile $zipPath -ErrorAction Stop | Out-Null
     }
@@ -248,36 +337,141 @@ function Get-PlatformExportZip {
     return $zipPath
 }
 
-function Get-CaseInsensitiveMemberValue {
-    param(
-        [Parameter(Mandatory)]$InputObject,
-        [Parameter(Mandatory)][string[]]$Names
-    )
+# ---------------- ACCOUNT API ----------------
+function Get-Accounts {
+    param([string]$QueryString)
 
-    if ($null -eq $InputObject) { return $null }
-
-    if ($InputObject -is [System.Collections.IDictionary]) {
-        foreach ($n in $Names) {
-            foreach ($k in $InputObject.Keys) {
-                if ([string]$k -ieq $n) {
-                    return $InputObject[$k]
-                }
-            }
-        }
-        return $null
+    $s = Get-PASSession
+    if (-not $s -or -not $s.WebSession) {
+        throw "No psPAS WebSession found. Auth failed or session not set."
     }
 
-    $propNames = @($InputObject.PSObject.Properties.Name)
-    foreach ($n in $Names) {
-        $match = $propNames | Where-Object { $_ -ieq $n } | Select-Object -First 1
-        if ($match) {
-            return $InputObject.$match
-        }
-    }
+    $u1 = "https://{0}.privilegecloud.cyberark.cloud/PasswordVault/API/Accounts{1}" -f $PCloudSubdomain, $QueryString
+    $u2 = "https://{0}.privilegecloud.cyberark.cloud/PasswordVault/api/Accounts{1}" -f $PCloudSubdomain, $QueryString
 
-    return $null
+    try {
+        Write-Log ("Calling accounts: {0}" -f $u1) "Gray"
+        return Invoke-RestMethod -Uri $u1 -Method GET -WebSession $s.WebSession -ErrorAction Stop
+    }
+    catch {
+        Write-Log ("Accounts uppercase path failed, trying lowercase path. Reason: {0}" -f $_.Exception.Message) "Yellow"
+        Write-Log ("Calling accounts: {0}" -f $u2) "Gray"
+        return Invoke-RestMethod -Uri $u2 -Method GET -WebSession $s.WebSession -ErrorAction Stop
+    }
 }
 
+function Get-AccountsFromResponse {
+    param($Response)
+
+    if ($null -eq $Response) { return @() }
+
+    if ($Response -is [System.Array]) {
+        return @($Response)
+    }
+
+    $value = Get-CaseInsensitiveMemberValue -InputObject $Response -Names @('value','accounts','Accounts')
+    if ($null -ne $value) {
+        return @($value)
+    }
+
+    return @()
+}
+
+function Get-AllPASAccounts {
+    param(
+        [Parameter()][int]$Limit = 1000
+    )
+
+    $allAccounts = New-Object System.Collections.Generic.List[object]
+    $offset = 0
+    $page = 1
+
+    while ($true) {
+        $qs = "?limit={0}&offset={1}" -f $Limit, $offset
+
+        $resp = Get-Accounts -QueryString $qs
+        $items = @(Get-AccountsFromResponse -Response $resp)
+
+        Write-Log ("Accounts page {0}: returned {1}; offset {2}" -f $page, $items.Count, $offset) "Gray"
+
+        foreach ($acct in $items) {
+            [void]$allAccounts.Add($acct)
+        }
+
+        if ($items.Count -lt $Limit) {
+            break
+        }
+
+        $offset += $Limit
+        $page++
+
+        if ($page -gt 10000) {
+            throw "Account pagination safety stop reached. Review API pagination behavior."
+        }
+    }
+
+    return @($allAccounts)
+}
+
+function Build-AccountPlatformLookup {
+    param(
+        [Parameter(Mandatory)]$Accounts
+    )
+
+    $lookup = @{}
+
+    foreach ($acct in @($Accounts)) {
+        if ($null -eq $acct) { continue }
+
+        $platformId = [string](Get-CaseInsensitiveMemberValue -InputObject $acct -Names @(
+            'platformId',
+            'platformID',
+            'PlatformId',
+            'PlatformID'
+        ))
+
+        if ([string]::IsNullOrWhiteSpace($platformId)) {
+            continue
+        }
+
+        if (-not $lookup.ContainsKey($platformId)) {
+            $lookup[$platformId] = New-Object System.Collections.Generic.List[object]
+        }
+
+        [void]$lookup[$platformId].Add($acct)
+    }
+
+    return $lookup
+}
+
+function Get-PlatformAssignmentStatus {
+    param(
+        [Parameter(Mandatory)]$Active,
+        [Parameter(Mandatory)][int]$AssignedAccountCount,
+        [Parameter(Mandatory)][bool]$AccountLookupReady
+    )
+
+    if (-not $AccountLookupReady) {
+        return "AccountLookupFailed"
+    }
+
+    $isActive = ConvertTo-BoolSafe $Active
+
+    if ($isActive -and $AssignedAccountCount -gt 0) {
+        return "Active_Assigned"
+    }
+    elseif ($isActive -and $AssignedAccountCount -eq 0) {
+        return "Active_NotAssigned"
+    }
+    elseif (-not $isActive -and $AssignedAccountCount -gt 0) {
+        return "Inactive_Assigned"
+    }
+    else {
+        return "Inactive_NotAssigned"
+    }
+}
+
+# ---------------- PLATFORM LINKED VALUE HELPERS ----------------
 function Get-PlatformPropertyValue {
     param(
         [Parameter(Mandatory)]$PlatformDetails,
@@ -287,7 +481,6 @@ function Get-PlatformPropertyValue {
     $props = Get-CaseInsensitiveMemberValue -InputObject $PlatformDetails -Names @('Properties','properties')
     if ($null -eq $props) { return "" }
 
-    # Case 1: dictionary
     if ($props -is [System.Collections.IDictionary]) {
         foreach ($wanted in $PropertyNames) {
             $direct = Get-CaseInsensitiveMemberValue -InputObject $props -Names @($wanted)
@@ -297,11 +490,9 @@ function Get-PlatformPropertyValue {
         }
     }
 
-    # Case 2: list / array
     foreach ($entry in @($props)) {
         if ($null -eq $entry) { continue }
 
-        # String case: Key=Value
         if ($entry -is [string]) {
             $line = $entry.Trim()
 
@@ -319,7 +510,6 @@ function Get-PlatformPropertyValue {
             continue
         }
 
-        # Object case: @{ Key='X'; Value='Y' } / @{ Name='X'; Value='Y' }
         $entryName = Get-CaseInsensitiveMemberValue -InputObject $entry -Names @('Key','Name','key','name')
         if ($null -ne $entryName) {
             foreach ($wanted in $PropertyNames) {
@@ -457,17 +647,14 @@ try {
 
     $PlatformsResponse = Get-Platforms -QueryString $qs
 
-    # Save raw JSON for debugging
     try {
         $PlatformsResponse | ConvertTo-Json -Depth 10 | Out-File -LiteralPath $DebugFile -Encoding utf8
-        Write-Log ("Raw response saved: {0}" -f $DebugFile) "Green"
+        Write-Log ("Raw platform response saved: {0}" -f $DebugFile) "Green"
     }
     catch {
-        Write-Log ("Could not save raw JSON: {0}" -f $_.Exception.Message) "Yellow"
+        Write-Log ("Could not save raw platform JSON: {0}" -f $_.Exception.Message) "Yellow"
     }
 
-    # Extract platforms array
-    $platforms = $null
     if ($PlatformsResponse.Platforms) {
         $platforms = $PlatformsResponse.Platforms
     }
@@ -489,6 +676,27 @@ try {
 
     Write-Log ("Platforms returned: {0}" -f $platforms.Count) "Green"
 
+    # Pull all accounts once and group by platformId
+    $accountLookupReady = $false
+    $accountsByPlatform = @{}
+
+    try {
+        Write-Log "Retrieving accounts to determine platform assignment status..." "Cyan"
+
+        $allAccounts = @(Get-AllPASAccounts -Limit $AccountPageLimit)
+        Write-Log ("Accounts returned for assignment lookup: {0}" -f $allAccounts.Count) "Green"
+
+        $accountsByPlatform = Build-AccountPlatformLookup -Accounts $allAccounts
+        $accountLookupReady = $true
+
+        Write-Log ("Platforms with at least one assigned account: {0}" -f $accountsByPlatform.Keys.Count) "Green"
+    }
+    catch {
+        Write-Log ("WARNING: Account assignment lookup failed. Platform report will still export, but account assignment columns will show Unknown/AccountLookupFailed. Error: {0}" -f $_.Exception.Message) "Yellow"
+        $accountLookupReady = $false
+        $accountsByPlatform = @{}
+    }
+
     $ProcessedPlatforms = foreach ($p in $platforms) {
 
         $g      = $p.general
@@ -497,6 +705,30 @@ try {
         $cred   = $p.credentialsManagement
         $sess   = $p.sessionManagement
         $wf     = $p.privilegedAccessWorkflows
+
+        $platformId = [string]$g.id
+
+        # Account assignment lookup
+        $assignedAccounts = @()
+        if ($accountLookupReady -and -not [string]::IsNullOrWhiteSpace($platformId) -and $accountsByPlatform.ContainsKey($platformId)) {
+            $assignedAccounts = @($accountsByPlatform[$platformId])
+        }
+
+        $assignedAccountCount = $assignedAccounts.Count
+
+        if ($accountLookupReady) {
+            $hasAssignedAccounts = [string]($assignedAccountCount -gt 0)
+            $assignedAccountSample = Format-AssignedAccountSample -Accounts $assignedAccounts -Limit $AccountSampleLimit
+        }
+        else {
+            $hasAssignedAccounts = "Unknown"
+            $assignedAccountSample = ""
+        }
+
+        $platformAssignmentStatus = Get-PlatformAssignmentStatus `
+            -Active $g.active `
+            -AssignedAccountCount $assignedAccountCount `
+            -AccountLookupReady $accountLookupReady
 
         # Future-proof direct reads if CyberArk ever exposes them in summary payload
         $reconcileSafe = [string](Get-CaseInsensitiveMemberValue -InputObject $cred -Names @('ReconcileAccountSafe','reconcileAccountSafe'))
@@ -511,7 +743,7 @@ try {
             [string]::IsNullOrWhiteSpace($logonSafe) -or
             [string]::IsNullOrWhiteSpace($logonName)) {
             try {
-                $detail = Get-PlatformDetails -PlatformID $g.id
+                $detail = Get-PlatformDetails -PlatformID $platformId
 
                 if ([string]::IsNullOrWhiteSpace($reconcileSafe)) {
                     $reconcileSafe = Get-PlatformPropertyValue -PlatformDetails $detail -PropertyNames @('ReconcileAccountSafe')
@@ -530,7 +762,7 @@ try {
                 }
             }
             catch {
-                Write-Log ("WARNING: Could not retrieve Get-PlatformDetails for [{0}]: {1}" -f $g.id, $_.Exception.Message) "Yellow"
+                Write-Log ("WARNING: Could not retrieve Get-PlatformDetails for [{0}]: {1}" -f $platformId, $_.Exception.Message) "Yellow"
             }
         }
 
@@ -540,7 +772,7 @@ try {
             [string]::IsNullOrWhiteSpace($logonSafe) -or
             [string]::IsNullOrWhiteSpace($logonName)) {
             try {
-                $exportVals = Get-PlatformLinkedValuesFromExport -PlatformID $g.id
+                $exportVals = Get-PlatformLinkedValuesFromExport -PlatformID $platformId
 
                 if ([string]::IsNullOrWhiteSpace($reconcileSafe)) {
                     $reconcileSafe = [string]$exportVals.ReconcileAccountSafe
@@ -559,14 +791,20 @@ try {
                 }
             }
             catch {
-                Write-Log ("WARNING: Could not export/parse platform package for [{0}]: {1}" -f $g.id, $_.Exception.Message) "Yellow"
+                Write-Log ("WARNING: Could not export/parse platform package for [{0}]: {1}" -f $platformId, $_.Exception.Message) "Yellow"
             }
         }
 
         [PSCustomObject]@{
-            PlatformID       = $g.id
+            PlatformID       = $platformId
             PlatformName     = $g.name
             Active           = $g.active
+
+            HasAssignedAccounts    = $hasAssignedAccounts
+            AssignedAccountCount   = if ($accountLookupReady) { $assignedAccountCount } else { "" }
+            AssignedAccountSample  = $assignedAccountSample
+            PlatformAssignmentStatus = $platformAssignmentStatus
+
             Description      = $g.description
             PlatformBaseID   = $g.platformBaseID
             PlatformType     = $g.platformType
