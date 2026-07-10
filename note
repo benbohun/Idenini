@@ -1,1036 +1,886 @@
-<# 
-Single Platform Report with Account Assignment Status (CSV)
 
-AUTH:
-  CCP -> Get-IdentityHeader -psPASFormat -> Use-PASSession
 
-EXPORTS:
-  - CyberArk_Platforms.csv
-  - CyberArk_Platforms_Raw.json
-  - CyberArk_Accounts_Raw_FirstPage.json
-  - CyberArk_PlatformReportLog.txt
 
-UPDATED:
-  - Includes ReconcileAccountSafe
-  - Includes ReconcileAccountName
-  - Includes LogonAccountSafe
-  - Includes LogonAccountName
-  - Includes HasAssignedAccounts
-  - Includes AssignedAccountCount
-  - Includes AssignedAccountSample
-  - Includes PlatformAssignmentStatus
+<#
+.SYNOPSIS
+    Deletes CyberArk accounts from a CSV by matching CyberArk username and address.
 
-FIX:
-  - Account lookup uses direct REST only.
-  - Bypasses psPAS Get-PASAccount to avoid object mismatch.
-  - Uses safe ArrayList/hashtable handling to prevent:
-      "Argument types do not match"
-  - If account lookup fails, platform report still exports.
+.DESCRIPTION
+    Read CSV rows containing Username and CyberArk Address.
+    For each row, the script searches CyberArk accounts and filters to exact matches where:
+        account.userName == CSV Username
+        account.address  == CSV CyberArk Address
 
-NOTES:
-  - Get-Platforms returns summary fields only.
-  - Get-PlatformDetails returns the platform Policy INI key/value list.
-  - If values are still blank there, this script falls back to Export Platform ZIP
-    and parses the CPM INI / PVWA XML.
-  - Export Platform requires Vault Admin rights.
-  - Account assignment check pulls all visible accounts once, groups them by platformId,
-    then joins the result back to each platform.
+    Login/config pattern matches the account field updater:
+      1. Load shared .env and selected env\<dev|prod>.env.
+      2. Apply proxy settings.
+      3. Prompt for CyberArk Identity service-user credentials.
+      4. Request OAuth bearer token from /oauth2/platformtoken.
+      5. Keep token only in memory and log only SHA256 fingerprint prefix.
+      6. Search CyberArk accounts by username/address.
+      7. Preview by default.
+      8. Delete only when -Execute -ConfirmDelete YES is supplied.
+      9. No per-account confirmation prompt is used.
+
+.NOTES
+    Designed for Windows PowerShell 5.1.
+    Do not store service-user passwords, bearer tokens, or production CSV data in Git.
 #>
 
-# ---- Execution policy & unblock psPAS silent ----
-try { Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force -ErrorAction Stop } catch {}
+#requires -Version 5.1
+[CmdletBinding()]
+param(
+    # CSV file containing the disabled accounts to delete.
+    [string]$CsvFile = (Join-Path $PSScriptRoot 'samples\delete-accounts-template.csv'),
 
-$psPASDirs = @(
-    "$env:ProgramFiles\WindowsPowerShell\Modules\psPAS\6.4.85",
-    "$HOME\Documents\WindowsPowerShell\Modules\psPAS\6.4.85"
-) | Where-Object { Test-Path $_ }
+    # Selects env\dev.env or env\prod.env.
+    [ValidateSet('dev','prod')]
+    [string]$Environment = 'dev',
 
-foreach ($dir in $psPASDirs) {
-    try { Get-ChildItem -Path $dir -Recurse -File | Unblock-File -ErrorAction SilentlyContinue } catch {}
+    # Folder that contains dev.env and prod.env.
+    [string]$EnvFolder = (Join-Path $PSScriptRoot 'env'),
+
+    # Required to perform deletes. Without this, the script only reports matches.
+    [switch]$Execute,
+
+    # Second batch-level confirmation gate. No per-account prompts are used.
+    [ValidateSet('NO','YES')]
+    [string]$ConfirmDelete = 'NO',
+
+    # By default, rows with multiple exact CyberArk matches are skipped.
+    # Supply this switch only when you intentionally want every exact match deleted.
+    [switch]$DeleteAllExactMatches,
+
+    # Uses the logged-in Windows identity for proxy authentication.
+    [switch]$ProxyUseDefaultCredentials,
+
+    # Maximum number of candidate accounts to read from each API search.
+    [int]$MaxSearchResults = 1000,
+
+    # Where CSV reports are written.
+    [string]$ReportFolder = (Join-Path $PSScriptRoot 'reports'),
+
+    # Where logs are written.
+    [string]$LogFolder = (Join-Path $PSScriptRoot 'logs'),
+
+    # Optional suffix for log/report file names.
+    [string]$LogId = ''
+)
+
+$ErrorActionPreference = 'Stop'
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+<#
+    Optional bootstrap proxy.
+    Leave as Placehold and use env\dev.env or env\prod.env normally:
+        PROXY="http://proxy.company.com:8080"
+#>
+$proxyUri = "Placehold"
+
+if ($proxyUri -and $proxyUri.Trim() -notmatch '^(Placehold|Placeholder|YOUR-|<.*>|CHANGEME)$') {
+    $proxy = New-Object System.Net.WebProxy($proxyUri, $true)
+    [System.Net.WebRequest]::DefaultWebProxy = $proxy
+    [System.Net.WebRequest]::DefaultWebProxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials
+    [System.Net.WebRequest]::DefaultWebProxy.Address | Out-Null
 }
 
-# ---------------- SETTINGS ----------------
-$OutDir         = "E:\Installation Media\Script\OnboardScript\data"
-$CsvFile        = Join-Path $OutDir "CyberArk_Platforms.csv"
-$DebugFile      = Join-Path $OutDir "CyberArk_Platforms_Raw.json"
-$AcctDebugFile  = Join-Path $OutDir "CyberArk_Accounts_Raw_FirstPage.json"
-$LogFile        = Join-Path $OutDir "CyberArk_PlatformReportLog.txt"
+$script:LogFile = $null
+$script:ReportFile = $null
+$script:DeleteReportFile = $null
+$script:CandidateReportFile = $null
+$script:Config = $null
 
-# 1000 worked in your tenant and is faster than 100.
-$AccountPageLimit   = 1000
-$AccountSampleLimit = 10
+function Test-BlankValue {
+    param([object]$Value)
 
-# ---------------- CCP + IDENTITY SETTINGS ----------------
-$CCPAddress      = "https://vskau1p1231.cna.com"
-$CCPLocation     = "AIMWebService"
-$CCPAppID        = "PAMDiscovery"
-$CCPSafe         = "CA_PCloud_Admins"
-$CCPObject       = "cna.com-CA_PAMDiscovery_SVC"
-$ServiceUPUser   = "CA_PAMDiscovery_SVC"
-$CCPWindowsAuth  = $false
+    if ($null -eq $Value) { return $true }
 
-$IdentityTenantURL = "https://aat4012.id.cyberark.cloud"
-$PCloudSubdomain   = "cna-prod"
+    $text = $Value.ToString().Trim()
 
-# ---------------- LOGGING ----------------
-function Write-Log {
+    if ($text.Length -eq 0) { return $true }
+    if ($text -match '^(Placehold|Placeholder|YOUR-|<.*>|CHANGEME)$') { return $true }
+
+    return $false
+}
+
+function New-RunLog {
+    if (-not (Test-Path $LogFolder)) {
+        New-Item -Path $LogFolder -ItemType Directory -Force | Out-Null
+    }
+
+    if (-not (Test-Path $ReportFolder)) {
+        New-Item -Path $ReportFolder -ItemType Directory -Force | Out-Null
+    }
+
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $suffix = if (Test-BlankValue $LogId) { '' } else { "_$LogId" }
+
+    $script:LogFile = Join-Path $LogFolder "Delete-CyberArkAccounts_$stamp$suffix.log"
+    $script:ReportFile = Join-Path $ReportFolder "Delete-CyberArkAccounts_Report_$stamp$suffix.csv"
+    $script:DeleteReportFile = Join-Path $ReportFolder "Delete-CyberArkAccounts_Deleted_$stamp$suffix.csv"
+    $script:CandidateReportFile = Join-Path $ReportFolder "Delete-CyberArkAccounts_Candidates_$stamp$suffix.csv"
+
+    Set-Content -Path $script:LogFile -Value "$(Get-Date -Format s) source=New-RunLog [INFO] Starting run"
+}
+
+function Write-RunLog {
     param(
-        [Parameter(Mandatory)][string]$Message,
-        [Parameter()][ValidateSet("White","Green","Yellow","Red","Cyan","Gray")][string]$Color = "White"
+        [string]$Source,
+        [string]$Message,
+
+        [ValidateSet('DEBUG','INFO','WARN','ERROR')]
+        [string]$Level = 'INFO'
     )
 
-    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $line = "{0} - {1}" -f $ts, $Message
+    $line = "$(Get-Date -Format s) source=$Source [$Level] $Message"
+    Add-Content -Path $script:LogFile -Value $line
 
-    try { Write-Host $line -ForegroundColor $Color } catch { Write-Host $line }
-    try { Add-Content -Path $LogFile -Value $line } catch {}
-}
-
-# Ensure output directory exists
-try {
-    if (-not (Test-Path $OutDir)) {
-        New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
+    if ($Level -eq 'ERROR') {
+        Write-Host $line -ForegroundColor Red
     }
-}
-catch {
-    Write-Host ("ERROR: Cannot create output directory: {0}. {1}" -f $OutDir, $_.Exception.Message) -ForegroundColor Red
-    exit 1
-}
-
-# ---------------- LOAD psPAS ----------------
-try {
-    Import-Module psPAS -Force -ErrorAction Stop
-    $mod = Get-Module psPAS
-    Write-Log ("psPAS loaded ({0})." -f $mod.Version) "Green"
-}
-catch {
-    Write-Log ("ERROR: psPAS module not found/loaded: {0}" -f $_.Exception.Message) "Red"
-    exit 1
-}
-
-# ---------------- GENERAL HELPERS ----------------
-function Join-Names {
-    param($arr)
-
-    if (-not $arr) { return "" }
-
-    try {
-        return (($arr | ForEach-Object { $_.name } | Where-Object { $_ }) -join "; ")
+    elseif ($Level -eq 'WARN') {
+        Write-Host $line -ForegroundColor Yellow
     }
-    catch {
-        return ""
+    else {
+        Write-Host $line
     }
 }
 
-function Join-PropNames {
-    param($arr)
+function Read-DotEnvFile {
+    param([string]$Path)
 
-    if (-not $arr) { return "" }
+    $result = @{}
 
-    try {
-        return (($arr | ForEach-Object { $_.name } | Where-Object { $_ }) -join "; ")
+    if (-not (Test-Path $Path)) {
+        return $result
     }
-    catch {
-        return ""
-    }
-}
 
-function Get-CaseInsensitiveMemberValue {
-    param(
-        [Parameter(Mandatory)]$InputObject,
-        [Parameter(Mandatory)][string[]]$Names
-    )
+    foreach ($line in (Get-Content -Path $Path -ErrorAction Stop)) {
+        $trimmed = $line.Trim()
 
-    if ($null -eq $InputObject) { return $null }
+        if ($trimmed.Length -eq 0) { continue }
+        if ($trimmed.StartsWith('#')) { continue }
+        if ($trimmed -notmatch '=') { continue }
 
-    if ($InputObject -is [System.Collections.IDictionary]) {
-        foreach ($n in $Names) {
-            foreach ($k in $InputObject.Keys) {
-                if ([string]$k -ieq $n) {
-                    return $InputObject[$k]
-                }
+        $parts = $trimmed.Split('=', 2)
+        $key = $parts[0].Trim()
+        $value = $parts[1].Trim()
+
+        if ($value.Length -ge 2) {
+            if (
+                ($value.StartsWith('"') -and $value.EndsWith('"')) -or
+                ($value.StartsWith("'") -and $value.EndsWith("'"))
+            ) {
+                $value = $value.Substring(1, $value.Length - 2)
             }
         }
+
+        if (-not (Test-BlankValue $key)) {
+            $result[$key] = $value
+        }
+    }
+
+    return $result
+}
+
+function Join-EnvValues {
+    param([hashtable[]]$Maps)
+
+    $merged = @{}
+
+    foreach ($map in $Maps) {
+        foreach ($key in $map.Keys) {
+            $merged[$key] = $map[$key]
+        }
+    }
+
+    return $merged
+}
+
+function Normalize-PvwaApiBase {
+    param([string]$PvwaValue)
+
+    $base = $PvwaValue.Trim().TrimEnd('/')
+
+    $base = $base -replace '/PrivilegeCloud$', ''
+    $base = $base -replace '/PasswordVault/API/Accounts/?$', '/PasswordVault/API'
+    $base = $base -replace '/PasswordVault/API/.+$', '/PasswordVault/API'
+
+    if ($base -match '/PasswordVault/API$') {
+        return $base
+    }
+
+    if ($base -match '/PasswordVault$') {
+        return "$base/API"
+    }
+
+    return "$base/PasswordVault/API"
+}
+
+function Resolve-IdentityBase {
+    param([hashtable]$Settings)
+
+    $tenant = $Settings['TENANT_ID']
+
+    if (Test-BlankValue $tenant) {
+        throw 'TENANT_ID is missing in .env. Example: TENANT_ID=abq4291 or TENANT_ID=https://abq4291.id.cyberark.cloud'
+    }
+
+    $tenant = $tenant.Trim().TrimEnd('/')
+
+    if ($tenant -match '^https?://') {
+        return $tenant
+    }
+
+    if ($tenant -match '\.id\.cyberark\.cloud$') {
+        return "https://$tenant"
+    }
+
+    if ($tenant -match '\.') {
+        return "https://$tenant"
+    }
+
+    return "https://$tenant.id.cyberark.cloud"
+}
+
+function Get-ProxyFromSettings {
+    param([hashtable]$Settings)
+
+    $proxy = $Settings['PROXY']
+
+    if (-not (Test-BlankValue $proxy)) {
+        return $proxy.Trim()
+    }
+
+    $proxyAddress = $Settings['PROXY_ADDRESS']
+
+    if (Test-BlankValue $proxyAddress) {
+        $proxyAddress = $Settings['ROXY_ADDRESS']
+    }
+
+    $proxyPort = $Settings['PROXY_PORT']
+
+    if ((Test-BlankValue $proxyAddress) -or (Test-BlankValue $proxyPort)) {
         return $null
     }
 
+    $proxyAddress = $proxyAddress.Trim().TrimEnd('/')
+
+    if ($proxyAddress -notmatch '^https?://') {
+        $proxyAddress = "http://$proxyAddress"
+    }
+
+    return "$proxyAddress`:$($proxyPort.Trim())"
+}
+
+function Import-RunConfig {
+    $baseFile = Join-Path $PSScriptRoot '.env'
+    $envFile1 = Join-Path $EnvFolder "$Environment.env"
+    $envFile2 = Join-Path $PSScriptRoot "$Environment.env"
+
+    $base = Read-DotEnvFile -Path $baseFile
+    $envSpecific = @{}
+
+    if (Test-Path $envFile1) {
+        $envSpecific = Read-DotEnvFile -Path $envFile1
+    }
+    elseif (Test-Path $envFile2) {
+        $envSpecific = Read-DotEnvFile -Path $envFile2
+    }
+    else {
+        throw "Could not find environment file for '$Environment'. Expected $envFile1 or $envFile2"
+    }
+
+    $settings = Join-EnvValues -Maps @($base, $envSpecific)
+
+    if (Test-BlankValue $settings['PVWA']) {
+        if (Test-BlankValue $settings['SUB_DOMAIN']) {
+            throw 'PVWA is missing and SUB_DOMAIN is not set. Set PVWA in dev.env/prod.env or SUB_DOMAIN in .env.'
+        }
+
+        $settings['PVWA'] = "https://$($settings['SUB_DOMAIN']).privilegecloud.cyberark.cloud"
+    }
+
+    $identityBase = Resolve-IdentityBase -Settings $settings
+    $apiBase = Normalize-PvwaApiBase -PvwaValue $settings['PVWA']
+    $proxyFromEnv = Get-ProxyFromSettings -Settings $settings
+
+    if (-not (Test-BlankValue $proxyFromEnv)) {
+        $webProxy = New-Object System.Net.WebProxy($proxyFromEnv, $true)
+
+        if ($ProxyUseDefaultCredentials) {
+            $webProxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials
+        }
+
+        [System.Net.WebRequest]::DefaultWebProxy = $webProxy
+    }
+
+    $script:Config = [pscustomobject]@{
+        Environment = $Environment
+        IdentityBase = $identityBase
+        TokenUrl = "$identityBase/oauth2/platformtoken"
+        ApiBase = $apiBase
+        Proxy = $proxyFromEnv
+    }
+
+    Write-RunLog 'Import-RunConfig' "Environment=$Environment IdentityBase=$identityBase ApiBase=$apiBase ProxyConfigured=$([bool]$proxyFromEnv)" 'INFO'
+}
+
+function ConvertTo-FormBody {
+    param([hashtable]$Body)
+
+    $pairs = @()
+
+    foreach ($key in $Body.Keys) {
+        $k = [System.Uri]::EscapeDataString([string]$key)
+        $v = [System.Uri]::EscapeDataString([string]$Body[$key])
+        $pairs += "$k=$v"
+    }
+
+    return ($pairs -join '&')
+}
+
+function Get-Sha256Fingerprint {
+    param([string]$Text)
+
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+
     try {
-        $propNames = @($InputObject.PSObject.Properties.Name)
-        foreach ($n in $Names) {
-            $match = $propNames | Where-Object { $_ -ieq $n } | Select-Object -First 1
-            if ($match) {
-                return $InputObject.$match
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
+        $hash = $sha.ComputeHash($bytes)
+
+        return (($hash | ForEach-Object { $_.ToString('x2') }) -join '')
+    }
+    finally {
+        $sha.Dispose()
+    }
+}
+
+function Get-WebErrorText {
+    param([System.Management.Automation.ErrorRecord]$ErrorRecord)
+
+    $msg = $ErrorRecord.Exception.Message
+    $response = $ErrorRecord.Exception.Response
+
+    if ($null -ne $response) {
+        try {
+            $stream = $response.GetResponseStream()
+
+            if ($null -ne $stream) {
+                $reader = New-Object System.IO.StreamReader($stream)
+                $body = $reader.ReadToEnd()
+
+                if (-not (Test-BlankValue $body)) {
+                    $msg = "$msg | Response: $body"
+                }
             }
         }
+        catch {
+            # Keep original error.
+        }
     }
-    catch {}
+
+    return $msg
+}
+
+function Get-IdentityBearerToken {
+    Write-RunLog 'Get-IdentityBearerToken' 'Prompting for CyberArk Identity service-user credentials' 'INFO'
+
+    $credential = Get-Credential -Message 'Enter CyberArk Identity service-user credentials'
+
+    $body = ConvertTo-FormBody -Body @{
+        grant_type = 'client_credentials'
+        client_id = $credential.UserName
+        client_secret = $credential.GetNetworkCredential().Password
+    }
+
+    $params = @{
+        Method = 'Post'
+        Uri = $script:Config.TokenUrl
+        Body = $body
+        ContentType = 'application/x-www-form-urlencoded'
+        Headers = @{ Accept = 'application/json' }
+        ErrorAction = 'Stop'
+    }
+
+    if (-not (Test-BlankValue $script:Config.Proxy)) {
+        $params['Proxy'] = $script:Config.Proxy
+    }
+
+    if ($ProxyUseDefaultCredentials) {
+        $params['ProxyUseDefaultCredentials'] = $true
+    }
+
+    try {
+        $response = Invoke-RestMethod @params
+    }
+    catch {
+        throw "Identity token request failed. $(Get-WebErrorText -ErrorRecord $_)"
+    }
+
+    if ($null -eq $response.access_token) {
+        throw 'Identity token response did not include access_token.'
+    }
+
+    $token = [string]$response.access_token
+    $fingerprint = Get-Sha256Fingerprint -Text $token
+
+    Write-RunLog 'Get-IdentityBearerToken' "Token acquired. SHA256 fingerprint=$($fingerprint.Substring(0,16))... ExpiresIn=$($response.expires_in)" 'INFO'
+
+    return $token
+}
+
+function Invoke-CyberArkRest {
+    param(
+        [ValidateSet('GET','POST','PATCH','DELETE')]
+        [string]$Method,
+
+        [string]$Path,
+
+        [string]$Token,
+
+        [object]$Body = $null,
+
+        [string]$ContentType = 'application/json'
+    )
+
+    if ($Path -match '^https?://') {
+        $uri = $Path
+    }
+    else {
+        $uri = "$($script:Config.ApiBase)/$($Path.TrimStart('/'))"
+    }
+
+    $params = @{
+        Method = $Method
+        Uri = $uri
+        Headers = @{ Authorization = "Bearer $Token" }
+        ErrorAction = 'Stop'
+    }
+
+    if ($Method -ne 'GET' -and $Method -ne 'DELETE') {
+        $params['ContentType'] = $ContentType
+    }
+
+    if ($null -ne $Body) {
+        if ($Body -is [string]) {
+            $params['Body'] = $Body
+        }
+        else {
+            $params['Body'] = ($Body | ConvertTo-Json -Depth 30 -Compress)
+        }
+    }
+
+    if (-not (Test-BlankValue $script:Config.Proxy)) {
+        $params['Proxy'] = $script:Config.Proxy
+    }
+
+    if ($ProxyUseDefaultCredentials) {
+        $params['ProxyUseDefaultCredentials'] = $true
+    }
+
+    try {
+        return Invoke-RestMethod @params
+    }
+    catch {
+        throw "REST call failed. Method=$Method Uri=$uri $(Get-WebErrorText -ErrorRecord $_)"
+    }
+}
+
+function Get-RowValue {
+    param(
+        [pscustomobject]$Row,
+        [string[]]$Names
+    )
+
+    foreach ($name in $Names) {
+        $p = $Row.PSObject.Properties[$name]
+
+        if ($null -ne $p -and -not (Test-BlankValue $p.Value)) {
+            return $p.Value.ToString().Trim()
+        }
+    }
 
     return $null
 }
 
-function Get-ObjectPropertyString {
-    param(
-        [Parameter()]$InputObject,
-        [Parameter(Mandatory)][string[]]$Names
-    )
-
-    if ($null -eq $InputObject) { return "" }
-
-    foreach ($name in $Names) {
-        try {
-            $prop = $InputObject.PSObject.Properties |
-                    Where-Object { $_.Name -ieq $name } |
-                    Select-Object -First 1
-
-            if ($prop -and $null -ne $prop.Value) {
-                $value = [string]$prop.Value
-                if (-not [string]::IsNullOrWhiteSpace($value)) {
-                    return $value.Trim()
-                }
-            }
-        }
-        catch {}
+function Get-CsvRows {
+    if (-not (Test-Path $CsvFile)) {
+        throw "CSV file not found: $CsvFile"
     }
 
-    return ""
+    if ((Get-Item $CsvFile).Length -eq 0) {
+        throw "CSV file is empty: $CsvFile"
+    }
+
+    $rows = Import-Csv -Path $CsvFile | Where-Object {
+        ($_.PSObject.Properties.Value | Where-Object {
+            $null -ne $_ -and $_.ToString().Trim().Length -gt 0
+        }).Count -gt 0
+    }
+
+    if ($null -eq $rows -or @($rows).Count -eq 0) {
+        throw "CSV contains no data rows: $CsvFile"
+    }
+
+    $first = @($rows)[0]
+
+    $hasUser = $false
+    foreach ($name in @('Username','UserName','CyberArk Username','CyberArk UserName','CurrentCyberArkUsername')) {
+        if ($first.PSObject.Properties[$name]) { $hasUser = $true }
+    }
+
+    $hasAddress = $false
+    foreach ($name in @('CyberArk Address','Address','TargetAddress','CyberArkAddress')) {
+        if ($first.PSObject.Properties[$name]) { $hasAddress = $true }
+    }
+
+    if (-not $hasUser) {
+        throw 'CSV is missing required Username column. Accepted aliases: Username, UserName, CyberArk Username, CyberArk UserName, CurrentCyberArkUsername.'
+    }
+
+    if (-not $hasAddress) {
+        throw 'CSV is missing required CyberArk Address column. Accepted aliases: CyberArk Address, CyberArkAddress, Address, TargetAddress.'
+    }
+
+    Write-RunLog 'Get-CsvRows' "Imported $(@($rows).Count) row(s) from $CsvFile" 'INFO'
+
+    return @($rows)
 }
 
-function ConvertTo-BoolSafe {
-    param($Value)
-
-    if ($null -eq $Value) { return $false }
-
-    $s = [string]$Value
-    return ($s -match '^(true|1|yes)$')
-}
-
-function Get-RestErrorDetail {
-    param($ErrorRecord)
-
-    $detail = ""
-
-    try {
-        if ($ErrorRecord.Exception.Response) {
-            $responseStream = $ErrorRecord.Exception.Response.GetResponseStream()
-            if ($responseStream) {
-                $reader = New-Object System.IO.StreamReader($responseStream)
-                $detail = $reader.ReadToEnd()
-                try { $reader.Dispose() } catch {}
-            }
-        }
-    }
-    catch {}
-
-    if ([string]::IsNullOrWhiteSpace($detail)) {
-        try { $detail = $ErrorRecord.Exception.Message } catch { $detail = "Unknown error" }
-    }
-
-    return $detail
-}
-
-function Format-AssignedAccountSample {
-    param(
-        [Parameter()]$Accounts,
-        [Parameter()][int]$Limit = 10
-    )
-
-    if (-not $Accounts) { return "" }
-
-    $sample = @($Accounts | Select-Object -First $Limit | ForEach-Object {
-        $safeName = Get-ObjectPropertyString -InputObject $_ -Names @('safeName','SafeName','safe')
-        $name     = Get-ObjectPropertyString -InputObject $_ -Names @('name','Name')
-        $userName = Get-ObjectPropertyString -InputObject $_ -Names @('userName','UserName','username')
-        $address  = Get-ObjectPropertyString -InputObject $_ -Names @('address','Address')
-
-        $left = ""
-
-        if (-not [string]::IsNullOrWhiteSpace($safeName) -and -not [string]::IsNullOrWhiteSpace($name)) {
-            $left = "{0}\{1}" -f $safeName, $name
-        }
-        elseif (-not [string]::IsNullOrWhiteSpace($name)) {
-            $left = $name
-        }
-        elseif (-not [string]::IsNullOrWhiteSpace($userName)) {
-            $left = $userName
-        }
-        else {
-            $left = "UnknownAccount"
-        }
-
-        $rightParts = @()
-        if (-not [string]::IsNullOrWhiteSpace($userName)) { $rightParts += $userName }
-        if (-not [string]::IsNullOrWhiteSpace($address))  { $rightParts += $address }
-
-        if ($rightParts.Count -gt 0) {
-            "{0} ({1})" -f $left, ($rightParts -join "@")
-        }
-        else {
-            $left
-        }
-    })
-
-    return ($sample -join "; ")
-}
-
-# ---------------- AUTH ----------------
-function Start-PASSessionFromCCP {
-    param(
-        [Parameter(Mandatory)][string]$ObjectName,
-        [Parameter(Mandatory)][string]$UPUser
-    )
-
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-
-    $headers = @{ "Content-Type" = "application/json" }
-    $ccpUrl  = "{0}/{1}/api/Accounts?AppID={2}&Safe={3}&Object={4}" -f `
-        $CCPAddress.TrimEnd('/'),
-        $CCPLocation.Trim('/'),
-        $CCPAppID,
-        $CCPSafe,
-        $ObjectName
-
-    Write-Log "Retrieving API credentials from CCP..." "Cyan"
-    Write-Log ("CCP URL: {0}" -f $ccpUrl) "Gray"
-
-    $resp = Invoke-RestMethod -Uri $ccpUrl -Method GET -Headers $headers -UseDefaultCredentials:$CCPWindowsAuth -ErrorAction Stop
-
-    if (-not $resp -or -not $resp.Content) {
-        throw "Empty CCP response. Missing Content."
-    }
-
-    Write-Log ("CCP secret retrieved successfully for: {0}" -f $UPUser) "Green"
-
-    $UPPass = ConvertTo-SecureString $resp.Content -AsPlainText -Force
-    $UPCred = [PSCredential]::new($UPUser, $UPPass)
-
-    Write-Log ("Authenticating to Privilege Cloud via Identity header as {0}..." -f $UPUser) "Cyan"
-
-    $headerSession = Get-IdentityHeader `
-        -IdentityTenantURL $IdentityTenantURL `
-        -psPASFormat `
-        -PCloudSubdomain $PCloudSubdomain `
-        -UPCreds $UPCred
-
-    Use-PASSession $headerSession
-
-    if (-not (Get-PASSession)) {
-        throw "psPAS session not established."
-    }
-
-    Write-Log ("PAS session established ({0})." -f $UPUser) "Green"
-}
-
-# ---------------- PLATFORM API ----------------
-function Get-Platforms {
-    param([string]$QueryString)
-
-    $s = Get-PASSession
-    if (-not $s -or -not $s.WebSession) {
-        throw "No psPAS WebSession found. Auth failed or session not set."
-    }
-
-    $u1 = "https://{0}.privilegecloud.cyberark.cloud/PasswordVault/API/Platforms{1}" -f $PCloudSubdomain, $QueryString
-    $u2 = "https://{0}.privilegecloud.cyberark.cloud/PasswordVault/api/Platforms{1}" -f $PCloudSubdomain, $QueryString
-
-    try {
-        Write-Log ("Calling platforms: {0}" -f $u1) "Cyan"
-        return Invoke-RestMethod -Uri $u1 -Method GET -WebSession $s.WebSession -ErrorAction Stop
-    }
-    catch {
-        $err1 = Get-RestErrorDetail -ErrorRecord $_
-        Write-Log ("Platforms uppercase path failed, trying lowercase. Error: {0}" -f $err1) "Yellow"
-
-        try {
-            Write-Log ("Calling platforms lowercase: {0}" -f $u2) "Cyan"
-            return Invoke-RestMethod -Uri $u2 -Method GET -WebSession $s.WebSession -ErrorAction Stop
-        }
-        catch {
-            $err2 = Get-RestErrorDetail -ErrorRecord $_
-            throw ("Platforms API failed. Uppercase error: {0} | Lowercase error: {1}" -f $err1, $err2)
-        }
-    }
-}
-
-function Get-PlatformDetails {
-    param(
-        [Parameter(Mandatory)][string]$PlatformID
-    )
-
-    $s = Get-PASSession
-    if (-not $s -or -not $s.WebSession) {
-        throw "No psPAS WebSession found. Auth failed or session not set."
-    }
-
-    $encodedPlatformID = [uri]::EscapeDataString($PlatformID)
-
-    # Trailing slash helps when the platform name contains dots.
-    $u1 = "https://{0}.privilegecloud.cyberark.cloud/PasswordVault/API/Platforms/{1}/" -f $PCloudSubdomain, $encodedPlatformID
-    $u2 = "https://{0}.privilegecloud.cyberark.cloud/PasswordVault/api/Platforms/{1}/" -f $PCloudSubdomain, $encodedPlatformID
-
-    try {
-        Write-Log ("Calling platform details: {0}" -f $u1) "Gray"
-        return Invoke-RestMethod -Uri $u1 -Method GET -WebSession $s.WebSession -ErrorAction Stop
-    }
-    catch {
-        $err1 = Get-RestErrorDetail -ErrorRecord $_
-        Write-Log ("Platform details uppercase path failed for [{0}], trying lowercase. Error: {1}" -f $PlatformID, $err1) "Yellow"
-
-        try {
-            Write-Log ("Calling platform details lowercase: {0}" -f $u2) "Gray"
-            return Invoke-RestMethod -Uri $u2 -Method GET -WebSession $s.WebSession -ErrorAction Stop
-        }
-        catch {
-            $err2 = Get-RestErrorDetail -ErrorRecord $_
-            throw ("Platform details API failed for [{0}]. Uppercase error: {1} | Lowercase error: {2}" -f $PlatformID, $err1, $err2)
-        }
-    }
-}
-
-function Get-PlatformExportZip {
-    param(
-        [Parameter(Mandatory)][string]$PlatformID
-    )
-
-    $s = Get-PASSession
-    if (-not $s -or -not $s.WebSession) {
-        throw "No psPAS WebSession found. Auth failed or session not set."
-    }
-
-    $encodedPlatformID = [uri]::EscapeDataString($PlatformID)
-
-    $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("CA_PlatformExport_" + [guid]::NewGuid().ToString("N"))
-    $null = New-Item -ItemType Directory -Path $tempRoot -Force
-    $zipPath = Join-Path $tempRoot ($PlatformID + ".zip")
-
-    $u1 = "https://{0}.privilegecloud.cyberark.cloud/PasswordVault/API/Platforms/{1}/Export/" -f $PCloudSubdomain, $encodedPlatformID
-    $u2 = "https://{0}.privilegecloud.cyberark.cloud/PasswordVault/api/Platforms/{1}/Export/" -f $PCloudSubdomain, $encodedPlatformID
-
-    try {
-        Write-Log ("Exporting platform package: {0}" -f $u1) "Gray"
-        Invoke-WebRequest -Uri $u1 -Method POST -WebSession $s.WebSession -OutFile $zipPath -ErrorAction Stop | Out-Null
-    }
-    catch {
-        $err1 = Get-RestErrorDetail -ErrorRecord $_
-        Write-Log ("Platform export uppercase path failed for [{0}], trying lowercase. Error: {1}" -f $PlatformID, $err1) "Yellow"
-
-        try {
-            Write-Log ("Exporting platform package lowercase: {0}" -f $u2) "Gray"
-            Invoke-WebRequest -Uri $u2 -Method POST -WebSession $s.WebSession -OutFile $zipPath -ErrorAction Stop | Out-Null
-        }
-        catch {
-            $err2 = Get-RestErrorDetail -ErrorRecord $_
-            throw ("Platform export failed for [{0}]. Uppercase error: {1} | Lowercase error: {2}" -f $PlatformID, $err1, $err2)
-        }
-    }
-
-    if (-not (Test-Path $zipPath)) {
-        throw "Platform export did not produce a ZIP file."
-    }
-
-    return $zipPath
-}
-
-# ---------------- ACCOUNT API ----------------
-function Get-Accounts {
-    param([string]$QueryString)
-
-    $s = Get-PASSession
-    if (-not $s -or -not $s.WebSession) {
-        throw "No psPAS WebSession found. Auth failed or session not set."
-    }
-
-    $u1 = "https://{0}.privilegecloud.cyberark.cloud/PasswordVault/API/Accounts{1}" -f $PCloudSubdomain, $QueryString
-    $u2 = "https://{0}.privilegecloud.cyberark.cloud/PasswordVault/api/Accounts{1}" -f $PCloudSubdomain, $QueryString
-
-    try {
-        Write-Log ("Calling accounts: {0}" -f $u1) "Gray"
-        return Invoke-RestMethod -Uri $u1 -Method GET -WebSession $s.WebSession -ErrorAction Stop
-    }
-    catch {
-        $err1 = Get-RestErrorDetail -ErrorRecord $_
-        Write-Log ("Accounts uppercase path failed. Error: {0}" -f $err1) "Yellow"
-
-        try {
-            Write-Log ("Calling accounts lowercase path: {0}" -f $u2) "Gray"
-            return Invoke-RestMethod -Uri $u2 -Method GET -WebSession $s.WebSession -ErrorAction Stop
-        }
-        catch {
-            $err2 = Get-RestErrorDetail -ErrorRecord $_
-            throw ("Accounts API failed. Uppercase error: {0} | Lowercase error: {1}" -f $err1, $err2)
-        }
-    }
-}
-
-function Get-AccountsFromResponse {
-    param($Response)
+function ConvertTo-AccountList {
+    param([object]$Response)
 
     if ($null -eq $Response) { return @() }
 
-    if ($Response -is [System.Array]) {
-        return @($Response)
+    if ($Response -is [System.Array]) { return @($Response) }
+
+    foreach ($name in @('value','accounts','Accounts')) {
+        $p = $Response.PSObject.Properties[$name]
+
+        if ($null -ne $p) {
+            return @($p.Value)
+        }
     }
 
-    $value = Get-CaseInsensitiveMemberValue -InputObject $Response -Names @('value','accounts','Accounts')
-
-    if ($null -ne $value) {
-        return @($value)
-    }
-
-    return @()
+    return @($Response)
 }
 
-function Get-AllPASAccountsViaREST {
+function Add-UniqueAccountById {
     param(
-        [Parameter()][int]$Limit = 1000
+        [hashtable]$Table,
+        [object]$Account
     )
 
-    $allAccounts = New-Object System.Collections.ArrayList
+    if ($null -eq $Account) { return }
+
+    $id = $null
+
+    foreach ($name in @('id','ID','accountId','AccountID')) {
+        $p = $Account.PSObject.Properties[$name]
+        if ($null -ne $p -and -not (Test-BlankValue $p.Value)) {
+            $id = $p.Value.ToString()
+            break
+        }
+    }
+
+    if (Test-BlankValue $id) { return }
+
+    if (-not $Table.ContainsKey($id)) {
+        $Table[$id] = $Account
+    }
+}
+
+function Search-Accounts {
+    param(
+        [string]$SearchText,
+        [string]$Token
+    )
+
+    if (Test-BlankValue $SearchText) { return @() }
+
+    $found = @{}
+    $limit = [Math]::Min([Math]::Max($MaxSearchResults, 1), 1000)
     $offset = 0
-    $page = 1
-    $firstRawSaved = $false
+    $totalRead = 0
 
-    while ($true) {
-        # Use limit first because this format was confirmed working in your logs.
-        $qs = "?limit={0}&offset={1}" -f $Limit, $offset
+    do {
+        $encoded = [System.Uri]::EscapeDataString($SearchText)
+        $path = "Accounts?search=$encoded&limit=$limit&offset=$offset"
 
-        $resp = Get-Accounts -QueryString $qs
+        $response = Invoke-CyberArkRest -Method GET -Path $path -Token $Token
+        $items = @(ConvertTo-AccountList -Response $response)
 
-        if (-not $firstRawSaved) {
-            try {
-                $resp | ConvertTo-Json -Depth 20 | Out-File -LiteralPath $AcctDebugFile -Encoding utf8
-                Write-Log ("Raw first accounts response saved: {0}" -f $AcctDebugFile) "Green"
-            }
-            catch {
-                Write-Log ("Could not save raw accounts JSON: {0}" -f $_.Exception.Message) "Yellow"
-            }
-
-            $firstRawSaved = $true
+        foreach ($item in $items) {
+            Add-UniqueAccountById -Table $found -Account $item
         }
 
-        $items = @(Get-AccountsFromResponse -Response $resp)
+        $totalRead += $items.Count
+        $offset += $limit
 
-        Write-Log ("Accounts page {0}: returned {1}; offset {2}" -f $page, $items.Count, $offset) "Gray"
+        if ($totalRead -ge $MaxSearchResults) { break }
+    } while ($items.Count -eq $limit)
 
-        foreach ($acct in $items) {
-            [void]$allAccounts.Add($acct)
-        }
-
-        if ($items.Count -eq 0) {
-            break
-        }
-
-        if ($items.Count -lt $Limit) {
-            break
-        }
-
-        $offset += $Limit
-        $page++
-
-        if ($page -gt 10000) {
-            throw "Account pagination safety stop reached. Review API pagination behavior."
-        }
-    }
-
-    return @($allAccounts)
+    return @($found.Values)
 }
 
-function Get-AllPASAccounts {
+function Get-ExactAccountMatches {
     param(
-        [Parameter()][int]$Limit = 1000
+        [string]$Username,
+        [string]$Address,
+        [string]$Token
     )
 
-    Write-Log "Using direct REST account lookup only. psPAS Get-PASAccount path is bypassed to avoid object type mismatch." "Cyan"
+    $candidateMap = @{}
 
-    $restAccounts = @(Get-AllPASAccountsViaREST -Limit $Limit)
+    foreach ($candidate in @(Search-Accounts -SearchText $Username -Token $Token)) {
+        Add-UniqueAccountById -Table $candidateMap -Account $candidate
+    }
 
-    Write-Log ("Direct REST account lookup completed. Total accounts returned: {0}" -f $restAccounts.Count) "Green"
+    foreach ($candidate in @(Search-Accounts -SearchText $Address -Token $Token)) {
+        Add-UniqueAccountById -Table $candidateMap -Account $candidate
+    }
 
-    return @($restAccounts)
-}
+    $matches = @()
 
-function Get-AccountPlatformId {
-    param(
-        [Parameter()]$Account
-    )
+    foreach ($account in $candidateMap.Values) {
+        $acctUser = ''
+        $acctAddress = ''
 
-    if ($null -eq $Account) { return "" }
+        if ($account.PSObject.Properties['userName']) { $acctUser = [string]$account.userName }
+        elseif ($account.PSObject.Properties['username']) { $acctUser = [string]$account.username }
 
-    return Get-ObjectPropertyString -InputObject $Account -Names @(
-        'platformId',
-        'platformID',
-        'PlatformId',
-        'PlatformID'
-    )
-}
+        if ($account.PSObject.Properties['address']) { $acctAddress = [string]$account.address }
+        elseif ($account.PSObject.Properties['Address']) { $acctAddress = [string]$account.Address }
 
-function Build-AccountPlatformLookup {
-    param(
-        [Parameter(Mandatory)]$Accounts
-    )
-
-    $lookup = @{}
-    $missingPlatformIdCount = 0
-    $processedCount = 0
-
-    foreach ($acct in @($Accounts)) {
-        if ($null -eq $acct) { continue }
-
-        $processedCount++
-
-        $platformId = Get-AccountPlatformId -Account $acct
-
-        if ([string]::IsNullOrWhiteSpace($platformId)) {
-            $missingPlatformIdCount++
-            continue
+        if (($acctUser.Trim() -ieq $Username.Trim()) -and ($acctAddress.Trim() -ieq $Address.Trim())) {
+            $matches += $account
         }
-
-        $platformId = ([string]$platformId).Trim()
-
-        if (-not $lookup.ContainsKey($platformId)) {
-            $lookup[$platformId] = New-Object System.Collections.ArrayList
-        }
-
-        [void]$lookup[$platformId].Add($acct)
     }
 
-    Write-Log ("Accounts processed for platform lookup: {0}" -f $processedCount) "Green"
-    Write-Log ("Accounts missing platformId in response: {0}" -f $missingPlatformIdCount) "Yellow"
-    Write-Log ("Unique platformIds found in account inventory: {0}" -f $lookup.Keys.Count) "Green"
-
-    return $lookup
+    return @($matches | Sort-Object id -Unique)
 }
 
-function Get-PlatformAssignmentStatus {
+function Remove-AccountById {
     param(
-        [Parameter(Mandatory)]$Active,
-        [Parameter(Mandatory)][int]$AssignedAccountCount,
-        [Parameter(Mandatory)][bool]$AccountLookupReady
+        [string]$AccountId,
+        [string]$Token
     )
 
-    if (-not $AccountLookupReady) {
-        return "AccountLookupFailed"
-    }
+    $id = [System.Uri]::EscapeDataString($AccountId)
+    Invoke-CyberArkRest -Method DELETE -Path "Accounts/$id/" -Token $Token | Out-Null
+}
 
-    $isActive = ConvertTo-BoolSafe $Active
+function Add-CsvRow {
+    param(
+        [string]$Path,
+        [pscustomobject]$Row
+    )
 
-    if ($isActive -and $AssignedAccountCount -gt 0) {
-        return "Active_Assigned"
-    }
-    elseif ($isActive -and $AssignedAccountCount -eq 0) {
-        return "Active_NotAssigned"
-    }
-    elseif (-not $isActive -and $AssignedAccountCount -gt 0) {
-        return "Inactive_Assigned"
+    if (-not (Test-Path $Path)) {
+        $Row | Export-Csv -Path $Path -NoTypeInformation
     }
     else {
-        return "Inactive_NotAssigned"
+        $Row | Export-Csv -Path $Path -NoTypeInformation -Append
     }
 }
 
-# ---------------- PLATFORM LINKED VALUE HELPERS ----------------
-function Get-PlatformPropertyValue {
+function Get-AccountField {
     param(
-        [Parameter(Mandatory)]$PlatformDetails,
-        [Parameter(Mandatory)][string[]]$PropertyNames
+        [object]$Account,
+        [string[]]$Names
     )
 
-    $props = Get-CaseInsensitiveMemberValue -InputObject $PlatformDetails -Names @('Properties','properties')
-    if ($null -eq $props) { return "" }
-
-    # Case 1: dictionary
-    if ($props -is [System.Collections.IDictionary]) {
-        foreach ($wanted in $PropertyNames) {
-            $direct = Get-CaseInsensitiveMemberValue -InputObject $props -Names @($wanted)
-            if ($null -ne $direct -and -not [string]::IsNullOrWhiteSpace([string]$direct)) {
-                return [string]$direct
-            }
+    foreach ($name in $Names) {
+        $p = $Account.PSObject.Properties[$name]
+        if ($null -ne $p -and -not (Test-BlankValue $p.Value)) {
+            return $p.Value.ToString()
         }
     }
 
-    # Case 2: list / array
-    foreach ($entry in @($props)) {
-        if ($null -eq $entry) { continue }
-
-        # String case: Key=Value
-        if ($entry -is [string]) {
-            $line = $entry.Trim()
-
-            if ($line -match '^\s*([^=]+?)\s*=\s*(.*)$') {
-                $key   = $matches[1].Trim()
-                $value = $matches[2]
-
-                foreach ($wanted in $PropertyNames) {
-                    if ($key -ieq $wanted) {
-                        return [string]$value
-                    }
-                }
-            }
-
-            continue
-        }
-
-        # Object case: @{ Key='X'; Value='Y' } / @{ Name='X'; Value='Y' }
-        $entryName = Get-CaseInsensitiveMemberValue -InputObject $entry -Names @('Key','Name','key','name')
-
-        if ($null -ne $entryName) {
-            foreach ($wanted in $PropertyNames) {
-                if ([string]$entryName -ieq $wanted) {
-                    $entryValue = Get-CaseInsensitiveMemberValue -InputObject $entry -Names @('Value','value')
-                    if ($null -ne $entryValue) {
-                        return [string]$entryValue
-                    }
-                }
-            }
-        }
-    }
-
-    return ""
+    return ''
 }
 
-function Get-TextKeyValue {
-    param(
-        [Parameter(Mandatory)][string]$Text,
-        [Parameter(Mandatory)][string]$Key
-    )
+function New-CandidateText {
+    param([array]$Accounts)
 
-    if ([string]::IsNullOrWhiteSpace($Text)) { return "" }
+    $parts = @()
 
-    $escaped = [regex]::Escape($Key)
-
-    $patterns = @(
-        "(?im)^\s*$escaped\s*=\s*(.+?)\s*$",
-        "(?is)(?:Name|Key)\s*=\s*[`"']$escaped[`"'][^>]*?(?:Value|value)\s*=\s*[`"']([^`"']*)[`"']",
-        "(?is)(?:Value|value)\s*=\s*[`"']([^`"']*)[`"'][^>]*?(?:Name|Key)\s*=\s*[`"']$escaped[`"']",
-        "(?is)<$escaped>\s*([^<]*)\s*</$escaped>",
-        "(?is)<add[^>]*\bkey\s*=\s*[`"']$escaped[`"'][^>]*\bvalue\s*=\s*[`"']([^`"']*)[`"']"
-    )
-
-    foreach ($pattern in $patterns) {
-        $m = [regex]::Match($Text, $pattern)
-        if ($m.Success) {
-            return $m.Groups[1].Value.Trim()
-        }
+    foreach ($a in $Accounts) {
+        $parts += "ID=$(Get-AccountField -Account $a -Names @('id','ID','accountId')); Safe=$(Get-AccountField -Account $a -Names @('safeName','SafeName')); Name=$(Get-AccountField -Account $a -Names @('name','Name')); User=$(Get-AccountField -Account $a -Names @('userName','username')); Address=$(Get-AccountField -Account $a -Names @('address','Address')); Platform=$(Get-AccountField -Account $a -Names @('platformId','platformID'))"
     }
 
-    return ""
+    return ($parts -join ' || ')
 }
 
-function Get-PlatformLinkedValuesFromExport {
+function Invoke-RowDelete {
     param(
-        [Parameter(Mandatory)][string]$PlatformID
+        [pscustomobject]$CsvRow,
+        [int]$RowNumber,
+        [string]$Token
     )
 
-    $zipPath  = $null
-    $tempRoot = $null
-    $expandTo = $null
+    $adAccountName = Get-RowValue -Row $CsvRow -Names @('Account Name','ADAccountName','AD Account Name','ADAccount','AccountName')
+    $username = Get-RowValue -Row $CsvRow -Names @('Username','UserName','CyberArk Username','CyberArk UserName','CurrentCyberArkUsername')
+    $address = Get-RowValue -Row $CsvRow -Names @('CyberArk Address','CyberArkAddress','Address','TargetAddress')
+
+    $baseResult = [ordered]@{
+        Row = $RowNumber
+        ADAccountName = $adAccountName
+        CyberArkUsername = $username
+        CyberArkAddress = $address
+        ExactMatchCount = 0
+        MatchStatus = ''
+        Action = ''
+        Result = ''
+        DeletedAccountIDs = ''
+        CandidateDetails = ''
+        Message = ''
+    }
 
     try {
-        $zipPath  = Get-PlatformExportZip -PlatformID $PlatformID
-        $tempRoot = Split-Path -Path $zipPath -Parent
-        $expandTo = Join-Path $tempRoot "expanded"
+        if (Test-BlankValue $username) { throw 'Username is blank.' }
+        if (Test-BlankValue $address) { throw 'CyberArk Address is blank.' }
 
-        Expand-Archive -LiteralPath $zipPath -DestinationPath $expandTo -Force
+        $matches = @(Get-ExactAccountMatches -Username $username -Address $address -Token $Token)
+        $baseResult.ExactMatchCount = $matches.Count
+        $baseResult.CandidateDetails = New-CandidateText -Accounts $matches
 
-        $files = Get-ChildItem -Path $expandTo -Recurse -File -ErrorAction SilentlyContinue |
-                 Where-Object { $_.Extension -in @('.ini', '.xml') }
-
-        $reconcileSafe   = ""
-        $reconcileFolder = ""
-        $reconcileName   = ""
-        $logonSafe       = ""
-        $logonFolder     = ""
-        $logonName       = ""
-
-        foreach ($file in $files) {
-            $raw = Get-Content -LiteralPath $file.FullName -Raw -ErrorAction SilentlyContinue
-            if ([string]::IsNullOrWhiteSpace($raw)) { continue }
-
-            if ([string]::IsNullOrWhiteSpace($reconcileSafe)) {
-                $reconcileSafe = Get-TextKeyValue -Text $raw -Key 'ReconcileAccountSafe'
-            }
-
-            if ([string]::IsNullOrWhiteSpace($reconcileFolder)) {
-                $reconcileFolder = Get-TextKeyValue -Text $raw -Key 'ReconcileAccountFolder'
-            }
-
-            if ([string]::IsNullOrWhiteSpace($reconcileName)) {
-                $reconcileName = Get-TextKeyValue -Text $raw -Key 'ReconcileAccountName'
-            }
-
-            if ([string]::IsNullOrWhiteSpace($logonSafe)) {
-                $logonSafe = Get-TextKeyValue -Text $raw -Key 'LogonAccountSafe'
-            }
-
-            if ([string]::IsNullOrWhiteSpace($logonFolder)) {
-                $logonFolder = Get-TextKeyValue -Text $raw -Key 'LogonAccountFolder'
-            }
-
-            if ([string]::IsNullOrWhiteSpace($logonName)) {
-                $logonName = Get-TextKeyValue -Text $raw -Key 'LogonAccountName'
-            }
-
-            $haveReconcile = (-not [string]::IsNullOrWhiteSpace($reconcileSafe) -and -not [string]::IsNullOrWhiteSpace($reconcileName))
-            $haveLogon     = (-not [string]::IsNullOrWhiteSpace($logonSafe) -and -not [string]::IsNullOrWhiteSpace($logonName))
-
-            if ($haveReconcile -and $haveLogon) {
-                break
-            }
+        foreach ($match in $matches) {
+            Add-CsvRow -Path $script:CandidateReportFile -Row ([pscustomobject]@{
+                Row = $RowNumber
+                ADAccountName = $adAccountName
+                CyberArkUsername = $username
+                CyberArkAddress = $address
+                AccountID = Get-AccountField -Account $match -Names @('id','ID','accountId')
+                SafeName = Get-AccountField -Account $match -Names @('safeName','SafeName')
+                CyberArkAccountName = Get-AccountField -Account $match -Names @('name','Name')
+                MatchedUserName = Get-AccountField -Account $match -Names @('userName','username')
+                MatchedAddress = Get-AccountField -Account $match -Names @('address','Address')
+                PlatformID = Get-AccountField -Account $match -Names @('platformId','platformID')
+            })
         }
 
-        return [PSCustomObject]@{
-            ReconcileAccountSafe   = $reconcileSafe
-            ReconcileAccountFolder = $reconcileFolder
-            ReconcileAccountName   = $reconcileName
-            LogonAccountSafe       = $logonSafe
-            LogonAccountFolder     = $logonFolder
-            LogonAccountName       = $logonName
+        if ($matches.Count -eq 0) {
+            $baseResult.MatchStatus = 'NO_EXACT_MATCH'
+            $baseResult.Action = 'None'
+            $baseResult.Result = 'SKIPPED'
+            $baseResult.Message = 'No CyberArk account matched exact Username + Address.'
+            return [pscustomobject]$baseResult
         }
-    }
-    finally {
-        if ($tempRoot -and (Test-Path $tempRoot)) {
-            Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+
+        if ($matches.Count -gt 1 -and -not $DeleteAllExactMatches) {
+            $baseResult.MatchStatus = 'MULTIPLE_EXACT_MATCHES'
+            $baseResult.Action = 'None'
+            $baseResult.Result = 'SKIPPED'
+            $baseResult.Message = 'Multiple exact matches found. Supply -DeleteAllExactMatches to delete every exact match for this row.'
+            return [pscustomobject]$baseResult
         }
-    }
-}
 
-# ---------------- MAIN ----------------
-$sessionCreated = $false
+        $baseResult.MatchStatus = if ($matches.Count -eq 1) { 'EXACT_MATCH' } else { 'MULTIPLE_EXACT_MATCHES' }
 
-try {
-    Start-PASSessionFromCCP -ObjectName $CCPObject -UPUser $ServiceUPUser
-    $sessionCreated = $true
+        if (-not $Execute) {
+            $baseResult.Action = 'PreviewDelete'
+            $baseResult.Result = 'PREVIEW'
+            $baseResult.DeletedAccountIDs = (($matches | ForEach-Object { Get-AccountField -Account $_ -Names @('id','ID','accountId') }) -join '; ')
+            $baseResult.Message = 'Preview only. No account deleted because -Execute was not supplied.'
+            return [pscustomobject]$baseResult
+        }
 
-    $useActiveOnly = Read-Host "Filter Active platforms only? (yes/no)"
-    $qs = ""
+        if ($ConfirmDelete -ne 'YES') {
+            $baseResult.Action = 'None'
+            $baseResult.Result = 'SKIPPED'
+            $baseResult.Message = 'Execute was supplied, but ConfirmDelete was not YES.'
+            return [pscustomobject]$baseResult
+        }
 
-    if ($useActiveOnly -match '^(y|yes)$') {
-        $qs = "?Active=True"
-    }
+        $deletedIds = @()
 
-    $PlatformsResponse = Get-Platforms -QueryString $qs
+        foreach ($account in $matches) {
+            $id = Get-AccountField -Account $account -Names @('id','ID','accountId')
+            $safeName = Get-AccountField -Account $account -Names @('safeName','SafeName')
+            $accountName = Get-AccountField -Account $account -Names @('name','Name')
+            $platformId = Get-AccountField -Account $account -Names @('platformId','platformID')
 
-    try {
-        $PlatformsResponse | ConvertTo-Json -Depth 20 | Out-File -LiteralPath $DebugFile -Encoding utf8
-        Write-Log ("Raw platform response saved: {0}" -f $DebugFile) "Green"
+            Remove-AccountById -AccountId $id -Token $Token
+            $deletedIds += $id
+
+            Add-CsvRow -Path $script:DeleteReportFile -Row ([pscustomobject]@{
+                Row = $RowNumber
+                ADAccountName = $adAccountName
+                CyberArkUsername = $username
+                CyberArkAddress = $address
+                DeletedAccountID = $id
+                SafeName = $safeName
+                CyberArkAccountName = $accountName
+                PlatformID = $platformId
+                DeletedTime = (Get-Date -Format s)
+            })
+        }
+
+        $baseResult.Action = 'DeleteAccount'
+        $baseResult.Result = 'SUCCESS'
+        $baseResult.DeletedAccountIDs = ($deletedIds -join '; ')
+        $baseResult.Message = "Deleted $($deletedIds.Count) exact matching account(s)."
+
+        return [pscustomobject]$baseResult
     }
     catch {
-        Write-Log ("Could not save raw platform JSON: {0}" -f $_.Exception.Message) "Yellow"
+        $baseResult.Action = 'DeleteAccount'
+        $baseResult.Result = 'FAILED'
+        $baseResult.Message = $_.Exception.Message
+        return [pscustomobject]$baseResult
     }
+}
 
-    # Extract platforms array
-    if ($PlatformsResponse.Platforms) {
-        $platforms = $PlatformsResponse.Platforms
+function Start-DeleteRun {
+    New-RunLog
+    Import-RunConfig
+
+    if (-not $Execute) {
+        Write-RunLog 'Start-DeleteRun' 'Preview mode. No accounts will be deleted because -Execute was not supplied.' 'WARN'
     }
-    elseif ($PlatformsResponse.platforms) {
-        $platforms = $PlatformsResponse.platforms
-    }
-    elseif ($PlatformsResponse.value) {
-        $platforms = $PlatformsResponse.value
+    elseif ($ConfirmDelete -ne 'YES') {
+        Write-RunLog 'Start-DeleteRun' 'Execute was supplied, but ConfirmDelete is not YES. No accounts will be deleted.' 'WARN'
     }
     else {
-        $platforms = @()
+        Write-RunLog 'Start-DeleteRun' 'DELETE MODE ENABLED. Matching CyberArk accounts will be deleted. No per-account confirmation prompt will be used.' 'WARN'
     }
 
-    $platforms = @($platforms)
-
-    if (-not $platforms -or $platforms.Count -eq 0) {
-        throw ("No platforms returned. Verify permissions/filters. Check: {0}" -f $DebugFile)
+    if ($DeleteAllExactMatches) {
+        Write-RunLog 'Start-DeleteRun' 'DeleteAllExactMatches enabled. Rows with multiple exact matches will delete every exact match.' 'WARN'
     }
 
-    Write-Log ("Platforms returned: {0}" -f $platforms.Count) "Green"
+    Write-RunLog 'Start-DeleteRun' "Using CSV file: $CsvFile" 'INFO'
 
-    # Pull all accounts once and group by platformId.
-    $accountLookupReady = $false
-    $accountsByPlatform = @{}
+    $rows = Get-CsvRows
+    $token = Get-IdentityBearerToken
 
-    try {
-        Write-Log "Retrieving accounts to determine platform assignment status..." "Cyan"
+    $rowNumber = 1
 
-        $allAccounts = @(Get-AllPASAccounts -Limit $AccountPageLimit)
+    foreach ($row in $rows) {
+        Write-RunLog 'Start-DeleteRun' "Processing CSV row $rowNumber" 'INFO'
 
-        if ($allAccounts.Count -eq 0) {
-            Write-Log "WARNING: Account lookup returned 0 accounts. The API user may not have visibility/List Accounts permission on the Safes, or no accounts are visible to this user." "Yellow"
+        $outcome = Invoke-RowDelete -CsvRow $row -RowNumber $rowNumber -Token $token
+        Add-CsvRow -Path $script:ReportFile -Row $outcome
+
+        if ($outcome.Result -eq 'FAILED') {
+            Write-RunLog 'Start-DeleteRun' "Row $rowNumber failed. User=$($outcome.CyberArkUsername) Address=$($outcome.CyberArkAddress) Message=$($outcome.Message)" 'ERROR'
         }
-
-        $accountsByPlatform = Build-AccountPlatformLookup -Accounts $allAccounts
-        $accountLookupReady = $true
-
-        Write-Log ("Platforms with at least one assigned account: {0}" -f $accountsByPlatform.Keys.Count) "Green"
-    }
-    catch {
-        Write-Log ("WARNING: Account assignment lookup failed. Real error: {0}" -f $_.Exception.Message) "Yellow"
-        $accountLookupReady = $false
-        $accountsByPlatform = @{}
-    }
-
-    $ProcessedPlatforms = foreach ($p in $platforms) {
-
-        $g      = $p.general
-        $props  = $p.properties
-        $linked = $p.linkedAccounts
-        $cred   = $p.credentialsManagement
-        $sess   = $p.sessionManagement
-        $wf     = $p.privilegedAccessWorkflows
-
-        $platformId = [string]$g.id
-
-        # Account assignment lookup
-        $assignedAccounts = @()
-
-        if ($accountLookupReady -and -not [string]::IsNullOrWhiteSpace($platformId) -and $accountsByPlatform.ContainsKey($platformId)) {
-            $assignedAccounts = @($accountsByPlatform[$platformId])
-        }
-
-        $assignedAccountCount = $assignedAccounts.Count
-
-        if ($accountLookupReady) {
-            $hasAssignedAccounts    = [string]($assignedAccountCount -gt 0)
-            $assignedAccountCountOut = $assignedAccountCount
-            $assignedAccountSample  = Format-AssignedAccountSample -Accounts $assignedAccounts -Limit $AccountSampleLimit
+        elseif ($outcome.Result -eq 'SUCCESS') {
+            Write-RunLog 'Start-DeleteRun' "Row $rowNumber deleted. AccountIDs=$($outcome.DeletedAccountIDs)" 'WARN'
         }
         else {
-            $hasAssignedAccounts     = "Unknown"
-            $assignedAccountCountOut = ""
-            $assignedAccountSample   = ""
+            Write-RunLog 'Start-DeleteRun' "Row $rowNumber $($outcome.Result). Status=$($outcome.MatchStatus) Message=$($outcome.Message)" 'INFO'
         }
 
-        $platformAssignmentStatus = Get-PlatformAssignmentStatus `
-            -Active $g.active `
-            -AssignedAccountCount $assignedAccountCount `
-            -AccountLookupReady $accountLookupReady
-
-        # Future-proof direct reads if CyberArk ever exposes them in summary payload.
-        $reconcileSafe = [string](Get-CaseInsensitiveMemberValue -InputObject $cred -Names @('ReconcileAccountSafe','reconcileAccountSafe'))
-        $reconcileName = [string](Get-CaseInsensitiveMemberValue -InputObject $cred -Names @('ReconcileAccountName','reconcileAccountName'))
-
-        $logonSafe = [string](Get-CaseInsensitiveMemberValue -InputObject $sess -Names @('LogonAccountSafe','logonAccountSafe'))
-        $logonName = [string](Get-CaseInsensitiveMemberValue -InputObject $sess -Names @('LogonAccountName','logonAccountName'))
-
-        # First attempt: Get-PlatformDetails
-        if ([string]::IsNullOrWhiteSpace($reconcileSafe) -or
-            [string]::IsNullOrWhiteSpace($reconcileName) -or
-            [string]::IsNullOrWhiteSpace($logonSafe) -or
-            [string]::IsNullOrWhiteSpace($logonName)) {
-
-            try {
-                $detail = Get-PlatformDetails -PlatformID $platformId
-
-                if ([string]::IsNullOrWhiteSpace($reconcileSafe)) {
-                    $reconcileSafe = Get-PlatformPropertyValue -PlatformDetails $detail -PropertyNames @('ReconcileAccountSafe')
-                }
-
-                if ([string]::IsNullOrWhiteSpace($reconcileName)) {
-                    $reconcileName = Get-PlatformPropertyValue -PlatformDetails $detail -PropertyNames @('ReconcileAccountName')
-                }
-
-                if ([string]::IsNullOrWhiteSpace($logonSafe)) {
-                    $logonSafe = Get-PlatformPropertyValue -PlatformDetails $detail -PropertyNames @('LogonAccountSafe')
-                }
-
-                if ([string]::IsNullOrWhiteSpace($logonName)) {
-                    $logonName = Get-PlatformPropertyValue -PlatformDetails $detail -PropertyNames @('LogonAccountName')
-                }
-            }
-            catch {
-                Write-Log ("WARNING: Could not retrieve Get-PlatformDetails for [{0}]: {1}" -f $platformId, $_.Exception.Message) "Yellow"
-            }
-        }
-
-        # Fallback: Export Platform ZIP and parse CPM INI / PVWA XML.
-        if ([string]::IsNullOrWhiteSpace($reconcileSafe) -or
-            [string]::IsNullOrWhiteSpace($reconcileName) -or
-            [string]::IsNullOrWhiteSpace($logonSafe) -or
-            [string]::IsNullOrWhiteSpace($logonName)) {
-
-            try {
-                $exportVals = Get-PlatformLinkedValuesFromExport -PlatformID $platformId
-
-                if ([string]::IsNullOrWhiteSpace($reconcileSafe)) {
-                    $reconcileSafe = [string]$exportVals.ReconcileAccountSafe
-                }
-
-                if ([string]::IsNullOrWhiteSpace($reconcileName)) {
-                    $reconcileName = [string]$exportVals.ReconcileAccountName
-                }
-
-                if ([string]::IsNullOrWhiteSpace($logonSafe)) {
-                    $logonSafe = [string]$exportVals.LogonAccountSafe
-                }
-
-                if ([string]::IsNullOrWhiteSpace($logonName)) {
-                    $logonName = [string]$exportVals.LogonAccountName
-                }
-            }
-            catch {
-                Write-Log ("WARNING: Could not export/parse platform package for [{0}]: {1}" -f $platformId, $_.Exception.Message) "Yellow"
-            }
-        }
-
-        [PSCustomObject]@{
-            PlatformID       = $platformId
-            PlatformName     = $g.name
-            Active           = $g.active
-
-            HasAssignedAccounts      = $hasAssignedAccounts
-            AssignedAccountCount     = $assignedAccountCountOut
-            AssignedAccountSample    = $assignedAccountSample
-            PlatformAssignmentStatus = $platformAssignmentStatus
-
-            Description      = $g.description
-            PlatformBaseID   = $g.platformBaseID
-            PlatformType     = $g.platformType
-            SystemType       = $g.systemType
-
-            RequiredProperties = (Join-PropNames $props.required)
-            OptionalProperties = (Join-PropNames $props.optional)
-
-            LinkedAccounts     = (Join-Names $linked)
-
-            AllowedSafes                          = $cred.allowedSafes
-            AllowManualChange                     = [string]$cred.allowManualChange
-            PerformPeriodicChange                 = [string]$cred.performPeriodicChange
-            RequirePasswordChangeEveryXDays       = [string]$cred.requirePasswordChangeEveryXDays
-            AllowManualVerification               = [string]$cred.allowManualVerification
-            PerformPeriodicVerification           = [string]$cred.performPeriodicVerification
-            RequirePasswordVerificationEveryXDays = [string]$cred.requirePasswordVerificationEveryXDays
-            AllowManualReconciliation             = [string]$cred.allowManualReconciliation
-            AutomaticReconcileWhenUnsynched       = [string]$cred.automaticReconcileWhenUnsynched
-
-            ReconcileAccountSafe                  = $reconcileSafe
-            ReconcileAccountName                  = $reconcileName
-
-            LogonAccountSafe                      = $logonSafe
-            LogonAccountName                      = $logonName
-
-            RequirePrivilegedSessionMonitoringAndIsolation = [string]$sess.requirePrivilegedSessionMonitoringAndIsolation
-            RecordAndSaveSessionActivity                  = [string]$sess.recordAndSaveSessionActivity
-            PSMServerID                                   = [string]$sess.PSMServerID
-
-            RequireDualControlPasswordAccessApproval = [string]$wf.requireDualControlPasswordAccessApproval
-            EnforceCheckinCheckoutExclusiveAccess    = [string]$wf.enforceCheckinCheckoutExclusiveAccess
-            EnforceOnetimePasswordAccess             = [string]$wf.enforceOnetimePasswordAccess
-        }
+        $rowNumber++
     }
 
-    $ProcessedPlatforms | Export-Csv -LiteralPath $CsvFile -NoTypeInformation -Encoding utf8
-    Write-Log ("Platform report exported: {0}" -f $CsvFile) "Green"
+    Write-RunLog 'Start-DeleteRun' "Run completed. MainReport=$script:ReportFile" 'INFO'
+    Write-RunLog 'Start-DeleteRun' "CandidateReport=$script:CandidateReportFile" 'INFO'
+    Write-RunLog 'Start-DeleteRun' "DeletedReport=$script:DeleteReportFile" 'INFO'
+    Write-RunLog 'Start-DeleteRun' "Log=$script:LogFile" 'INFO'
+}
 
-    if (-not $accountLookupReady) {
-        Write-Log "Account lookup did not complete. Review the Real error line above. Platform details exported, but assignment status is AccountLookupFailed." "Yellow"
-    }
-}
-catch {
-    Write-Log ("ERROR: {0}" -f $_.Exception.Message) "Red"
-    throw
-}
-finally {
-    if ($sessionCreated) {
-        try {
-            Close-PASSession | Out-Null
-            Write-Log "Logged off." "Green"
-        }
-        catch {
-            Write-Log ("Logoff warning: {0}" -f $_.Exception.Message) "Yellow"
-        }
-    }
-}
+Start-DeleteRun
