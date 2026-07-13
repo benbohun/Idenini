@@ -1,2 +1,540 @@
-```powershell
-.\Remove-CyberArkAccountsByUserAddress.ps1 -CsvFile .\samples\delete-accounts-template.csv -Environment prod -Execute -ConfirmDelete YES
+Based on this safe membership script, i need a script that will a list of group i have in a csv, then identify which group is tied to a safe, and if the safe is linked to an account or not.
+
+This is for a onetime script so no required for ongoing
+<#
+.SYNOPSIS
+    CNA Privilege Cloud Safe Membership Report
+
+.DESCRIPTION
+    - Authenticates to CNA Privilege Cloud using CCP + psPAS Identity Header
+    - Retrieves all safes visible to the service account
+    - Retrieves safe members and permissions
+    - Exports detailed safe membership report
+    - Exports summary report showing whether required members exist on each safe
+
+.NOTES
+    This script is report-only. It does not add, update, or remove safe members.
+#>
+
+[CmdletBinding()]
+param(
+    # ===== CNA Identity / Privilege Cloud =====
+    [string]$IdentityTenantURL = 'https://aat4012.id.cyberark.cloud',
+    [string]$PCloudSubdomain   = 'cna-prod',
+    [string]$PrivilegeCloudURL = 'https://cna-prod.privilegecloud.cyberark.cloud',
+
+    # ===== CCP settings CNA =====
+    [string]$CCPAddress        = 'https://vskau1p1231.cna.com',
+    [string]$CCPLocation       = 'AIMWebService',
+    [string]$CCPAppID          = 'PAMDiscovery',
+    [string]$CCPSafe           = 'CA_PCloud_Admins',
+    [string]$CCPObject         = 'cna-prod.cyberark.cloud-cnarestbot',
+    [bool]$CCPWindowsAuth      = $false,
+
+    # ===== Members to evaluate in summary report =====
+    [string]$AdminGroup        = 'CA_PCloud_Admins@cna.com',
+    [string]$AdminMember       = 'cna_pas_admin@cyberark.cloud.6679',
+    [string]$IdentityMember    = 'identity-privilege-integration-user$@cyberark.cloud.6679',
+
+    # ===== Output paths =====
+    [string]$OutputFolder      = 'E:\Installation Media\Script\OnboardScript\data',
+    [string]$DetailCsvName     = 'SafeMembershipReport.csv',
+    [string]$SummaryCsvName    = 'SafeMembershipSummary.csv',
+    [string]$LogFileName       = 'SafeMembershipReport.log'
+)
+
+# ============================================
+# Runtime Settings
+# ============================================
+
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$ErrorActionPreference = 'Stop'
+$ProgressPreference    = 'SilentlyContinue'
+
+# ============================================
+# Paths
+# ============================================
+
+if (-not (Test-Path -Path $OutputFolder)) {
+    New-Item -ItemType Directory -Path $OutputFolder -Force | Out-Null
+}
+
+$LogFile        = Join-Path $OutputFolder $LogFileName
+$DetailCsvPath  = Join-Path $OutputFolder $DetailCsvName
+$SummaryCsvPath = Join-Path $OutputFolder $SummaryCsvName
+
+New-Item -ItemType File -Force -Path $LogFile | Out-Null
+
+# ============================================
+# Logger
+# ============================================
+
+function Write-Log {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Message,
+
+        [ConsoleColor]$Color = 'White'
+    )
+
+    $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $line = "$ts - $Message"
+
+    Write-Host $line -ForegroundColor $Color
+    Add-Content -Path $LogFile -Value $line
+}
+
+# ============================================
+# Helper: Normalize Identity Tenant URL
+# ============================================
+
+function Get-NormalizedIdentityTenant {
+    param(
+        [Parameter(Mandatory)]
+        [string]$TenantUrl
+    )
+
+    $normalized = $TenantUrl.Trim()
+
+    if ($normalized -notmatch '^https?://') {
+        $normalized = "https://$normalized"
+    }
+
+    return $normalized.TrimEnd('/')
+}
+
+# ============================================
+# Helper: Safely get object property
+# ============================================
+
+function Get-ObjectPropertyValue {
+    param(
+        [Parameter(Mandatory)]
+        [object]$InputObject,
+
+        [Parameter(Mandatory)]
+        [string[]]$PropertyNames
+    )
+
+    foreach ($propName in $PropertyNames) {
+        if ($InputObject.PSObject.Properties.Name -contains $propName) {
+            return $InputObject.$propName
+        }
+    }
+
+    return $null
+}
+
+# ============================================
+# Helper: Normalize member comparison
+# ============================================
+
+function Test-MemberExists {
+    param(
+        [Parameter(Mandatory)]
+        [array]$Members,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedMember
+    )
+
+    foreach ($member in $Members) {
+        $memberName = Get-ObjectPropertyValue -InputObject $member -PropertyNames @(
+            'MemberName',
+            'memberName',
+            'UserName',
+            'username',
+            'Name',
+            'name'
+        )
+
+        if (-not [string]::IsNullOrWhiteSpace($memberName)) {
+            if ($memberName.Trim().Equals($ExpectedMember.Trim(), [System.StringComparison]::OrdinalIgnoreCase)) {
+                return $true
+            }
+        }
+    }
+
+    return $false
+}
+
+# ============================================
+# Import psPAS
+# ============================================
+
+try {
+    Import-Module psPAS -Force -ErrorAction Stop
+    $psPASModule = Get-Module psPAS
+
+    if ($psPASModule) {
+        Write-Log ("psPAS module loaded. Version: {0}" -f $psPASModule.Version) 'Green'
+    } else {
+        Write-Log "psPAS module loaded." 'Green'
+    }
+} catch {
+    Write-Log ("ERROR: Failed to import psPAS module. {0}" -f $_.Exception.Message) 'Red'
+    throw
+}
+
+# ============================================
+# Validate IdentityCommand / Get-IdentityHeader
+# ============================================
+
+if (-not (Get-Command Get-IdentityHeader -ErrorAction SilentlyContinue)) {
+    Write-Log "ERROR: Get-IdentityHeader cmdlet was not found. Confirm IdentityCommand module is installed and available." 'Red'
+    throw "Get-IdentityHeader cmdlet not found."
+}
+
+# ============================================
+# Login Method: CCP + psPAS Identity Header
+# ============================================
+
+function Start-PASSessionFromCCP {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ObjectName
+    )
+
+    $headers = @{
+        'Content-Type' = 'application/json'
+    }
+
+    $ccpUrl = "$CCPAddress/$CCPLocation/api/Accounts?AppID=$CCPAppID&Safe=$CCPSafe&Object=$ObjectName"
+
+    Write-Log ("Retrieving CyberArk API credentials from CCP using Object='{0}'..." -f $ObjectName) 'Cyan'
+    Write-Log ("CCP URL: {0}" -f $ccpUrl) 'Gray'
+
+    try {
+        $resp = Invoke-RestMethod `
+            -Uri $ccpUrl `
+            -Method GET `
+            -Headers $headers `
+            -UseDefaultCredentials:$CCPWindowsAuth `
+            -ErrorAction Stop
+
+        if (-not $resp -or -not $resp.Content) {
+            throw 'Empty CCP response or missing Content field.'
+        }
+    } catch {
+        Write-Log ("ERROR: CCP credential fetch failed. {0}" -f $_.Exception.Message) 'Red'
+        throw
+    }
+
+    $resolvedUser = $null
+
+    if ($resp.PSObject.Properties.Name -contains 'Username') {
+        $resolvedUser = [string]$resp.Username
+    } elseif ($resp.PSObject.Properties.Name -contains 'UserName') {
+        $resolvedUser = [string]$resp.UserName
+    }
+
+    if ([string]::IsNullOrWhiteSpace($resolvedUser)) {
+        throw 'CCP returned password but no Username/UserName field.'
+    }
+
+    Write-Log ("Successfully retrieved CCP credential for user: {0}" -f $resolvedUser) 'Green'
+
+    try {
+        $normalizedTenant = Get-NormalizedIdentityTenant -TenantUrl $IdentityTenantURL
+
+        $securePass = ConvertTo-SecureString $resp.Content -AsPlainText -Force
+        $credential = [PSCredential]::new($resolvedUser, $securePass)
+
+        Write-Log ("Requesting CyberArk PAS authentication using psPAS Identity header as {0}..." -f $resolvedUser) 'Cyan'
+        Write-Log ("IdentityTenantURL passed to Get-IdentityHeader: {0}" -f $normalizedTenant) 'Gray'
+        Write-Log ("Privilege Cloud Subdomain: {0}" -f $PCloudSubdomain) 'Gray'
+
+        $header = Get-IdentityHeader `
+            -IdentityTenantURL $normalizedTenant `
+            -psPASFormat `
+            -PCloudSubdomain $PCloudSubdomain `
+            -UPCreds $credential
+
+        Use-PASSession $header | Out-Null
+
+        if (-not (Get-PASSession)) {
+            throw 'psPAS session not established.'
+        }
+
+        Write-Log ("Authentication successful. PAS session established as {0}." -f $resolvedUser) 'Green'
+    } catch {
+        Write-Log ("ERROR: Failed to authenticate via psPAS Identity header. {0}" -f $_.Exception.Message) 'Red'
+        throw
+    } finally {
+        if ($resp.PSObject.Properties.Name -contains 'Content') {
+            $resp.Content = $null
+        }
+
+        if ($securePass) {
+            $securePass.Dispose()
+        }
+    }
+
+    return $resolvedUser
+}
+
+# ============================================
+# Start Script
+# ============================================
+
+Write-Log "============================================================" 'Gray'
+Write-Log "CNA Safe Membership Report started." 'Cyan'
+Write-Log ("Identity Tenant URL : {0}" -f $IdentityTenantURL) 'Gray'
+Write-Log ("Privilege Cloud URL : {0}" -f $PrivilegeCloudURL) 'Gray'
+Write-Log ("PCloud Subdomain    : {0}" -f $PCloudSubdomain) 'Gray'
+Write-Log ("CCP Address         : {0}" -f $CCPAddress) 'Gray'
+Write-Log ("CCP AppID           : {0}" -f $CCPAppID) 'Gray'
+Write-Log ("CCP Safe            : {0}" -f $CCPSafe) 'Gray'
+Write-Log ("CCP Object          : {0}" -f $CCPObject) 'Gray'
+Write-Log ("Detail CSV          : {0}" -f $DetailCsvPath) 'Gray'
+Write-Log ("Summary CSV         : {0}" -f $SummaryCsvPath) 'Gray'
+Write-Log "============================================================" 'Gray'
+
+# ============================================
+# Authenticate
+# ============================================
+
+try {
+    $AuthenticatedUser = Start-PASSessionFromCCP -ObjectName $CCPObject
+} catch {
+    Write-Log ("FATAL: Authentication failed. {0}" -f $_.Exception.Message) 'Red'
+    exit 1
+}
+
+# ============================================
+# Retrieve All Safes
+# ============================================
+
+Write-Log "Retrieving list of safes..." 'Yellow'
+
+try {
+    $Safes = Get-PASSafe -ErrorAction Stop
+
+    if ($null -eq $Safes) {
+        $Safes = @()
+    } else {
+        $Safes = @($Safes)
+    }
+
+    Write-Log ("Retrieved {0} safe(s)." -f $Safes.Count) 'Green'
+} catch {
+    Write-Log ("ERROR: Failed to retrieve safes. {0}" -f $_.Exception.Message) 'Red'
+    exit 1
+}
+
+# ============================================
+# Prepare Reports
+# ============================================
+
+$SafeMembersReport = New-Object System.Collections.Generic.List[object]
+$SafeSummaryReport = New-Object System.Collections.Generic.List[object]
+
+$RequiredMembers = @(
+    $AdminGroup,
+    $AdminMember,
+    $IdentityMember
+) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+
+# ============================================
+# Retrieve Safe Members & Permissions
+# ============================================
+
+$totalSafes   = $Safes.Count
+$currentIndex = 0
+$successCount = 0
+$failedCount  = 0
+
+foreach ($Safe in $Safes) {
+    $currentIndex++
+
+    $SafeName = Get-ObjectPropertyValue -InputObject $Safe -PropertyNames @(
+        'safeName',
+        'SafeName',
+        'Safe',
+        'Name'
+    )
+
+    if ([string]::IsNullOrWhiteSpace($SafeName)) {
+        Write-Log ("[{0}/{1}] WARNING: Could not resolve safe name. Skipping item." -f $currentIndex, $totalSafes) 'Yellow'
+        continue
+    }
+
+    Write-Log ("[{0}/{1}] Retrieving members for safe: {2}" -f $currentIndex, $totalSafes, $SafeName) 'Cyan'
+
+    try {
+        $SafeMembers = Get-PASSafeMember -SafeName $SafeName -ErrorAction Stop
+
+        if ($null -eq $SafeMembers) {
+            $SafeMembers = @()
+        } else {
+            $SafeMembers = @($SafeMembers)
+        }
+
+        $hasAdminGroup     = Test-MemberExists -Members $SafeMembers -ExpectedMember $AdminGroup
+        $hasAdminMember    = Test-MemberExists -Members $SafeMembers -ExpectedMember $AdminMember
+        $hasIdentityMember = Test-MemberExists -Members $SafeMembers -ExpectedMember $IdentityMember
+
+        $missingMembers = New-Object System.Collections.Generic.List[string]
+
+        if (-not $hasAdminGroup) {
+            $missingMembers.Add($AdminGroup)
+        }
+
+        if (-not $hasAdminMember) {
+            $missingMembers.Add($AdminMember)
+        }
+
+        if (-not $hasIdentityMember) {
+            $missingMembers.Add($IdentityMember)
+        }
+
+        foreach ($Member in $SafeMembers) {
+            $perm = $Member.Permissions
+
+            $memberName = Get-ObjectPropertyValue -InputObject $Member -PropertyNames @(
+                'MemberName',
+                'memberName',
+                'UserName',
+                'username',
+                'Name',
+                'name'
+            )
+
+            $memberType = Get-ObjectPropertyValue -InputObject $Member -PropertyNames @(
+                'MemberType',
+                'memberType',
+                'Type',
+                'type'
+            )
+
+            $isRequiredMember = $false
+
+            foreach ($requiredMember in $RequiredMembers) {
+                if (-not [string]::IsNullOrWhiteSpace($memberName)) {
+                    if ($memberName.Trim().Equals($requiredMember.Trim(), [System.StringComparison]::OrdinalIgnoreCase)) {
+                        $isRequiredMember = $true
+                        break
+                    }
+                }
+            }
+
+            $SafeMembersReport.Add([PSCustomObject]@{
+                SafeName                               = $SafeName
+                Member                                 = $memberName
+                MemberType                             = $memberType
+                IsRequiredMember                       = $isRequiredMember
+
+                UseAccounts                            = $perm.useAccounts
+                RetrieveAccounts                       = $perm.retrieveAccounts
+                ListAccounts                           = $perm.listAccounts
+                AddAccounts                            = $perm.addAccounts
+                UpdateAccountContent                   = $perm.updateAccountContent
+                UpdateAccountProperties                = $perm.updateAccountProperties
+                InitiateCPMAccountManagementOperations = $perm.initiateCPMAccountManagementOperations
+                SpecifyNextAccountContent              = $perm.specifyNextAccountContent
+                RenameAccounts                         = $perm.renameAccounts
+                DeleteAccounts                         = $perm.deleteAccounts
+                UnlockAccounts                         = $perm.unlockAccounts
+                ManageSafe                             = $perm.manageSafe
+                ManageSafeMembers                      = $perm.manageSafeMembers
+                BackupSafe                             = $perm.backupSafe
+                ViewAuditLog                           = $perm.viewAuditLog
+                ViewSafeMembers                        = $perm.viewSafeMembers
+                AccessWithoutConfirmation              = $perm.accessWithoutConfirmation
+                CreateFolders                          = $perm.createFolders
+                DeleteFolders                          = $perm.deleteFolders
+                MoveAccountsAndFolders                 = $perm.moveAccountsAndFolders
+                RequestsAuthorizationLevel1            = $perm.requestsAuthorizationLevel1
+                RequestsAuthorizationLevel2            = $perm.requestsAuthorizationLevel2
+            })
+        }
+
+        $summaryStatus = if ($missingMembers.Count -eq 0) { 'Compliant' } else { 'MissingRequiredMember' }
+
+        $SafeSummaryReport.Add([PSCustomObject]@{
+            SafeName               = $SafeName
+            TotalMemberCount       = $SafeMembers.Count
+            HasAdminGroup          = $hasAdminGroup
+            HasAdminMember         = $hasAdminMember
+            HasIdentityMember      = $hasIdentityMember
+            MissingRequiredMembers = ($missingMembers -join '; ')
+            Status                 = $summaryStatus
+            ErrorMessage           = ''
+        })
+
+        Write-Log ("Retrieved {0} member(s) for safe: {1}" -f $SafeMembers.Count, $SafeName) 'Green'
+        $successCount++
+    } catch {
+        $failedCount++
+
+        $errorMessage = $_.Exception.Message
+
+        Write-Log ("ERROR: Failed to retrieve members for safe '{0}'. {1}" -f $SafeName, $errorMessage) 'Red'
+
+        $SafeSummaryReport.Add([PSCustomObject]@{
+            SafeName               = $SafeName
+            TotalMemberCount       = 0
+            HasAdminGroup          = $false
+            HasAdminMember         = $false
+            HasIdentityMember      = $false
+            MissingRequiredMembers = ($RequiredMembers -join '; ')
+            Status                 = 'FailedToRetrieveMembers'
+            ErrorMessage           = $errorMessage
+        })
+    }
+}
+
+# ============================================
+# Export Reports
+# ============================================
+
+try {
+    Write-Log "Exporting detailed safe membership report..." 'Yellow'
+
+    $SafeMembersReport |
+        Sort-Object SafeName, Member |
+        Export-Csv -Path $DetailCsvPath -NoTypeInformation -Encoding UTF8
+
+    Write-Log ("Detailed safe membership report exported to: {0}" -f $DetailCsvPath) 'Green'
+} catch {
+    Write-Log ("ERROR: Failed to export detailed CSV. {0}" -f $_.Exception.Message) 'Red'
+    exit 1
+}
+
+try {
+    Write-Log "Exporting safe membership summary report..." 'Yellow'
+
+    $SafeSummaryReport |
+        Sort-Object SafeName |
+        Export-Csv -Path $SummaryCsvPath -NoTypeInformation -Encoding UTF8
+
+    Write-Log ("Safe membership summary report exported to: {0}" -f $SummaryCsvPath) 'Green'
+} catch {
+    Write-Log ("ERROR: Failed to export summary CSV. {0}" -f $_.Exception.Message) 'Red'
+    exit 1
+}
+
+# ============================================
+# Close Session
+# ============================================
+
+try {
+    Close-PASSession | Out-Null
+    Write-Log "PAS session closed." 'Gray'
+} catch {
+    Write-Log ("WARNING: Could not close PAS session cleanly. {0}" -f $_.Exception.Message) 'Yellow'
+}
+
+# ============================================
+# Completion
+# ============================================
+
+Write-Log "============================================================" 'Gray'
+Write-Log "CNA Safe Membership Report completed." 'Green'
+Write-Log ("Authenticated User      : {0}" -f $AuthenticatedUser) 'Gray'
+Write-Log ("Total Safes Processed   : {0}" -f $totalSafes) 'Gray'
+Write-Log ("Successful Safe Reads   : {0}" -f $successCount) 'Green'
+Write-Log ("Failed Safe Reads       : {0}" -f $failedCount) 'Red'
+Write-Log ("Detailed Report         : {0}" -f $DetailCsvPath) 'Gray'
+Write-Log ("Summary Report          : {0}" -f $SummaryCsvPath) 'Gray'
+Write-Log "============================================================" 'Gray'
