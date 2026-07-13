@@ -1,52 +1,1396 @@
-PS E:\Installation Media\Script\OnboardScript> .\Get-CNAGroupSafeAccountReport.ps1
-At E:\Installation Media\Script\OnboardScript\Get-CNAGroupSafeAccountReport.ps1:1032 char:1
-+ [CmdletBinding()]
-+ ~~~~~~~~~~~~~~~~~
-Unexpected attribute 'CmdletBinding'.
-At E:\Installation Media\Script\OnboardScript\Get-CNAGroupSafeAccountReport.ps1:1033 char:1
-+ param(
-+ ~~~~~
-Unexpected token 'param' in expression or statement.
-At E:\Installation Media\Script\OnboardScript\Get-CNAGroupSafeAccountReport.ps1:1035 char:29
-+     [string]$GroupCsvPath = '',
-+                             ~~
-The assignment expression is not valid. The input to an assignment operator must be an object that is able to accept
-assignments, such as a variable or a property.
-At E:\Installation Media\Script\OnboardScript\Get-CNAGroupSafeAccountReport.ps1:1036 char:32
-+     [string]$GroupColumnName = '',
-+                                ~~
-The assignment expression is not valid. The input to an assignment operator must be an object that is able to accept
-assignments, such as a variable or a property.
-At E:\Installation Media\Script\OnboardScript\Get-CNAGroupSafeAccountReport.ps1:1043 char:34
-+     [string]$IdentityTenantURL = 'https://aat4012.id.cyberark.cloud',
-+                                  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-The assignment expression is not valid. The input to an assignment operator must be an object that is able to accept
-assignments, such as a variable or a property.
-At E:\Installation Media\Script\OnboardScript\Get-CNAGroupSafeAccountReport.ps1:1044 char:34
-+     [string]$PCloudSubdomain   = 'cna-prod',
-+                                  ~~~~~~~~~~
-The assignment expression is not valid. The input to an assignment operator must be an object that is able to accept
-assignments, such as a variable or a property.
-At E:\Installation Media\Script\OnboardScript\Get-CNAGroupSafeAccountReport.ps1:1045 char:34
-+ ... PrivilegeCloudURL = 'https://cna-prod.privilegecloud.cyberark.cloud',
-+                         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-The assignment expression is not valid. The input to an assignment operator must be an object that is able to accept
-assignments, such as a variable or a property.
-At E:\Installation Media\Script\OnboardScript\Get-CNAGroupSafeAccountReport.ps1:1048 char:34
-+     [string]$CCPAddress        = 'https://vskau1p1231.cna.com',
-+                                  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-The assignment expression is not valid. The input to an assignment operator must be an object that is able to accept
-assignments, such as a variable or a property.
-At E:\Installation Media\Script\OnboardScript\Get-CNAGroupSafeAccountReport.ps1:1049 char:34
-+     [string]$CCPLocation       = 'AIMWebService',
-+                                  ~~~~~~~~~~~~~~~
-The assignment expression is not valid. The input to an assignment operator must be an object that is able to accept
-assignments, such as a variable or a property.
-At E:\Installation Media\Script\OnboardScript\Get-CNAGroupSafeAccountReport.ps1:1050 char:34
-+     [string]$CCPAppID          = 'PAMDiscovery',
-+                                  ~~~~~~~~~~~~~~
-The assignment expression is not valid. The input to an assignment operator must be an object that is able to accept
-assignments, such as a variable or a property.
-Not all parse errors were reported.  Correct the reported errors and try again.
-    + CategoryInfo          : ParserError: (:) [], ParseException
-    + FullyQualifiedErrorId : UnexpectedAttribute
+<#
+.SYNOPSIS
+    CNA Privilege Cloud Group-to-Safe and Safe-to-Account Report (Fast One-Time Version)
+
+.DESCRIPTION
+    Report-only script that:
+      - Authenticates using the existing CCP + CyberArk Identity header pattern.
+      - Reads group names from a CSV.
+      - Retrieves visible Safes in large REST API pages.
+      - Scans Safe group memberships concurrently.
+      - Checks accounts only for Safes that matched an input group.
+      - Exports a summary, optional account details, errors, and a log.
+
+    No Safe, member, account, or credential is changed.
+
+.CSV FORMAT
+    GroupName
+    CA_Example_Group@cna.com
+    CA_Another_Group@cna.com
+
+.NOTES
+    PowerShell 5.1 compatible.
+    Requires psPAS and IdentityCommand (Get-IdentityHeader).
+    This file must replace the previous script; do not append it to an existing .ps1 file.
+#>
+
+[CmdletBinding()]
+param(
+    # ===== Input =====
+    [string]$GroupCsvPath = '',
+    [string]$GroupColumnName = '',
+    [bool]$AllowShortNameMatch = $true,
+
+    # ===== Performance =====
+    [ValidateRange(1, 1000)]
+    [int]$SafePageSize = 1000,
+
+    [ValidateRange(1, 1000)]
+    [int]$MemberPageSize = 1000,
+
+    [ValidateRange(1, 32)]
+    [int]$ThrottleLimit = 12,
+
+    [ValidateRange(10, 600)]
+    [int]$RequestTimeoutSec = 90,
+
+    [ValidateRange(0, 10)]
+    [int]$MaxRetryCount = 4,
+
+    [ValidateRange(10, 1000)]
+    [int]$ProgressEvery = 100,
+
+    # False is fastest and still returns HasAccounts and AccountCount.
+    [bool]$IncludeAccountDetails = $false,
+
+    [ValidateRange(1, 1000)]
+    [int]$AccountPageSize = 1000,
+
+    # ===== CNA Identity / Privilege Cloud =====
+    [string]$IdentityTenantURL = 'https://aat4012.id.cyberark.cloud',
+    [string]$PCloudSubdomain   = 'cna-prod',
+    [string]$PrivilegeCloudURL = 'https://cna-prod.privilegecloud.cyberark.cloud',
+
+    # ===== CCP =====
+    [string]$CCPAddress        = 'https://vskau1p1231.cna.com',
+    [string]$CCPLocation       = 'AIMWebService',
+    [string]$CCPAppID          = 'PAMDiscovery',
+    [string]$CCPSafe           = 'CA_PCloud_Admins',
+    [string]$CCPObject         = 'cna-prod.cyberark.cloud-cnarestbot',
+    [bool]$CCPWindowsAuth      = $false,
+
+    # ===== Output =====
+    [string]$OutputFolder      = 'E:\Installation Media\Script\OnboardScript\data',
+    [string]$SummaryCsvName    = 'GroupSafeAccountSummary.csv',
+    [string]$AccountCsvName    = 'GroupSafeAccountDetails.csv',
+    [string]$ErrorCsvName      = 'GroupSafeAccountErrors.csv',
+    [string]$LogFileName       = 'GroupSafeAccountReport.log'
+)
+
+# ============================================
+# Runtime settings and output paths
+# ============================================
+
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+[Net.ServicePointManager]::DefaultConnectionLimit = [Math]::Max(64, ($ThrottleLimit * 4))
+[Net.ServicePointManager]::Expect100Continue = $false
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+
+if (-not (Test-Path -LiteralPath $OutputFolder)) {
+    New-Item -ItemType Directory -Path $OutputFolder -Force | Out-Null
+}
+
+$LogFile = Join-Path $OutputFolder $LogFileName
+$SummaryCsvPath = Join-Path $OutputFolder $SummaryCsvName
+$AccountCsvPath = Join-Path $OutputFolder $AccountCsvName
+$ErrorCsvPath = Join-Path $OutputFolder $ErrorCsvName
+
+New-Item -ItemType File -Path $LogFile -Force | Out-Null
+
+# ============================================
+# Logging and common helpers
+# ============================================
+
+function Write-Log {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Message,
+
+        [ConsoleColor]$Color = 'White'
+    )
+
+    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $line = '{0} - {1}' -f $timestamp, $Message
+    Write-Host $line -ForegroundColor $Color
+    Add-Content -LiteralPath $LogFile -Value $line
+}
+
+function Get-NormalizedIdentityTenant {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TenantUrl
+    )
+
+    $value = $TenantUrl.Trim()
+    if ($value -notmatch '^https?://') {
+        $value = 'https://{0}' -f $value
+    }
+
+    return $value.TrimEnd('/')
+}
+
+function Get-NormalizedNameKey {
+    param(
+        [AllowNull()]
+        [string]$Name
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Name)) {
+        return ''
+    }
+
+    return $Name.Trim().ToLowerInvariant()
+}
+
+function Get-ShortNameKey {
+    param(
+        [AllowNull()]
+        [string]$Name
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Name)) {
+        return ''
+    }
+
+    $value = $Name.Trim()
+
+    if ($value.Contains('\')) {
+        $value = $value.Substring($value.LastIndexOf('\') + 1)
+    }
+
+    if ($value.Contains('@')) {
+        $value = $value.Substring(0, $value.IndexOf('@'))
+    }
+
+    return $value.Trim().ToLowerInvariant()
+}
+
+function Select-GroupCsvFile {
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        $dialog = New-Object System.Windows.Forms.OpenFileDialog
+        $dialog.Title = 'Select the CSV containing CyberArk group names'
+        $dialog.Filter = 'CSV files (*.csv)|*.csv|All files (*.*)|*.*'
+        $dialog.Multiselect = $false
+
+        if ($dialog.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) {
+            throw 'No CSV file was selected.'
+        }
+
+        return $dialog.FileName
+    }
+    catch {
+        throw ('GroupCsvPath was not provided and the file selection dialog could not be used. Specify -GroupCsvPath. {0}' -f $_.Exception.Message)
+    }
+}
+
+function Import-InputGroups {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [string]$RequestedColumn
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw ('CSV file was not found: {0}' -f $Path)
+    }
+
+    Write-Log ('Importing group CSV: {0}' -f $Path) 'Cyan'
+    $rows = @(Import-Csv -LiteralPath $Path -ErrorAction Stop)
+
+    if ($rows.Count -eq 0) {
+        throw 'The input CSV contains no data rows.'
+    }
+
+    $availableColumns = @($rows[0].PSObject.Properties.Name)
+    $column = $null
+
+    if (-not [string]::IsNullOrWhiteSpace($RequestedColumn)) {
+        $column = $availableColumns | Where-Object {
+            $_.Equals($RequestedColumn.Trim(), [System.StringComparison]::OrdinalIgnoreCase)
+        } | Select-Object -First 1
+
+        if ([string]::IsNullOrWhiteSpace($column)) {
+            throw "Requested group column '$RequestedColumn' was not found. Available columns: $($availableColumns -join ', ')"
+        }
+    }
+    else {
+        $acceptedColumns = @(
+            'GroupName',
+            'Group',
+            'ADGroup',
+            'ADGroupName',
+            'MemberName',
+            'Member',
+            'Name'
+        )
+
+        foreach ($candidate in $acceptedColumns) {
+            $column = $availableColumns | Where-Object {
+                $_.Equals($candidate, [System.StringComparison]::OrdinalIgnoreCase)
+            } | Select-Object -First 1
+
+            if (-not [string]::IsNullOrWhiteSpace($column)) {
+                break
+            }
+        }
+
+        if ([string]::IsNullOrWhiteSpace($column) -and $availableColumns.Count -eq 1) {
+            $column = $availableColumns[0]
+        }
+
+        if ([string]::IsNullOrWhiteSpace($column)) {
+            throw "Could not determine the group column. Available columns: $($availableColumns -join ', '). Use -GroupColumnName."
+        }
+    }
+
+    $groups = New-Object System.Collections.ArrayList
+    $seen = @{}
+
+    foreach ($row in $rows) {
+        $value = [string]$row.$column
+        if ([string]::IsNullOrWhiteSpace($value)) {
+            continue
+        }
+
+        $value = $value.Trim()
+        $key = Get-NormalizedNameKey -Name $value
+
+        if (-not $seen.ContainsKey($key)) {
+            $seen[$key] = $true
+            [void]$groups.Add($value)
+        }
+    }
+
+    if ($groups.Count -eq 0) {
+        throw "The CSV column '$column' contains no usable group names."
+    }
+
+    $groupArray = [object[]]$groups.ToArray()
+
+    return [PSCustomObject]@{
+        ColumnName = $column
+        RowCount = $rows.Count
+        Groups = $groupArray
+    }
+}
+
+function Invoke-RestWithRetry {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Uri,
+
+        [Parameter(Mandatory = $true)]
+        [Microsoft.PowerShell.Commands.WebRequestSession]$WebSession,
+
+        [int]$TimeoutSec = 90,
+        [int]$RetryCount = 4
+    )
+
+    $lastError = $null
+
+    for ($attempt = 0; $attempt -le $RetryCount; $attempt++) {
+        try {
+            return Invoke-RestMethod -Uri $Uri -Method Get -WebSession $WebSession -Headers @{ Accept = 'application/json' } -TimeoutSec $TimeoutSec -ErrorAction Stop
+        }
+        catch {
+            $lastError = $_
+            $statusCode = 0
+
+            try {
+                if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
+                    $statusCode = [int]$_.Exception.Response.StatusCode
+                }
+            }
+            catch {
+                $statusCode = 0
+            }
+
+            $isRetryable = ($statusCode -eq 0 -or $statusCode -eq 408 -or $statusCode -eq 429 -or $statusCode -ge 500)
+
+            if (-not $isRetryable -or $attempt -ge $RetryCount) {
+                throw
+            }
+
+            $delaySeconds = [int][Math]::Min(8, [Math]::Pow(2, $attempt))
+            Start-Sleep -Seconds $delaySeconds
+        }
+    }
+
+    throw $lastError
+}
+
+# ============================================
+# Authentication
+# ============================================
+
+function Start-PASSessionFromCCP {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ObjectName
+    )
+
+    $ccpUrl = '{0}/{1}/api/Accounts?AppID={2}&Safe={3}&Object={4}' -f `
+        $CCPAddress.TrimEnd('/'),
+        $CCPLocation.Trim('/'),
+        [uri]::EscapeDataString($CCPAppID),
+        [uri]::EscapeDataString($CCPSafe),
+        [uri]::EscapeDataString($ObjectName)
+
+    Write-Log ("Retrieving CyberArk API credentials from CCP using Object='{0}'..." -f $ObjectName) 'Cyan'
+    Write-Log ('CCP URL: {0}' -f $ccpUrl) 'Gray'
+
+    $response = $null
+    $securePassword = $null
+
+    try {
+        $response = Invoke-RestMethod -Uri $ccpUrl -Method Get -Headers @{ 'Content-Type' = 'application/json' } -UseDefaultCredentials:$CCPWindowsAuth -TimeoutSec $RequestTimeoutSec -ErrorAction Stop
+
+        if (-not $response -or -not $response.Content) {
+            throw 'CCP returned an empty response or no Content field.'
+        }
+
+        $resolvedUser = $null
+        if ($response.PSObject.Properties.Name -contains 'Username') {
+            $resolvedUser = [string]$response.Username
+        }
+        elseif ($response.PSObject.Properties.Name -contains 'UserName') {
+            $resolvedUser = [string]$response.UserName
+        }
+
+        if ([string]::IsNullOrWhiteSpace($resolvedUser)) {
+            throw 'CCP returned a password but no Username/UserName field.'
+        }
+
+        Write-Log ('Successfully retrieved CCP credential for user: {0}' -f $resolvedUser) 'Green'
+
+        $normalizedTenant = Get-NormalizedIdentityTenant -TenantUrl $IdentityTenantURL
+        $securePassword = ConvertTo-SecureString $response.Content -AsPlainText -Force
+        $credential = [System.Management.Automation.PSCredential]::new($resolvedUser, $securePassword)
+
+        Write-Log ('Requesting CyberArk PAS authentication using psPAS Identity header as {0}...' -f $resolvedUser) 'Cyan'
+        Write-Log ('IdentityTenantURL passed to Get-IdentityHeader: {0}' -f $normalizedTenant) 'Gray'
+        Write-Log ('Privilege Cloud Subdomain: {0}' -f $PCloudSubdomain) 'Gray'
+
+        $identityHeader = Get-IdentityHeader `
+            -IdentityTenantURL $normalizedTenant `
+            -psPASFormat `
+            -PCloudSubdomain $PCloudSubdomain `
+            -UPCreds $credential
+
+        Use-PASSession $identityHeader | Out-Null
+
+        $session = Get-PASSession
+        if (-not $session -or -not $session.BaseURI -or -not $session.WebSession) {
+            throw 'psPAS session was not established correctly.'
+        }
+
+        Write-Log ('Authentication successful. PAS session established as {0}.' -f $resolvedUser) 'Green'
+        return $resolvedUser
+    }
+    finally {
+        if ($response -and $response.PSObject.Properties.Name -contains 'Content') {
+            $response.Content = $null
+        }
+
+        if ($securePassword) {
+            $securePassword.Dispose()
+        }
+    }
+}
+
+function Get-AuthorizationHeaderValue {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Session
+    )
+
+    $authorization = $null
+
+    if ($Session.WebSession -and $Session.WebSession.Headers) {
+        $authorization = [string]$Session.WebSession.Headers['Authorization']
+    }
+
+    if ([string]::IsNullOrWhiteSpace($authorization)) {
+        throw 'The psPAS session did not expose an Authorization header.'
+    }
+
+    return $authorization
+}
+
+function Get-PrivilegeCloudApiBase {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$BaseUrl
+    )
+
+    $value = $BaseUrl.Trim().TrimEnd('/')
+
+    if ($value -match '(?i)/PasswordVault/API$') {
+        return $value
+    }
+
+    if ($value -match '(?i)/PasswordVault$') {
+        return '{0}/API' -f $value
+    }
+
+    return '{0}/PasswordVault/API' -f $value
+}
+
+# ============================================
+# Fast Safe retrieval
+# ============================================
+
+function Get-AllVisibleSafesFast {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ApiBase,
+
+        [Parameter(Mandatory = $true)]
+        [Microsoft.PowerShell.Commands.WebRequestSession]$WebSession,
+
+        [int]$PageSize = 1000
+    )
+
+    $results = New-Object System.Collections.ArrayList
+    $offset = 0
+    $pageNumber = 0
+    $expectedTotal = $null
+
+    while ($true) {
+        $pageNumber++
+        $uri = '{0}/Safes/?limit={1}&offset={2}&includeAccounts=false&extendedDetails=true' -f $ApiBase.TrimEnd('/'), $PageSize, $offset
+        $response = Invoke-RestWithRetry -Uri $uri -WebSession $WebSession -TimeoutSec $RequestTimeoutSec -RetryCount $MaxRetryCount
+
+        $page = @()
+        if ($response.PSObject.Properties.Name -contains 'value') {
+            $page = @($response.value)
+        }
+        else {
+            $page = @($response)
+        }
+
+        foreach ($safe in $page) {
+            if ($safe) {
+                [void]$results.Add($safe)
+            }
+        }
+
+        if ($response.PSObject.Properties.Name -contains 'count') {
+            $parsedCount = 0
+            if ([int]::TryParse([string]$response.count, [ref]$parsedCount)) {
+                if ($parsedCount -ge $results.Count) {
+                    $expectedTotal = $parsedCount
+                }
+            }
+        }
+
+        Write-Log ('Safe page {0}: returned {1}; accumulated {2}{3}.' -f `
+            $pageNumber,
+            $page.Count,
+            $results.Count,
+            $(if ($null -ne $expectedTotal) { ' of approximately {0}' -f $expectedTotal } else { '' })) 'Gray'
+
+        if ($page.Count -eq 0) {
+            break
+        }
+
+        $offset += $page.Count
+
+        $hasNextLink = ($response.PSObject.Properties.Name -contains 'nextLink' -and -not [string]::IsNullOrWhiteSpace([string]$response.nextLink))
+
+        if (-not $hasNextLink -and $page.Count -lt $PageSize) {
+            break
+        }
+    }
+
+    return [object[]]$results.ToArray()
+}
+
+# ============================================
+# Runspace result collection
+# ============================================
+
+function Receive-CompletedRunspaceOutput {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.ArrayList]$Jobs,
+
+        [switch]$WaitForOne
+    )
+
+    do {
+        $completedOne = $false
+
+        for ($index = $Jobs.Count - 1; $index -ge 0; $index--) {
+            $job = $Jobs[$index]
+
+            if ($job.AsyncResult.IsCompleted) {
+                try {
+                    $items = $job.PowerShell.EndInvoke($job.AsyncResult)
+                    foreach ($item in $items) {
+                        Write-Output $item
+                    }
+
+                    if ($job.PowerShell.Streams.Error.Count -gt 0) {
+                        $streamErrors = @($job.PowerShell.Streams.Error | ForEach-Object { $_.ToString() }) -join ' | '
+                        Write-Output ([PSCustomObject]@{
+                            RecordType = 'WorkerError'
+                            SafeName = $job.SafeName
+                            SafeUrlId = $job.SafeUrlId
+                            ErrorMessage = $streamErrors
+                        })
+                    }
+                }
+                catch {
+                    Write-Output ([PSCustomObject]@{
+                        RecordType = 'WorkerError'
+                        SafeName = $job.SafeName
+                        SafeUrlId = $job.SafeUrlId
+                        ErrorMessage = $_.Exception.Message
+                    })
+                }
+                finally {
+                    Write-Output ([PSCustomObject]@{
+                        RecordType = 'Complete'
+                        SafeName = $job.SafeName
+                        SafeUrlId = $job.SafeUrlId
+                        ErrorMessage = ''
+                    })
+
+                    $job.PowerShell.Dispose()
+                    $Jobs.RemoveAt($index)
+                }
+
+                $completedOne = $true
+            }
+        }
+
+        if ($completedOne -or -not $WaitForOne -or $Jobs.Count -eq 0) {
+            break
+        }
+
+        Start-Sleep -Milliseconds 100
+    }
+    while ($Jobs.Count -gt 0)
+}
+
+# ============================================
+# Membership worker
+# ============================================
+
+$MembershipWorker = {
+    param(
+        [object]$Safe,
+        [string]$ApiBase,
+        [string]$Authorization,
+        [hashtable]$ExactMap,
+        [hashtable]$ShortMap,
+        [bool]$AllowShortMatch,
+        [int]$PageSize,
+        [int]$TimeoutSec,
+        [int]$RetryCount
+    )
+
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+    function Invoke-WorkerRest {
+        param([string]$Uri)
+
+        for ($attempt = 0; $attempt -le $RetryCount; $attempt++) {
+            try {
+                return Invoke-RestMethod -Uri $Uri -Method Get -Headers @{
+                    Authorization = $Authorization
+                    Accept = 'application/json'
+                } -TimeoutSec $TimeoutSec -ErrorAction Stop
+            }
+            catch {
+                $statusCode = 0
+                try {
+                    if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
+                        $statusCode = [int]$_.Exception.Response.StatusCode
+                    }
+                }
+                catch {
+                    $statusCode = 0
+                }
+
+                $retryable = ($statusCode -eq 0 -or $statusCode -eq 408 -or $statusCode -eq 429 -or $statusCode -ge 500)
+                if (-not $retryable -or $attempt -ge $RetryCount) {
+                    throw
+                }
+
+                $delay = [int][Math]::Min(8, [Math]::Pow(2, $attempt))
+                Start-Sleep -Seconds $delay
+            }
+        }
+    }
+
+    function Get-WorkerShortKey {
+        param([string]$Name)
+
+        if ([string]::IsNullOrWhiteSpace($Name)) {
+            return ''
+        }
+
+        $value = $Name.Trim()
+        if ($value.Contains('\')) {
+            $value = $value.Substring($value.LastIndexOf('\') + 1)
+        }
+        if ($value.Contains('@')) {
+            $value = $value.Substring(0, $value.IndexOf('@'))
+        }
+
+        return $value.Trim().ToLowerInvariant()
+    }
+
+    $safeName = [string]$Safe.safeName
+    $safeUrlId = [string]$Safe.safeUrlId
+
+    if ([string]::IsNullOrWhiteSpace($safeUrlId)) {
+        $safeUrlId = $safeName
+    }
+
+    try {
+        $encodedSafeId = [uri]::EscapeDataString($safeUrlId)
+        $encodedFilter = [uri]::EscapeDataString('memberType eq group')
+        $offset = 0
+        $seenMatches = @{}
+
+        while ($true) {
+            $uri = '{0}/Safes/{1}/Members/?limit={2}&offset={3}&filter={4}' -f `
+                $ApiBase.TrimEnd('/'),
+                $encodedSafeId,
+                $PageSize,
+                $offset,
+                $encodedFilter
+
+            $response = Invoke-WorkerRest -Uri $uri
+            $members = @()
+
+            if ($response.PSObject.Properties.Name -contains 'value') {
+                $members = @($response.value)
+            }
+            else {
+                $members = @($response)
+            }
+
+            foreach ($member in $members) {
+                $memberName = [string]$member.memberName
+                if ([string]::IsNullOrWhiteSpace($memberName)) {
+                    continue
+                }
+
+                $exactKey = $memberName.Trim().ToLowerInvariant()
+                $matchedInputs = @()
+                $matchType = ''
+
+                if ($ExactMap.ContainsKey($exactKey)) {
+                    $matchedInputs = @($ExactMap[$exactKey])
+                    $matchType = 'Exact'
+                }
+                elseif ($AllowShortMatch) {
+                    $shortKey = Get-WorkerShortKey -Name $memberName
+                    if (-not [string]::IsNullOrWhiteSpace($shortKey) -and $ShortMap.ContainsKey($shortKey)) {
+                        $matchedInputs = @($ShortMap[$shortKey])
+                        $matchType = 'ShortName'
+                    }
+                }
+
+                foreach ($inputGroup in $matchedInputs) {
+                    $dedupeKey = ([string]$inputGroup).Trim().ToLowerInvariant()
+                    if ($seenMatches.ContainsKey($dedupeKey)) {
+                        continue
+                    }
+
+                    $seenMatches[$dedupeKey] = $true
+                    $permissions = $member.permissions
+
+                    [PSCustomObject]@{
+                        RecordType = 'MembershipMatch'
+                        InputGroup = [string]$inputGroup
+                        MatchedMemberName = $memberName
+                        MatchType = $matchType
+                        SafeName = $safeName
+                        SafeUrlId = $safeUrlId
+                        MemberType = [string]$member.memberType
+                        MembershipExpired = [bool]$member.isExpiredMembershipEnable
+                        ListAccountsPermission = $(if ($permissions) { [bool]$permissions.listAccounts } else { $null })
+                    }
+                }
+            }
+
+            if ($members.Count -eq 0 -or $members.Count -lt $PageSize) {
+                break
+            }
+
+            $offset += $members.Count
+        }
+    }
+    catch {
+        [PSCustomObject]@{
+            RecordType = 'MembershipError'
+            SafeName = $safeName
+            SafeUrlId = $safeUrlId
+            ErrorMessage = $_.Exception.Message
+        }
+    }
+
+}
+
+# ============================================
+# Account worker
+# ============================================
+
+$AccountWorker = {
+    param(
+        [object]$Safe,
+        [string]$ApiBase,
+        [string]$Authorization,
+        [bool]$IncludeDetails,
+        [int]$PageSize,
+        [int]$TimeoutSec,
+        [int]$RetryCount
+    )
+
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+    function Invoke-WorkerRest {
+        param([string]$Uri)
+
+        for ($attempt = 0; $attempt -le $RetryCount; $attempt++) {
+            try {
+                return Invoke-RestMethod -Uri $Uri -Method Get -Headers @{
+                    Authorization = $Authorization
+                    Accept = 'application/json'
+                } -TimeoutSec $TimeoutSec -ErrorAction Stop
+            }
+            catch {
+                $statusCode = 0
+                try {
+                    if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
+                        $statusCode = [int]$_.Exception.Response.StatusCode
+                    }
+                }
+                catch {
+                    $statusCode = 0
+                }
+
+                $retryable = ($statusCode -eq 0 -or $statusCode -eq 408 -or $statusCode -eq 429 -or $statusCode -ge 500)
+                if (-not $retryable -or $attempt -ge $RetryCount) {
+                    throw
+                }
+
+                $delay = [int][Math]::Min(8, [Math]::Pow(2, $attempt))
+                Start-Sleep -Seconds $delay
+            }
+        }
+    }
+
+    $safeName = [string]$Safe.SafeName
+    $safeUrlId = [string]$Safe.SafeUrlId
+
+    try {
+        $escapedSafeName = $safeName.Replace("'", "''")
+        $encodedFilter = [uri]::EscapeDataString("safeName eq '$escapedSafeName'")
+
+        if (-not $IncludeDetails) {
+            $uri = '{0}/Accounts?limit=1&offset=0&filter={1}' -f $ApiBase.TrimEnd('/'), $encodedFilter
+            $response = Invoke-WorkerRest -Uri $uri
+            $accounts = @()
+
+            if ($response.PSObject.Properties.Name -contains 'value') {
+                $accounts = @($response.value)
+            }
+            else {
+                $accounts = @($response)
+            }
+
+            $count = $accounts.Count
+            if ($response.PSObject.Properties.Name -contains 'count') {
+                $parsedCount = 0
+                if ([int]::TryParse([string]$response.count, [ref]$parsedCount)) {
+                    $count = $parsedCount
+                }
+            }
+
+            [PSCustomObject]@{
+                RecordType = 'AccountSummary'
+                SafeName = $safeName
+                SafeUrlId = $safeUrlId
+                HasAccounts = ($count -gt 0)
+                AccountCount = $count
+                AccountLookupStatus = 'Success'
+                ErrorMessage = ''
+            }
+        }
+        else {
+            $offset = 0
+            $totalCount = 0
+
+            while ($true) {
+                $uri = '{0}/Accounts?limit={1}&offset={2}&filter={3}' -f $ApiBase.TrimEnd('/'), $PageSize, $offset, $encodedFilter
+                $response = Invoke-WorkerRest -Uri $uri
+                $accounts = @()
+
+                if ($response.PSObject.Properties.Name -contains 'value') {
+                    $accounts = @($response.value)
+                }
+                else {
+                    $accounts = @($response)
+                }
+
+                foreach ($account in $accounts) {
+                    [PSCustomObject]@{
+                        RecordType = 'AccountDetail'
+                        SafeName = $safeName
+                        SafeUrlId = $safeUrlId
+                        AccountID = [string]$account.id
+                        AccountName = [string]$account.name
+                        Username = [string]$account.userName
+                        Address = [string]$account.address
+                        PlatformID = [string]$account.platformId
+                    }
+                }
+
+                $totalCount += $accounts.Count
+
+                if ($accounts.Count -eq 0 -or $accounts.Count -lt $PageSize) {
+                    break
+                }
+
+                $offset += $accounts.Count
+            }
+
+            [PSCustomObject]@{
+                RecordType = 'AccountSummary'
+                SafeName = $safeName
+                SafeUrlId = $safeUrlId
+                HasAccounts = ($totalCount -gt 0)
+                AccountCount = $totalCount
+                AccountLookupStatus = 'Success'
+                ErrorMessage = ''
+            }
+        }
+    }
+    catch {
+        [PSCustomObject]@{
+            RecordType = 'AccountSummary'
+            SafeName = $safeName
+            SafeUrlId = $safeUrlId
+            HasAccounts = $null
+            AccountCount = $null
+            AccountLookupStatus = 'Failed'
+            ErrorMessage = $_.Exception.Message
+        }
+
+        [PSCustomObject]@{
+            RecordType = 'AccountError'
+            SafeName = $safeName
+            SafeUrlId = $safeUrlId
+            ErrorMessage = $_.Exception.Message
+        }
+    }
+
+}
+
+# ============================================
+# Main execution
+# ============================================
+
+$authenticatedUser = $null
+$sessionOpened = $false
+$runspacePool = $null
+
+try {
+    Write-Log '============================================================' 'Gray'
+    Write-Log 'CNA Group-to-Safe and Safe-to-Account Report started.' 'Cyan'
+    Write-Log ('Identity Tenant URL : {0}' -f $IdentityTenantURL) 'Gray'
+    Write-Log ('Privilege Cloud URL : {0}' -f $PrivilegeCloudURL) 'Gray'
+    Write-Log ('PCloud Subdomain    : {0}' -f $PCloudSubdomain) 'Gray'
+    Write-Log ('CCP Address         : {0}' -f $CCPAddress) 'Gray'
+    Write-Log ('CCP AppID           : {0}' -f $CCPAppID) 'Gray'
+    Write-Log ('CCP Safe            : {0}' -f $CCPSafe) 'Gray'
+    Write-Log ('CCP Object          : {0}' -f $CCPObject) 'Gray'
+    Write-Log ('Output Folder       : {0}' -f $OutputFolder) 'Gray'
+    Write-Log ('Throttle Limit      : {0}' -f $ThrottleLimit) 'Gray'
+    Write-Log ('Account Details     : {0}' -f $IncludeAccountDetails) 'Gray'
+    Write-Log '============================================================' 'Gray'
+
+    if ([string]::IsNullOrWhiteSpace($GroupCsvPath)) {
+        $GroupCsvPath = Select-GroupCsvFile
+    }
+
+    $importResult = Import-InputGroups -Path $GroupCsvPath -RequestedColumn $GroupColumnName
+    $inputGroups = @($importResult.Groups)
+
+    Write-Log ('Using CSV group column: {0}' -f $importResult.ColumnName) 'Green'
+    Write-Log ('Loaded {0} unique group(s) from {1} CSV row(s).' -f $inputGroups.Count, $importResult.RowCount) 'Green'
+
+    Import-Module psPAS -Force -ErrorAction Stop
+    if (-not (Get-Command Get-IdentityHeader -ErrorAction SilentlyContinue)) {
+        throw 'Get-IdentityHeader was not found. Confirm the IdentityCommand module is installed.'
+    }
+
+    $authenticatedUser = Start-PASSessionFromCCP -ObjectName $CCPObject
+    $sessionOpened = $true
+
+    $pasSession = Get-PASSession
+    $apiBase = Get-PrivilegeCloudApiBase -BaseUrl $PrivilegeCloudURL
+    $authorization = Get-AuthorizationHeaderValue -Session $pasSession
+
+    Write-Log ('psPAS Session Base URI : {0}' -f ([string]$pasSession.BaseURI)) 'Gray'
+    Write-Log ('REST API Base URI      : {0}' -f $apiBase) 'Gray'
+    Write-Log 'Retrieving visible Safes through large REST pages...' 'Yellow'
+
+    $safeStart = Get-Date
+    $safes = @(Get-AllVisibleSafesFast -ApiBase $apiBase -WebSession $pasSession.WebSession -PageSize $SafePageSize)
+    $safeDuration = (Get-Date) - $safeStart
+
+    Write-Log ('Retrieved {0} Safe(s) in {1:n1} seconds.' -f $safes.Count, $safeDuration.TotalSeconds) 'Green'
+
+    if ($safes.Count -eq 0) {
+        throw 'No visible Safes were returned.'
+    }
+
+    # Build fast exact and short-name lookup tables.
+    $exactMap = @{}
+    $shortMap = @{}
+
+    foreach ($group in $inputGroups) {
+        $exactKey = Get-NormalizedNameKey -Name $group
+        $shortKey = Get-ShortNameKey -Name $group
+
+        if (-not $exactMap.ContainsKey($exactKey)) {
+            $exactMap[$exactKey] = @()
+        }
+        $exactMap[$exactKey] = @($exactMap[$exactKey]) + [string]$group
+
+        if (-not [string]::IsNullOrWhiteSpace($shortKey)) {
+            if (-not $shortMap.ContainsKey($shortKey)) {
+                $shortMap[$shortKey] = @()
+            }
+            $shortMap[$shortKey] = @($shortMap[$shortKey]) + [string]$group
+        }
+    }
+
+    $membershipMatches = New-Object System.Collections.ArrayList
+    $errorRows = New-Object System.Collections.ArrayList
+    $matchedGroups = @{}
+    $matchedSafes = @{}
+    $membershipErrorCount = 0
+    $processedSafes = 0
+
+    Write-Log ('Scanning Safe group memberships with throttle {0}...' -f $ThrottleLimit) 'Yellow'
+    $membershipStart = Get-Date
+
+    $runspacePool = [runspacefactory]::CreateRunspacePool(1, $ThrottleLimit)
+    $runspacePool.ApartmentState = 'MTA'
+    $runspacePool.Open()
+
+    $jobs = New-Object System.Collections.ArrayList
+    $queueLimit = [Math]::Max($ThrottleLimit * 4, $ThrottleLimit)
+    $membershipScriptText = $MembershipWorker.ToString()
+
+    foreach ($safe in $safes) {
+        while ($jobs.Count -ge $queueLimit) {
+            $outputs = @(Receive-CompletedRunspaceOutput -Jobs $jobs -WaitForOne)
+
+            foreach ($output in $outputs) {
+                switch ([string]$output.RecordType) {
+                    'MembershipMatch' {
+                        [void]$membershipMatches.Add($output)
+                        $matchedGroups[(Get-NormalizedNameKey -Name ([string]$output.InputGroup))] = $true
+                        $matchedSafes[[string]$output.SafeUrlId] = [PSCustomObject]@{
+                            SafeName = [string]$output.SafeName
+                            SafeUrlId = [string]$output.SafeUrlId
+                        }
+                    }
+                    'MembershipError' {
+                        $membershipErrorCount++
+                        [void]$errorRows.Add([PSCustomObject]@{
+                            Stage = 'SafeMembership'
+                            InputGroup = ''
+                            SafeName = [string]$output.SafeName
+                            SafeUrlId = [string]$output.SafeUrlId
+                            ErrorMessage = [string]$output.ErrorMessage
+                        })
+                    }
+                    'WorkerError' {
+                        $membershipErrorCount++
+                        [void]$errorRows.Add([PSCustomObject]@{
+                            Stage = 'SafeMembershipWorker'
+                            InputGroup = ''
+                            SafeName = [string]$output.SafeName
+                            SafeUrlId = [string]$output.SafeUrlId
+                            ErrorMessage = [string]$output.ErrorMessage
+                        })
+                    }
+                    'Complete' {
+                        $processedSafes++
+                        if (($processedSafes % $ProgressEvery) -eq 0 -or $processedSafes -eq $safes.Count) {
+                            Write-Log ('Membership scan progress: {0}/{1} Safes; matches={2}; errors={3}.' -f $processedSafes, $safes.Count, $membershipMatches.Count, $membershipErrorCount) 'Cyan'
+                        }
+                    }
+                }
+            }
+        }
+
+        $powerShell = [powershell]::Create()
+        $powerShell.RunspacePool = $runspacePool
+        [void]$powerShell.AddScript($membershipScriptText)
+        [void]$powerShell.AddArgument($safe)
+        [void]$powerShell.AddArgument($apiBase)
+        [void]$powerShell.AddArgument($authorization)
+        [void]$powerShell.AddArgument($exactMap)
+        [void]$powerShell.AddArgument($shortMap)
+        [void]$powerShell.AddArgument($AllowShortNameMatch)
+        [void]$powerShell.AddArgument($MemberPageSize)
+        [void]$powerShell.AddArgument($RequestTimeoutSec)
+        [void]$powerShell.AddArgument($MaxRetryCount)
+
+        $asyncResult = $powerShell.BeginInvoke()
+        [void]$jobs.Add([PSCustomObject]@{
+            PowerShell = $powerShell
+            AsyncResult = $asyncResult
+            SafeName = [string]$safe.safeName
+            SafeUrlId = [string]$safe.safeUrlId
+        })
+    }
+
+    while ($jobs.Count -gt 0) {
+        $outputs = @(Receive-CompletedRunspaceOutput -Jobs $jobs -WaitForOne)
+
+        foreach ($output in $outputs) {
+            switch ([string]$output.RecordType) {
+                'MembershipMatch' {
+                    [void]$membershipMatches.Add($output)
+                    $matchedGroups[(Get-NormalizedNameKey -Name ([string]$output.InputGroup))] = $true
+                    $matchedSafes[[string]$output.SafeUrlId] = [PSCustomObject]@{
+                        SafeName = [string]$output.SafeName
+                        SafeUrlId = [string]$output.SafeUrlId
+                    }
+                }
+                'MembershipError' {
+                    $membershipErrorCount++
+                    [void]$errorRows.Add([PSCustomObject]@{
+                        Stage = 'SafeMembership'
+                        InputGroup = ''
+                        SafeName = [string]$output.SafeName
+                        SafeUrlId = [string]$output.SafeUrlId
+                        ErrorMessage = [string]$output.ErrorMessage
+                    })
+                }
+                'WorkerError' {
+                    $membershipErrorCount++
+                    [void]$errorRows.Add([PSCustomObject]@{
+                        Stage = 'SafeMembershipWorker'
+                        InputGroup = ''
+                        SafeName = [string]$output.SafeName
+                        SafeUrlId = [string]$output.SafeUrlId
+                        ErrorMessage = [string]$output.ErrorMessage
+                    })
+                }
+                'Complete' {
+                    $processedSafes++
+                    if (($processedSafes % $ProgressEvery) -eq 0 -or $processedSafes -eq $safes.Count) {
+                        Write-Log ('Membership scan progress: {0}/{1} Safes; matches={2}; errors={3}.' -f $processedSafes, $safes.Count, $membershipMatches.Count, $membershipErrorCount) 'Cyan'
+                    }
+                }
+            }
+        }
+    }
+
+    $runspacePool.Close()
+    $runspacePool.Dispose()
+    $runspacePool = $null
+
+    $membershipDuration = (Get-Date) - $membershipStart
+    Write-Log ('Membership scan completed in {0:n1} seconds. Matched rows={1}; unique matched Safes={2}; read errors={3}.' -f `
+        $membershipDuration.TotalSeconds,
+        $membershipMatches.Count,
+        $matchedSafes.Count,
+        $membershipErrorCount) 'Green'
+
+    # Check accounts only for unique matched Safes.
+    $accountSummaryBySafe = @{}
+    $accountDetails = New-Object System.Collections.ArrayList
+    $accountErrorCount = 0
+
+    if ($matchedSafes.Count -gt 0) {
+        Write-Log ('Checking accounts on only {0} matched Safe(s)...' -f $matchedSafes.Count) 'Yellow'
+        $accountStart = Get-Date
+
+        $runspacePool = [runspacefactory]::CreateRunspacePool(1, $ThrottleLimit)
+        $runspacePool.ApartmentState = 'MTA'
+        $runspacePool.Open()
+
+        $jobs = New-Object System.Collections.ArrayList
+        $queueLimit = [Math]::Max($ThrottleLimit * 4, $ThrottleLimit)
+        $accountScriptText = $AccountWorker.ToString()
+        $processedMatchedSafes = 0
+
+        foreach ($safeKey in @($matchedSafes.Keys)) {
+            $matchedSafe = $matchedSafes[$safeKey]
+
+            while ($jobs.Count -ge $queueLimit) {
+                $outputs = @(Receive-CompletedRunspaceOutput -Jobs $jobs -WaitForOne)
+
+                foreach ($output in $outputs) {
+                    switch ([string]$output.RecordType) {
+                        'AccountSummary' {
+                            $accountSummaryBySafe[[string]$output.SafeUrlId] = $output
+                        }
+                        'AccountDetail' {
+                            [void]$accountDetails.Add($output)
+                        }
+                        'AccountError' {
+                            $accountErrorCount++
+                            [void]$errorRows.Add([PSCustomObject]@{
+                                Stage = 'AccountLookup'
+                                InputGroup = ''
+                                SafeName = [string]$output.SafeName
+                                SafeUrlId = [string]$output.SafeUrlId
+                                ErrorMessage = [string]$output.ErrorMessage
+                            })
+                        }
+                        'WorkerError' {
+                            $accountErrorCount++
+                            [void]$errorRows.Add([PSCustomObject]@{
+                                Stage = 'AccountLookupWorker'
+                                InputGroup = ''
+                                SafeName = [string]$output.SafeName
+                                SafeUrlId = [string]$output.SafeUrlId
+                                ErrorMessage = [string]$output.ErrorMessage
+                            })
+                        }
+                        'Complete' {
+                            $processedMatchedSafes++
+                        }
+                    }
+                }
+            }
+
+            $powerShell = [powershell]::Create()
+            $powerShell.RunspacePool = $runspacePool
+            [void]$powerShell.AddScript($accountScriptText)
+            [void]$powerShell.AddArgument($matchedSafe)
+            [void]$powerShell.AddArgument($apiBase)
+            [void]$powerShell.AddArgument($authorization)
+            [void]$powerShell.AddArgument($IncludeAccountDetails)
+            [void]$powerShell.AddArgument($AccountPageSize)
+            [void]$powerShell.AddArgument($RequestTimeoutSec)
+            [void]$powerShell.AddArgument($MaxRetryCount)
+
+            $asyncResult = $powerShell.BeginInvoke()
+            [void]$jobs.Add([PSCustomObject]@{
+                PowerShell = $powerShell
+                AsyncResult = $asyncResult
+                SafeName = [string]$matchedSafe.SafeName
+                SafeUrlId = [string]$matchedSafe.SafeUrlId
+            })
+        }
+
+        while ($jobs.Count -gt 0) {
+            $outputs = @(Receive-CompletedRunspaceOutput -Jobs $jobs -WaitForOne)
+
+            foreach ($output in $outputs) {
+                switch ([string]$output.RecordType) {
+                    'AccountSummary' {
+                        $accountSummaryBySafe[[string]$output.SafeUrlId] = $output
+                    }
+                    'AccountDetail' {
+                        [void]$accountDetails.Add($output)
+                    }
+                    'AccountError' {
+                        $accountErrorCount++
+                        [void]$errorRows.Add([PSCustomObject]@{
+                            Stage = 'AccountLookup'
+                            InputGroup = ''
+                            SafeName = [string]$output.SafeName
+                            SafeUrlId = [string]$output.SafeUrlId
+                            ErrorMessage = [string]$output.ErrorMessage
+                        })
+                    }
+                    'WorkerError' {
+                        $accountErrorCount++
+                        [void]$errorRows.Add([PSCustomObject]@{
+                            Stage = 'AccountLookupWorker'
+                            InputGroup = ''
+                            SafeName = [string]$output.SafeName
+                            SafeUrlId = [string]$output.SafeUrlId
+                            ErrorMessage = [string]$output.ErrorMessage
+                        })
+                    }
+                    'Complete' {
+                        $processedMatchedSafes++
+                    }
+                }
+            }
+        }
+
+        $runspacePool.Close()
+        $runspacePool.Dispose()
+        $runspacePool = $null
+
+        $accountDuration = (Get-Date) - $accountStart
+        Write-Log ('Account checks completed in {0:n1} seconds. Lookup errors={1}.' -f $accountDuration.TotalSeconds, $accountErrorCount) 'Green'
+    }
+    else {
+        Write-Log 'No input group was found on a visible Safe; account checks were skipped.' 'Yellow'
+    }
+
+    # Build final summary rows.
+    $summaryRows = New-Object System.Collections.ArrayList
+    $scanCompleteness = $(if ($membershipErrorCount -eq 0) { 'Complete' } else { 'Partial' })
+
+    foreach ($match in $membershipMatches) {
+        $accountResult = $null
+        if ($accountSummaryBySafe.ContainsKey([string]$match.SafeUrlId)) {
+            $accountResult = $accountSummaryBySafe[[string]$match.SafeUrlId]
+        }
+
+        $status = 'MatchedSafeAccountLookupFailed'
+        $hasAccounts = $null
+        $accountCount = $null
+        $accountLookupStatus = 'NotRun'
+        $accountErrorMessage = ''
+
+        if ($accountResult) {
+            $hasAccounts = $accountResult.HasAccounts
+            $accountCount = $accountResult.AccountCount
+            $accountLookupStatus = [string]$accountResult.AccountLookupStatus
+            $accountErrorMessage = [string]$accountResult.ErrorMessage
+
+            if ($accountLookupStatus -eq 'Success') {
+                if ($hasAccounts) {
+                    $status = 'MatchedSafeHasAccounts'
+                }
+                else {
+                    $status = 'MatchedSafeNoAccounts'
+                }
+            }
+        }
+
+        [void]$summaryRows.Add([PSCustomObject]@{
+            InputGroup = [string]$match.InputGroup
+            SafeMembershipFound = $true
+            MatchedMemberName = [string]$match.MatchedMemberName
+            MatchType = [string]$match.MatchType
+            MemberType = [string]$match.MemberType
+            MembershipExpired = $match.MembershipExpired
+            ListAccountsPermission = $match.ListAccountsPermission
+            SafeName = [string]$match.SafeName
+            SafeUrlId = [string]$match.SafeUrlId
+            HasAccounts = $hasAccounts
+            AccountCount = $accountCount
+            AccountLookupStatus = $accountLookupStatus
+            Status = $status
+            MembershipScanCompleteness = $scanCompleteness
+            ErrorMessage = $accountErrorMessage
+        })
+    }
+
+    foreach ($group in $inputGroups) {
+        $groupKey = Get-NormalizedNameKey -Name $group
+        if (-not $matchedGroups.ContainsKey($groupKey)) {
+            $status = $(if ($membershipErrorCount -eq 0) { 'NoSafeMembershipFound' } else { 'NoSafeMembershipFoundInSuccessfullyScannedSafes' })
+
+            [void]$summaryRows.Add([PSCustomObject]@{
+                InputGroup = [string]$group
+                SafeMembershipFound = $false
+                MatchedMemberName = ''
+                MatchType = ''
+                MemberType = ''
+                MembershipExpired = $null
+                ListAccountsPermission = $null
+                SafeName = ''
+                SafeUrlId = ''
+                HasAccounts = $null
+                AccountCount = $null
+                AccountLookupStatus = 'NotApplicable'
+                Status = $status
+                MembershipScanCompleteness = $scanCompleteness
+                ErrorMessage = ''
+            })
+        }
+    }
+
+    Write-Log 'Exporting summary report...' 'Yellow'
+    $summaryRows |
+        Sort-Object InputGroup, SafeName |
+        Export-Csv -LiteralPath $SummaryCsvPath -NoTypeInformation -Encoding UTF8
+
+    if ($IncludeAccountDetails -and $accountDetails.Count -gt 0) {
+        $accountDetails |
+            Select-Object SafeName, SafeUrlId, AccountID, AccountName, Username, Address, PlatformID |
+            Sort-Object SafeName, AccountName |
+            Export-Csv -LiteralPath $AccountCsvPath -NoTypeInformation -Encoding UTF8
+    }
+    else {
+        $accountHeader = '"SafeName","SafeUrlId","AccountID","AccountName","Username","Address","PlatformID"'
+        [System.IO.File]::WriteAllText($AccountCsvPath, $accountHeader + [Environment]::NewLine, (New-Object System.Text.UTF8Encoding($true)))
+    }
+
+    if ($errorRows.Count -gt 0) {
+        $errorRows |
+            Sort-Object Stage, SafeName |
+            Export-Csv -LiteralPath $ErrorCsvPath -NoTypeInformation -Encoding UTF8
+    }
+    else {
+        $errorHeader = '"Stage","InputGroup","SafeName","SafeUrlId","ErrorMessage"'
+        [System.IO.File]::WriteAllText($ErrorCsvPath, $errorHeader + [Environment]::NewLine, (New-Object System.Text.UTF8Encoding($true)))
+    }
+
+    $groupsMatched = @($matchedGroups.Keys).Count
+    $groupsNotMatched = $inputGroups.Count - $groupsMatched
+    $safesWithAccounts = @($accountSummaryBySafe.Values | Where-Object { $_.AccountLookupStatus -eq 'Success' -and $_.HasAccounts }).Count
+    $safesWithoutAccounts = @($accountSummaryBySafe.Values | Where-Object { $_.AccountLookupStatus -eq 'Success' -and -not $_.HasAccounts }).Count
+
+    Write-Log '============================================================' 'Gray'
+    Write-Log 'CNA Group-to-Safe and Safe-to-Account Report completed.' 'Green'
+    Write-Log ('Authenticated User             : {0}' -f $authenticatedUser) 'Gray'
+    Write-Log ('Input Groups                   : {0}' -f $inputGroups.Count) 'Gray'
+    Write-Log ('Visible Safes                  : {0}' -f $safes.Count) 'Gray'
+    Write-Log ('Groups Matched                 : {0}' -f $groupsMatched) 'Green'
+    Write-Log ('Groups Not Matched             : {0}' -f $groupsNotMatched) 'Yellow'
+    Write-Log ('Unique Matched Safes           : {0}' -f $matchedSafes.Count) 'Green'
+    Write-Log ('Matched Safes With Accounts    : {0}' -f $safesWithAccounts) 'Green'
+    Write-Log ('Matched Safes Without Accounts : {0}' -f $safesWithoutAccounts) 'Yellow'
+    $membershipErrorColor = if ($membershipErrorCount -eq 0) { 'Green' } else { 'Red' }
+    $accountErrorColor = if ($accountErrorCount -eq 0) { 'Green' } else { 'Red' }
+    Write-Log ('Membership Read Errors         : {0}' -f $membershipErrorCount) $membershipErrorColor
+    Write-Log ('Account Lookup Errors          : {0}' -f $accountErrorCount) $accountErrorColor
+    Write-Log ('Summary Report                 : {0}' -f $SummaryCsvPath) 'Gray'
+    Write-Log ('Account Detail Report          : {0}' -f $AccountCsvPath) 'Gray'
+    Write-Log ('Error Report                   : {0}' -f $ErrorCsvPath) 'Gray'
+    Write-Log ('Log File                       : {0}' -f $LogFile) 'Gray'
+    Write-Log '============================================================' 'Gray'
+}
+catch {
+    Write-Log ('FATAL: {0}' -f $_.Exception.Message) 'Red'
+    Write-Log ('At: {0}' -f $_.InvocationInfo.PositionMessage) 'Red'
+    exit 1
+}
+finally {
+    if ($runspacePool) {
+        try {
+            $runspacePool.Close()
+            $runspacePool.Dispose()
+        }
+        catch {
+        }
+    }
+
+    if ($sessionOpened) {
+        try {
+            Close-PASSession | Out-Null
+            Write-Log 'PAS session closed.' 'Gray'
+        }
+        catch {
+            Write-Log ('WARNING: PAS session could not be closed cleanly. {0}' -f $_.Exception.Message) 'Yellow'
+        }
+    }
+}
