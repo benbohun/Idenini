@@ -5,7 +5,7 @@
 .SYNOPSIS
     Finds CyberArk accounts with confirmed disabled-user activity (winRc=1331),
     replicates eligible IND_ accounts into the retirement Safe/platform, validates
-    the replacement, and deletes the source only after successful validation.
+    the replacement, releases locked source accounts, and deletes the source only after successful validation.
 
 .DESCRIPTION
     This script intentionally uses only exported/public psPAS commands for
@@ -31,10 +31,18 @@
     Eligible IND_ accounts are replicated transactionally to the retirement Safe and
     platform, validated, and then removed from the source Safe.
 
+    The workflow is idempotent. When the target Safe already contains an account with
+    the same case-insensitive UserName and Address, the script does not create another
+    account. It validates or corrects that target account and deletes the old source pair.
+
+    Before secret retrieval and source deletion, the script disables source CPM automatic
+    management and attempts both the CyberArk Unlock and Check-In operations. This prevents
+    a CPM process or exclusive-access lock from blocking retirement.
+
 .NOTES
     PowerShell      : Windows PowerShell 5.1
     Module          : psPAS
-    Script version  : 2026.07.15.10
+    Script version  : 2026.07.15.11
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true)]
@@ -64,6 +72,15 @@ param(
 
     [bool]$FinalizeExistingTarget = $true,
 
+    [bool]$DisableSourceCPMBeforeMove = $true,
+    [bool]$ReleaseLockedSource = $true,
+
+    [ValidateRange(1, 5)]
+    [int]$OperationRetryCount = 3,
+
+    [ValidateRange(1, 30)]
+    [int]$OperationRetryDelaySeconds = 3,
+
     [string]$PasswordRetrievalReason = "Retire disabled CyberArk account after confirmed winRc=1331 activity",
 
     [string]$ReportFolder = "I:\Script\IDENTITY Script New\logs\Disabled_Account_Migration",
@@ -87,7 +104,7 @@ $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 $ConfirmPreference = "None"
 
-$script:ScriptVersion = "2026.07.15.10"
+$script:ScriptVersion = "2026.07.15.11"
 $script:RunStart = Get-Date
 $script:RunId = $script:RunStart.ToString("yyyyMMdd_HHmmss")
 $script:LogPath = $null
@@ -387,6 +404,11 @@ function Add-ReportRow {
         TargetSafeName        = $TargetSafeName
         TargetPlatformID      = $TargetPlatformID
         TargetAccountID       = ""
+        TargetMatchCount      = 0
+        SourceCPMStatus       = ""
+        SourceReleaseStatus   = ""
+        SourceReleaseError    = ""
+        SourceDeleteVerified  = $false
         ActionStatus          = ""
         Error                 = ""
     }
@@ -533,6 +555,9 @@ function Assert-PublicCommands {
         "Get-PASAccountActivity",
         "Get-PASAccountPassword",
         "Add-PASAccount",
+        "Set-PASAccount",
+        "Disable-PASCPMAutoManagement",
+        "Unlock-PASAccount",
         "Remove-PASAccount",
         "Get-PASSafe",
         "Get-PASSession",
@@ -781,8 +806,11 @@ function Initialize-TargetIndex {
             -UserName (Get-AccountUserName -Account $targetAccount) `
             -Address (Get-AccountAddress -Account $targetAccount)
 
-        if (-not $script:TargetIndex.ContainsKey($key)) {
-            $script:TargetIndex[$key] = $targetAccount
+        if ($script:TargetIndex.ContainsKey($key)) {
+            $script:TargetIndex[$key] = @($script:TargetIndex[$key]) + @($targetAccount)
+        }
+        else {
+            $script:TargetIndex[$key] = @($targetAccount)
         }
     }
 
@@ -825,6 +853,226 @@ function Test-TargetAccount {
         AccountID = $actualID
         Error     = $errors -join " "
     }
+}
+
+
+function Get-ExistingTargetMatch {
+    param(
+        [Parameter(Mandatory)][string]$UserName,
+        [Parameter(Mandatory)][string]$Address
+    )
+
+    $key = Get-DuplicateKey -UserName $UserName -Address $Address
+    $matches = @()
+
+    if ($script:TargetIndex.ContainsKey($key)) {
+        $matches = @($script:TargetIndex[$key])
+    }
+
+    if ($matches.Count -eq 0) {
+        return [pscustomobject][ordered]@{
+            Account    = $null
+            MatchCount = 0
+        }
+    }
+
+    $preferred = @(
+        $matches |
+            Where-Object { (Get-AccountPlatformID -Account $_) -ieq $TargetPlatformID } |
+            Select-Object -First 1
+    )
+
+    if ($preferred.Count -eq 0) {
+        $preferred = @($matches | Select-Object -First 1)
+    }
+
+    return [pscustomobject][ordered]@{
+        Account    = $preferred[0]
+        MatchCount = $matches.Count
+    }
+}
+
+function Ensure-ExistingTargetReady {
+    param(
+        [Parameter(Mandatory)][object]$TargetAccount,
+        [Parameter(Mandatory)][string]$ExpectedUserName,
+        [Parameter(Mandatory)][string]$ExpectedAddress
+    )
+
+    $targetID = Get-AccountID -Account $TargetAccount
+    if ([string]::IsNullOrWhiteSpace($targetID)) {
+        throw "Matching target account does not contain an AccountID."
+    }
+
+    $targetDetails = Get-PASAccount -id $targetID -ErrorAction Stop
+    $actualPlatform = Get-AccountPlatformID -Account $targetDetails
+
+    if ($actualPlatform -ine $TargetPlatformID) {
+        Write-Warn "Matching target AccountID '$targetID' uses platform '$actualPlatform'. Updating it to '$TargetPlatformID' instead of creating a duplicate."
+
+        Set-PASAccount `
+            -AccountID $targetID `
+            -op replace `
+            -path "/platformId" `
+            -value $TargetPlatformID `
+            -Confirm:$false `
+            -ErrorAction Stop | Out-Null
+
+        $targetDetails = Get-PASAccount -id $targetID -ErrorAction Stop
+    }
+
+    $validation = Test-TargetAccount `
+        -TargetAccount $targetDetails `
+        -ExpectedUserName $ExpectedUserName `
+        -ExpectedAddress $ExpectedAddress
+
+    if (-not $validation.Valid) {
+        throw $validation.Error
+    }
+
+    return [pscustomobject][ordered]@{
+        Details    = $targetDetails
+        Validation = $validation
+    }
+}
+
+function Prepare-SourceForRetirement {
+    param([Parameter(Mandatory)][string]$SourceAccountID)
+
+    $cpmStatus = "NOT_REQUESTED"
+    $releaseStatus = "NOT_REQUESTED"
+    $releaseErrors = @()
+
+    if ($DisableSourceCPMBeforeMove) {
+        try {
+            Disable-PASCPMAutoManagement `
+                -AccountID $SourceAccountID `
+                -Reason "Disabled account retirement automation. Confirmed winRc=1331." `
+                -ErrorAction Stop | Out-Null
+
+            $cpmStatus = "DISABLED"
+            Write-Ok "Disabled CPM automatic management for source AccountID '$SourceAccountID'."
+        }
+        catch {
+            $cpmStatus = "DISABLE_FAILED_CONTINUING"
+            $releaseErrors += "Disable CPM: $($_.Exception.Message)"
+            Write-Warn "Could not disable CPM automatic management for source AccountID '$SourceAccountID'. Continuing with unlock and operation: $($_.Exception.Message)"
+        }
+    }
+
+    if ($ReleaseLockedSource) {
+        try {
+            Unlock-PASAccount `
+                -AccountID $SourceAccountID `
+                -Unlock `
+                -Confirm:$false `
+                -ErrorAction Stop | Out-Null
+
+            $releaseStatus = "UNLOCKED"
+            Write-Ok "Released lock on source AccountID '$SourceAccountID' using the Unlock operation."
+        }
+        catch {
+            $unlockError = $_.Exception.Message
+
+            try {
+                Unlock-PASAccount `
+                    -AccountID $SourceAccountID `
+                    -CheckIn `
+                    -Confirm:$false `
+                    -ErrorAction Stop | Out-Null
+
+                $releaseStatus = "CHECKED_IN"
+                Write-Ok "Released source AccountID '$SourceAccountID' using the Check-In operation."
+            }
+            catch {
+                $releaseStatus = "RELEASE_NOT_CONFIRMED_CONTINUING"
+                $releaseErrors += "Unlock: $unlockError"
+                $releaseErrors += "Check-In: $($_.Exception.Message)"
+                Write-Warn "Source AccountID '$SourceAccountID' could not be explicitly unlocked or checked in. The requested account operation will still be attempted."
+            }
+        }
+    }
+
+    return [pscustomobject][ordered]@{
+        CPMStatus     = $cpmStatus
+        ReleaseStatus = $releaseStatus
+        Error         = $releaseErrors -join " | "
+    }
+}
+
+function Get-SourceSecretWithRetry {
+    param([Parameter(Mandatory)][string]$SourceAccountID)
+
+    $lastError = $null
+
+    for ($attempt = 1; $attempt -le $OperationRetryCount; $attempt++) {
+        $null = Prepare-SourceForRetirement -SourceAccountID $SourceAccountID
+
+        try {
+            return Get-PASAccountPassword `
+                -AccountID $SourceAccountID `
+                -Reason $PasswordRetrievalReason `
+                -ActionType show `
+                -ErrorAction Stop
+        }
+        catch {
+            $lastError = $_.Exception.Message
+            if ($attempt -lt $OperationRetryCount) {
+                Write-Warn "Secret retrieval attempt $attempt failed for AccountID '$SourceAccountID'. Retrying after lock release: $lastError"
+                Start-Sleep -Seconds $OperationRetryDelaySeconds
+            }
+        }
+    }
+
+    throw "Secret retrieval failed after $OperationRetryCount attempt(s). Last error: $lastError"
+}
+
+function Test-SourceAccountDeleted {
+    param(
+        [Parameter(Mandatory)][string]$SourceAccountID,
+        [Parameter(Mandatory)][string]$SourceSafeName,
+        [Parameter(Mandatory)][string]$UserName,
+        [Parameter(Mandatory)][string]$Address
+    )
+
+    $lastError = $null
+
+    for ($attempt = 1; $attempt -le $OperationRetryCount; $attempt++) {
+        try {
+            $remainingMatches = @(
+                Get-PASAccount `
+                    -SafeName $SourceSafeName `
+                    -search $UserName `
+                    -searchType contains `
+                    -limit 1000 `
+                    -ErrorAction Stop |
+                Where-Object {
+                    (Get-AccountID -Account $_) -ieq $SourceAccountID -or
+                    (
+                        (Get-AccountUserName -Account $_) -ieq $UserName -and
+                        (Get-AccountAddress -Account $_) -ieq $Address -and
+                        (Get-AccountID -Account $_) -ieq $SourceAccountID
+                    )
+                }
+            )
+
+            if ($remainingMatches.Count -eq 0) {
+                return $true
+            }
+
+            $lastError = "Source AccountID '$SourceAccountID' is still returned from Safe '$SourceSafeName'."
+        }
+        catch {
+            $lastError = $_.Exception.Message
+        }
+
+        if ($attempt -lt $OperationRetryCount) {
+            Start-Sleep -Seconds $OperationRetryDelaySeconds
+        }
+    }
+
+    Write-Warn "Unable to verify deletion of source AccountID '$SourceAccountID': $lastError"
+    return $false
 }
 
 function Find-TargetAccountAfterCreation {
@@ -897,12 +1145,53 @@ function New-RetirementAccount {
 }
 
 function Remove-SourceAccount {
-    param([Parameter(Mandatory)][string]$SourceAccountID)
+    param(
+        [Parameter(Mandatory)][string]$SourceAccountID,
+        [Parameter(Mandatory)][string]$SourceSafeName,
+        [Parameter(Mandatory)][string]$UserName,
+        [Parameter(Mandatory)][string]$Address
+    )
 
-    Remove-PASAccount `
-        -AccountID $SourceAccountID `
-        -Confirm:$false `
-        -ErrorAction Stop
+    $lastError = $null
+    $lastPreparation = $null
+
+    for ($attempt = 1; $attempt -le $OperationRetryCount; $attempt++) {
+        $lastPreparation = Prepare-SourceForRetirement -SourceAccountID $SourceAccountID
+
+        try {
+            Remove-PASAccount `
+                -AccountID $SourceAccountID `
+                -Confirm:$false `
+                -ErrorAction Stop
+
+            if (Test-SourceAccountDeleted `
+                -SourceAccountID $SourceAccountID `
+                -SourceSafeName $SourceSafeName `
+                -UserName $UserName `
+                -Address $Address) {
+
+                return [pscustomobject][ordered]@{
+                    Deleted       = $true
+                    Verified      = $true
+                    CPMStatus     = $lastPreparation.CPMStatus
+                    ReleaseStatus = $lastPreparation.ReleaseStatus
+                    ReleaseError  = $lastPreparation.Error
+                }
+            }
+
+            $lastError = "Delete API completed, but the old source pair still exists after verification."
+        }
+        catch {
+            $lastError = $_.Exception.Message
+        }
+
+        if ($attempt -lt $OperationRetryCount) {
+            Write-Warn "Source deletion attempt $attempt failed for AccountID '$SourceAccountID'. Releasing the account and retrying: $lastError"
+            Start-Sleep -Seconds $OperationRetryDelaySeconds
+        }
+    }
+
+    throw "Source deletion failed after $OperationRetryCount attempt(s). Last error: $lastError"
 }
 
 function Process-MatchedAccount {
@@ -977,48 +1266,59 @@ function Process-MatchedAccount {
     $reportValues["GroupDetected"] = $false
 
     $duplicateKey = Get-DuplicateKey -UserName $sourceUserName -Address $sourceAddress
-    $existingTarget = $null
-    if ($script:TargetIndex.ContainsKey($duplicateKey)) {
-        $existingTarget = $script:TargetIndex[$duplicateKey]
-    }
+    $existingTargetResult = Get-ExistingTargetMatch -UserName $sourceUserName -Address $sourceAddress
+    $existingTarget = $existingTargetResult.Account
+    $reportValues["TargetMatchCount"] = $existingTargetResult.MatchCount
 
     if ($null -ne $existingTarget) {
-        $existingValidation = Test-TargetAccount `
-            -TargetAccount $existingTarget `
-            -ExpectedUserName $sourceUserName `
-            -ExpectedAddress $sourceAddress
+        $readyTarget = $null
 
-        $reportValues["TargetAccountID"] = $existingValidation.AccountID
+        try {
+            $readyTarget = Ensure-ExistingTargetReady `
+                -TargetAccount $existingTarget `
+                -ExpectedUserName $sourceUserName `
+                -ExpectedAddress $sourceAddress
 
-        if (-not $existingValidation.Valid) {
-            $reportValues["ActionStatus"] = "SKIPPED_TARGET_DUPLICATE_INVALID"
-            $reportValues["Error"] = $existingValidation.Error
+            $reportValues["TargetAccountID"] = $readyTarget.Validation.AccountID
+        }
+        catch {
+            $reportValues["ActionStatus"] = "FAILED_EXISTING_TARGET_PREPARATION"
+            $reportValues["Error"] = $_.Exception.Message
             Add-ReportRow -Values $reportValues
+            $script:ExitCode = [Math]::Max($script:ExitCode, 2)
             return
         }
 
         if (-not $Execute) {
-            $reportValues["ActionStatus"] = "PREVIEW_TARGET_ALREADY_EXISTS"
-            $reportValues["Error"] = "A valid target account already exists. Execute mode can finalize deletion of the source when FinalizeExistingTarget is enabled."
+            $reportValues["ActionStatus"] = "PREVIEW_TARGET_ALREADY_EXISTS_SOURCE_WILL_BE_DELETED"
+            $reportValues["Error"] = "Matching UserName and Address already exist in the target Safe. No duplicate will be created; execute mode will delete the old source pair."
             Add-ReportRow -Values $reportValues
             return
         }
 
         if (-not $FinalizeExistingTarget) {
             $reportValues["ActionStatus"] = "SKIPPED_TARGET_ALREADY_EXISTS"
-            $reportValues["Error"] = "Valid target exists, but FinalizeExistingTarget is disabled."
+            $reportValues["Error"] = "Matching target exists, but FinalizeExistingTarget is disabled."
             Add-ReportRow -Values $reportValues
             return
         }
 
         try {
-            Remove-SourceAccount -SourceAccountID $sourceID
-            $reportValues["ActionStatus"] = "TARGET_ALREADY_EXISTS_SOURCE_DELETED"
+            $deleteResult = Remove-SourceAccount `
+                -SourceAccountID $sourceID `
+                -SourceSafeName $sourceSafe `
+                -UserName $sourceUserName `
+                -Address $sourceAddress
+            $reportValues["SourceCPMStatus"] = $deleteResult.CPMStatus
+            $reportValues["SourceReleaseStatus"] = $deleteResult.ReleaseStatus
+            $reportValues["SourceReleaseError"] = $deleteResult.ReleaseError
+            $reportValues["SourceDeleteVerified"] = $deleteResult.Verified
+            $reportValues["ActionStatus"] = "TARGET_MATCH_EXISTS_OLD_SOURCE_DELETED"
             Add-ReportRow -Values $reportValues
-            Write-Ok "Finalized prior migration for AccountID '$sourceID'; valid target '$($existingValidation.AccountID)' already existed."
+            Write-Ok "Matching target AccountID '$($readyTarget.Validation.AccountID)' already existed for UserName '$sourceUserName' and Address '$sourceAddress'. No duplicate was created; old source AccountID '$sourceID' was deleted."
         }
         catch {
-            $reportValues["ActionStatus"] = "FAILED_DELETE_SOURCE_WITH_EXISTING_TARGET"
+            $reportValues["ActionStatus"] = "FAILED_DELETE_OLD_SOURCE_WITH_EXISTING_TARGET"
             $reportValues["Error"] = $_.Exception.Message
             Add-ReportRow -Values $reportValues
             $script:ExitCode = [Math]::Max($script:ExitCode, 2)
@@ -1039,13 +1339,8 @@ function Process-MatchedAccount {
     $targetDetails = $null
 
     try {
-        Write-Info "Retrieving source secret for AccountID '$sourceID'."
-        $secretResult = Get-PASAccountPassword `
-            -AccountID $sourceID `
-            -Reason $PasswordRetrievalReason `
-            -ActionType show `
-            -ErrorAction Stop
-
+        Write-Info "Preparing and retrieving source secret for AccountID '$sourceID'."
+        $secretResult = Get-SourceSecretWithRetry -SourceAccountID $sourceID
         $secureSecret = ConvertTo-SecureSecret -SecretResult $secretResult
     }
     catch {
@@ -1109,14 +1404,22 @@ function Process-MatchedAccount {
     }
 
     try {
-        Write-Info "Deleting source AccountID '$sourceID' after successful target validation."
-        Remove-SourceAccount -SourceAccountID $sourceID
+        Write-Info "Releasing and deleting source AccountID '$sourceID' after successful target validation."
+        $deleteResult = Remove-SourceAccount `
+            -SourceAccountID $sourceID `
+            -SourceSafeName $sourceSafe `
+            -UserName $sourceUserName `
+            -Address $sourceAddress
 
+        $reportValues["SourceCPMStatus"] = $deleteResult.CPMStatus
+        $reportValues["SourceReleaseStatus"] = $deleteResult.ReleaseStatus
+        $reportValues["SourceReleaseError"] = $deleteResult.ReleaseError
+        $reportValues["SourceDeleteVerified"] = $deleteResult.Verified
         $reportValues["ActionStatus"] = "MOVED_SUCCESSFULLY"
         Add-ReportRow -Values $reportValues
 
-        $script:TargetIndex[$duplicateKey] = $targetDetails
-        Write-Ok "Moved AccountID '$sourceID' to target AccountID '$targetID'."
+        $script:TargetIndex[$duplicateKey] = @($targetDetails)
+        Write-Ok "Moved AccountID '$sourceID' to target AccountID '$targetID' and verified deletion of the old source pair."
     }
     catch {
         $reportValues["ActionStatus"] = "TARGET_CREATED_SOURCE_DELETE_FAILED"
@@ -1165,7 +1468,7 @@ try {
     Write-Info "============================================================"
     Write-Info "Disabled IND account retirement migration starting."
     Write-Info "Script version       : $script:ScriptVersion"
-    Write-Info "Build marker         : NO-RELATIONSHIP-CHECK-20260715.10"
+    Write-Info "Build marker         : LOCK-RELEASE-IDEMPOTENT-20260715.11"
     Write-Info "Script path          : $PSCommandPath"
     Write-Info "Script SHA256        : $(Get-ScriptSHA256)"
     Write-Info "Execution mode       : $(if ($Execute) { 'EXECUTE' } else { 'REPORT ONLY' })"
@@ -1174,6 +1477,9 @@ try {
     Write-Info "Target Platform      : $TargetPlatformID"
     Write-Info "Allowed Safe prefix  : $AllowedSourceSafePrefix"
     Write-Info "Relationship checks  : BYPASSED BY DESIGN"
+    Write-Info "Existing target rule : REUSE USERNAME+ADDRESS MATCH; DELETE OLD SOURCE"
+    Write-Info "Source CPM handling  : $(if ($DisableSourceCPMBeforeMove) { 'DISABLE BEFORE MOVE' } else { 'UNCHANGED' })"
+    Write-Info "Source lock handling : $(if ($ReleaseLockedSource) { 'UNLOCK/CHECK-IN WITH RETRY' } else { 'DISABLED' })"
     Write-Info "Lookback Days        : $LookbackDays"
     Write-Info "Discovery mode       : $(if ($FullScan) { 'FULL SCAN' } elseif ($SourceSafeName.Count -gt 0) { 'SOURCE SAFE LIST' } else { 'FAST SAVED FILTERS' })"
     Write-Info "============================================================"
@@ -1236,7 +1542,7 @@ try {
         }) | Export-Csv -LiteralPath $script:ReportPath -NoTypeInformation -Encoding UTF8
     }
 
-    $movedCount = @($script:ReportRows | Where-Object { $_.ActionStatus -in @("MOVED_SUCCESSFULLY", "TARGET_ALREADY_EXISTS_SOURCE_DELETED") }).Count
+    $movedCount = @($script:ReportRows | Where-Object { $_.ActionStatus -in @("MOVED_SUCCESSFULLY", "TARGET_MATCH_EXISTS_OLD_SOURCE_DELETED") }).Count
     $previewCount = @($script:ReportRows | Where-Object { $_.ActionStatus -like "PREVIEW_*" }).Count
     $outOfScopeCount = @($script:ReportRows | Where-Object { $_.ActionStatus -eq "SKIPPED_SOURCE_SAFE_PREFIX_NOT_ALLOWED" }).Count
     $failedCount = @($script:ReportRows | Where-Object { $_.ActionStatus -like "FAILED_*" -or $_.ActionStatus -like "TARGET_CREATED_*FAILED" }).Count
