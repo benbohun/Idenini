@@ -3,258 +3,494 @@
 
 <#
 .SYNOPSIS
-    Finds CyberArk accounts with confirmed disabled-user activity (winRc=1331),
-    replicates eligible IND_ accounts into the retirement Safe/platform, validates
-    the replacement, and deletes the source only after successful validation.
+    Finds CyberArk accounts whose activity reports an AD-disabled account with winRc=1331.
+    All matching accounts are reported, but only accounts in source Safes beginning with IND_
+    are eligible to migrate to the "Accounts to be deleted" Safe on platform WIN_Removed.
 
 .DESCRIPTION
-    This script intentionally uses only exported/public psPAS commands for
-    Privilege Cloud account operations. It does not call any private psPAS REST helper or use direct Privilege Cloud REST requests.
+    Authentication follows the Alliant Privilege Cloud login pattern:
+      CCP -> Identity Shared Services -> New-PASSession -ServiceUser
 
-    CyberArk does not expose a public psPAS command that changes an account's
-    Safe. The supported migration pattern implemented here is:
+    Detection is deliberately narrow. An account qualifies only when the same activity record,
+    or the account's manual management reason, contains BOTH:
+      - winRc=1331
+      - a disabled-account phrase such as "account is currently disabled"
 
-        Get-PASAccountPassword -> Add-PASAccount -> Get-PASAccount validation
-        -> Remove-PASAccount
+    CyberArk does not expose SafeName as a normal Gen2 account PATCH property. Therefore, the
+    migration is performed as a controlled transaction:
+      1. Retrieve and validate the source account.
+      2. Retrieve its secret in memory.
+      3. Create a replacement in the target Safe using WIN_Removed.
+      4. Validate the replacement account.
+      5. Delete the source account only after successful target validation.
 
-    Default mode is REPORT ONLY. Specify -Execute to perform the migration.
+    The script is report-only unless -Execute is supplied.
 
-    Only accounts whose source Safe begins with IND_ are eligible to move by
-    default. Confirmed winRc=1331 matches from other Safes are still included in
-    the CSV report with a skipped status.
+    SAFETY CONTROLS
+      - Report-only by default.
+      - Excludes the target Safe from discovery.
+      - Reports matching accounts from all discovered source Safes.
+      - Moves only accounts whose source Safe begins with the configured prefix (default IND_).
+      - Does not move an account unless the winRc=1331 signature is confirmed.
+      - Skips non-password secrets.
+      - Skips accounts with detected linked/dependent/group relationships unless
+        -SkipRelationshipChecks is explicitly supplied.
+      - Skips when an exact target duplicate already exists.
+      - Does not log or export account secrets.
+      - Does not reconcile or verify disabled accounts after migration.
+      - Disables automatic management on the replacement account.
+      - Never deletes the source if target creation or validation fails.
 
-    RelationshipCheckMode defaults to Disabled because the prior implementation
-    was blocking every account on an unsupported dependent-account fallback.
-    Optional BestEffort and Strict modes use only exported psPAS commands:
-    Get-PASLinkedAccount and Get-PASDependentAccount. No REST fallback is used.
+.EXAMPLE
+    # Report-only scan of selected source Safes
+    .\Move-DisabledAccount.ps1 `
+        -SourceSafeName "IND_User1_10001","IND_User2_10002"
+
+.EXAMPLE
+    # Report-only scan of all accessible accounts except the target Safe
+    .\Move-DisabledAccount.ps1
+
+.EXAMPLE
+    # Execute confirmed migrations without interactive confirmation
+    .\Move-DisabledAccount.ps1 `
+        -SourceSafeName "IND_User1_10001" `
+        -Execute `
+        -Confirm:$false
+
+
+.EXAMPLE
+    # Unattended execution for Windows Task Scheduler
+    .\Move-DisabledAccount.ps1 `
+        -ScheduledTaskMode `
+        -Execute `
+        -LookbackDays 2 `
+        -Confirm:$false
 
 .NOTES
-    PowerShell      : Windows PowerShell 5.1
-    Module          : psPAS
-    Script version  : 2026.07.15.7
+    Required source Safe permissions normally include:
+      List Accounts, Retrieve Accounts, Delete Accounts, View Audit Log.
+
+    Required target Safe permissions normally include:
+      List Accounts, Add Accounts, Update Account Properties.
+
+    JULY 14, 2026 FINAL CORRECTIONS
+      - Removed all Generic.List use from this script to eliminate the Windows
+        PowerShell 5.1 'Argument types do not match' failure.
+      - Uses fast CyberArk saved-filter candidate discovery by default and
+        performs a full scan only when requested or when every filter fails.
+      - Avoids a full account-detail API call until winRc=1331 is confirmed.
+      - Uses the configured Privilege Cloud URL as the deterministic REST base;
+        relationship fallbacks no longer depend on Get-PASSession BaseURI.
+      - Only source Safes beginning with IND_ are eligible for migration.
+      - Matching accounts from other Safes remain in the CSV as
+        SKIPPED_SOURCE_SAFE_PREFIX_NOT_ALLOWED.
+      - Target Safe accounts are indexed once for fast duplicate checks.
+
+    Recommended first run:
+      Run without -Execute and review the generated CSV report.
 #>
 
-[CmdletBinding(SupportsShouldProcess = $true)]
+[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
 param(
-    [switch]$Execute,
-    [switch]$ScheduledTaskMode,
-
-    [string]$TargetSafeName = "Accounts to be deleted",
-    [string]$TargetPlatformID = "WIN_Removed",
-    [string]$AllowedSourceSafePrefix = "IND_",
-
+    # Empty means scan all accounts visible to the authenticated service user.
     [string[]]$SourceSafeName = @(),
 
-    [ValidateRange(0, 3650)]
-    [int]$LookbackDays = 2,
+    [string]$TargetSafeName   = "Accounts to be deleted",
+    [string]$TargetPlatformID = "WIN_Removed",
 
+    # All matching accounts remain in the report, but migration is permitted only
+    # when the source Safe starts with this prefix (case-insensitive).
+    [ValidateNotNullOrEmpty()]
+    [string]$AllowedSourceSafePrefix = "IND_",
+
+    # Only consider matching activity within this lookback period.
+    # Set to 0 to disable the date filter.
+    [ValidateRange(0, 3650)]
+    [int]$LookbackDays = 0,
+
+    # Optional safety limit for large report-only tests. 0 means no limit.
     [ValidateRange(0, 1000000)]
     [int]$MaxAccounts = 0,
 
-    [ValidateRange(1, 1000)]
-    [int]$ProgressInterval = 50,
-
+    # Fast mode searches current CyberArk policy failures rather than reviewing
+    # every accessible account. Use -FullScan for an exhaustive historical scan.
     [switch]$FullScan,
 
-    [ValidateSet("Disabled", "BestEffort", "Strict")]
-    [string]$RelationshipCheckMode = "Disabled",
+    [ValidateSet(
+        "PolicyFailures",
+        "FailedChange",
+        "FailedVerify",
+        "FailedReconcile",
+        "DisabledPasswordByCPM"
+    )]
+    [string[]]$CandidateSavedFilters = @(
+        "PolicyFailures",
+        "DisabledPasswordByCPM"
+    ),
 
-    [switch]$PreservePlatformAccountProperties,
+    # Progress is logged only at this interval to reduce disk I/O during large runs.
+    [ValidateRange(1, 10000)]
+    [int]$ProgressInterval = 50,
 
-    [bool]$FinalizeExistingTarget = $true,
-
-    [string]$PasswordRetrievalReason = "Retire disabled CyberArk account after confirmed winRc=1331 activity",
+    [ValidateRange(10, 3600)]
+    [int]$ApiTimeoutSec = 120,
 
     [string]$ReportFolder = "I:\Script\IDENTITY Script New\logs\Disabled_Account_Migration",
 
+    # ===== Execution Controls =====
+    [switch]$Execute,
+
+    # Enables unattended controls intended for Windows Task Scheduler.
+    # ScheduledTaskMode requires -Execute, prevents concurrent runs, cleans old logs,
+    # writes a last-run status file, and returns meaningful process exit codes.
+    [switch]$ScheduledTaskMode,
+
+    [switch]$SkipRelationshipChecks,
+    [switch]$PreservePlatformAccountProperties,
+
+    # Retention for timestamped CSV and log files. The last-run JSON is retained.
     [ValidateRange(1, 3650)]
     [int]$LogRetentionDays = 90,
 
+    [string]$StatusFileName = "Disabled1331_LastRun.json",
+
+
+    # ===== Secret Retrieval Audit Information =====
+    [string]$PasswordAccessReason = "Migrate disabled account after CPM detected winRc=1331",
+    [string]$TicketingSystem = "",
+    [string]$TicketId        = "",
+
+    # ===== Identity / Privilege Cloud =====
     [string]$IdentityTenantURL = "https://aak4521.my.idaptive.app",
     [string]$PrivilegeCloudURL = "https://alliantcredit.privilegecloud.cyberark.cloud",
 
-    [string]$CCPAddress = "https://aam.alliantcreditunion.com",
-    [string]$CCPLocation = "AIMWebService",
-    [string]$CCPAppID = "ACURestAPI",
-    [string]$CCPSafe = "ACU-VAULT-API",
-    [string]$CCPObject = "Application-CyberArkVaultRestAPI-alliantcredit.cyberark.cloud",
-    [bool]$CCPWindowsAuth = $false
+    # ===== CCP Settings =====
+    [string]$CCPAddress     = "https://aam.alliantcreditunion.com",
+    [string]$CCPLocation    = "AIMWebService",
+    [string]$CCPAppID       = "ACURestAPI",
+    [string]$CCPSafe        = "ACU-VAULT-API",
+    [string]$CCPObject      = "Application-CyberArkVaultRestAPI-alliantcredit.cyberark.cloud",
+    [bool]$CCPWindowsAuth   = $false
 )
 
-Set-StrictMode -Version 2.0
+# ============================================================
+# Runtime Setup
+# ============================================================
+
+Import-Module psPAS -ErrorAction Stop
+
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $ErrorActionPreference = "Stop"
-$ProgressPreference = "SilentlyContinue"
 
-$script:ScriptVersion = "2026.07.15.7"
-$script:RunStart = Get-Date
-$script:RunId = $script:RunStart.ToString("yyyyMMdd_HHmmss")
-$script:LogPath = $null
-$script:ReportPath = $null
-$script:SummaryPath = $null
-$script:PASSessionCreated = $false
-$script:Mutex = $null
-$script:MutexAcquired = $false
-$script:ExitCode = 0
-$script:ReportRows = @()
-$script:TargetIndex = @{}
-
-$script:DisabledWinRcRegex = '(?i)winRc\s*(?:=|:)\s*1331\b'
-$script:DisabledTextRegex = '(?i)(account\s+is\s+currently\s+disabled|account\s+is\s+disabled|user.{0,40}disabled|disabled\s+state|currently\s+disabled)'
-
-$script:FastSavedFilters = @(
-    "PolicyFailures",
-    "DisabledPasswordByCPM",
-    "FailedVerify",
-    "FailedChange",
-    "FailedReconcile"
-)
-
-# ============================================================
-# Logging and utility helpers
-# ============================================================
-
-function Initialize-OutputFiles {
-    if (-not (Test-Path -LiteralPath $ReportFolder)) {
-        New-Item -Path $ReportFolder -ItemType Directory -Force | Out-Null
-    }
-
-    $script:LogPath = Join-Path $ReportFolder ("Disabled1331_Migration_Log_{0}.log" -f $script:RunId)
-    $script:ReportPath = Join-Path $ReportFolder ("Disabled1331_Migration_Report_{0}.csv" -f $script:RunId)
-    $script:SummaryPath = Join-Path $ReportFolder "Disabled1331_LastRun.json"
+if (-not (Test-Path -LiteralPath $ReportFolder)) {
+    New-Item -Path $ReportFolder -ItemType Directory -Force | Out-Null
 }
+
+$timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+$script:LogPath     = Join-Path $ReportFolder "Disabled1331_Migration_Log_$timestamp.log"
+$script:ReportPath  = Join-Path $ReportFolder "Disabled1331_Migration_Report_$timestamp.csv"
+$script:StatusPath  = Join-Path $ReportFolder $StatusFileName
+$script:LockPath    = Join-Path $ReportFolder "Disabled1331_Migration.lock"
+$script:LockStream  = $null
+$script:ExitCode    = 0
+$script:RunStarted  = Get-Date
+$script:ScriptVersion = "2026.07.14.3"
+$script:OperationalErrorCount = 0
+
+$script:DisabledWinRcRegex = '(?i)winRc\s*[=:]\s*1331\b'
+$script:DisabledTextRegex  = '(?i)(account\s+is\s+(currently\s+)?disabled|user\s+can(?:not|''t)\s+sign\s+in\s+because\s+this\s+account\s+is\s+(currently\s+)?disabled|account\s+has\s+been\s+disabled)'
+
+$script:ApiBaseURI = $PrivilegeCloudURL.TrimEnd("/")
+if ($script:ApiBaseURI -notmatch '(?i)/PasswordVault$') {
+    $script:ApiBaseURI = "$script:ApiBaseURI/PasswordVault"
+}
+
+$script:TargetDuplicateIndex = @{}
+
+# ============================================================
+# Logging
+# ============================================================
 
 function Write-Log {
     param(
-        [Parameter(Mandatory)][ValidateSet("INFO", "OK", "WARN", "ERROR")][string]$Level,
-        [Parameter(Mandatory)][string]$Message
+        [Parameter(Mandatory)][string]$Message,
+        [ValidateSet("INFO", "OK", "WARN", "ERROR")]
+        [string]$Level = "INFO",
+        [ConsoleColor]$Color = [ConsoleColor]::White
     )
 
     $line = "{0} | {1,-5} | {2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level, $Message
-    Write-Host $line
 
-    if (-not [string]::IsNullOrWhiteSpace($script:LogPath)) {
+    try {
         Add-Content -LiteralPath $script:LogPath -Value $line -Encoding UTF8
+    }
+    catch {
+        # Logging failure must not expose or interrupt secret handling.
+    }
+
+    Write-Host $line -ForegroundColor $Color
+}
+
+function Write-Info { param([string]$Message) Write-Log -Message $Message -Level INFO  -Color Cyan }
+function Write-Ok   { param([string]$Message) Write-Log -Message $Message -Level OK    -Color Green }
+function Write-Warn { param([string]$Message) Write-Log -Message $Message -Level WARN  -Color Yellow }
+function Write-Err  { param([string]$Message) Write-Log -Message $Message -Level ERROR -Color Red }
+
+# ============================================================
+# Scheduled Task / Run-State Helpers
+# ============================================================
+
+function Remove-ExpiredRunFiles {
+    if ($LogRetentionDays -le 0) {
+        return
+    }
+
+    $cutoff = (Get-Date).AddDays(-$LogRetentionDays)
+    $patterns = @(
+        "Disabled1331_Migration_Log_*.log",
+        "Disabled1331_Migration_Report_*.csv"
+    )
+
+    foreach ($pattern in $patterns) {
+        try {
+            Get-ChildItem -LiteralPath $ReportFolder -Filter $pattern -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.LastWriteTime -lt $cutoff } |
+                Remove-Item -Force -ErrorAction SilentlyContinue
+        }
+        catch {
+            Write-Warn "Old run-file cleanup warning for pattern '$pattern': $($_.Exception.Message)"
+        }
     }
 }
 
-function Write-Info {
-    param([string]$Message)
-    Write-Log -Level INFO -Message $Message
-}
-function Write-Ok {
-    param([string]$Message)
-    Write-Log -Level OK -Message $Message
-}
-function Write-Warn {
-    param([string]$Message)
-    Write-Log -Level WARN -Message $Message
-}
-function Write-Err {
-    param([string]$Message)
-    Write-Log -Level ERROR -Message $Message
+function Enter-RunLock {
+    if (-not $ScheduledTaskMode) {
+        return
+    }
+
+    try {
+        $script:LockStream = [System.IO.File]::Open(
+            $script:LockPath,
+            [System.IO.FileMode]::OpenOrCreate,
+            [System.IO.FileAccess]::ReadWrite,
+            [System.IO.FileShare]::None
+        )
+
+        $lockText = "PID=$PID; Started=$((Get-Date).ToString('o')); Computer=$env:COMPUTERNAME"
+        $lockBytes = [System.Text.Encoding]::UTF8.GetBytes($lockText)
+        $script:LockStream.SetLength(0)
+        $script:LockStream.Write($lockBytes, 0, $lockBytes.Length)
+        $script:LockStream.Flush()
+
+        Write-Ok "Acquired scheduled-run lock '$script:LockPath'."
+    }
+    catch [System.IO.IOException] {
+        $script:ExitCode = 3
+        throw "Another instance appears to be running because the lock file is in use: $script:LockPath"
+    }
 }
 
-function Get-ObjectPropertyValue {
+function Exit-RunLock {
+    if ($null -ne $script:LockStream) {
+        try {
+            $script:LockStream.Dispose()
+        }
+        catch {}
+        finally {
+            $script:LockStream = $null
+        }
+    }
+
+    if ($ScheduledTaskMode) {
+        try {
+            Remove-Item -LiteralPath $script:LockPath -Force -ErrorAction SilentlyContinue
+        }
+        catch {}
+    }
+}
+
+function Write-RunStatus {
+    param(
+        [Parameter(Mandatory)][string]$State,
+        [Parameter(Mandatory)][int]$ExitCode,
+        [Parameter()][int]$AccountsReviewed = 0,
+        [Parameter()][int]$SignatureMatches = 0,
+        [Parameter()][int]$Moved = 0,
+        [Parameter()][int]$PreviewEligible = 0,
+        [Parameter()][int]$Skipped = 0,
+        [Parameter()][int]$FailedOrPartial = 0,
+        [Parameter()][string]$FatalError = ""
+    )
+
+    $status = [ordered]@{
+        State                 = $State
+        ExitCode              = $ExitCode
+        ScheduledTaskMode     = [bool]$ScheduledTaskMode
+        ExecutionMode         = if ($Execute) { "EXECUTE" } else { "REPORT_ONLY" }
+        ComputerName          = $env:COMPUTERNAME
+        ProcessId             = $PID
+        Started               = $script:RunStarted.ToString("o")
+        Completed             = (Get-Date).ToString("o")
+        DurationSeconds       = [math]::Round(((Get-Date) - $script:RunStarted).TotalSeconds, 2)
+        TargetSafeName        = $TargetSafeName
+        TargetPlatformID      = $TargetPlatformID
+        AccountsReviewed      = $AccountsReviewed
+        SignatureMatches      = $SignatureMatches
+        Moved                 = $Moved
+        PreviewEligible       = $PreviewEligible
+        Skipped               = $Skipped
+        FailedOrPartial       = $FailedOrPartial
+        OperationalErrorCount = $script:OperationalErrorCount
+        ReportPath            = $script:ReportPath
+        LogPath               = $script:LogPath
+        FatalError            = $FatalError
+    }
+
+    try {
+        $status | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $script:StatusPath -Encoding UTF8 -Force
+    }
+    catch {
+        Write-Warn "Unable to write last-run status file '$script:StatusPath': $($_.Exception.Message)"
+    }
+}
+
+# ============================================================
+# Generic Helpers
+# ============================================================
+
+function Get-PropertyValue {
     param(
         [Parameter()][AllowNull()][object]$InputObject,
-        [Parameter(Mandatory)][string[]]$Names
+        [Parameter(Mandatory)][string[]]$Names,
+        [Parameter()][AllowNull()][object]$Default = $null
     )
 
     if ($null -eq $InputObject) {
-        return $null
+        return $Default
     }
 
-    foreach ($name in $Names) {
-        if ($InputObject -is [System.Collections.IDictionary]) {
-            foreach ($key in $InputObject.Keys) {
+    # Get-PASSession returns an OrderedDictionary in current psPAS releases.
+    # Check dictionary keys before normal PSObject properties.
+    if ($InputObject -is [System.Collections.IDictionary]) {
+        foreach ($name in $Names) {
+            foreach ($key in @($InputObject.Keys)) {
                 if ([string]$key -ieq $name) {
-                    return $InputObject[$key]
+                    $value = $InputObject[$key]
+                    if ($null -ne $value) {
+                        return $value
+                    }
                 }
             }
         }
+    }
 
+    foreach ($name in $Names) {
         $property = $InputObject.PSObject.Properties |
             Where-Object { $_.Name -ieq $name } |
             Select-Object -First 1
 
-        if ($null -ne $property) {
+        if ($property -and $null -ne $property.Value) {
             return $property.Value
         }
     }
 
-    return $null
+    return $Default
 }
 
 function Get-AccountID {
-    param([AllowNull()][object]$Account)
-    return [string](Get-ObjectPropertyValue -InputObject $Account -Names @("id", "AccountID", "accountId"))
+    param([Parameter()][AllowNull()][object]$Account)
+    return [string](Get-PropertyValue -InputObject $Account -Names @("id", "ID", "AccountID", "AccountId", "accountId") -Default "")
 }
 
 function Get-AccountSafeName {
-    param([AllowNull()][object]$Account)
-    return [string](Get-ObjectPropertyValue -InputObject $Account -Names @("safeName", "SafeName", "Safe"))
+    param([Parameter()][AllowNull()][object]$Account)
+    return [string](Get-PropertyValue -InputObject $Account -Names @("safeName", "SafeName", "safe", "Safe") -Default "")
 }
 
 function Get-AccountPlatformID {
-    param([AllowNull()][object]$Account)
-    return [string](Get-ObjectPropertyValue -InputObject $Account -Names @("platformId", "PlatformID", "PolicyID"))
+    param([Parameter()][AllowNull()][object]$Account)
+    return [string](Get-PropertyValue -InputObject $Account -Names @("platformId", "PlatformID", "PlatformId", "platformID") -Default "")
 }
 
 function Get-AccountUserName {
-    param([AllowNull()][object]$Account)
-    return [string](Get-ObjectPropertyValue -InputObject $Account -Names @("userName", "UserName", "username"))
+    param([Parameter()][AllowNull()][object]$Account)
+    return [string](Get-PropertyValue -InputObject $Account -Names @("userName", "UserName", "username", "Username") -Default "")
 }
 
 function Get-AccountAddress {
-    param([AllowNull()][object]$Account)
-    return [string](Get-ObjectPropertyValue -InputObject $Account -Names @("address", "Address"))
+    param([Parameter()][AllowNull()][object]$Account)
+    return [string](Get-PropertyValue -InputObject $Account -Names @("address", "Address") -Default "")
 }
 
 function Get-AccountName {
-    param([AllowNull()][object]$Account)
-    return [string](Get-ObjectPropertyValue -InputObject $Account -Names @("name", "Name", "accountName", "AccountName"))
+    param([Parameter()][AllowNull()][object]$Account)
+    return [string](Get-PropertyValue -InputObject $Account -Names @("name", "Name") -Default "")
 }
 
-function Get-AccountSecretType {
-    param([AllowNull()][object]$Account)
-    $value = [string](Get-ObjectPropertyValue -InputObject $Account -Names @("secretType", "SecretType"))
-    if ([string]::IsNullOrWhiteSpace($value)) {
-        return "Password"
-    }
-    return $value
-}
+function Test-AllowedSourceSafe {
+    param([Parameter()][AllowNull()][string]$SafeName)
 
-function Get-ManualManagementReason {
-    param([AllowNull()][object]$Account)
-
-    $secretManagement = Get-ObjectPropertyValue -InputObject $Account -Names @("secretManagement", "SecretManagement")
-    if ($null -eq $secretManagement) {
-        return ""
+    if ([string]::IsNullOrWhiteSpace($SafeName)) {
+        return $false
     }
 
-    return [string](Get-ObjectPropertyValue -InputObject $secretManagement -Names @("manualManagementReason", "ManualManagementReason"))
+    return $SafeName.Trim().StartsWith(
+        $AllowedSourceSafePrefix,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )
 }
 
-function Get-PlatformAccountProperties {
-    param([AllowNull()][object]$Account)
-    return Get-ObjectPropertyValue -InputObject $Account -Names @("platformAccountProperties", "PlatformAccountProperties")
+function ConvertTo-SecureSecret {
+    param([Parameter(Mandatory)][AllowNull()][object]$SecretResult)
+
+    if ($null -eq $SecretResult) {
+        throw "The password retrieval command returned no secret value."
+    }
+
+    if ($SecretResult -is [Security.SecureString]) {
+        return $SecretResult
+    }
+
+    if ($SecretResult -is [string]) {
+        if ([string]::IsNullOrWhiteSpace($SecretResult)) {
+            throw "The password retrieval command returned an empty secret."
+        }
+        return ConvertTo-SecureString -String $SecretResult -AsPlainText -Force
+    }
+
+    foreach ($name in @("Content", "content", "Password", "password", "Secret", "secret")) {
+        $value = Get-PropertyValue -InputObject $SecretResult -Names @($name)
+        if ($null -ne $value) {
+            if ($value -is [Security.SecureString]) {
+                return $value
+            }
+            if ($value -is [string] -and -not [string]::IsNullOrWhiteSpace($value)) {
+                return ConvertTo-SecureString -String $value -AsPlainText -Force
+            }
+        }
+    }
+
+    throw "Unable to convert the password retrieval response into a SecureString."
 }
 
 function ConvertTo-Hashtable {
-    param([AllowNull()][object]$InputObject)
+    param([Parameter()][AllowNull()][object]$InputObject)
 
     if ($null -eq $InputObject) {
         return $null
     }
 
-    $result = @{}
-
     if ($InputObject -is [System.Collections.IDictionary]) {
-        foreach ($key in $InputObject.Keys) {
+        $result = @{}
+
+        foreach ($key in @($InputObject.Keys)) {
             $result[[string]$key] = $InputObject[$key]
         }
+
         return $result
     }
+
+    $result = @{}
 
     foreach ($property in $InputObject.PSObject.Properties) {
         $result[$property.Name] = $property.Value
@@ -263,55 +499,13 @@ function ConvertTo-Hashtable {
     return $result
 }
 
-function ConvertTo-SecureSecret {
-    param([Parameter(Mandatory)][AllowNull()][object]$SecretResult)
-
-    if ($null -eq $SecretResult) {
-        throw "Get-PASAccountPassword returned no result."
-    }
-
-    if ($SecretResult -is [Security.SecureString]) {
-        return $SecretResult
-    }
-
-    $passwordValue = Get-ObjectPropertyValue -InputObject $SecretResult -Names @("Password", "password", "Content", "content", "Secret", "secret")
-    if ($null -eq $passwordValue) {
-        $passwordValue = $SecretResult
-    }
-
-    if ($passwordValue -is [Security.SecureString]) {
-        return $passwordValue
-    }
-
-    $passwordText = [string]$passwordValue
-    if ([string]::IsNullOrEmpty($passwordText)) {
-        throw "Get-PASAccountPassword returned an empty password."
-    }
-
-    return ConvertTo-SecureString -String $passwordText -AsPlainText -Force
-}
-
-function Test-SourceSafeEligible {
-    param([AllowNull()][string]$SafeName)
-
-    if ([string]::IsNullOrWhiteSpace($SafeName)) {
-        return $false
-    }
-
-    return $SafeName.StartsWith($AllowedSourceSafePrefix, [System.StringComparison]::OrdinalIgnoreCase)
-}
-
-function Get-DuplicateKey {
-    param(
-        [AllowNull()][string]$UserName,
-        [AllowNull()][string]$Address
-    )
-
-    return (([string]$UserName).Trim().ToLowerInvariant() + "|" + ([string]$Address).Trim().ToLowerInvariant())
+function Test-CommandAvailable {
+    param([Parameter(Mandatory)][string]$Name)
+    return [bool](Get-Command -Name $Name -ErrorAction SilentlyContinue)
 }
 
 function Convert-ActivityTime {
-    param([AllowNull()][object]$Value)
+    param([Parameter()][AllowNull()][object]$Value)
 
     if ($null -eq $Value) {
         return $null
@@ -334,8 +528,8 @@ function Convert-ActivityTime {
     return $null
 }
 
-function Test-DisabledSignatureText {
-    param([AllowNull()][string]$Text)
+function Test-Disabled1331Text {
+    param([Parameter()][AllowNull()][string]$Text)
 
     if ([string]::IsNullOrWhiteSpace($Text)) {
         return $false
@@ -344,120 +538,32 @@ function Test-DisabledSignatureText {
     return (($Text -match $script:DisabledWinRcRegex) -and ($Text -match $script:DisabledTextRegex))
 }
 
-function Limit-Text {
-    param(
-        [AllowNull()][string]$Text,
-        [int]$MaximumLength = 1000
-    )
-
-    if ([string]::IsNullOrEmpty($Text)) {
-        return ""
-    }
-
-    if ($Text.Length -le $MaximumLength) {
-        return $Text
-    }
-
-    return $Text.Substring(0, $MaximumLength)
-}
-
-function Add-ReportRow {
-    param([Parameter(Mandatory)][hashtable]$Values)
-
-    $row = [ordered]@{
-        RunId                 = $script:RunId
-        ReviewTime            = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-        SourceAccountID       = ""
-        SourceSafeName        = ""
-        SourcePlatformID      = ""
-        AccountName           = ""
-        UserName              = ""
-        Address               = ""
-        SourceSafeEligible    = $false
-        EvidenceSource        = ""
-        EvidenceTime          = ""
-        EvidenceText          = ""
-        RelationshipMode      = $RelationshipCheckMode
-        RelationshipStatus    = "NOT_CHECKED"
-        LinkedAccountCount    = 0
-        DependentAccountCount = 0
-        GroupDetected         = $false
-        TargetSafeName        = $TargetSafeName
-        TargetPlatformID      = $TargetPlatformID
-        TargetAccountID       = ""
-        ActionStatus          = ""
-        Error                 = ""
-    }
-
-    foreach ($key in $Values.Keys) {
-        if ($row.Contains($key)) {
-            $row[$key] = $Values[$key]
-        }
-    }
-
-    $script:ReportRows += [pscustomobject]$row
-}
-
-function Get-ScriptSHA256 {
-    try {
-        if (-not [string]::IsNullOrWhiteSpace($PSCommandPath) -and (Test-Path -LiteralPath $PSCommandPath)) {
-            return (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
-        }
-    }
-    catch {
-    }
-
-    return "Unavailable"
-}
-
-function Remove-OldOutputFiles {
-    try {
-        $cutoff = (Get-Date).AddDays(-1 * $LogRetentionDays)
-        Get-ChildItem -LiteralPath $ReportFolder -File -ErrorAction SilentlyContinue |
-            Where-Object {
-                $_.LastWriteTime -lt $cutoff -and
-                ($_.Name -like "Disabled1331_Migration_Log_*.log" -or $_.Name -like "Disabled1331_Migration_Report_*.csv")
-            } |
-            Remove-Item -Force -ErrorAction SilentlyContinue
-    }
-    catch {
-        Write-Warn "Unable to complete old log cleanup: $($_.Exception.Message)"
-    }
-}
-
-function Enter-SingleInstance {
-    $mutexName = "Global\CyberArk_Move_Disabled_IND_Account"
-    $createdNew = $false
-    $script:Mutex = [System.Threading.Mutex]::new($false, $mutexName, [ref]$createdNew)
-
-    try {
-        $script:MutexAcquired = $script:Mutex.WaitOne(0, $false)
-    }
-    catch [System.Threading.AbandonedMutexException] {
-        $script:MutexAcquired = $true
-    }
-
-    if (-not $script:MutexAcquired) {
-        throw "Another instance of the disabled-account migration script is already running."
-    }
-}
-
 # ============================================================
-# Authentication
+# CCP / Authentication
 # ============================================================
 
 function Get-ServiceUserCredentialFromCCP {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$CCPAddress,
+        [Parameter(Mandatory)][string]$Location,
+        [Parameter(Mandatory)][string]$AppID,
+        [Parameter(Mandatory)][string]$Safe,
+        [Parameter(Mandatory)][string]$Object,
+        [bool]$WindowsAuth = $false
+    )
+
     $base = $CCPAddress.TrimEnd("/")
-    $location = $CCPLocation.Trim("/")
+    $loc  = $Location.Trim("/")
 
     $url = "{0}/{1}/api/Accounts?AppID={2}&Safe={3}&Object={4}" -f `
         $base,
-        $location,
-        [uri]::EscapeDataString($CCPAppID),
-        [uri]::EscapeDataString($CCPSafe),
-        [uri]::EscapeDataString($CCPObject)
+        $loc,
+        [uri]::EscapeDataString($AppID),
+        [uri]::EscapeDataString($Safe),
+        [uri]::EscapeDataString($Object)
 
-    Write-Info "Retrieving Privilege Cloud service credential from CCP."
+    Write-Info "Retrieving the Privilege Cloud service credential from CCP."
     Write-Info "CCP endpoint: $url"
 
     $response = $null
@@ -468,948 +574,1196 @@ function Get-ServiceUserCredentialFromCCP {
             -Uri $url `
             -Method GET `
             -ContentType "application/json" `
-            -UseDefaultCredentials:$CCPWindowsAuth `
+            -UseDefaultCredentials:$WindowsAuth `
             -ErrorAction Stop
 
-        $userName = [string](Get-ObjectPropertyValue -InputObject $response -Names @("UserName", "username"))
-        $content = [string](Get-ObjectPropertyValue -InputObject $response -Names @("Content", "content"))
-
-        if ([string]::IsNullOrWhiteSpace($userName) -or [string]::IsNullOrWhiteSpace($content)) {
-            throw "CCP response did not contain both UserName and Content."
+        if ([string]::IsNullOrWhiteSpace([string]$response.UserName) -or
+            [string]::IsNullOrWhiteSpace([string]$response.Content)) {
+            throw "CCP response is missing UserName or Content."
         }
 
-        Write-Ok "CCP returned service user '$userName'."
+        Write-Ok "CCP returned service user '$($response.UserName)'."
 
-        $securePassword = ConvertTo-SecureString -String $content -AsPlainText -Force
-        return [System.Management.Automation.PSCredential]::new($userName, $securePassword)
+        $securePassword = ConvertTo-SecureString `
+            -String ([string]$response.Content) `
+            -AsPlainText `
+            -Force
+
+        return [System.Management.Automation.PSCredential]::new(
+            [string]$response.UserName,
+            $securePassword
+        )
     }
     finally {
-        if ($null -ne $response) {
-            $contentProperty = $response.PSObject.Properties |
-                Where-Object { $_.Name -ieq "Content" } |
-                Select-Object -First 1
-            if ($null -ne $contentProperty) {
-                $contentProperty.Value = $null
-            }
+        if ($null -ne $response -and $response.PSObject.Properties.Name -contains "Content") {
+            $response.Content = $null
         }
 
         $securePassword = $null
     }
 }
 
-function Connect-PrivilegeCloud {
-    $serviceCredential = Get-ServiceUserCredentialFromCCP
-
-    try {
-        Write-Info "Authenticating to Privilege Cloud through Identity Shared Services."
-
-        New-PASSession `
-            -IdentityTenantURL $IdentityTenantURL `
-            -PrivilegeCloudURL $PrivilegeCloudURL `
-            -Credential $serviceCredential `
-            -ServiceUser `
-            -ErrorAction Stop | Out-Null
-
-        $script:PASSessionCreated = $true
-
-        $session = Get-PASSession -ErrorAction SilentlyContinue
-        $sessionUser = [string](Get-ObjectPropertyValue -InputObject $session -Names @("User", "user", "UserName", "username"))
-        if ([string]::IsNullOrWhiteSpace($sessionUser)) {
-            $sessionUser = $serviceCredential.UserName
-        }
-
-        Write-Ok "Authenticated to Privilege Cloud as '$sessionUser'."
-    }
-    finally {
-        $serviceCredential = $null
-    }
-}
-
-function Assert-PublicCommands {
-    $requiredCommands = @(
-        "Get-PASAccount",
-        "Get-PASAccountActivity",
-        "Get-PASAccountPassword",
-        "Add-PASAccount",
-        "Remove-PASAccount",
-        "Get-PASSafe",
-        "Get-PASSession",
-        "Close-PASSession"
-    )
-
-    $missing = @()
-    foreach ($commandName in $requiredCommands) {
-        if (-not (Get-Command -Name $commandName -ErrorAction SilentlyContinue)) {
-            $missing += $commandName
-        }
-    }
-
-    if ($missing.Count -gt 0) {
-        throw "Required exported psPAS command(s) missing: $($missing -join ', ')."
-    }
-
-    Write-Ok "All required exported psPAS commands are available."
-}
-
-function Assert-TargetConfiguration {
-    $targetSafe = Get-PASSafe -SafeName $TargetSafeName -ErrorAction Stop
-    if ($null -eq $targetSafe) {
-        throw "Target Safe '$TargetSafeName' was not found."
-    }
-    Write-Ok "Target Safe '$TargetSafeName' exists."
-
-    $platformCommand = Get-Command -Name Get-PASPlatform -ErrorAction SilentlyContinue
-    if ($null -eq $platformCommand) {
-        Write-Warn "Get-PASPlatform is not available. Platform existence will be validated by Add-PASAccount during creation."
-        return
-    }
-
-    try {
-        $targetPlatform = Get-PASPlatform -PlatformID $TargetPlatformID -ErrorAction Stop
-        if ($null -eq $targetPlatform) {
-            Write-Warn "Target platform '$TargetPlatformID' was not returned. Add-PASAccount will perform the authoritative validation."
-        }
-        else {
-            Write-Ok "Target platform '$TargetPlatformID' exists."
-        }
-    }
-    catch {
-        Write-Warn "Unable to pre-validate target platform '$TargetPlatformID': $($_.Exception.Message). Add-PASAccount will perform the authoritative validation."
-    }
-}
-
 # ============================================================
-# Candidate discovery
+# Account Discovery and Signature Matching
 # ============================================================
 
-function Add-CandidateToMap {
+function Add-CandidateAccount {
     param(
-        [Parameter(Mandatory)][hashtable]$Map,
+        [Parameter(Mandatory)][hashtable]$CandidateMap,
         [Parameter(Mandatory)][object]$Account,
         [Parameter(Mandatory)][string]$DiscoverySource
     )
 
+    if ($null -eq $Account) {
+        return
+    }
+
     $accountID = Get-AccountID -Account $Account
+    $safeName  = Get-AccountSafeName -Account $Account
+
     if ([string]::IsNullOrWhiteSpace($accountID)) {
         return
     }
 
-    $safeName = Get-AccountSafeName -Account $Account
     if (-not [string]::IsNullOrWhiteSpace($safeName) -and $safeName -ieq $TargetSafeName) {
         return
     }
 
     $key = $accountID.Trim().ToLowerInvariant()
-    if (-not $Map.ContainsKey($key)) {
-        $Map[$key] = [pscustomobject][ordered]@{
-            Account         = $Account
+
+    if (-not $CandidateMap.ContainsKey($key)) {
+        $CandidateMap[$key] = [pscustomobject][ordered]@{
+            Summary         = $Account
             DiscoverySource = $DiscoverySource
         }
     }
 }
 
-function Get-AccountsBySafe {
-    param([Parameter(Mandatory)][string]$SafeName)
-
-    return @(
-        Get-PASAccount `
-            -SafeName $SafeName `
-            -limit 1000 `
-            -ErrorAction Stop
-    )
-}
-
-function Get-CandidateAccounts {
+function Get-SourceAccounts {
     $candidateMap = @{}
+    $successfulQueries = 0
+    $failedQueries = 0
 
-    if ($SourceSafeName.Count -gt 0) {
+    if ($SourceSafeName -and $SourceSafeName.Count -gt 0) {
+        Write-Info "Explicit source Safe selection supplied. Retrieving accounts only from the requested Safes."
+
         foreach ($safe in $SourceSafeName) {
             if ([string]::IsNullOrWhiteSpace($safe)) {
                 continue
             }
 
-            Write-Info "Retrieving accounts from source Safe '$safe'."
-            $accounts = Get-AccountsBySafe -SafeName $safe
-            foreach ($account in $accounts) {
-                Add-CandidateToMap -Map $candidateMap -Account $account -DiscoverySource ("Safe:{0}" -f $safe)
+            $trimmedSafe = $safe.Trim()
+
+            if ($trimmedSafe -ieq $TargetSafeName.Trim()) {
+                Write-Warn "Source Safe '$trimmedSafe' is the target Safe and was excluded."
+                continue
+            }
+
+            try {
+                $items = @(
+                    Get-PASAccount `
+                        -SafeName $trimmedSafe `
+                        -Limit 1000 `
+                        -TimeoutSec $ApiTimeoutSec `
+                        -ErrorAction Stop
+                )
+
+                foreach ($item in $items) {
+                    Add-CandidateAccount `
+                        -CandidateMap $candidateMap `
+                        -Account $item `
+                        -DiscoverySource "SAFE:$trimmedSafe"
+                }
+
+                $successfulQueries++
+                Write-Ok "Retrieved $($items.Count) account(s) from source Safe '$trimmedSafe'."
+            }
+            catch {
+                $failedQueries++
+                $script:OperationalErrorCount++
+                Write-Warn "Unable to retrieve accounts from Safe '$trimmedSafe': $($_.Exception.Message)"
             }
         }
     }
     elseif ($FullScan) {
-        Write-Warn "FullScan was requested. Retrieving all accessible accounts."
-        $accounts = @(Get-PASAccount -limit 1000 -ErrorAction Stop)
-        foreach ($account in $accounts) {
-            Add-CandidateToMap -Map $candidateMap -Account $account -DiscoverySource "FullScan"
+        Write-Warn "FullScan was requested. Retrieving every account visible to the service user."
+
+        $items = @(
+            Get-PASAccount `
+                -Limit 1000 `
+                -TimeoutSec $ApiTimeoutSec `
+                -ErrorAction Stop
+        )
+
+        foreach ($item in $items) {
+            Add-CandidateAccount `
+                -CandidateMap $candidateMap `
+                -Account $item `
+                -DiscoverySource "FULL_SCAN"
         }
+
+        $successfulQueries = 1
+        Write-Ok "Retrieved $($items.Count) accessible account(s) during the full scan."
     }
     else {
-        Write-Info "Fast discovery enabled. Querying CyberArk failure saved filters."
+        Write-Info "Fast candidate discovery enabled. Querying CyberArk saved failure filters."
 
-        $successfulFilterCount = 0
-        foreach ($savedFilter in $script:FastSavedFilters) {
+        $uniqueFilters = @(
+            $CandidateSavedFilters |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                Select-Object -Unique
+        )
+
+        foreach ($savedFilter in $uniqueFilters) {
             try {
-                $accounts = @(
+                $items = @(
                     Get-PASAccount `
-                        -savedFilter $savedFilter `
-                        -limit 1000 `
+                        -SavedFilter $savedFilter `
+                        -Limit 1000 `
+                        -TimeoutSec $ApiTimeoutSec `
                         -ErrorAction Stop
                 )
 
-                $successfulFilterCount++
-                Write-Info "Saved filter '$savedFilter' returned $($accounts.Count) account(s)."
-
-                foreach ($account in $accounts) {
-                    Add-CandidateToMap -Map $candidateMap -Account $account -DiscoverySource ("SavedFilter:{0}" -f $savedFilter)
+                foreach ($item in $items) {
+                    Add-CandidateAccount `
+                        -CandidateMap $candidateMap `
+                        -Account $item `
+                        -DiscoverySource "SAVED_FILTER:$savedFilter"
                 }
+
+                $successfulQueries++
+                Write-Ok "Saved filter '$savedFilter' returned $($items.Count) account(s)."
             }
             catch {
+                $failedQueries++
                 Write-Warn "Saved filter '$savedFilter' failed: $($_.Exception.Message)"
             }
         }
 
-        if ($successfulFilterCount -eq 0 -or $candidateMap.Count -eq 0) {
-            Write-Warn "Fast saved-filter discovery produced no usable candidates. Falling back to all accessible accounts."
-            $accounts = @(Get-PASAccount -limit 1000 -ErrorAction Stop)
-            foreach ($account in $accounts) {
-                Add-CandidateToMap -Map $candidateMap -Account $account -DiscoverySource "AutomaticFullScanFallback"
+        if ($successfulQueries -eq 0) {
+            Write-Warn "Every saved-filter query failed. Falling back to a full accessible-account scan."
+
+            $items = @(
+                Get-PASAccount `
+                    -Limit 1000 `
+                    -TimeoutSec $ApiTimeoutSec `
+                    -ErrorAction Stop
+            )
+
+            foreach ($item in $items) {
+                Add-CandidateAccount `
+                    -CandidateMap $candidateMap `
+                    -Account $item `
+                    -DiscoverySource "FALLBACK_FULL_SCAN"
             }
+
+            $successfulQueries = 1
+            Write-Ok "Fallback full scan returned $($items.Count) accessible account(s)."
         }
     }
 
-    $candidates = @()
-    foreach ($entry in $candidateMap.Values) {
-        $candidates += $entry
+    $preparedCount = 0
+
+    foreach ($candidate in $candidateMap.Values) {
+        if ($MaxAccounts -gt 0 -and $preparedCount -ge $MaxAccounts) {
+            break
+        }
+
+        $preparedCount++
+        Write-Output $candidate
     }
 
-    $candidates = @(
-        $candidates |
-            Sort-Object {
-                Get-AccountSafeName -Account $_.Account
-            }, {
-                Get-AccountUserName -Account $_.Account
-            }
-    )
-
-    if ($MaxAccounts -gt 0 -and $candidates.Count -gt $MaxAccounts) {
-        Write-Warn "MaxAccounts limits processing from $($candidates.Count) to $MaxAccounts candidate(s)."
-        $candidates = @($candidates | Select-Object -First $MaxAccounts)
+    if ($MaxAccounts -gt 0 -and $candidateMap.Count -gt $MaxAccounts) {
+        Write-Warn "MaxAccounts=$MaxAccounts applied. Only the first $MaxAccounts candidate account(s) will be reviewed."
     }
 
-    return $candidates
+    Write-Ok "Prepared $preparedCount unique candidate account(s) for exact winRc=1331 review."
+    Write-Info "Candidate discovery queries: successful=$successfulQueries; failed=$failedQueries."
 }
 
-function Find-DisabledEvidence {
+function Get-AccountActivitiesForReview {
     param(
-        [Parameter(Mandatory)][object]$AccountSummary,
+        [Parameter(Mandatory)]
+        [string]$AccountID
+    )
+
+    $cmdletError = ""
+
+    if (Test-CommandAvailable -Name "Get-PASAccountActivity") {
+        try {
+            return @(
+                Get-PASAccountActivity `
+                    -AccountID $AccountID `
+                    -ErrorAction Stop
+            )
+        }
+        catch {
+            $cmdletError = $_.Exception.Message
+        }
+    }
+    else {
+        $cmdletError = "Get-PASAccountActivity is not available in the loaded psPAS module."
+    }
+
+    try {
+        $encodedID = [uri]::EscapeDataString($AccountID)
+        $response = Invoke-PASRestMethod `
+            -Uri "$script:ApiBaseURI/api/Accounts/$encodedID/Activities" `
+            -Method GET `
+            -TimeoutSec $ApiTimeoutSec `
+            -ErrorAction Stop
+
+        $nested = Get-PropertyValue `
+            -InputObject $response `
+            -Names @("Activities", "activities")
+
+        if ($null -ne $nested) {
+            return @($nested)
+        }
+
+        return @($response)
+    }
+    catch {
+        $restError = $_.Exception.Message
+        throw "Account activity retrieval failed. Cmdlet error='$cmdletError'; REST fallback error='$restError'."
+    }
+}
+
+function Find-Disabled1331Evidence {
+    param(
+        [Parameter(Mandatory)][object]$AccountDetails,
         [Parameter(Mandatory)][string]$AccountID
     )
 
+    # The list-account response usually contains secretManagement. Check its
+    # manual reason first because this avoids an activity API call when the
+    # exact disabled-account signature is already present there.
+    $secretManagement = Get-PropertyValue `
+        -InputObject $AccountDetails `
+        -Names @("secretManagement", "SecretManagement")
+
+    $manualReason = [string](Get-PropertyValue `
+        -InputObject $secretManagement `
+        -Names @("manualManagementReason", "ManualManagementReason") `
+        -Default "")
+
+    if (Test-Disabled1331Text -Text $manualReason) {
+        return [pscustomobject][ordered]@{
+            DetectionSource = "MANUAL_MANAGEMENT_REASON"
+            ActivityTime    = ""
+            ParsedTime      = $null
+            Activity        = ""
+            Reason          = $manualReason
+            MoreInfo        = ""
+        }
+    }
+
     $cutoff = $null
     if ($LookbackDays -gt 0) {
-        $cutoff = (Get-Date).AddDays(-1 * $LookbackDays)
+        $cutoff = (Get-Date).AddDays(-$LookbackDays)
     }
 
-    $manualReason = Get-ManualManagementReason -Account $AccountSummary
-    if (Test-DisabledSignatureText -Text $manualReason) {
-        return [pscustomobject][ordered]@{
-            Matched = $true
-            Source  = "ManualManagementReason"
-            Time    = ""
-            Text    = $manualReason
-        }
-    }
+    $bestMatch = $null
+    $bestTime = [datetime]::MinValue
 
-    $activities = @(
-        Get-PASAccountActivity `
-            -AccountID $AccountID `
-            -ErrorAction Stop
-    )
+    try {
+        $activities = @(Get-AccountActivitiesForReview -AccountID $AccountID)
 
-    foreach ($activity in $activities) {
-        $activityTimeRaw = Get-ObjectPropertyValue -InputObject $activity -Names @("Time", "time", "Date", "date")
-        $activityTime = Convert-ActivityTime -Value $activityTimeRaw
+        foreach ($activity in $activities) {
+            $activityName = [string](Get-PropertyValue `
+                -InputObject $activity `
+                -Names @("Activity", "activity", "Action", "action") `
+                -Default "")
 
-        if ($null -ne $cutoff -and $null -ne $activityTime -and $activityTime -lt $cutoff) {
-            continue
-        }
+            $reason = [string](Get-PropertyValue `
+                -InputObject $activity `
+                -Names @("Reason", "reason") `
+                -Default "")
 
-        $parts = @(
-            [string](Get-ObjectPropertyValue -InputObject $activity -Names @("Activity", "activity")),
-            [string](Get-ObjectPropertyValue -InputObject $activity -Names @("Reason", "reason")),
-            [string](Get-ObjectPropertyValue -InputObject $activity -Names @("MoreInfo", "moreInfo")),
-            [string](Get-ObjectPropertyValue -InputObject $activity -Names @("Description", "description"))
-        )
+            $moreInfo = [string](Get-PropertyValue `
+                -InputObject $activity `
+                -Names @("MoreInfo", "moreInfo", "Details", "details") `
+                -Default "")
 
-        $combined = ($parts | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join " | "
-        if (Test-DisabledSignatureText -Text $combined) {
-            $activityTimeText = [string]$activityTimeRaw
-            if ($null -ne $activityTime) {
-                $activityTimeText = $activityTime.ToString("yyyy-MM-dd HH:mm:ss")
+            $rawTime = Get-PropertyValue `
+                -InputObject $activity `
+                -Names @("Time", "time", "Date", "date", "CreationTime", "creationTime")
+
+            $parsedTime = Convert-ActivityTime -Value $rawTime
+            $combined = "$activityName`n$reason`n$moreInfo"
+
+            if (-not (Test-Disabled1331Text -Text $combined)) {
+                continue
             }
 
-            return [pscustomobject][ordered]@{
-                Matched = $true
-                Source  = "AccountActivity"
-                Time    = $activityTimeText
-                Text    = $combined
+            if ($cutoff -and $parsedTime -and $parsedTime -lt $cutoff) {
+                continue
+            }
+
+            $comparisonTime = if ($parsedTime) { $parsedTime } else { [datetime]::MinValue }
+
+            if ($null -eq $bestMatch -or $comparisonTime -gt $bestTime) {
+                $bestTime = $comparisonTime
+                $bestMatch = [pscustomobject][ordered]@{
+                    DetectionSource = "ACCOUNT_ACTIVITY"
+                    ActivityTime    = if ($parsedTime) { $parsedTime } else { $rawTime }
+                    ParsedTime      = $parsedTime
+                    Activity        = $activityName
+                    Reason          = $reason
+                    MoreInfo        = $moreInfo
+                }
             }
         }
     }
-
-    return [pscustomobject][ordered]@{
-        Matched = $false
-        Source  = ""
-        Time    = ""
-        Text    = ""
+    catch {
+        $script:OperationalErrorCount++
+        Write-Warn "Account activity could not be retrieved for AccountID '$AccountID': $($_.Exception.Message)"
     }
+
+    return $bestMatch
 }
 
 # ============================================================
-# Optional public-cmdlet-only relationship checking
+# Relationship and Duplicate Checks
 # ============================================================
 
-function Test-AccountRelationships {
+function Get-DependentAccountCount {
+    param([Parameter()][AllowNull()][object[]]$Response)
+
+    if (-not $Response -or $Response.Count -eq 0) {
+        return 0
+    }
+
+    # Some psPAS/CyberArk versions return a wrapper with Total and
+    # DependentAccounts; others return the dependent-account objects directly.
+    if ($Response.Count -eq 1) {
+        $single = $Response[0]
+        $totalValue = Get-PropertyValue -InputObject $single -Names @("Total", "total")
+        if ($null -ne $totalValue -and [string]$totalValue -match '^\d+$') {
+            return [int]$totalValue
+        }
+
+        $nested = Get-PropertyValue -InputObject $single -Names @("DependentAccounts", "dependentAccounts")
+        if ($null -ne $nested) {
+            return @($nested).Count
+        }
+    }
+
+    return @($Response | Where-Object { $null -ne $_ }).Count
+}
+
+function Get-LinkedAccountCount {
+    param([Parameter()][AllowNull()][object[]]$Response)
+
+    if (-not $Response -or $Response.Count -eq 0) {
+        return 0
+    }
+
+    if ($Response.Count -eq 1) {
+        $single = $Response[0]
+        $nested = Get-PropertyValue -InputObject $single -Names @("LinkedAccounts", "linkedAccounts")
+        if ($null -ne $nested) {
+            return @($nested).Count
+        }
+    }
+
+    return @($Response | Where-Object { $null -ne $_ }).Count
+}
+
+function Get-PASApiBaseURI {
+    if ([string]::IsNullOrWhiteSpace($script:ApiBaseURI)) {
+        throw "The configured Privilege Cloud API BaseURI is blank."
+    }
+
+    return $script:ApiBaseURI
+}
+
+function Get-LinkedAccountsForSafetyCheck {
+    param([Parameter(Mandatory)][string]$AccountID)
+
+    $cmdletError = ""
+
+    if (Test-CommandAvailable -Name "Get-PASLinkedAccount") {
+        try {
+            return @(Get-PASLinkedAccount -id $AccountID -ErrorAction Stop)
+        }
+        catch {
+            $cmdletError = $_.Exception.Message
+        }
+    }
+
+    try {
+        $encodedID = [uri]::EscapeDataString($AccountID)
+        $response = Invoke-PASRestMethod `
+            -Uri "$script:ApiBaseURI/api/ExtendedAccounts/$encodedID/LinkedAccounts" `
+            -Method GET `
+            -TimeoutSec $ApiTimeoutSec `
+            -ErrorAction Stop
+
+        $nested = Get-PropertyValue -InputObject $response -Names @("LinkedAccounts", "linkedAccounts")
+        if ($null -ne $nested) {
+            return @($nested)
+        }
+
+        return @($response)
+    }
+    catch {
+        $restError = $_.Exception.Message
+        throw "Linked-account check failed. Cmdlet error='$cmdletError'; REST fallback error='$restError'."
+    }
+}
+
+function Get-DependentAccountsForSafetyCheck {
+    param([Parameter(Mandatory)][string]$AccountID)
+
+    $cmdletError = ""
+
+    if (Test-CommandAvailable -Name "Get-PASDependentAccount") {
+        try {
+            return @(Get-PASDependentAccount -id $AccountID -ErrorAction Stop)
+        }
+        catch {
+            $cmdletError = $_.Exception.Message
+        }
+    }
+
+    try {
+        $encodedID = [uri]::EscapeDataString($AccountID)
+        $response = Invoke-PASRestMethod `
+            -Uri "$script:ApiBaseURI/api/Accounts/$encodedID/dependentAccounts" `
+            -Method GET `
+            -TimeoutSec $ApiTimeoutSec `
+            -ErrorAction Stop
+
+        return @($response)
+    }
+    catch {
+        $restError = $_.Exception.Message
+        throw "Dependent-account check failed. Cmdlet error='$cmdletError'; REST fallback error='$restError'."
+    }
+}
+
+function Get-RelationshipCheck {
     param(
         [Parameter(Mandatory)][object]$AccountDetails,
         [Parameter(Mandatory)][string]$AccountID
     )
 
     $result = [ordered]@{
-        Allowed        = $true
-        Status         = "NOT_CHECKED"
-        Error          = ""
+        Success        = $true
         LinkedCount    = 0
         DependentCount = 0
         GroupDetected  = $false
+        Status         = "OK"
+        Error          = ""
     }
 
-    if ($RelationshipCheckMode -eq "Disabled") {
+    if ($SkipRelationshipChecks) {
+        $result.Status = "SKIPPED_BY_PARAMETER"
         return [pscustomobject]$result
     }
 
-    $groupValue = Get-ObjectPropertyValue -InputObject $AccountDetails -Names @(
+    $groupValue = Get-PropertyValue -InputObject $AccountDetails -Names @(
         "groupName", "GroupName", "groupID", "GroupID", "accountGroup", "AccountGroup"
     )
+
     if ($null -ne $groupValue -and -not [string]::IsNullOrWhiteSpace([string]$groupValue)) {
         $result.GroupDetected = $true
     }
 
-    $checkErrors = @()
-
-    $linkedCommand = Get-Command -Name Get-PASLinkedAccount -ErrorAction SilentlyContinue
-    if ($null -ne $linkedCommand) {
-        try {
-            $linkedAccounts = @(Get-PASLinkedAccount -id $AccountID -ErrorAction Stop)
-            $result.LinkedCount = @($linkedAccounts | Where-Object { $null -ne $_ }).Count
-        }
-        catch {
-            $checkErrors += "Linked-account check: $($_.Exception.Message)"
-        }
+    try {
+        $linkedResponse = @(Get-LinkedAccountsForSafetyCheck -AccountID $AccountID)
+        $result.LinkedCount = Get-LinkedAccountCount -Response $linkedResponse
     }
-    else {
-        $checkErrors += "Get-PASLinkedAccount is not available in the installed psPAS module."
+    catch {
+        $result.Success = $false
+        $result.Status  = "LINKED_ACCOUNT_CHECK_FAILED"
+        $result.Error   = $_.Exception.Message
+        return [pscustomobject]$result
     }
 
-    $dependentCommand = Get-Command -Name Get-PASDependentAccount -ErrorAction SilentlyContinue
-    if ($null -ne $dependentCommand) {
-        try {
-            $dependentAccounts = @(Get-PASDependentAccount -id $AccountID -ErrorAction Stop)
-            $result.DependentCount = @($dependentAccounts | Where-Object { $null -ne $_ }).Count
-        }
-        catch {
-            $checkErrors += "Dependent-account check: $($_.Exception.Message)"
-        }
+    try {
+        $dependentResponse = @(Get-DependentAccountsForSafetyCheck -AccountID $AccountID)
+        $result.DependentCount = Get-DependentAccountCount -Response $dependentResponse
     }
-    else {
-        $checkErrors += "Get-PASDependentAccount is not available in the installed psPAS module."
+    catch {
+        $result.Success = $false
+        $result.Status  = "DEPENDENT_ACCOUNT_CHECK_FAILED"
+        $result.Error   = $_.Exception.Message
+        return [pscustomobject]$result
     }
 
     if ($result.LinkedCount -gt 0 -or $result.DependentCount -gt 0 -or $result.GroupDetected) {
-        $result.Allowed = $false
-        $result.Status = "RELATIONSHIP_DETECTED"
-        $result.Error = "Linked=$($result.LinkedCount); Dependent=$($result.DependentCount); Group=$($result.GroupDetected)."
-        return [pscustomobject]$result
+        $result.Success = $false
+        $result.Status  = "RELATIONSHIP_DETECTED"
+        $result.Error   = "Account has linked, dependent, or group relationships. Migration was skipped to avoid breaking references."
     }
 
-    if ($checkErrors.Count -gt 0) {
-        $result.Error = $checkErrors -join " | "
-
-        if ($RelationshipCheckMode -eq "Strict") {
-            $result.Allowed = $false
-            $result.Status = "RELATIONSHIP_CHECK_FAILED"
-        }
-        else {
-            $result.Allowed = $true
-            $result.Status = "CHECK_ERROR_CONTINUED"
-        }
-
-        return [pscustomobject]$result
-    }
-
-    $result.Status = "NO_RELATIONSHIPS_FOUND"
     return [pscustomobject]$result
 }
 
-# ============================================================
-# Target indexing, validation and migration
-# ============================================================
-
-function Initialize-TargetIndex {
-    Write-Info "Loading target Safe accounts once for duplicate and recovery checks."
-
-    $script:TargetIndex = @{}
-    $targetAccounts = Get-AccountsBySafe -SafeName $TargetSafeName
-
-    foreach ($targetAccount in $targetAccounts) {
-        $key = Get-DuplicateKey `
-            -UserName (Get-AccountUserName -Account $targetAccount) `
-            -Address (Get-AccountAddress -Account $targetAccount)
-
-        if (-not $script:TargetIndex.ContainsKey($key)) {
-            $script:TargetIndex[$key] = $targetAccount
-        }
-    }
-
-    Write-Ok "Loaded $($targetAccounts.Count) account(s) from target Safe '$TargetSafeName'."
-}
-
-function Test-TargetAccount {
+function Get-TargetDuplicateKey {
     param(
-        [Parameter(Mandatory)][object]$TargetAccount,
-        [Parameter(Mandatory)][string]$ExpectedUserName,
-        [Parameter(Mandatory)][string]$ExpectedAddress
+        [AllowNull()][string]$UserName,
+        [AllowNull()][string]$Address
     )
 
-    $actualSafe = Get-AccountSafeName -Account $TargetAccount
-    $actualPlatform = Get-AccountPlatformID -Account $TargetAccount
-    $actualUserName = Get-AccountUserName -Account $TargetAccount
-    $actualAddress = Get-AccountAddress -Account $TargetAccount
-    $actualID = Get-AccountID -Account $TargetAccount
-
-    $errors = @()
-
-    if ([string]::IsNullOrWhiteSpace($actualID)) {
-        $errors += "Target AccountID is missing."
-    }
-    if ($actualSafe -ine $TargetSafeName) {
-        $errors += "Safe='$actualSafe' instead of '$TargetSafeName'."
-    }
-    if ($actualPlatform -ine $TargetPlatformID) {
-        $errors += "Platform='$actualPlatform' instead of '$TargetPlatformID'."
-    }
-    if ($actualUserName -ine $ExpectedUserName) {
-        $errors += "UserName='$actualUserName' instead of '$ExpectedUserName'."
-    }
-    if ($actualAddress -ine $ExpectedAddress) {
-        $errors += "Address='$actualAddress' instead of '$ExpectedAddress'."
-    }
-
-    return [pscustomobject][ordered]@{
-        Valid     = ($errors.Count -eq 0)
-        AccountID = $actualID
-        Error     = $errors -join " "
-    }
+    return (([string]$UserName).Trim().ToLowerInvariant() + "|" + ([string]$Address).Trim().ToLowerInvariant())
 }
 
-function Find-TargetAccountAfterCreation {
-    param(
-        [Parameter(Mandatory)][string]$UserName,
-        [Parameter(Mandatory)][string]$Address
-    )
+function Initialize-TargetDuplicateIndex {
+    $script:TargetDuplicateIndex = @{}
 
-    $matches = @(
+    Write-Info "Loading target Safe accounts once for fast duplicate checks."
+
+    $targetAccounts = @(
         Get-PASAccount `
             -SafeName $TargetSafeName `
-            -search $UserName `
-            -searchType contains `
-            -limit 1000 `
-            -ErrorAction Stop |
-        Where-Object {
-            (Get-AccountUserName -Account $_) -ieq $UserName -and
-            (Get-AccountAddress -Account $_) -ieq $Address
-        }
+            -Limit 1000 `
+            -TimeoutSec $ApiTimeoutSec `
+            -ErrorAction Stop
     )
 
-    if ($matches.Count -eq 1) {
-        return $matches[0]
+    foreach ($account in $targetAccounts) {
+        $userName = Get-AccountUserName -Account $account
+        $address  = Get-AccountAddress -Account $account
+
+        if ([string]::IsNullOrWhiteSpace($userName) -or [string]::IsNullOrWhiteSpace($address)) {
+            continue
+        }
+
+        $key = Get-TargetDuplicateKey -UserName $userName -Address $address
+        $script:TargetDuplicateIndex[$key] = $account
     }
 
-    if ($matches.Count -gt 1) {
-        $platformMatches = @($matches | Where-Object { (Get-AccountPlatformID -Account $_) -ieq $TargetPlatformID })
-        if ($platformMatches.Count -eq 1) {
-            return $platformMatches[0]
+    Write-Ok "Indexed $($script:TargetDuplicateIndex.Count) target Safe account key(s)."
+}
+
+function Find-ExactTargetDuplicate {
+    param(
+        [Parameter(Mandatory)][string]$UserName,
+        [Parameter(Mandatory)][string]$Address,
+        [switch]$RefreshFromApi
+    )
+
+    $key = Get-TargetDuplicateKey -UserName $UserName -Address $Address
+
+    if ($script:TargetDuplicateIndex.ContainsKey($key)) {
+        return $script:TargetDuplicateIndex[$key]
+    }
+
+    if ($RefreshFromApi) {
+        $candidates = @(
+            Get-PASAccount `
+                -SafeName $TargetSafeName `
+                -Search $UserName `
+                -Limit 1000 `
+                -TimeoutSec $ApiTimeoutSec `
+                -ErrorAction Stop
+        )
+
+        $match = $candidates |
+            Where-Object {
+                (Get-AccountUserName -Account $_) -ieq $UserName -and
+                (Get-AccountAddress -Account $_) -ieq $Address
+            } |
+            Select-Object -First 1
+
+        if ($match) {
+            $script:TargetDuplicateIndex[$key] = $match
+            return $match
         }
     }
 
     return $null
 }
 
-function New-RetirementAccount {
-    param(
-        [Parameter(Mandatory)][object]$SourceAccount,
-        [Parameter(Mandatory)][Security.SecureString]$Secret
-    )
+function Add-TargetDuplicateIndexEntry {
+    param([Parameter(Mandatory)][object]$Account)
 
-    $sourceName = Get-AccountName -Account $SourceAccount
-    $sourceAddress = Get-AccountAddress -Account $SourceAccount
-    $sourceUserName = Get-AccountUserName -Account $SourceAccount
+    $userName = Get-AccountUserName -Account $Account
+    $address  = Get-AccountAddress -Account $Account
 
-    $parameters = @{
-        address                    = $sourceAddress
-        userName                   = $sourceUserName
-        platformID                 = $TargetPlatformID
-        SafeName                   = $TargetSafeName
-        secretType                 = "Password"
-        secret                     = $Secret
-        automaticManagementEnabled = $false
-        manualManagementReason     = "Moved after confirmed disabled-user failure winRc=1331. Source account retired by automation."
-        ErrorAction                = "Stop"
+    if ([string]::IsNullOrWhiteSpace($userName) -or [string]::IsNullOrWhiteSpace($address)) {
+        return
     }
 
-    if (-not [string]::IsNullOrWhiteSpace($sourceName)) {
-        $parameters["name"] = $sourceName
+    $key = Get-TargetDuplicateKey -UserName $userName -Address $address
+    $script:TargetDuplicateIndex[$key] = $Account
+}
+
+# ============================================================
+# Secret Retrieval / Target Creation / Source Deletion
+# ============================================================
+
+function Get-SourceSecretSecureString {
+    param([Parameter(Mandatory)][string]$AccountID)
+
+    $passwordSplat = @{
+        AccountID  = $AccountID
+        Reason     = $PasswordAccessReason
+        ErrorAction = "Stop"
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($TicketingSystem)) {
+        $passwordSplat["TicketingSystem"] = $TicketingSystem
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($TicketId)) {
+        $passwordSplat["TicketId"] = $TicketId
+    }
+
+    $secretResult = Get-PASAccountPassword @passwordSplat
+    return ConvertTo-SecureSecret -SecretResult $secretResult
+}
+
+function New-TargetAccount {
+    param(
+        [Parameter(Mandatory)][object]$SourceAccount,
+        [Parameter(Mandatory)][Security.SecureString]$Secret,
+        [Parameter(Mandatory)][string]$SourceAccountID,
+        [Parameter(Mandatory)][string]$SourceSafe
+    )
+
+    $name       = Get-AccountName -Account $SourceAccount
+    $userName   = Get-AccountUserName -Account $SourceAccount
+    $address    = Get-AccountAddress -Account $SourceAccount
+    $secretType = [string](Get-PropertyValue -InputObject $SourceAccount -Names @("secretType", "SecretType") -Default "password")
+
+    if ([string]::IsNullOrWhiteSpace($secretType)) {
+        $secretType = "password"
+    }
+
+    if ($secretType -ine "password") {
+        throw "SecretType '$secretType' is not supported by this disabled Windows-account migration workflow."
+    }
+
+    $manualReason = "Moved after disabled-account failure winRc=1331; source Safe '$SourceSafe'; source AccountID '$SourceAccountID'."
+
+    $addSplat = @{
+        SafeName                    = $TargetSafeName
+        PlatformID                  = $TargetPlatformID
+        Address                     = $address
+        UserName                    = $userName
+        SecretType                  = "password"
+        Secret                      = $Secret
+        AutomaticManagementEnabled  = $false
+        ManualManagementReason      = $manualReason
+        ErrorAction                 = "Stop"
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($name)) {
+        $addSplat["Name"] = $name
     }
 
     if ($PreservePlatformAccountProperties) {
-        $properties = ConvertTo-Hashtable -InputObject (Get-PlatformAccountProperties -Account $SourceAccount)
-        if ($null -ne $properties -and $properties.Count -gt 0) {
-            $parameters["platformAccountProperties"] = $properties
+        $propertiesObject = Get-PropertyValue -InputObject $SourceAccount -Names @("platformAccountProperties", "PlatformAccountProperties")
+        $propertiesHash = ConvertTo-Hashtable -InputObject $propertiesObject
+        if ($propertiesHash -and $propertiesHash.Count -gt 0) {
+            $addSplat["PlatformAccountProperties"] = $propertiesHash
         }
     }
 
-    return Add-PASAccount @parameters
+    return Add-PASAccount @addSplat
 }
 
-function Remove-SourceAccount {
-    param([Parameter(Mandatory)][string]$SourceAccountID)
-
-    Remove-PASAccount `
-        -AccountID $SourceAccountID `
-        -Confirm:$false `
-        -ErrorAction Stop
-}
-
-function Process-MatchedAccount {
+function Test-NewTargetAccount {
     param(
-        [Parameter(Mandatory)][object]$AccountSummary,
+        [Parameter(Mandatory)][string]$TargetAccountID,
+        [Parameter(Mandatory)][string]$ExpectedUserName,
+        [Parameter(Mandatory)][string]$ExpectedAddress
+    )
+
+    $details = Get-PASAccount -id $TargetAccountID -ErrorAction Stop
+
+    $actualSafe     = Get-AccountSafeName -Account $details
+    $actualPlatform = Get-AccountPlatformID -Account $details
+    $actualUserName = Get-AccountUserName -Account $details
+    $actualAddress  = Get-AccountAddress -Account $details
+
+    if ($actualSafe -ine $TargetSafeName) {
+        throw "Target validation failed. Expected Safe '$TargetSafeName', returned '$actualSafe'."
+    }
+
+    if ($actualPlatform -ine $TargetPlatformID) {
+        throw "Target validation failed. Expected platform '$TargetPlatformID', returned '$actualPlatform'."
+    }
+
+    if ($actualUserName -ine $ExpectedUserName) {
+        throw "Target validation failed. Expected username '$ExpectedUserName', returned '$actualUserName'."
+    }
+
+    if ($actualAddress -ine $ExpectedAddress) {
+        throw "Target validation failed. Expected address '$ExpectedAddress', returned '$actualAddress'."
+    }
+
+    $secretManagement = Get-PropertyValue -InputObject $details -Names @("secretManagement", "SecretManagement")
+    $automaticManagement = Get-PropertyValue -InputObject $secretManagement -Names @("automaticManagementEnabled", "AutomaticManagementEnabled")
+
+    if ($null -ne $automaticManagement -and [bool]$automaticManagement -ne $false) {
+        throw "Target validation failed. Automatic management is still enabled."
+    }
+
+    return $details
+}
+
+function Move-DisabledAccount {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [Parameter(Mandatory)][object]$AccountDetails,
         [Parameter(Mandatory)][object]$Evidence,
+        [Parameter(Mandatory)][object]$RelationshipResult,
+        [Parameter(Mandatory)][bool]$TargetSafeReady,
         [Parameter(Mandatory)][string]$DiscoverySource
     )
 
-    $sourceID = Get-AccountID -Account $AccountSummary
-    $sourceSafe = Get-AccountSafeName -Account $AccountSummary
-    $sourcePlatform = Get-AccountPlatformID -Account $AccountSummary
-    $sourceName = Get-AccountName -Account $AccountSummary
-    $sourceUserName = Get-AccountUserName -Account $AccountSummary
-    $sourceAddress = Get-AccountAddress -Account $AccountSummary
-    $safeEligible = Test-SourceSafeEligible -SafeName $sourceSafe
+    $sourceAccountID = Get-AccountID -Account $AccountDetails
+    $sourceSafe      = Get-AccountSafeName -Account $AccountDetails
+    $sourcePlatform  = Get-AccountPlatformID -Account $AccountDetails
+    $name            = Get-AccountName -Account $AccountDetails
+    $userName        = Get-AccountUserName -Account $AccountDetails
+    $address         = Get-AccountAddress -Account $AccountDetails
+    $secretType      = [string](Get-PropertyValue -InputObject $AccountDetails -Names @("secretType", "SecretType") -Default "")
 
-    $reportValues = @{
-        SourceAccountID    = $sourceID
-        SourceSafeName     = $sourceSafe
-        SourcePlatformID   = $sourcePlatform
-        AccountName        = $sourceName
-        UserName           = $sourceUserName
-        Address            = $sourceAddress
-        SourceSafeEligible = $safeEligible
-        EvidenceSource     = ("{0}; {1}" -f $Evidence.Source, $DiscoverySource)
-        EvidenceTime       = $Evidence.Time
-        EvidenceText       = Limit-Text -Text $Evidence.Text -MaximumLength 1000
+    $row = [ordered]@{
+        ReviewTime            = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+        SourceAccountID       = $sourceAccountID
+        SourceSafeName        = $sourceSafe
+        SourceSafeEligible    = (Test-AllowedSourceSafe -SafeName $sourceSafe)
+        SourcePlatformID      = $sourcePlatform
+        AccountName           = $name
+        UserName              = $userName
+        Address               = $address
+        SecretType            = $secretType
+        CandidateDiscovery    = $DiscoverySource
+        DetectionSource       = $Evidence.DetectionSource
+        ActivityTime          = [string]$Evidence.ActivityTime
+        Activity              = $Evidence.Activity
+        Reason                = $Evidence.Reason
+        MoreInfo              = $Evidence.MoreInfo
+        LinkedAccountCount    = $RelationshipResult.LinkedCount
+        DependentAccountCount = $RelationshipResult.DependentCount
+        GroupDetected         = $RelationshipResult.GroupDetected
+        TargetSafeName        = $TargetSafeName
+        TargetPlatformID      = $TargetPlatformID
+        TargetAccountID       = ""
+        ActionStatus          = ""
+        SourceDeleted         = $false
+        Error                 = ""
     }
 
-    if (-not $safeEligible) {
-        $reportValues["ActionStatus"] = "SKIPPED_SOURCE_SAFE_PREFIX_NOT_ALLOWED"
-        $reportValues["Error"] = "Source Safe does not begin with '$AllowedSourceSafePrefix'."
-        Add-ReportRow -Values $reportValues
-        return
+    if ([string]::IsNullOrWhiteSpace($sourceSafe) -or
+        [string]::IsNullOrWhiteSpace($userName) -or
+        [string]::IsNullOrWhiteSpace($address)) {
+        $row.ActionStatus = "SKIPPED_MISSING_REQUIRED_ACCOUNT_FIELD"
+        $row.Error = "Source Safe, username, or address is blank."
+        return [pscustomobject]$row
     }
 
-    if ([string]::IsNullOrWhiteSpace($sourceID) -or
-        [string]::IsNullOrWhiteSpace($sourceUserName) -or
-        [string]::IsNullOrWhiteSpace($sourceAddress)) {
-        $reportValues["ActionStatus"] = "FAILED_MISSING_REQUIRED_SOURCE_FIELD"
-        $reportValues["Error"] = "Source AccountID, UserName, or Address is missing."
-        Add-ReportRow -Values $reportValues
-        $script:ExitCode = [Math]::Max($script:ExitCode, 2)
-        return
+    if (-not (Test-AllowedSourceSafe -SafeName $sourceSafe)) {
+        $row.ActionStatus = "SKIPPED_SOURCE_SAFE_PREFIX_NOT_ALLOWED"
+        $row.Error = "Source Safe '$sourceSafe' is outside migration scope. Only Safes beginning with '$AllowedSourceSafePrefix' may be moved."
+        return [pscustomobject]$row
     }
 
-    $sourceDetails = $null
-    try {
-        $sourceDetails = Get-PASAccount -id $sourceID -ErrorAction Stop
-    }
-    catch {
-        $reportValues["ActionStatus"] = "FAILED_SOURCE_DETAIL_RETRIEVAL"
-        $reportValues["Error"] = $_.Exception.Message
-        Add-ReportRow -Values $reportValues
-        $script:ExitCode = [Math]::Max($script:ExitCode, 2)
-        return
+    if ($sourceSafe -ieq $TargetSafeName) {
+        $row.ActionStatus = "SKIPPED_ALREADY_IN_TARGET_SAFE"
+        return [pscustomobject]$row
     }
 
-    $secretType = Get-AccountSecretType -Account $sourceDetails
-    if ($secretType -ine "Password") {
-        $reportValues["ActionStatus"] = "SKIPPED_UNSUPPORTED_SECRET_TYPE"
-        $reportValues["Error"] = "Secret type '$secretType' is not supported by this retirement workflow."
-        Add-ReportRow -Values $reportValues
-        return
+    if ($secretType -and $secretType -ine "password") {
+        $row.ActionStatus = "SKIPPED_UNSUPPORTED_SECRET_TYPE"
+        $row.Error = "Only password accounts are migrated by this workflow."
+        return [pscustomobject]$row
     }
 
-    $relationship = Test-AccountRelationships -AccountDetails $sourceDetails -AccountID $sourceID
-    $reportValues["RelationshipStatus"] = $relationship.Status
-    $reportValues["LinkedAccountCount"] = $relationship.LinkedCount
-    $reportValues["DependentAccountCount"] = $relationship.DependentCount
-    $reportValues["GroupDetected"] = $relationship.GroupDetected
-
-    if (-not $relationship.Allowed) {
-        $reportValues["ActionStatus"] = $relationship.Status
-        $reportValues["Error"] = $relationship.Error
-        Add-ReportRow -Values $reportValues
-        if ($relationship.Status -eq "RELATIONSHIP_CHECK_FAILED") {
-            $script:ExitCode = [Math]::Max($script:ExitCode, 2)
-        }
-        return
+    if (-not $RelationshipResult.Success) {
+        $row.ActionStatus = "SKIPPED_RELATIONSHIP_CHECK"
+        $row.Error = "$($RelationshipResult.Status): $($RelationshipResult.Error)"
+        return [pscustomobject]$row
     }
 
-    if ($relationship.Status -eq "CHECK_ERROR_CONTINUED") {
-        Write-Warn "AccountID '$sourceID' relationship check had an error but BestEffort mode allows processing: $($relationship.Error)"
-    }
-
-    $duplicateKey = Get-DuplicateKey -UserName $sourceUserName -Address $sourceAddress
-    $existingTarget = $null
-    if ($script:TargetIndex.ContainsKey($duplicateKey)) {
-        $existingTarget = $script:TargetIndex[$duplicateKey]
-    }
-
-    if ($null -ne $existingTarget) {
-        $existingValidation = Test-TargetAccount `
-            -TargetAccount $existingTarget `
-            -ExpectedUserName $sourceUserName `
-            -ExpectedAddress $sourceAddress
-
-        $reportValues["TargetAccountID"] = $existingValidation.AccountID
-
-        if (-not $existingValidation.Valid) {
-            $reportValues["ActionStatus"] = "SKIPPED_TARGET_DUPLICATE_INVALID"
-            $reportValues["Error"] = $existingValidation.Error
-            Add-ReportRow -Values $reportValues
-            return
-        }
-
-        if (-not $Execute) {
-            $reportValues["ActionStatus"] = "PREVIEW_TARGET_ALREADY_EXISTS"
-            $reportValues["Error"] = "A valid target account already exists. Execute mode can finalize deletion of the source when FinalizeExistingTarget is enabled."
-            Add-ReportRow -Values $reportValues
-            return
-        }
-
-        if (-not $FinalizeExistingTarget) {
-            $reportValues["ActionStatus"] = "SKIPPED_TARGET_ALREADY_EXISTS"
-            $reportValues["Error"] = "Valid target exists, but FinalizeExistingTarget is disabled."
-            Add-ReportRow -Values $reportValues
-            return
-        }
-
+    if ($TargetSafeReady) {
         try {
-            Remove-SourceAccount -SourceAccountID $sourceID
-            $reportValues["ActionStatus"] = "TARGET_ALREADY_EXISTS_SOURCE_DELETED"
-            Add-ReportRow -Values $reportValues
-            Write-Ok "Finalized prior migration for AccountID '$sourceID'; valid target '$($existingValidation.AccountID)' already existed."
+            $duplicate = Find-ExactTargetDuplicate -UserName $userName -Address $address
+            if ($duplicate) {
+                $row.TargetAccountID = Get-AccountID -Account $duplicate
+                $row.ActionStatus = "SKIPPED_TARGET_DUPLICATE_EXISTS"
+                $row.Error = "An exact username/address match already exists in the target Safe. Source was not deleted."
+                return [pscustomobject]$row
+            }
         }
         catch {
-            $reportValues["ActionStatus"] = "FAILED_DELETE_SOURCE_WITH_EXISTING_TARGET"
-            $reportValues["Error"] = $_.Exception.Message
-            Add-ReportRow -Values $reportValues
-            $script:ExitCode = [Math]::Max($script:ExitCode, 2)
+            $row.ActionStatus = "SKIPPED_TARGET_DUPLICATE_CHECK_FAILED"
+            $row.Error = $_.Exception.Message
+            return [pscustomobject]$row
         }
-
-        return
     }
 
     if (-not $Execute) {
-        $reportValues["ActionStatus"] = "PREVIEW_ELIGIBLE"
-        Add-ReportRow -Values $reportValues
-        return
+        $row.ActionStatus = if ($TargetSafeReady) { "PREVIEW_ELIGIBLE" } else { "PREVIEW_ELIGIBLE_TARGET_SAFE_MISSING" }
+        return [pscustomobject]$row
     }
 
-    $secretResult = $null
+    if (-not $TargetSafeReady) {
+        $row.ActionStatus = "FAILED_TARGET_SAFE_NOT_READY"
+        $row.Error = "Target Safe '$TargetSafeName' is not available."
+        return [pscustomobject]$row
+    }
+
+    $targetDescription = "$TargetSafeName/$userName ($address)"
+
+    if (-not $PSCmdlet.ShouldProcess($targetDescription, "Create validated replacement and delete source AccountID $sourceAccountID")) {
+        $row.ActionStatus = "WHATIF_OR_DECLINED"
+        return [pscustomobject]$row
+    }
+
     $secureSecret = $null
-    $createdAccount = $null
-    $targetDetails = $null
 
     try {
-        Write-Info "Retrieving source secret for AccountID '$sourceID'."
-        $secretResult = Get-PASAccountPassword `
-            -AccountID $sourceID `
-            -Reason $PasswordRetrievalReason `
-            -ActionType show `
-            -ErrorAction Stop
+        Write-Info "Retrieving source secret for AccountID '$sourceAccountID'. The secret will not be logged."
+        $secureSecret = Get-SourceSecretSecureString -AccountID $sourceAccountID
 
-        $secureSecret = ConvertTo-SecureSecret -SecretResult $secretResult
+        Write-Info "Creating replacement account '$userName' in Safe '$TargetSafeName' on platform '$TargetPlatformID'."
+        $newAccount = New-TargetAccount `
+            -SourceAccount $AccountDetails `
+            -Secret $secureSecret `
+            -SourceAccountID $sourceAccountID `
+            -SourceSafe $sourceSafe
+
+        $targetAccountID = Get-AccountID -Account $newAccount
+        if ([string]::IsNullOrWhiteSpace($targetAccountID)) {
+            Start-Sleep -Seconds 2
+            $lookup = Find-ExactTargetDuplicate -UserName $userName -Address $address -RefreshFromApi
+            $targetAccountID = Get-AccountID -Account $lookup
+        }
+
+        if ([string]::IsNullOrWhiteSpace($targetAccountID)) {
+            throw "The target account was created, but its AccountID could not be resolved. Source was not deleted."
+        }
+
+        $row.TargetAccountID = $targetAccountID
+
+        Write-Info "Validating target AccountID '$targetAccountID'."
+        $validatedTarget = Test-NewTargetAccount `
+            -TargetAccountID $targetAccountID `
+            -ExpectedUserName $userName `
+            -ExpectedAddress $address
+
+        Write-Ok "Target account '$targetAccountID' passed validation."
+        Add-TargetDuplicateIndexEntry -Account $validatedTarget
+
+        Write-Warn "Deleting source AccountID '$sourceAccountID' from Safe '$sourceSafe' only after successful target validation."
+        Remove-PASAccount -AccountID $sourceAccountID -Confirm:$false -ErrorAction Stop | Out-Null
+
+        $row.SourceDeleted = $true
+        $row.ActionStatus = "MOVED_SUCCESSFULLY"
+
+        Write-Ok "Moved '$userName' from Safe '$sourceSafe' to '$TargetSafeName' using platform '$TargetPlatformID'."
     }
     catch {
-        $reportValues["ActionStatus"] = "FAILED_SECRET_RETRIEVAL"
-        $reportValues["Error"] = $_.Exception.Message
-        Add-ReportRow -Values $reportValues
-        $script:ExitCode = [Math]::Max($script:ExitCode, 2)
-        return
-    }
+        $row.Error = $_.Exception.Message
 
-    try {
-        Write-Info "Creating replacement for AccountID '$sourceID' in Safe '$TargetSafeName' on platform '$TargetPlatformID'."
-        $createdAccount = New-RetirementAccount -SourceAccount $sourceDetails -Secret $secureSecret
-    }
-    catch {
-        $reportValues["ActionStatus"] = "FAILED_TARGET_CREATE"
-        $reportValues["Error"] = $_.Exception.Message
-        Add-ReportRow -Values $reportValues
-        $script:ExitCode = [Math]::Max($script:ExitCode, 2)
-        return
-    }
-    finally {
-        $secretResult = $null
-        $secureSecret = $null
-    }
-
-    $targetID = Get-AccountID -Account $createdAccount
-
-    try {
-        if (-not [string]::IsNullOrWhiteSpace($targetID)) {
-            $targetDetails = Get-PASAccount -id $targetID -ErrorAction Stop
+        if (-not [string]::IsNullOrWhiteSpace($row.TargetAccountID) -and -not $row.SourceDeleted) {
+            $row.ActionStatus = "TARGET_CREATED_SOURCE_NOT_DELETED"
+            Write-Err "Target AccountID '$($row.TargetAccountID)' may exist, but source AccountID '$sourceAccountID' was not deleted: $($row.Error)"
         }
         else {
-            $targetDetails = Find-TargetAccountAfterCreation -UserName $sourceUserName -Address $sourceAddress
-            $targetID = Get-AccountID -Account $targetDetails
+            $row.ActionStatus = "MIGRATION_FAILED_SOURCE_UNCHANGED"
+            Write-Err "Migration failed for source AccountID '$sourceAccountID'. Source was left unchanged: $($row.Error)"
         }
-
-        if ($null -eq $targetDetails -or [string]::IsNullOrWhiteSpace($targetID)) {
-            throw "Target account was created but its AccountID could not be resolved."
-        }
-
-        $targetValidation = Test-TargetAccount `
-            -TargetAccount $targetDetails `
-            -ExpectedUserName $sourceUserName `
-            -ExpectedAddress $sourceAddress
-
-        if (-not $targetValidation.Valid) {
-            throw $targetValidation.Error
-        }
-
-        $reportValues["TargetAccountID"] = $targetValidation.AccountID
     }
-    catch {
-        $reportValues["ActionStatus"] = "TARGET_CREATED_VALIDATION_FAILED"
-        $reportValues["Error"] = $_.Exception.Message
-        $reportValues["TargetAccountID"] = $targetID
-        Add-ReportRow -Values $reportValues
-        $script:ExitCode = [Math]::Max($script:ExitCode, 2)
-        Write-Err "Target was created for source AccountID '$sourceID', but validation failed. Source was not deleted."
-        return
+    finally {
+        $secureSecret = $null
+        [GC]::Collect()
     }
 
-    try {
-        Write-Info "Deleting source AccountID '$sourceID' after successful target validation."
-        Remove-SourceAccount -SourceAccountID $sourceID
-
-        $reportValues["ActionStatus"] = "MOVED_SUCCESSFULLY"
-        Add-ReportRow -Values $reportValues
-
-        $script:TargetIndex[$duplicateKey] = $targetDetails
-        Write-Ok "Moved AccountID '$sourceID' to target AccountID '$targetID'."
-    }
-    catch {
-        $reportValues["ActionStatus"] = "TARGET_CREATED_SOURCE_DELETE_FAILED"
-        $reportValues["Error"] = $_.Exception.Message
-        Add-ReportRow -Values $reportValues
-        $script:ExitCode = [Math]::Max($script:ExitCode, 2)
-        Write-Err "Target AccountID '$targetID' was created and validated, but source AccountID '$sourceID' could not be deleted."
-    }
+    return [pscustomobject]$row
 }
 
 # ============================================================
-# Main execution
+# Main
 # ============================================================
 
-Initialize-OutputFiles
+$sessionCreated = $false
+$serviceCredential = $null
+$results = @()
+$totalAccounts = 0
+$matchedCount = 0
 
 try {
-    Enter-SingleInstance
-    Remove-OldOutputFiles
+    if ($ScheduledTaskMode -and -not $Execute) {
+        throw "ScheduledTaskMode requires -Execute. This prevents a daily task from silently running in report-only mode."
+    }
+
+    if ($ScheduledTaskMode) {
+        $ConfirmPreference = "None"
+    }
+
+    Remove-ExpiredRunFiles
+    Enter-RunLock
 
     Write-Info "============================================================"
-    Write-Info "Disabled account retirement review starting."
+    Write-Info "Disabled account migration review starting."
     Write-Info "Script version       : $script:ScriptVersion"
     Write-Info "Script path          : $PSCommandPath"
-    Write-Info "Script SHA256        : $(Get-ScriptSHA256)"
     Write-Info "Execution mode       : $(if ($Execute) { 'EXECUTE' } else { 'REPORT ONLY' })"
-    Write-Info "Scheduled task mode  : $($ScheduledTaskMode.IsPresent)"
+    Write-Info "Scheduled task mode  : $ScheduledTaskMode"
     Write-Info "Target Safe          : $TargetSafeName"
     Write-Info "Target Platform      : $TargetPlatformID"
-    Write-Info "Allowed Safe prefix  : $AllowedSourceSafePrefix"
-    Write-Info "Relationship mode    : $RelationshipCheckMode"
+    Write-Info "Allowed Source Prefix: $AllowedSourceSafePrefix"
     Write-Info "Lookback Days        : $LookbackDays"
-    Write-Info "Discovery mode       : $(if ($FullScan) { 'FULL SCAN' } elseif ($SourceSafeName.Count -gt 0) { 'SOURCE SAFE LIST' } else { 'FAST SAVED FILTERS' })"
-    Write-Info "============================================================"
+    Write-Info "Discovery mode       : $(if ($SourceSafeName.Count -gt 0) { 'EXPLICIT SAFES' } elseif ($FullScan) { 'FULL SCAN' } else { 'FAST SAVED FILTERS' })"
+    Write-Info "Relationship checks  : $(if ($SkipRelationshipChecks) { 'SKIPPED BY PARAMETER' } else { 'ENABLED' })"
+    Write-Info "API Base URI         : $script:ApiBaseURI"
+    Write-Info "Report               : $script:ReportPath"
+    Write-Info "Log                  : $script:LogPath"
 
-    Import-Module psPAS -ErrorAction Stop
-    $module = Get-Module psPAS | Sort-Object Version -Descending | Select-Object -First 1
-    Write-Ok "Loaded psPAS version '$($module.Version)'."
+    $serviceCredential = Get-ServiceUserCredentialFromCCP `
+        -CCPAddress $CCPAddress `
+        -Location $CCPLocation `
+        -AppID $CCPAppID `
+        -Safe $CCPSafe `
+        -Object $CCPObject `
+        -WindowsAuth $CCPWindowsAuth
 
-    Assert-PublicCommands
-    Connect-PrivilegeCloud
-    Assert-TargetConfiguration
-    Initialize-TargetIndex
+    Write-Info "Authenticating to Privilege Cloud through Identity Shared Services."
 
-    $candidates = @(Get-CandidateAccounts)
-    Write-Ok "Retrieved $($candidates.Count) unique candidate account(s)."
+    New-PASSession `
+        -IdentityTenantURL $IdentityTenantURL `
+        -PrivilegeCloudURL $PrivilegeCloudURL `
+        -Credential $serviceCredential `
+        -ServiceUser `
+        -ErrorAction Stop | Out-Null
 
-    $reviewed = 0
-    $signatureMatches = 0
+    $sessionCreated = $true
+    Write-Ok "Authenticated to Privilege Cloud as '$($serviceCredential.UserName)'."
 
-    foreach ($candidate in $candidates) {
-        $reviewed++
-        $summary = $candidate.Account
-        $accountID = Get-AccountID -Account $summary
+    # Loading target accounts once both validates access and removes a duplicate
+    # API query from every matched source account.
+    Initialize-TargetDuplicateIndex
+    $targetSafeReady = $true
+
+    $candidateWrappers = @(Get-SourceAccounts)
+    $totalAccounts = $candidateWrappers.Count
+
+    Write-Info "Reviewing $totalAccounts candidate account(s) for the exact disabled-account winRc=1331 signature."
+
+    $index = 0
+
+    foreach ($candidateWrapper in $candidateWrappers) {
+        $index++
+        $accountSummary = $candidateWrapper.Summary
+        $discoverySource = [string]$candidateWrapper.DiscoverySource
+        $accountID = Get-AccountID -Account $accountSummary
 
         if ([string]::IsNullOrWhiteSpace($accountID)) {
             continue
         }
 
+        if ($index -eq 1 -or $index -eq $totalAccounts -or ($index % $ProgressInterval) -eq 0) {
+            Write-Info "Progress: reviewed $index of $totalAccounts candidate account(s)."
+        }
+
         try {
-            $evidence = Find-DisabledEvidence -AccountSummary $summary -AccountID $accountID
+            # Search activity first. Full account details are requested only after
+            # the exact winRc=1331 + disabled-account signature is confirmed.
+            $evidence = Find-Disabled1331Evidence `
+                -AccountDetails $accountSummary `
+                -AccountID $accountID
+
+            if (-not $evidence) {
+                continue
+            }
+
+            $matchedCount++
+            $sourceSafe = Get-AccountSafeName -Account $accountSummary
+            Write-Warn "Confirmed disabled-account signature winRc=1331 for AccountID '$accountID' in Safe '$sourceSafe'."
+
+            if (Test-AllowedSourceSafe -SafeName $sourceSafe) {
+                $accountDetails = Get-PASAccount -id $accountID -ErrorAction Stop
+                $sourceSafe = Get-AccountSafeName -Account $accountDetails
+
+                $relationshipResult = Get-RelationshipCheck `
+                    -AccountDetails $accountDetails `
+                    -AccountID $accountID
+
+                if (-not $relationshipResult.Success) {
+                    Write-Warn "AccountID '$accountID' relationship safety check status: $($relationshipResult.Status)."
+                }
+            }
+            else {
+                # A matching account outside IND_ is included in the CSV but is
+                # not subjected to relationship checks, secret retrieval, creation,
+                # or deletion.
+                $accountDetails = $accountSummary
+                $relationshipResult = [pscustomobject][ordered]@{
+                    Success        = $true
+                    LinkedCount    = 0
+                    DependentCount = 0
+                    GroupDetected  = $false
+                    Status         = "NOT_EVALUATED_SOURCE_SAFE_OUT_OF_SCOPE"
+                    Error          = ""
+                }
+            }
+
+            $moveResult = Move-DisabledAccount `
+                -AccountDetails $accountDetails `
+                -Evidence $evidence `
+                -RelationshipResult $relationshipResult `
+                -TargetSafeReady $targetSafeReady `
+                -DiscoverySource $discoverySource `
+                -Confirm:$false
+
+            $results += ,$moveResult
         }
         catch {
-            Write-Warn "Unable to review activity for AccountID '$accountID': $($_.Exception.Message)"
-            $script:ExitCode = [Math]::Max($script:ExitCode, 2)
-            continue
-        }
+            $script:OperationalErrorCount++
+            Write-Err "AccountID '$accountID' review failed: $($_.Exception.Message)"
 
-        if ($evidence.Matched) {
-            $signatureMatches++
-            Write-Warn "Confirmed disabled-account signature winRc=1331 for AccountID '$accountID' in Safe '$(Get-AccountSafeName -Account $summary)'."
-            Process-MatchedAccount `
-                -AccountSummary $summary `
-                -Evidence $evidence `
-                -DiscoverySource $candidate.DiscoverySource
-        }
-
-        if (($reviewed % $ProgressInterval) -eq 0 -or $reviewed -eq $candidates.Count) {
-            Write-Info "Progress: reviewed $reviewed of $($candidates.Count) candidate account(s)."
+            $results += [pscustomobject][ordered]@{
+                ReviewTime            = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+                SourceAccountID       = $accountID
+                SourceSafeName        = Get-AccountSafeName -Account $accountSummary
+                SourceSafeEligible    = (Test-AllowedSourceSafe -SafeName (Get-AccountSafeName -Account $accountSummary))
+                SourcePlatformID      = Get-AccountPlatformID -Account $accountSummary
+                AccountName           = Get-AccountName -Account $accountSummary
+                UserName              = Get-AccountUserName -Account $accountSummary
+                Address               = Get-AccountAddress -Account $accountSummary
+                SecretType            = ""
+                CandidateDiscovery    = $discoverySource
+                DetectionSource       = "REVIEW_ERROR"
+                ActivityTime          = ""
+                Activity              = ""
+                Reason                = ""
+                MoreInfo              = ""
+                LinkedAccountCount    = 0
+                DependentAccountCount = 0
+                GroupDetected         = $false
+                TargetSafeName        = $TargetSafeName
+                TargetPlatformID      = $TargetPlatformID
+                TargetAccountID       = ""
+                ActionStatus          = "REVIEW_FAILED"
+                SourceDeleted         = $false
+                Error                 = $_.Exception.Message
+            }
         }
     }
 
-    if ($script:ReportRows.Count -gt 0) {
-        $script:ReportRows | Export-Csv -LiteralPath $script:ReportPath -NoTypeInformation -Encoding UTF8
+    if ($results.Count -gt 0) {
+        $results | Export-Csv -LiteralPath $script:ReportPath -NoTypeInformation -Encoding UTF8
     }
     else {
-        @([pscustomobject][ordered]@{
-            RunId = $script:RunId
-            ReviewTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-            ActionStatus = "NO_DISABLED_SIGNATURE_MATCHES"
-        }) | Export-Csv -LiteralPath $script:ReportPath -NoTypeInformation -Encoding UTF8
+        [pscustomobject][ordered]@{
+            ReviewTime            = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+            SourceAccountID       = ""
+            SourceSafeName        = ""
+            SourceSafeEligible    = $false
+            SourcePlatformID      = ""
+            AccountName           = ""
+            UserName              = ""
+            Address               = ""
+            SecretType            = ""
+            CandidateDiscovery    = ""
+            DetectionSource       = "NO_MATCHES"
+            ActivityTime          = ""
+            Activity              = ""
+            Reason                = ""
+            MoreInfo              = ""
+            LinkedAccountCount    = 0
+            DependentAccountCount = 0
+            GroupDetected         = $false
+            TargetSafeName        = $TargetSafeName
+            TargetPlatformID      = $TargetPlatformID
+            TargetAccountID       = ""
+            ActionStatus          = "NO_DISABLED_1331_MATCHES"
+            SourceDeleted         = $false
+            Error                 = ""
+        } | Export-Csv -LiteralPath $script:ReportPath -NoTypeInformation -Encoding UTF8
     }
 
-    $movedCount = @($script:ReportRows | Where-Object { $_.ActionStatus -in @("MOVED_SUCCESSFULLY", "TARGET_ALREADY_EXISTS_SOURCE_DELETED") }).Count
-    $previewCount = @($script:ReportRows | Where-Object { $_.ActionStatus -like "PREVIEW_*" }).Count
-    $outOfScopeCount = @($script:ReportRows | Where-Object { $_.ActionStatus -eq "SKIPPED_SOURCE_SAFE_PREFIX_NOT_ALLOWED" }).Count
-    $failedCount = @($script:ReportRows | Where-Object { $_.ActionStatus -like "FAILED_*" -or $_.ActionStatus -like "TARGET_CREATED_*FAILED" }).Count
-    $skippedCount = @($script:ReportRows | Where-Object { $_.ActionStatus -like "SKIPPED_*" -or $_.ActionStatus -eq "RELATIONSHIP_DETECTED" -or $_.ActionStatus -eq "RELATIONSHIP_CHECK_FAILED" }).Count
+    $movedCount = @($results | Where-Object { $_.ActionStatus -eq "MOVED_SUCCESSFULLY" }).Count
+    $previewCount = @($results | Where-Object { $_.ActionStatus -like "PREVIEW_*" }).Count
+    $skippedCount = @($results | Where-Object { $_.ActionStatus -like "SKIPPED_*" }).Count
+    $outOfScopeSafeCount = @($results | Where-Object { $_.ActionStatus -eq "SKIPPED_SOURCE_SAFE_PREFIX_NOT_ALLOWED" }).Count
+    $failedCount = @($results | Where-Object {
+        $_.ActionStatus -like "*FAILED*" -or
+        $_.ActionStatus -eq "TARGET_CREATED_SOURCE_NOT_DELETED"
+    }).Count
 
-    if ($failedCount -gt 0) {
-        $script:ExitCode = [Math]::Max($script:ExitCode, 2)
+    if ($ScheduledTaskMode -and ($failedCount -gt 0 -or $script:OperationalErrorCount -gt 0)) {
+        $script:ExitCode = 2
     }
-
-    $summaryObject = [ordered]@{
-        ScriptVersion     = $script:ScriptVersion
-        RunId             = $script:RunId
-        Started           = $script:RunStart.ToString("o")
-        Completed         = (Get-Date).ToString("o")
-        Execute           = $Execute.IsPresent
-        RelationshipMode  = $RelationshipCheckMode
-        CandidatesReviewed = $reviewed
-        SignatureMatches  = $signatureMatches
-        Moved             = $movedCount
-        PreviewEligible   = $previewCount
-        Skipped           = $skippedCount
-        OutOfScopeSafes   = $outOfScopeCount
-        Failed            = $failedCount
-        ExitCode          = $script:ExitCode
-        ReportPath        = $script:ReportPath
-        LogPath           = $script:LogPath
+    else {
+        $script:ExitCode = 0
     }
-
-    $summaryObject | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $script:SummaryPath -Encoding UTF8
 
     Write-Info "============================================================"
     Write-Ok "Review completed."
-    Write-Ok "Candidates reviewed : $reviewed"
-    Write-Ok "Signature matches   : $signatureMatches"
+    Write-Ok "Candidates reviewed : $totalAccounts"
+    Write-Ok "Signature matches   : $matchedCount"
     Write-Ok "Moved               : $movedCount"
     Write-Info "Preview eligible    : $previewCount"
     Write-Warn "Skipped             : $skippedCount"
-    Write-Info "Out-of-scope Safes  : $outOfScopeCount"
-    if ($failedCount -gt 0) {
-        Write-Err "Failed/partial      : $failedCount"
-    }
-    else {
-        Write-Ok "Failed/partial      : 0"
-    }
+    Write-Info "Out-of-scope Safes  : $outOfScopeSafeCount"
+    Write-Err "Failed/partial      : $failedCount"
+    Write-Warn "Operational errors  : $script:OperationalErrorCount"
     Write-Ok "Report              : $script:ReportPath"
     Write-Ok "Log                 : $script:LogPath"
     Write-Info "Process exit code   : $script:ExitCode"
+
+    Write-RunStatus `
+        -State "COMPLETED" `
+        -ExitCode $script:ExitCode `
+        -AccountsReviewed $totalAccounts `
+        -SignatureMatches $matchedCount `
+        -Moved $movedCount `
+        -PreviewEligible $previewCount `
+        -Skipped $skippedCount `
+        -FailedOrPartial $failedCount
 }
 catch {
-    $script:ExitCode = 1
-    Write-Err "Fatal error: $($_.Exception.Message)"
+    if ($script:ExitCode -eq 0) {
+        $script:ExitCode = 1
+    }
 
-    try {
-        $fatalSummary = [ordered]@{
-            ScriptVersion = $script:ScriptVersion
-            RunId         = $script:RunId
-            Started       = $script:RunStart.ToString("o")
-            Completed     = (Get-Date).ToString("o")
-            ExitCode      = 1
-            FatalError    = $_.Exception.Message
-            ReportPath    = $script:ReportPath
-            LogPath       = $script:LogPath
-        }
-        $fatalSummary | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $script:SummaryPath -Encoding UTF8
-    }
-    catch {
-    }
+    $fatalMessage = $_.Exception.Message
+    $fatalType = $_.Exception.GetType().FullName
+    $fatalLine = $_.InvocationInfo.ScriptLineNumber
+    $fatalPosition = $_.InvocationInfo.PositionMessage -replace "\r?\n", " "
+
+    Write-Err "Fatal error: $fatalMessage"
+    Write-Err "Exception type: $fatalType"
+    Write-Err "Script line   : $fatalLine"
+    Write-Err "Position      : $fatalPosition"
+
+    Write-RunStatus `
+        -State "FATAL_ERROR" `
+        -ExitCode $script:ExitCode `
+        -AccountsReviewed $totalAccounts `
+        -SignatureMatches $matchedCount `
+        -FatalError $fatalMessage
 }
 finally {
-    if ($script:PASSessionCreated) {
+    $serviceCredential = $null
+
+    if ($sessionCreated) {
         try {
-            Close-PASSession -ErrorAction Stop
+            Close-PASSession | Out-Null
             Write-Ok "Logged off from Privilege Cloud."
         }
         catch {
-            Write-Warn "Privilege Cloud logoff failed: $($_.Exception.Message)"
+            Write-Warn "Logoff warning: $($_.Exception.Message)"
         }
     }
 
-    if ($script:MutexAcquired -and $null -ne $script:Mutex) {
-        try {
-            $script:Mutex.ReleaseMutex()
-        }
-        catch {
-        }
-    }
-
-    if ($null -ne $script:Mutex) {
-        $script:Mutex.Dispose()
-    }
+    Exit-RunLock
 }
 
 if ($ScheduledTaskMode) {
     exit $script:ExitCode
 }
 
-$global:LASTEXITCODE = $script:ExitCode
-
-[pscustomobject][ordered]@{
-    ScriptVersion = $script:ScriptVersion
-    ExitCode      = $script:ExitCode
-    ReportPath    = $script:ReportPath
-    LogPath       = $script:LogPath
+if ($script:ExitCode -ne 0) {
+    throw "Script completed with exit code $script:ExitCode. Review '$script:LogPath'."
 }
