@@ -1,311 +1,36 @@
-#requires -Version 5.1
-
-<#
-Creates or updates:
-
-    \PAM\Move Disabled Accounts Daily
-
-The installer does not request or configure a service-account username or
-password. It preserves an existing task principal. A newly created task uses
-the currently logged-on administrator temporarily so you can later select the
-intended run-as account in Task Scheduler.
-
-The task passes -ScheduledTaskMode and an explicit compatible psPAS module.
-#>
-
-[CmdletBinding()]
-param(
-    [string]$TaskPath = "\PAM\",
-    [string]$TaskName = "Move Disabled Accounts Daily",
-    [string]$ScriptPath = "I:\Script\IDENTITY Script New\Onbarding Project\Move-DisabledAccount.ps1",
-    [ValidatePattern("^(?:[01]\d|2[0-3]):[0-5]\d$")]
-    [string]$DailyAt = "02:00",
-    [switch]$RunNow
-)
-
-Set-StrictMode -Version 2.0
-$ErrorActionPreference = "Stop"
-
-function Write-Step {
-    param([Parameter(Mandatory)][string]$Message)
-    Write-Host ("{0} | {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Message)
-}
-
-function Assert-Administrator {
-    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
-
-    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        throw "Run this installer from Windows PowerShell 5.1 as Administrator."
-    }
-}
-
-function Normalize-TaskPath {
-    param([Parameter(Mandatory)][string]$Path)
-
-    $normalized = $Path.Trim()
-    if ([string]::IsNullOrWhiteSpace($normalized)) {
-        return "\"
-    }
-    if (-not $normalized.StartsWith("\")) {
-        $normalized = "\" + $normalized
-    }
-    if (-not $normalized.EndsWith("\")) {
-        $normalized += "\"
-    }
-    return $normalized
-}
-
-function Ensure-TaskFolder {
-    param([Parameter(Mandatory)][string]$Path)
-
-    $folderName = $Path.Trim("\")
-    if ([string]::IsNullOrWhiteSpace($folderName)) {
-        return
-    }
-
-    $service = New-Object -ComObject "Schedule.Service"
-    $service.Connect()
-
-    try {
-        $null = $service.GetFolder("\$folderName")
-    }
-    catch {
-        $root = $service.GetFolder("\")
-        $null = $root.CreateFolder($folderName, $null)
-    }
-}
-
-function Test-CompatibleManifest {
-    param([Parameter(Mandatory)][string]$ManifestPath)
-
-    try {
-        Remove-Module psPAS -Force -ErrorAction SilentlyContinue
-        Import-Module -Name $ManifestPath -Force -ErrorAction Stop
-
-        $command = Get-Command -Name New-PASSession -Module psPAS -ErrorAction Stop
-
-        foreach ($required in @("IdentityTenantURL", "PrivilegeCloudURL", "Credential", "ServiceUser")) {
-            if (-not $command.Parameters.ContainsKey($required)) {
-                return $false
-            }
-        }
-
-        return $true
-    }
-    catch {
-        return $false
-    }
-}
-
-function Get-CompatiblePsPAS {
-    param([Parameter(Mandatory)][string]$ProjectFolder)
-
-    $candidates = @()
-
-    foreach ($module in @(Get-Module -Name psPAS -ErrorAction SilentlyContinue)) {
-        if ($null -ne $module -and -not [string]::IsNullOrWhiteSpace([string]$module.Path)) {
-            $candidates += [pscustomobject]@{
-                Path       = [string]$module.Path
-                Version    = [version]$module.Version
-                ModuleBase = [string]$module.ModuleBase
-            }
-        }
-    }
-
-    foreach ($module in @(Get-Module -ListAvailable -Name psPAS | Sort-Object Version -Descending)) {
-        if ($null -ne $module -and -not [string]::IsNullOrWhiteSpace([string]$module.Path)) {
-            $candidates += [pscustomobject]@{
-                Path       = [string]$module.Path
-                Version    = [version]$module.Version
-                ModuleBase = [string]$module.ModuleBase
-            }
-        }
-    }
-
-    foreach ($manifest in @(
-            Get-ChildItem `
-                -Path (Join-Path $ProjectFolder "Modules\psPAS\*\psPAS.psd1") `
-                -File `
-                -ErrorAction SilentlyContinue
-        )) {
-        try {
-            $manifestData = Test-ModuleManifest -Path $manifest.FullName -ErrorAction Stop
-            $candidates += [pscustomobject]@{
-                Path       = $manifest.FullName
-                Version    = [version]$manifestData.Version
-                ModuleBase = $manifest.Directory.FullName
-            }
-        }
-        catch {
-        }
-    }
-
-    foreach ($candidate in @(
-            $candidates |
-                Group-Object Path |
-                ForEach-Object { $_.Group | Sort-Object Version -Descending | Select-Object -First 1 } |
-                Sort-Object Version -Descending
-        )) {
-        if (Test-CompatibleManifest -ManifestPath $candidate.Path) {
-            return $candidate
-        }
-    }
-
-    throw "No compatible psPAS module was found in the elevated interactive PowerShell session."
-}
-
-function Stage-PsPAS {
-    param(
-        [Parameter(Mandatory)]$Module,
-        [Parameter(Mandatory)][string]$ProjectFolder
-    )
-
-    $destination = Join-Path $ProjectFolder ("Modules\psPAS\{0}" -f $Module.Version)
-    $manifest = Join-Path $destination "psPAS.psd1"
-
-    $source = (Resolve-Path -LiteralPath $Module.ModuleBase -ErrorAction Stop).Path
-    $sameLocation = $false
-
-    if (Test-Path -LiteralPath $destination -PathType Container) {
-        $existing = (Resolve-Path -LiteralPath $destination -ErrorAction Stop).Path
-        $sameLocation = [string]::Equals(
-            $source,
-            $existing,
-            [System.StringComparison]::OrdinalIgnoreCase
-        )
-    }
-
-    if (-not $sameLocation) {
-        if (Test-Path -LiteralPath $destination) {
-            Remove-Item -LiteralPath $destination -Recurse -Force
-        }
-
-        $null = New-Item -Path $destination -ItemType Directory -Force
-        Copy-Item -Path (Join-Path $source "*") -Destination $destination -Recurse -Force
-    }
-
-    if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) {
-        throw "Staged psPAS manifest was not found: $manifest"
-    }
-
-    if (-not (Test-CompatibleManifest -ManifestPath $manifest)) {
-        throw "The staged psPAS module is not compatible: $manifest"
-    }
-
-    return $manifest
-}
-
-try {
-    Write-Step "Starting task installation."
-    Assert-Administrator
-
-    $TaskPath = Normalize-TaskPath -Path $TaskPath
-    Ensure-TaskFolder -Path $TaskPath
-
-    if (-not (Test-Path -LiteralPath $ScriptPath -PathType Leaf)) {
-        throw "Move-DisabledAccount.ps1 was not found: $ScriptPath"
-    }
-
-    $projectFolder = Split-Path -Path $ScriptPath -Parent
-    $module = Get-CompatiblePsPAS -ProjectFolder $projectFolder
-    $manifest = Stage-PsPAS -Module $module -ProjectFolder $projectFolder
-
-    $powerShellExe = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
-
-    $arguments = (
-        '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass ' +
-        '-File "{0}" -ScheduledTaskMode -PsPASModulePath "{1}"' -f
-        $ScriptPath,
-        $manifest
-    )
-
-    $action = New-ScheduledTaskAction `
-        -Execute $powerShellExe `
-        -Argument $arguments `
-        -WorkingDirectory $projectFolder
-
-    $trigger = New-ScheduledTaskTrigger -Daily -At $DailyAt
-
-    $settings = New-ScheduledTaskSettingsSet `
-        -StartWhenAvailable `
-        -MultipleInstances IgnoreNew `
-        -ExecutionTimeLimit (New-TimeSpan -Hours 6)
-
-    $existingTask = Get-ScheduledTask `
-        -TaskPath $TaskPath `
-        -TaskName $TaskName `
-        -ErrorAction SilentlyContinue
-
-    if ($null -ne $existingTask) {
-        Set-ScheduledTask `
-            -TaskPath $TaskPath `
-            -TaskName $TaskName `
-            -Action $action `
-            -Trigger $trigger `
-            -Settings $settings `
-            -ErrorAction Stop | Out-Null
-
-        $operation = "updated"
-    }
-    else {
-        $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-
-        $principal = New-ScheduledTaskPrincipal `
-            -UserId $currentUser `
-            -LogonType Interactive `
-            -RunLevel Highest
-
-        $definition = New-ScheduledTask `
-            -Action $action `
-            -Trigger $trigger `
-            -Settings $settings `
-            -Principal $principal `
-            -Description "Runs Move-DisabledAccount.ps1 daily."
-
-        Register-ScheduledTask `
-            -TaskPath $TaskPath `
-            -TaskName $TaskName `
-            -InputObject $definition `
-            -Force `
-            -ErrorAction Stop | Out-Null
-
-        $operation = "created"
-    }
-
-    $verified = Get-ScheduledTask `
-        -TaskPath $TaskPath `
-        -TaskName $TaskName `
-        -ErrorAction Stop
-
-    $info = Get-ScheduledTaskInfo `
-        -TaskPath $TaskPath `
-        -TaskName $TaskName `
-        -ErrorAction Stop
-
-    Write-Host ""
-    Write-Host "Scheduled task $operation successfully." -ForegroundColor Green
-    Write-Host "Task       : $TaskPath$TaskName"
-    Write-Host "Run As     : $($verified.Principal.UserId)"
-    Write-Host "Schedule   : Daily at $DailyAt"
-    Write-Host "Next Run   : $($info.NextRunTime)"
-    Write-Host "Script     : $ScriptPath"
-    Write-Host "psPAS      : $manifest"
-    Write-Host ""
-    Write-Host "Configure the intended run-as account manually in Task Scheduler."
-
-    if ($RunNow) {
-        Start-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction Stop
-        Write-Host "Task start request submitted." -ForegroundColor Green
-    }
-
-    exit 0
-}
-catch {
-    Write-Host ""
-    Write-Host "TASK INSTALLATION FAILED" -ForegroundColor Red
-    Write-Host "Message : $($_.Exception.Message)" -ForegroundColor Red
-    Write-Host "Line    : $($_.InvocationInfo.ScriptLineNumber)"
-    Write-Host "Command : $($_.InvocationInfo.Line)"
-    exit 1
-}
+2026-07-15 13:42:42 | INFO  | ============================================================
+2026-07-15 13:42:42 | INFO  | Disabled IND account retirement migration starting.
+2026-07-15 13:42:42 | INFO  | Script version       : 2026.07.15.15
+2026-07-15 13:42:42 | INFO  | Build marker         : TASK-LOGGING-RESILIENT-20260715.15
+2026-07-15 13:42:42 | INFO  | Script path          : I:\Script\IDENTITY Script New\Onbarding Project\Move-DisabledAccount.ps1
+2026-07-15 13:42:42 | INFO  | Script SHA256        : 319E016C3A2634262D18CE96CB88611B6DFDE6382F9B5DF4CD895BFCC98E62E9
+2026-07-15 13:42:42 | INFO  | Execution identity   : ACU\SVC_IAMCArkWinPrd
+2026-07-15 13:42:42 | INFO  | Working directory    : I:\Script\IDENTITY Script New\Onbarding Project
+2026-07-15 13:42:42 | INFO  | Requested log folder : I:\Script\IDENTITY Script New\logs\Disabled_Account_Migration
+2026-07-15 13:42:42 | INFO  | Effective log folder : I:\Script\IDENTITY Script New\logs\Disabled_Account_Migration
+2026-07-15 13:42:42 | INFO  | Bootstrap log        : C:\Users\SVC_IA~2\AppData\Local\Temp\CyberArk-MoveDisabledAccount\Logs\MoveDisabledAccount_Bootstrap_20260715_134242.log
+2026-07-15 13:42:42 | INFO  | Execution mode       : EXECUTE
+2026-07-15 13:42:42 | INFO  | Scheduled task mode  : True
+2026-07-15 13:42:42 | INFO  | Target Safe          : Accounts to be deleted
+2026-07-15 13:42:42 | INFO  | Target Platform      : WIN_Removed
+2026-07-15 13:42:42 | INFO  | Allowed Safe prefix  : IND_
+2026-07-15 13:42:42 | INFO  | Relationship checks  : BYPASSED BY DESIGN
+2026-07-15 13:42:43 | INFO  | Existing target rule : REUSE USERNAME+ADDRESS MATCH; DELETE OLD SOURCE
+2026-07-15 13:42:43 | INFO  | Source CPM handling  : DISABLE BEFORE MOVE
+2026-07-15 13:42:43 | INFO  | Source lock handling : UNLOCK/CHECK-IN WITH RETRY
+2026-07-15 13:42:43 | INFO  | Lookback Days        : 2
+2026-07-15 13:42:43 | INFO  | Discovery mode       : FAST SAVED FILTERS
+2026-07-15 13:42:43 | INFO  | ============================================================
+2026-07-15 13:42:43 | OK    | Loaded compatible psPAS version '7.0.242'.
+2026-07-15 13:42:43 | INFO  | psPAS module path    : I:\Script\IDENTITY Script New\Onbarding Project\Modules\psPAS\7.0.242\psPAS.psm1
+2026-07-15 13:42:43 | OK    | All required exported psPAS commands are available.
+2026-07-15 13:42:43 | INFO  | Retrieving Privilege Cloud service credential from CCP.
+2026-07-15 13:42:43 | INFO  | CCP endpoint: https://aam.alliantcreditunion.com/AIMWebService/api/Accounts?AppID=ACURestAPI&Safe=ACU-VAULT-API&Object=Application-CyberArkVaultRestAPI-alliantcredit.cyberark.cloud
+2026-07-15 13:42:44 | OK    | CCP returned service user 'acurestapi_local@alliantcreditunion.admin'.
+2026-07-15 13:42:44 | INFO  | Authenticating to Privilege Cloud through Identity Shared Services.
+2026-07-15 13:42:46 | OK    | Authenticated to Privilege Cloud as 'acurestapi_local@alliantcreditunion.admin'.
+2026-07-15 13:42:46 | OK    | Target Safe 'Accounts to be deleted' exists.
+2026-07-15 13:42:46 | OK    | Target platform 'WIN_Removed' exists.
+2026-07-15 13:42:46 | INFO  | Loading target Safe accounts once for duplicate and recovery checks.
+2026-07-15 13:42:46 | ERROR | Fatal error: The property 'Count' cannot be found on this object. Verify that the property exists.
+2026-07-15 13:42:46 | OK    | Logged off from Privilege Cloud.
