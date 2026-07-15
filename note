@@ -1,17 +1,38 @@
-<#
-Creates or replaces a daily scheduled task for the existing working
-Move-DisabledAccount.ps1 script.
+#requires -Version 5.1
 
-Run from Windows PowerShell 5.1 as Administrator.
+<#
+.SYNOPSIS
+    Creates or updates the daily PAM scheduled task for Move-DisabledAccount.ps1.
+
+.DESCRIPTION
+    Creates or updates:
+
+        \PAM\Move Disabled Accounts Daily
+
+    The installer:
+      - Does not request or configure a service-account username or password.
+      - Preserves the principal of an existing task.
+      - Uses the currently logged-on administrator only as the temporary principal
+        when creating a new task.
+      - Finds a psPAS module compatible with IdentityTenantURL, PrivilegeCloudURL,
+        Credential, and ServiceUser.
+      - Copies that compatible psPAS module into the project folder.
+      - Configures the task action with -ScheduledTaskMode and -PsPASModulePath.
+
+    After creation, manually set the intended run-as account in Task Scheduler.
+
+.NOTES
+    Run this installer from the elevated Windows PowerShell 5.1 session where
+    direct execution of Move-DisabledAccount.ps1 succeeds.
 #>
 
 [CmdletBinding()]
 param(
-    [string]$TaskName = "CyberArk - Move Disabled Accounts Daily",
+    [string]$TaskPath = "\PAM\",
+
+    [string]$TaskName = "Move Disabled Accounts Daily",
 
     [string]$ScriptPath = "I:\Script\IDENTITY Script New\Onbarding Project\Move-DisabledAccount.ps1",
-
-    [string]$RunAsUser = "ACU\SVC_IAMCArkWinPrd",
 
     [ValidatePattern("^(?:[01]\d|2[0-3]):[0-5]\d$")]
     [string]$DailyAt = "02:00",
@@ -19,34 +40,312 @@ param(
     [switch]$RunNow
 )
 
+Set-StrictMode -Version 2.0
 $ErrorActionPreference = "Stop"
 
+function Write-Step {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Message
+    )
+
+    Write-Host ("{0} | {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Message)
+}
+
+function Assert-Administrator {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+
+    if (-not $principal.IsInRole(
+            [Security.Principal.WindowsBuiltInRole]::Administrator
+        )) {
+        throw "Run this installer from Windows PowerShell 5.1 as Administrator."
+    }
+}
+
+function Normalize-TaskPath {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    $normalized = $Path.Trim()
+
+    if ([string]::IsNullOrWhiteSpace($normalized)) {
+        return "\"
+    }
+
+    if (-not $normalized.StartsWith("\")) {
+        $normalized = "\" + $normalized
+    }
+
+    if (-not $normalized.EndsWith("\")) {
+        $normalized += "\"
+    }
+
+    return $normalized
+}
+
+function Ensure-TaskFolder {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    $folderName = $Path.Trim("\")
+
+    if ([string]::IsNullOrWhiteSpace($folderName)) {
+        return
+    }
+
+    $service = New-Object -ComObject "Schedule.Service"
+    $service.Connect()
+
+    try {
+        $null = $service.GetFolder("\$folderName")
+        return
+    }
+    catch {
+        $rootFolder = $service.GetFolder("\")
+        $null = $rootFolder.CreateFolder($folderName, $null)
+    }
+}
+
+function Test-CompatiblePsPASManifest {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ManifestPath
+    )
+
+    $requiredParameters = @(
+        "IdentityTenantURL",
+        "PrivilegeCloudURL",
+        "Credential",
+        "ServiceUser"
+    )
+
+    try {
+        Remove-Module psPAS -Force -ErrorAction SilentlyContinue
+
+        Import-Module `
+            -Name $ManifestPath `
+            -Force `
+            -ErrorAction Stop
+
+        $command = Get-Command `
+            -Name New-PASSession `
+            -Module psPAS `
+            -ErrorAction Stop
+
+        foreach ($parameterName in $requiredParameters) {
+            if (-not $command.Parameters.ContainsKey($parameterName)) {
+                return $false
+            }
+        }
+
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+function Find-CompatiblePsPAS {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ProjectFolder
+    )
+
+    $candidates = @()
+
+    foreach ($loadedModule in @(
+            Get-Module -Name psPAS -ErrorAction SilentlyContinue
+        )) {
+        if (
+            $null -ne $loadedModule -and
+            -not [string]::IsNullOrWhiteSpace([string]$loadedModule.Path)
+        ) {
+            $candidates += [pscustomobject][ordered]@{
+                Path       = [string]$loadedModule.Path
+                Version    = [version]$loadedModule.Version
+                ModuleBase = [string]$loadedModule.ModuleBase
+            }
+        }
+    }
+
+    foreach ($availableModule in @(
+            Get-Module -ListAvailable -Name psPAS |
+                Sort-Object Version -Descending
+        )) {
+        if (
+            $null -ne $availableModule -and
+            -not [string]::IsNullOrWhiteSpace([string]$availableModule.Path)
+        ) {
+            $candidates += [pscustomobject][ordered]@{
+                Path       = [string]$availableModule.Path
+                Version    = [version]$availableModule.Version
+                ModuleBase = [string]$availableModule.ModuleBase
+            }
+        }
+    }
+
+    foreach ($localManifest in @(
+            Get-ChildItem `
+                -Path (Join-Path $ProjectFolder "Modules\psPAS\*\psPAS.psd1") `
+                -File `
+                -ErrorAction SilentlyContinue
+        )) {
+        try {
+            $manifestData = Test-ModuleManifest `
+                -Path $localManifest.FullName `
+                -ErrorAction Stop
+
+            $candidates += [pscustomobject][ordered]@{
+                Path       = $localManifest.FullName
+                Version    = [version]$manifestData.Version
+                ModuleBase = $localManifest.Directory.FullName
+            }
+        }
+        catch {
+        }
+    }
+
+    $uniqueCandidates = @(
+        $candidates |
+            Group-Object Path |
+            ForEach-Object {
+                $_.Group |
+                    Sort-Object Version -Descending |
+                    Select-Object -First 1
+            } |
+            Sort-Object Version -Descending
+    )
+
+    foreach ($candidate in $uniqueCandidates) {
+        if (Test-CompatiblePsPASManifest -ManifestPath $candidate.Path) {
+            return $candidate
+        }
+    }
+
+    throw (
+        "No compatible psPAS module was found. " +
+        "The required New-PASSession parameters are IdentityTenantURL, " +
+        "PrivilegeCloudURL, Credential, and ServiceUser."
+    )
+}
+
+function Stage-CompatiblePsPAS {
+    param(
+        [Parameter(Mandatory)]
+        $Module,
+
+        [Parameter(Mandatory)]
+        [string]$ProjectFolder
+    )
+
+    $destinationFolder = Join-Path `
+        $ProjectFolder `
+        ("Modules\psPAS\{0}" -f $Module.Version)
+
+    $destinationManifest = Join-Path $destinationFolder "psPAS.psd1"
+
+    $sourceFolder = (Resolve-Path `
+        -LiteralPath $Module.ModuleBase `
+        -ErrorAction Stop).Path
+
+    $sameFolder = $false
+
+    if (Test-Path -LiteralPath $destinationFolder -PathType Container) {
+        $existingDestination = (Resolve-Path `
+            -LiteralPath $destinationFolder `
+            -ErrorAction Stop).Path
+
+        $sameFolder = [string]::Equals(
+            $sourceFolder,
+            $existingDestination,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )
+    }
+
+    if (-not $sameFolder) {
+        if (Test-Path -LiteralPath $destinationFolder) {
+            Remove-Item `
+                -LiteralPath $destinationFolder `
+                -Recurse `
+                -Force
+        }
+
+        $null = New-Item `
+            -Path $destinationFolder `
+            -ItemType Directory `
+            -Force
+
+        Copy-Item `
+            -Path (Join-Path $sourceFolder "*") `
+            -Destination $destinationFolder `
+            -Recurse `
+            -Force
+    }
+
+    if (-not (Test-Path -LiteralPath $destinationManifest -PathType Leaf)) {
+        throw "Staged psPAS manifest was not found: $destinationManifest"
+    }
+
+    if (-not (Test-CompatiblePsPASManifest -ManifestPath $destinationManifest)) {
+        throw "The staged psPAS module is not compatible: $destinationManifest"
+    }
+
+    return $destinationManifest
+}
+
 try {
+    Write-Step "Starting PAM scheduled-task installation."
+
+    Assert-Administrator
+
+    $TaskPath = Normalize-TaskPath -Path $TaskPath
+    Ensure-TaskFolder -Path $TaskPath
+
     if (-not (Test-Path -LiteralPath $ScriptPath -PathType Leaf)) {
-        throw "Working script not found: $ScriptPath"
+        throw "Move-DisabledAccount.ps1 was not found: $ScriptPath"
     }
 
-    $workingDirectory = Split-Path -Path $ScriptPath -Parent
-    $powerShellExe = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+    $projectFolder = Split-Path -Path $ScriptPath -Parent
 
-    $credential = Get-Credential `
-        -UserName $RunAsUser `
-        -Message "Enter the password for $RunAsUser"
+    Write-Step "Finding the compatible psPAS module used by the working interactive session."
+    $compatibleModule = Find-CompatiblePsPAS -ProjectFolder $projectFolder
 
-    if ($null -eq $credential) {
-        throw "Credential entry was cancelled."
+    Write-Step (
+        "Compatible psPAS version found: {0} at {1}" -f
+        $compatibleModule.Version,
+        $compatibleModule.Path
+    )
+
+    $stagedManifest = Stage-CompatiblePsPAS `
+        -Module $compatibleModule `
+        -ProjectFolder $projectFolder
+
+    Write-Step "Staged compatible psPAS module: $stagedManifest"
+
+    $powerShellExe = Join-Path `
+        $env:SystemRoot `
+        "System32\WindowsPowerShell\v1.0\powershell.exe"
+
+    if (-not (Test-Path -LiteralPath $powerShellExe -PathType Leaf)) {
+        throw "Windows PowerShell was not found: $powerShellExe"
     }
 
-    $password = $credential.GetNetworkCredential().Password
-
-    if ([string]::IsNullOrWhiteSpace($password)) {
-        throw "The supplied password is empty."
-    }
+    $arguments = (
+        '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass ' +
+        '-File "{0}" -ScheduledTaskMode -PsPASModulePath "{1}"' -f
+        $ScriptPath,
+        $stagedManifest
+    )
 
     $action = New-ScheduledTaskAction `
         -Execute $powerShellExe `
-        -Argument "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$ScriptPath`"" `
-        -WorkingDirectory $workingDirectory
+        -Argument $arguments `
+        -WorkingDirectory $projectFolder
 
     $trigger = New-ScheduledTaskTrigger `
         -Daily `
@@ -57,34 +356,91 @@ try {
         -MultipleInstances IgnoreNew `
         -ExecutionTimeLimit (New-TimeSpan -Hours 6)
 
-    Register-ScheduledTask `
+    $existingTask = Get-ScheduledTask `
+        -TaskPath $TaskPath `
         -TaskName $TaskName `
-        -Action $action `
-        -Trigger $trigger `
-        -Settings $settings `
-        -Description "Runs Move-DisabledAccount.ps1 daily." `
-        -User $RunAsUser `
-        -Password $password `
-        -RunLevel Highest `
-        -Force | Out-Null
+        -ErrorAction SilentlyContinue
+
+    if ($null -ne $existingTask) {
+        Write-Step "Existing task found. Updating its action, trigger, and settings."
+
+        Set-ScheduledTask `
+            -TaskPath $TaskPath `
+            -TaskName $TaskName `
+            -Action $action `
+            -Trigger $trigger `
+            -Settings $settings `
+            -ErrorAction Stop | Out-Null
+
+        $operation = "updated"
+    }
+    else {
+        Write-Step "Creating a new task under the current administrator temporarily."
+
+        $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+
+        $principal = New-ScheduledTaskPrincipal `
+            -UserId $currentUser `
+            -LogonType Interactive `
+            -RunLevel Highest
+
+        $taskDefinition = New-ScheduledTask `
+            -Action $action `
+            -Trigger $trigger `
+            -Settings $settings `
+            -Principal $principal `
+            -Description "Runs Move-DisabledAccount.ps1 daily."
+
+        Register-ScheduledTask `
+            -TaskPath $TaskPath `
+            -TaskName $TaskName `
+            -InputObject $taskDefinition `
+            -Force `
+            -ErrorAction Stop | Out-Null
+
+        $operation = "created"
+    }
+
+    $verifiedTask = Get-ScheduledTask `
+        -TaskPath $TaskPath `
+        -TaskName $TaskName `
+        -ErrorAction Stop
+
+    $taskInfo = Get-ScheduledTaskInfo `
+        -TaskPath $TaskPath `
+        -TaskName $TaskName `
+        -ErrorAction Stop
 
     Write-Host ""
-    Write-Host "Scheduled task created successfully." -ForegroundColor Green
-    Write-Host "Task Name : $TaskName"
-    Write-Host "Schedule  : Daily at $DailyAt"
-    Write-Host "Run As    : $RunAsUser"
-    Write-Host "Script    : $ScriptPath"
+    Write-Host "Scheduled task $operation successfully." -ForegroundColor Green
+    Write-Host "Task       : $TaskPath$TaskName"
+    Write-Host "Run As     : $($verifiedTask.Principal.UserId)"
+    Write-Host "Schedule   : Daily at $DailyAt"
+    Write-Host "Next Run   : $($taskInfo.NextRunTime)"
+    Write-Host "Script     : $ScriptPath"
+    Write-Host "psPAS      : $stagedManifest"
+    Write-Host ""
+    Write-Host "Set the intended run-as account manually in:"
+    Write-Host "Task Scheduler > PAM > Move Disabled Accounts Daily > Properties > General"
 
     if ($RunNow) {
-        Start-ScheduledTask -TaskName $TaskName
-        Write-Host "Task started." -ForegroundColor Green
+        Start-ScheduledTask `
+            -TaskPath $TaskPath `
+            -TaskName $TaskName `
+            -ErrorAction Stop
+
+        Write-Host "Task start request submitted." -ForegroundColor Green
     }
+
+    exit 0
 }
 catch {
-    Write-Error $_.Exception.Message
+    Write-Host ""
+    Write-Host "SCHEDULED TASK INSTALLATION FAILED" -ForegroundColor Red
+    Write-Host $_.Exception.Message -ForegroundColor Red
+    Write-Host ""
+    Write-Host "Error type : $($_.Exception.GetType().FullName)"
+    Write-Host "Line       : $($_.InvocationInfo.ScriptLineNumber)"
+    Write-Host "Command    : $($_.InvocationInfo.Line)"
     exit 1
-}
-finally {
-    $password = $null
-    $credential = $null
 }
