@@ -1,18 +1,41 @@
+<#
+BUILD: SIMPLE-SCHTASKS-INSTALLER-2026.07.15.1
+
+Creates or replaces one daily Windows scheduled task for the existing
+working Move-DisabledAccount.ps1 script.
+
+Run this file from Windows PowerShell 5.1 as Administrator.
+#>
+
 [CmdletBinding()]
 param(
     [string]$TaskName = "CyberArk - Move Disabled Accounts Daily",
+
     [string]$ScriptPath = "I:\Script\IDENTITY Script New\Onbarding Project\Move-DisabledAccount.ps1",
+
     [string]$RunAsUser = "ACU\SVC_IAMCArkWinPrd",
+
     [ValidatePattern("^(?:[01]\d|2[0-3]):[0-5]\d$")]
     [string]$DailyAt = "02:00",
+
     [switch]$RunNow
 )
 
 $ErrorActionPreference = "Stop"
 
+Write-Host "============================================================"
+Write-Host "SIMPLE-SCHTASKS-INSTALLER-2026.07.15.1"
+Write-Host "============================================================"
+
 try {
     if (-not (Test-Path -LiteralPath $ScriptPath -PathType Leaf)) {
-        throw "Script not found: $ScriptPath"
+        throw "Working script was not found: $ScriptPath"
+    }
+
+    $powerShellExe = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+
+    if (-not (Test-Path -LiteralPath $powerShellExe -PathType Leaf)) {
+        throw "Windows PowerShell executable was not found: $powerShellExe"
     }
 
     $credential = Get-Credential `
@@ -23,34 +46,52 @@ try {
         throw "Credential entry was cancelled."
     }
 
+    if (
+        -not [string]::IsNullOrWhiteSpace($credential.UserName) -and
+        -not [string]::Equals(
+            $credential.UserName,
+            $RunAsUser,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )
+    ) {
+        throw "Credential username '$($credential.UserName)' does not match '$RunAsUser'."
+    }
+
     $password = $credential.GetNetworkCredential().Password
-    $workingDirectory = Split-Path -Path $ScriptPath -Parent
-    $powershellExe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
 
-    $action = New-ScheduledTaskAction `
-        -Execute $powershellExe `
-        -Argument "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$ScriptPath`"" `
-        -WorkingDirectory $workingDirectory
+    if ([string]::IsNullOrWhiteSpace($password)) {
+        throw "The supplied password is empty."
+    }
 
-    $trigger = New-ScheduledTaskTrigger `
-        -Daily `
-        -At $DailyAt
+    $taskCommand = (
+        '"{0}" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{1}"' -f
+        $powerShellExe,
+        $ScriptPath
+    )
 
-    $settings = New-ScheduledTaskSettingsSet `
-        -StartWhenAvailable `
-        -MultipleInstances IgnoreNew `
-        -ExecutionTimeLimit (New-TimeSpan -Hours 6)
+    # Remove an existing task with the same name. Ignore "task not found".
+    & "$env:SystemRoot\System32\schtasks.exe" `
+        /Delete `
+        /TN $TaskName `
+        /F 2>$null | Out-Null
 
-    Register-ScheduledTask `
-        -TaskName $TaskName `
-        -Action $action `
-        -Trigger $trigger `
-        -Settings $settings `
-        -Description "Runs the existing Move-DisabledAccount.ps1 script daily." `
-        -User $RunAsUser `
-        -Password $password `
-        -RunLevel Highest `
-        -Force | Out-Null
+    # Create the daily task.
+    $createOutput = & "$env:SystemRoot\System32\schtasks.exe" `
+        /Create `
+        /TN $TaskName `
+        /TR $taskCommand `
+        /SC DAILY `
+        /ST $DailyAt `
+        /RU $RunAsUser `
+        /RP $password `
+        /RL HIGHEST `
+        /F 2>&1
+
+    $createExitCode = $LASTEXITCODE
+
+    if ($createExitCode -ne 0) {
+        throw "schtasks.exe failed with exit code $createExitCode. Output: $($createOutput -join ' ')"
+    }
 
     Write-Host ""
     Write-Host "Scheduled task created successfully." -ForegroundColor Green
@@ -58,11 +99,34 @@ try {
     Write-Host "Schedule  : Daily at $DailyAt"
     Write-Host "Run As    : $RunAsUser"
     Write-Host "Script    : $ScriptPath"
+    Write-Host ""
+
+    & "$env:SystemRoot\System32\schtasks.exe" `
+        /Query `
+        /TN $TaskName `
+        /V `
+        /FO LIST
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "The task was created but verification with schtasks.exe /Query failed."
+    }
 
     if ($RunNow) {
-        Start-ScheduledTask -TaskName $TaskName
-        Write-Host "Task started." -ForegroundColor Green
+        Write-Host ""
+        $runOutput = & "$env:SystemRoot\System32\schtasks.exe" `
+            /Run `
+            /TN $TaskName 2>&1
+
+        $runExitCode = $LASTEXITCODE
+
+        if ($runExitCode -ne 0) {
+            throw "The task was created, but starting it failed. Output: $($runOutput -join ' ')"
+        }
+
+        Write-Host "Task start request submitted successfully." -ForegroundColor Green
     }
+
+    exit 0
 }
 catch {
     Write-Error $_.Exception.Message
