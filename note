@@ -1,15 +1,24 @@
 <#
 .SYNOPSIS
-    Compares CyberArk account records with Active Directory records.
+    Compares a CyberArk CSV containing Username and Address against an
+    Active Directory CSV containing distinguished names in the Username column.
 
-.CYBERARK CSV
-    Account ID, Username, Address
+.CYBERARK CSV FORMAT
+    Username,Address
 
-.AD CSV
-    Username, Address
+.AD CSV FORMAT
+    Username
 
-.OUTPUT
-    Matched, Likely Matched, Unmatched CyberArk, and Unmatched AD reports.
+.AD EXAMPLE
+    CN=SVCCWFDDI=Service,OU=Accounts,DC=prod,DC=mtb,DC=com
+
+.DERIVED AD VALUES
+    Username: SVCCWFDDI
+    Address : prod.mtb.com
+
+.CYBERARK UNIQUENESS
+    Because no CyberArk Account ID is provided, each CyberArk CSV row receives
+    a generated identifier such as CA-000001.
 
 .NOTES
     Compatible with Windows PowerShell 5.1.
@@ -48,7 +57,7 @@ function Write-Log {
 }
 
 # ============================================================
-# File selection
+# CSV file selection
 # ============================================================
 
 function Select-CsvFile {
@@ -72,16 +81,18 @@ function Select-CsvFile {
         }
     }
     catch {
-        Write-Log -Level 'WARNING' -Message 'Graphical file selection is unavailable.'
+        Write-Log `
+            -Level 'WARNING' `
+            -Message 'Graphical file selection is unavailable.'
     }
 
-    $path = Read-Host "$Title - enter the complete CSV path"
+    $selectedPath = Read-Host "$Title - enter the complete CSV path"
 
-    if ([string]::IsNullOrWhiteSpace($path)) {
+    if ([string]::IsNullOrWhiteSpace($selectedPath)) {
         throw 'No CSV file was selected.'
     }
 
-    return $path.Trim().Trim('"')
+    return $selectedPath.Trim().Trim('"')
 }
 
 # ============================================================
@@ -119,7 +130,9 @@ function Find-ColumnName {
         $acceptedKey = ConvertTo-ColumnKey -Name $acceptedName
 
         foreach ($columnName in $availableColumns) {
-            if ((ConvertTo-ColumnKey -Name $columnName) -eq $acceptedKey) {
+            $columnKey = ConvertTo-ColumnKey -Name $columnName
+
+            if ($columnKey -eq $acceptedKey) {
                 return $columnName
             }
         }
@@ -129,8 +142,29 @@ function Find-ColumnName {
 }
 
 # ============================================================
-# Username cleanup
+# Text cleanup
 # ============================================================
+
+function Remove-OuterCharacters {
+    param(
+        [AllowNull()]
+        [string]$Value
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return ''
+    }
+
+    $result = $Value.Trim()
+    $result = $result.Trim('"')
+    $result = $result.Trim("'")
+    $result = $result.Trim('`')
+
+    $result = $result -replace '^[^a-zA-Z0-9]+', ''
+    $result = $result -replace '[^a-zA-Z0-9$_.-]+$', ''
+
+    return $result.Trim()
+}
 
 function Get-CompactUsername {
     param(
@@ -145,7 +179,7 @@ function Get-CompactUsername {
     return ($Username.ToLowerInvariant() -replace '[^a-z0-9]', '')
 }
 
-function Get-ADCanonicalUsername {
+function Get-NormalizedUsername {
     param(
         [AllowNull()]
         [string]$Username
@@ -155,12 +189,20 @@ function Get-ADCanonicalUsername {
         return ''
     }
 
-    $value = $Username.Trim()
-    $value = $value.Trim('"', "'", '`')
+    $value = Remove-OuterCharacters -Value $Username
+
+    if ([string]::IsNullOrWhiteSpace($value)) {
+        return ''
+    }
 
     # DOMAIN\Username or DOMAIN/Username
     if ($value -match '[\\/]') {
-        $parts = [regex]::Split($value, '[\\/]+')
+        $parts = @(
+            [regex]::Split($value, '[\\/]+') |
+                Where-Object {
+                    -not [string]::IsNullOrWhiteSpace($_)
+                }
+        )
 
         if ($parts.Count -gt 0) {
             $value = $parts[$parts.Count - 1]
@@ -172,244 +214,9 @@ function Get-ADCanonicalUsername {
         $value = ($value -split '@', 2)[0]
     }
 
-    $value = $value.Trim()
-
-    # Remove punctuation from the beginning and end only.
-    $value = $value -replace '^[^a-zA-Z0-9]+', ''
-    $value = $value -replace '[^a-zA-Z0-9]+$', ''
+    $value = Remove-OuterCharacters -Value $value
 
     return $value.ToLowerInvariant()
-}
-
-function Get-CyberArkUsernameCandidates {
-    param(
-        [AllowNull()]
-        [string]$Username
-    )
-
-    $results = New-Object System.Collections.Generic.List[object]
-
-    if ([string]::IsNullOrWhiteSpace($Username)) {
-        return @()
-    }
-
-    $stopWords = @{
-        'account'          = $true
-        'accounts'         = $true
-        'service'          = $true
-        'services'         = $true
-        'serviceaccount'   = $true
-        'serviceaccounts'  = $true
-        'sql'              = $true
-        'oracle'           = $true
-        'windows'          = $true
-        'linux'            = $true
-        'database'         = $true
-        'domain'           = $true
-        'production'       = $true
-        'development'      = $true
-        'description'      = $true
-        'credential'       = $true
-        'credentials'      = $true
-        'managed'          = $true
-        'cyberark'         = $true
-    }
-
-    $seenCandidates = @{}
-    $processedValues = @{}
-    $queue = New-Object System.Collections.ArrayList
-
-    [void]$queue.Add(
-        [PSCustomObject]@{
-            Value  = $Username
-            Source = 'Original'
-        }
-    )
-
-    $queueIndex = 0
-
-    while ($queueIndex -lt $queue.Count -and $queueIndex -lt 100) {
-        $queueItem = $queue[$queueIndex]
-        $queueIndex++
-
-        $currentValue = [string]$queueItem.Value
-        $currentSource = [string]$queueItem.Source
-
-        if ([string]::IsNullOrWhiteSpace($currentValue)) {
-            continue
-        }
-
-        $currentValue = $currentValue.Trim()
-        $currentValue = $currentValue.Trim('"', "'", '`')
-
-        if ([string]::IsNullOrWhiteSpace($currentValue)) {
-            continue
-        }
-
-        $processedKey = $currentValue.ToLowerInvariant()
-
-        if ($processedValues.ContainsKey($processedKey)) {
-            continue
-        }
-
-        $processedValues[$processedKey] = $true
-
-        # Remove punctuation only from the beginning and end.
-        $cleanValue = $currentValue
-        $cleanValue = $cleanValue -replace '^[^a-zA-Z0-9]+', ''
-        $cleanValue = $cleanValue -replace '[^a-zA-Z0-9]+$', ''
-        $cleanValue = $cleanValue.Trim()
-
-        if (-not [string]::IsNullOrWhiteSpace($cleanValue)) {
-            $normalized = $cleanValue.ToLowerInvariant()
-            $compact = Get-CompactUsername -Username $cleanValue
-
-            $isStopWord = $false
-
-            if ($stopWords.ContainsKey($compact)) {
-                $isStopWord = $true
-            }
-
-            if (
-                -not $isStopWord -and
-                $compact.Length -ge 2
-            ) {
-                $candidateKey = "$normalized|$compact"
-
-                if (-not $seenCandidates.ContainsKey($candidateKey)) {
-                    $seenCandidates[$candidateKey] = $true
-
-                    $results.Add(
-                        [PSCustomObject]@{
-                            CandidateUsername = $cleanValue
-                            NormalizedUsername = $normalized
-                            CompactUsername = $compact
-                            CandidateSource = $currentSource
-                        }
-                    )
-                }
-            }
-        }
-
-        # ----------------------------------------------------
-        # CyberArk descriptive delimiter:
-        # SVCWDBSQLAGC_:_SQL_SERVICE_ACCOUNTS
-        # ----------------------------------------------------
-
-        if ($currentValue -match '\s*_+\s*:\s*_+\s*') {
-            $parts = [regex]::Split(
-                $currentValue,
-                '\s*_+\s*:\s*_+\s*'
-            )
-
-            for ($i = 0; $i -lt $parts.Count; $i++) {
-                if (-not [string]::IsNullOrWhiteSpace($parts[$i])) {
-                    [void]$queue.Add(
-                        [PSCustomObject]@{
-                            Value  = $parts[$i]
-                            Source = if ($i -eq 0) {
-                                'Before CyberArk descriptive suffix'
-                            }
-                            else {
-                                'CyberArk descriptive section'
-                            }
-                        }
-                    )
-                }
-            }
-        }
-
-        # ----------------------------------------------------
-        # Backslash or forward-slash:
-        # DOMAIN\Username
-        # DOMAIN/Username
-        # ----------------------------------------------------
-
-        if ($currentValue -match '[\\/]') {
-            $pathParts = [regex]::Split($currentValue, '[\\/]+')
-
-            if ($pathParts.Count -gt 0) {
-                [void]$queue.Add(
-                    [PSCustomObject]@{
-                        Value  = $pathParts[$pathParts.Count - 1]
-                        Source = 'Domain or path removed'
-                    }
-                )
-            }
-
-            foreach ($pathPart in $pathParts) {
-                if (-not [string]::IsNullOrWhiteSpace($pathPart)) {
-                    [void]$queue.Add(
-                        [PSCustomObject]@{
-                            Value  = $pathPart
-                            Source = 'Slash-delimited section'
-                        }
-                    )
-                }
-            }
-        }
-
-        # ----------------------------------------------------
-        # UPN or email:
-        # Username@domain.com
-        # ----------------------------------------------------
-
-        if ($currentValue.Contains('@')) {
-            $upnParts = $currentValue -split '@', 2
-
-            if ($upnParts.Count -gt 0) {
-                [void]$queue.Add(
-                    [PSCustomObject]@{
-                        Value  = $upnParts[0]
-                        Source = 'UPN suffix removed'
-                    }
-                )
-            }
-        }
-
-        # ----------------------------------------------------
-        # Remove bracketed descriptions:
-        # SVCACCOUNT (SQL Account)
-        # SVCACCOUNT [Production]
-        # ----------------------------------------------------
-
-        if ($currentValue -match '^([^\(\[\{]+)[\(\[\{]') {
-            [void]$queue.Add(
-                [PSCustomObject]@{
-                    Value  = $Matches[1]
-                    Source = 'Bracketed description removed'
-                }
-            )
-        }
-
-        # ----------------------------------------------------
-        # Other separator characters:
-        # account|description
-        # account:description
-        # account;description
-        # [PROD] account
-        # ----------------------------------------------------
-
-        $separatorParts = [regex]::Split(
-            $currentValue,
-            '[\|\;\,\:\=\(\)\[\]\{\}\s]+'
-        )
-
-        if ($separatorParts.Count -gt 1) {
-            foreach ($separatorPart in $separatorParts) {
-                if (-not [string]::IsNullOrWhiteSpace($separatorPart)) {
-                    [void]$queue.Add(
-                        [PSCustomObject]@{
-                            Value  = $separatorPart
-                            Source = 'Special-character section'
-                        }
-                    )
-                }
-            }
-        }
-    }
-
-    return @($results)
 }
 
 # ============================================================
@@ -427,19 +234,20 @@ function Get-NormalizedAddress {
     }
 
     $value = $Address.Trim()
-    $value = $value.Trim('"', "'", '`')
+    $value = $value.Trim('"')
+    $value = $value.Trim("'")
     $value = $value.ToLowerInvariant()
 
     $value = $value -replace '^https?://', ''
     $value = $value -replace '^\\\\', ''
     $value = $value -replace '^//', ''
 
-    # Remove a port when formatted as server.domain.com:443.
+    # Remove a port, such as server.domain.com:443.
     if ($value -match '^[^:]+:\d+$') {
         $value = ($value -split ':', 2)[0]
     }
 
-    # Remove URL or share paths after the hostname.
+    # Remove paths after a hostname.
     if ($value.Contains('/')) {
         $value = ($value -split '/', 2)[0]
     }
@@ -470,84 +278,342 @@ function Get-ShortAddress {
     return $normalizedAddress
 }
 
-function Get-AddressEvaluation {
+# ============================================================
+# Parse AD distinguished name
+# ============================================================
+
+function ConvertFrom-ADUsernameField {
     param(
         [AllowNull()]
-        [string]$CyberArkAddress,
-
-        [AllowNull()]
-        [string]$ADAddress
+        [string]$Value
     )
 
-    $caAddress = Get-NormalizedAddress -Address $CyberArkAddress
-    $adAddress = Get-NormalizedAddress -Address $ADAddress
-
-    if (
-        [string]::IsNullOrWhiteSpace($caAddress) -and
-        [string]::IsNullOrWhiteSpace($adAddress)
-    ) {
+    if ([string]::IsNullOrWhiteSpace($Value)) {
         return [PSCustomObject]@{
-            Method    = 'Both addresses blank'
-            Score     = 5
-            IsExact   = $false
-            IsRelated = $false
+            OriginalValue   = $Value
+            DerivedUsername = ''
+            DerivedAddress  = ''
+            ParseMethod     = 'Blank'
+            ParseWarning    = 'The AD Username field was blank.'
         }
     }
 
-    if (
-        [string]::IsNullOrWhiteSpace($caAddress) -or
-        [string]::IsNullOrWhiteSpace($adAddress)
-    ) {
-        return [PSCustomObject]@{
-            Method    = 'One address blank'
-            Score     = 0
-            IsExact   = $false
-            IsRelated = $false
+    $originalValue = $Value
+    $value = $Value.Trim().Trim('"').Trim("'")
+
+    $derivedUsername = ''
+    $derivedAddress = ''
+    $parseMethod = ''
+    $parseWarning = ''
+
+    $isDistinguishedName = (
+        $value -match '(?i)(^|,)\s*CN\s*=' -or
+        $value -match '(?i)(^|,)\s*DC\s*='
+    )
+
+    if ($isDistinguishedName) {
+        # Split on commas that are not escaped.
+        $dnParts = @(
+            [regex]::Split($value, '(?<!\\),')
+        )
+
+        $cnValue = ''
+
+        foreach ($dnPart in $dnParts) {
+            if ($dnPart -match '^\s*CN\s*=(.*)$') {
+                $cnValue = $Matches[1].Trim()
+                break
+            }
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($cnValue)) {
+            $cnValue = $cnValue.Replace('\,', ',')
+            $cnValue = $cnValue.Replace('\=', '=')
+            $cnValue = $cnValue.Replace('\\', '\')
+
+            # Example:
+            # SVCCWFDDI=Service -> SVCCWFDDI
+            if ($cnValue.Contains('=')) {
+                $derivedUsername = ($cnValue -split '=', 2)[0]
+                $parseMethod = 'CN value before descriptive equals suffix'
+            }
+            else {
+                $derivedUsername = $cnValue
+                $parseMethod = 'CN value'
+            }
+        }
+        else {
+            $parseWarning = 'No CN component was found.'
+        }
+
+        $domainComponents = New-Object System.Collections.Generic.List[string]
+
+        foreach ($dnPart in $dnParts) {
+            if ($dnPart -match '^\s*DC\s*=(.*)$') {
+                $dcValue = $Matches[1].Trim()
+                $dcValue = $dcValue.Replace('\,', ',')
+                $dcValue = $dcValue.Replace('\=', '=')
+
+                if (-not [string]::IsNullOrWhiteSpace($dcValue)) {
+                    $domainComponents.Add($dcValue)
+                }
+            }
+        }
+
+        if ($domainComponents.Count -gt 0) {
+            $derivedAddress = $domainComponents -join '.'
+        }
+        elseif ([string]::IsNullOrWhiteSpace($parseWarning)) {
+            $parseWarning = 'No DC components were found.'
         }
     }
-
-    if ($caAddress -eq $adAddress) {
-        return [PSCustomObject]@{
-            Method    = 'Exact address'
-            Score     = 30
-            IsExact   = $true
-            IsRelated = $true
-        }
+    else {
+        $derivedUsername = Get-NormalizedUsername -Username $value
+        $parseMethod = 'Plain username'
+        $parseWarning = 'The value was not formatted as a distinguished name; no address was derived.'
     }
 
-    $caShortAddress = Get-ShortAddress -Address $caAddress
-    $adShortAddress = Get-ShortAddress -Address $adAddress
-
-    if (
-        -not [string]::IsNullOrWhiteSpace($caShortAddress) -and
-        $caShortAddress -eq $adShortAddress
-    ) {
-        return [PSCustomObject]@{
-            Method    = 'Short hostname or FQDN match'
-            Score     = 20
-            IsExact   = $false
-            IsRelated = $true
-        }
-    }
-
-    if (
-        $caAddress.EndsWith(".$adAddress") -or
-        $adAddress.EndsWith(".$caAddress")
-    ) {
-        return [PSCustomObject]@{
-            Method    = 'Related DNS address'
-            Score     = 15
-            IsExact   = $false
-            IsRelated = $true
-        }
-    }
+    $derivedUsername = Remove-OuterCharacters -Value $derivedUsername
 
     return [PSCustomObject]@{
-        Method    = 'Different address'
-        Score     = 0
-        IsExact   = $false
-        IsRelated = $false
+        OriginalValue   = $originalValue
+        DerivedUsername = $derivedUsername
+        DerivedAddress  = $derivedAddress.ToLowerInvariant()
+        ParseMethod     = $parseMethod
+        ParseWarning    = $parseWarning
     }
+}
+
+# ============================================================
+# CyberArk username candidate extraction
+# ============================================================
+
+function Add-UsernameCandidate {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.ArrayList]$CandidateList,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$SeenCandidates,
+
+        [AllowNull()]
+        [string]$Value,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Source
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return
+    }
+
+    $cleanedValue = Remove-OuterCharacters -Value $Value
+
+    if ([string]::IsNullOrWhiteSpace($cleanedValue)) {
+        return
+    }
+
+    $normalizedValue = $cleanedValue.ToLowerInvariant()
+    $compactValue = Get-CompactUsername -Username $cleanedValue
+
+    if ($compactValue.Length -lt 2) {
+        return
+    }
+
+    $stopWords = @{
+        'service'         = $true
+        'services'        = $true
+        'account'         = $true
+        'accounts'        = $true
+        'serviceaccount'  = $true
+        'serviceaccounts' = $true
+        'sql'             = $true
+        'oracle'          = $true
+        'windows'         = $true
+        'linux'           = $true
+        'database'        = $true
+        'description'     = $true
+        'production'      = $true
+        'development'     = $true
+        'prod'            = $true
+        'dev'             = $true
+        'cert'            = $true
+        'domain'          = $true
+        'cyberark'        = $true
+        'credential'      = $true
+        'credentials'     = $true
+    }
+
+    if ($stopWords.ContainsKey($compactValue)) {
+        return
+    }
+
+    $candidateKey = "$normalizedValue|$compactValue"
+
+    if ($SeenCandidates.ContainsKey($candidateKey)) {
+        return
+    }
+
+    $SeenCandidates[$candidateKey] = $true
+
+    [void]$CandidateList.Add(
+        [PSCustomObject]@{
+            CandidateUsername  = $cleanedValue
+            NormalizedUsername = $normalizedValue
+            CompactUsername    = $compactValue
+            CandidateSource    = $Source
+        }
+    )
+}
+
+function Get-CyberArkUsernameCandidates {
+    param(
+        [AllowNull()]
+        [string]$Username
+    )
+
+    $candidates = New-Object System.Collections.ArrayList
+    $seenCandidates = @{}
+    $processedValues = @{}
+    $queue = New-Object System.Collections.ArrayList
+
+    if ([string]::IsNullOrWhiteSpace($Username)) {
+        return @()
+    }
+
+    [void]$queue.Add(
+        [PSCustomObject]@{
+            Value  = $Username
+            Source = 'Original CyberArk username'
+        }
+    )
+
+    $queuePosition = 0
+
+    while (
+        $queuePosition -lt $queue.Count -and
+        $queuePosition -lt 100
+    ) {
+        $queueItem = $queue[$queuePosition]
+        $queuePosition++
+
+        $currentValue = [string]$queueItem.Value
+        $currentSource = [string]$queueItem.Source
+
+        if ([string]::IsNullOrWhiteSpace($currentValue)) {
+            continue
+        }
+
+        $currentValue = $currentValue.Trim().Trim('"').Trim("'")
+        $processedKey = $currentValue.ToLowerInvariant()
+
+        if ($processedValues.ContainsKey($processedKey)) {
+            continue
+        }
+
+        $processedValues[$processedKey] = $true
+
+        Add-UsernameCandidate `
+            -CandidateList $candidates `
+            -SeenCandidates $seenCandidates `
+            -Value $currentValue `
+            -Source $currentSource
+
+        # SVCWDBSQLAGC_:_SQL_SERVICE_ACCOUNTS
+        if ($currentValue -match '\s*_+\s*:\s*_+\s*') {
+            $parts = @(
+                [regex]::Split(
+                    $currentValue,
+                    '\s*_+\s*:\s*_+\s*'
+                )
+            )
+
+            if ($parts.Count -gt 0) {
+                [void]$queue.Add(
+                    [PSCustomObject]@{
+                        Value  = $parts[0]
+                        Source = 'Before CyberArk descriptive suffix'
+                    }
+                )
+            }
+        }
+
+        # DOMAIN\Username or DOMAIN/Username
+        if ($currentValue -match '[\\/]') {
+            $slashParts = @(
+                [regex]::Split($currentValue, '[\\/]+') |
+                    Where-Object {
+                        -not [string]::IsNullOrWhiteSpace($_)
+                    }
+            )
+
+            if ($slashParts.Count -gt 0) {
+                [void]$queue.Add(
+                    [PSCustomObject]@{
+                        Value  = $slashParts[$slashParts.Count - 1]
+                        Source = 'Domain or path removed'
+                    }
+                )
+            }
+
+            foreach ($slashPart in $slashParts) {
+                [void]$queue.Add(
+                    [PSCustomObject]@{
+                        Value  = $slashPart
+                        Source = 'Slash-delimited section'
+                    }
+                )
+            }
+        }
+
+        # Username@domain.com
+        if ($currentValue.Contains('@')) {
+            $upnParts = $currentValue -split '@', 2
+
+            if ($upnParts.Count -gt 0) {
+                [void]$queue.Add(
+                    [PSCustomObject]@{
+                        Value  = $upnParts[0]
+                        Source = 'UPN suffix removed'
+                    }
+                )
+            }
+        }
+
+        # Account name before bracketed description.
+        if ($currentValue -match '^([^\(\[\{]+)[\(\[\{]') {
+            [void]$queue.Add(
+                [PSCustomObject]@{
+                    Value  = $Matches[1]
+                    Source = 'Bracketed description removed'
+                }
+            )
+        }
+
+        # Split other special-character formats.
+        $specialParts = @(
+            [regex]::Split(
+                $currentValue,
+                '[\|\;\,\:\=\(\)\[\]\{\}\s]+'
+            ) |
+                Where-Object {
+                    -not [string]::IsNullOrWhiteSpace($_)
+                }
+        )
+
+        if ($specialParts.Count -gt 1) {
+            foreach ($specialPart in $specialParts) {
+                [void]$queue.Add(
+                    [PSCustomObject]@{
+                        Value  = $specialPart
+                        Source = 'Special-character section'
+                    }
+                )
+            }
+        }
+    }
+
+    return @($candidates)
 }
 
 # ============================================================
@@ -585,13 +651,10 @@ function Get-LevenshteinDistance {
 
     for ($row = 1; $row -lt $rows; $row++) {
         for ($column = 1; $column -lt $columns; $column++) {
-            $cost = if (
-                $Source[$row - 1] -eq $Target[$column - 1]
-            ) {
-                0
-            }
-            else {
-                1
+            $cost = 1
+
+            if ($Source[$row - 1] -eq $Target[$column - 1]) {
+                $cost = 0
             }
 
             $deletion = $matrix[$row - 1, $column] + 1
@@ -631,7 +694,10 @@ function Get-UsernameSimilarity {
         return 1
     }
 
-    $maximumLength = [Math]::Max($first.Length, $second.Length)
+    $maximumLength = [Math]::Max(
+        $first.Length,
+        $second.Length
+    )
 
     if ($maximumLength -eq 0) {
         return 1
@@ -645,6 +711,90 @@ function Get-UsernameSimilarity {
         1 - ($distance / [double]$maximumLength),
         4
     )
+}
+
+# ============================================================
+# Address evaluation
+# ============================================================
+
+function Get-AddressEvaluation {
+    param(
+        [AllowNull()]
+        [string]$CyberArkAddress,
+
+        [AllowNull()]
+        [string]$ADAddress
+    )
+
+    $caAddress = Get-NormalizedAddress -Address $CyberArkAddress
+    $adAddress = Get-NormalizedAddress -Address $ADAddress
+
+    if (
+        [string]::IsNullOrWhiteSpace($caAddress) -and
+        [string]::IsNullOrWhiteSpace($adAddress)
+    ) {
+        return [PSCustomObject]@{
+            Method    = 'Both addresses blank'
+            Score     = 0
+            IsExact   = $false
+            IsRelated = $false
+        }
+    }
+
+    if (
+        [string]::IsNullOrWhiteSpace($caAddress) -or
+        [string]::IsNullOrWhiteSpace($adAddress)
+    ) {
+        return [PSCustomObject]@{
+            Method    = 'One address blank'
+            Score     = 0
+            IsExact   = $false
+            IsRelated = $false
+        }
+    }
+
+    if ($caAddress -eq $adAddress) {
+        return [PSCustomObject]@{
+            Method    = 'Exact address'
+            Score     = 30
+            IsExact   = $true
+            IsRelated = $true
+        }
+    }
+
+    $caShortAddress = Get-ShortAddress -Address $caAddress
+    $adShortAddress = Get-ShortAddress -Address $adAddress
+
+    if (
+        -not [string]::IsNullOrWhiteSpace($caShortAddress) -and
+        $caShortAddress -eq $adShortAddress
+    ) {
+        return [PSCustomObject]@{
+            Method    = 'Short address or FQDN match'
+            Score     = 20
+            IsExact   = $false
+            IsRelated = $true
+        }
+    }
+
+    if (
+        $caAddress.EndsWith(".$adAddress") -or
+        $adAddress.EndsWith(".$caAddress")
+    ) {
+        return [PSCustomObject]@{
+            Method    = 'Related DNS address'
+            Score     = 15
+            IsExact   = $false
+            IsRelated = $true
+        }
+    }
+
+    return [PSCustomObject]@{
+        Method    = 'Different address'
+        Score     = 0
+        IsExact   = $false
+        IsRelated = $false
+    }
 }
 
 # ============================================================
@@ -665,6 +815,7 @@ function Get-MatchEvaluation {
 
     $caNormalized = $CyberArkCandidate.NormalizedUsername
     $caCompact = $CyberArkCandidate.CompactUsername
+
     $adNormalized = $ADRecord.NormalizedUsername
     $adCompact = $ADRecord.CompactUsername
 
@@ -732,48 +883,48 @@ function Get-MatchEvaluation {
 
     $addressEvaluation = Get-AddressEvaluation `
         -CyberArkAddress $CyberArkRecord.Address `
-        -ADAddress $ADRecord.Address
+        -ADAddress $ADRecord.DerivedAddress
 
     $totalScore = $usernameScore + $addressEvaluation.Score
-    $status = 'Unmatched'
-    $reason = 'Username and address did not meet the matching threshold.'
+    $matchStatus = 'Unmatched'
+    $matchReason = 'Username and address did not meet the matching threshold.'
 
     if (
         $usernameMethod -eq 'Exact after username extraction' -and
         $addressEvaluation.IsExact
     ) {
-        $status = 'Matched'
+        $matchStatus = 'Matched'
         $totalScore = 100
-        $reason = 'Extracted CyberArk username and address matched the AD record exactly.'
+        $matchReason = 'CyberArk username and AD-derived address matched exactly.'
     }
     elseif (
         $usernameMethod -eq 'Exact after username extraction' -and
         $addressEvaluation.IsRelated
     ) {
-        $status = 'Likely Matched'
+        $matchStatus = 'Likely Matched'
         $totalScore = [Math]::Max($totalScore, 90)
-        $reason = 'Extracted CyberArk username matched exactly and the addresses appear related.'
+        $matchReason = 'Username matched exactly and the addresses appear related.'
     }
     elseif ($usernameMethod -eq 'Exact after username extraction') {
-        $status = 'Likely Matched'
+        $matchStatus = 'Likely Matched'
         $totalScore = [Math]::Max($totalScore, 78)
-        $reason = 'Extracted CyberArk username matched exactly, but the addresses differ or are blank.'
+        $matchReason = 'Username matched exactly, but the addresses differ.'
     }
     elseif (
         $usernameMethod -eq 'Exact after special-character removal' -and
         $addressEvaluation.IsExact
     ) {
-        $status = 'Likely Matched'
+        $matchStatus = 'Likely Matched'
         $totalScore = [Math]::Max($totalScore, 92)
-        $reason = 'Usernames matched after removing special characters and the addresses matched.'
+        $matchReason = 'Usernames matched after special-character removal and addresses matched.'
     }
     elseif (
         $usernameMethod -eq 'Exact after special-character removal' -and
         $addressEvaluation.IsRelated
     ) {
-        $status = 'Likely Matched'
+        $matchStatus = 'Likely Matched'
         $totalScore = [Math]::Max($totalScore, 84)
-        $reason = 'Usernames matched after removing special characters and the addresses appear related.'
+        $matchReason = 'Usernames matched after special-character removal and addresses appear related.'
     }
     elseif (
         (
@@ -782,9 +933,9 @@ function Get-MatchEvaluation {
         ) -and
         $addressEvaluation.IsExact
     ) {
-        $status = 'Likely Matched'
+        $matchStatus = 'Likely Matched'
         $totalScore = [Math]::Max($totalScore, 75)
-        $reason = 'The usernames are highly similar and the addresses matched exactly.'
+        $matchReason = 'Usernames are highly similar and addresses matched exactly.'
     }
     elseif (
         (
@@ -793,18 +944,86 @@ function Get-MatchEvaluation {
         ) -and
         $addressEvaluation.IsRelated
     ) {
-        $status = 'Likely Matched'
+        $matchStatus = 'Likely Matched'
         $totalScore = [Math]::Max($totalScore, 70)
-        $reason = 'The usernames and addresses appear related but require manual review.'
+        $matchReason = 'Usernames and addresses appear related and require review.'
     }
 
     return [PSCustomObject]@{
-        MatchStatus       = $status
+        MatchStatus       = $matchStatus
         ConfidenceScore   = [Math]::Min([int]$totalScore, 100)
-        MatchReason       = $reason
+        MatchReason       = $matchReason
         UsernameMethod    = $usernameMethod
         AddressMethod     = $addressEvaluation.Method
         SimilarityPercent = [Math]::Round($similarity * 100, 2)
+    }
+}
+
+# ============================================================
+# Add unique AD candidates
+# ============================================================
+
+function Add-UniqueADRecords {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.ArrayList]$TargetList,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$SeenRecords,
+
+        [AllowNull()]
+        [object[]]$Records
+    )
+
+    foreach ($record in @($Records)) {
+        if ($null -eq $record) {
+            continue
+        }
+
+        $recordNumber = [int]$record.RecordNumber
+
+        if (-not $SeenRecords.ContainsKey($recordNumber)) {
+            $SeenRecords[$recordNumber] = $true
+            [void]$TargetList.Add($record)
+        }
+    }
+}
+
+# ============================================================
+# Export helper
+# ============================================================
+
+function Export-ResultSet {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$Data,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$Columns
+    )
+
+    if (@($Data).Count -gt 0) {
+        $Data |
+            Select-Object -Property $Columns |
+            Export-Csv `
+                -LiteralPath $Path `
+                -NoTypeInformation `
+                -Encoding UTF8
+    }
+    else {
+        $header = @(
+            foreach ($column in $Columns) {
+                '"' + ($column -replace '"', '""') + '"'
+            }
+        ) -join ','
+
+        Set-Content `
+            -LiteralPath $Path `
+            -Value $header `
+            -Encoding UTF8
     }
 }
 
@@ -814,18 +1033,18 @@ function Get-MatchEvaluation {
 
 try {
     Write-Host
-    Write-Log -Message ('=' * 70)
+    Write-Log -Message ('=' * 72)
     Write-Log -Message 'CyberArk and AD account comparison starting.'
-    Write-Log -Message ('=' * 70)
+    Write-Log -Message ('=' * 72)
 
     if ([string]::IsNullOrWhiteSpace($CyberArkCsvPath)) {
         $CyberArkCsvPath = Select-CsvFile `
-            -Title 'Select CyberArk CSV: Account ID, Username, Address'
+            -Title 'Select CyberArk CSV: Username and Address'
     }
 
     if ([string]::IsNullOrWhiteSpace($ADCsvPath)) {
         $ADCsvPath = Select-CsvFile `
-            -Title 'Select AD CSV: Username, Address'
+            -Title 'Select AD CSV containing the Username distinguished-name column'
     }
 
     $CyberArkCsvPath = $CyberArkCsvPath.Trim().Trim('"')
@@ -843,7 +1062,7 @@ try {
         $OutputFolder = Split-Path -Parent $CyberArkCsvPath
     }
 
-    if (-not (Test-Path -LiteralPath $OutputFolder)) {
+    if (-not (Test-Path -LiteralPath $OutputFolder -PathType Container)) {
         New-Item `
             -Path $OutputFolder `
             -ItemType Directory `
@@ -851,8 +1070,17 @@ try {
             Out-Null
     }
 
-    $cyberArkCsv = @(Import-Csv -LiteralPath $CyberArkCsvPath)
-    $adCsv = @(Import-Csv -LiteralPath $ADCsvPath)
+    # --------------------------------------------------------
+    # Import CSV files
+    # --------------------------------------------------------
+
+    $cyberArkCsv = @(
+        Import-Csv -LiteralPath $CyberArkCsvPath
+    )
+
+    $adCsv = @(
+        Import-Csv -LiteralPath $ADCsvPath
+    )
 
     if ($cyberArkCsv.Count -eq 0) {
         throw 'The CyberArk CSV contains no records.'
@@ -863,18 +1091,8 @@ try {
     }
 
     # --------------------------------------------------------
-    # Detect CSV columns
+    # Detect columns
     # --------------------------------------------------------
-
-    $caAccountIdColumn = Find-ColumnName `
-        -SampleRow $cyberArkCsv[0] `
-        -AcceptedNames @(
-            'Account ID',
-            'AccountID',
-            'CyberArk Account ID',
-            'ID'
-        ) `
-        -Description 'CyberArk Account ID'
 
     $caUsernameColumn = Find-ColumnName `
         -SampleRow $cyberArkCsv[0] `
@@ -891,9 +1109,9 @@ try {
             'Address',
             'CyberArk Address',
             'Machine Address',
+            'Domain',
             'Host',
-            'Hostname',
-            'Domain'
+            'Hostname'
         ) `
         -Description 'CyberArk Address'
 
@@ -902,54 +1120,115 @@ try {
         -AcceptedNames @(
             'Username',
             'User Name',
-            'SamAccountName',
-            'SAM Account Name',
-            'Account Name'
+            'Distinguished Name',
+            'DistinguishedName',
+            'DN'
         ) `
         -Description 'AD Username'
 
-    $adAddressColumn = Find-ColumnName `
-        -SampleRow $adCsv[0] `
-        -AcceptedNames @(
-            'Address',
-            'AD Address',
-            'Domain',
-            'Host',
-            'Hostname'
-        ) `
-        -Description 'AD Address'
-
-    Write-Log -Message "CyberArk records loaded: $($cyberArkCsv.Count)"
+    Write-Log -Message "CyberArk records loaded : $($cyberArkCsv.Count)"
     Write-Log -Message "AD records loaded       : $($adCsv.Count)"
+    Write-Log -Message "CyberArk username column: $caUsernameColumn"
+    Write-Log -Message "CyberArk address column : $caAddressColumn"
+    Write-Log -Message "AD source column        : $adUsernameColumn"
 
     # --------------------------------------------------------
-    # Prepare AD records
+    # Prepare CyberArk rows and generate row identifiers
+    # --------------------------------------------------------
+
+    $preparedCyberArkRecords = New-Object System.Collections.Generic.List[object]
+    $compositeKeyCounts = @{}
+    $cyberArkSourceRow = 0
+
+    foreach ($cyberArkRow in $cyberArkCsv) {
+        $cyberArkSourceRow++
+
+        $cyberArkUsername = [string]$cyberArkRow.$caUsernameColumn
+        $cyberArkAddress = [string]$cyberArkRow.$caAddressColumn
+
+        $normalizedAddress = Get-NormalizedAddress `
+            -Address $cyberArkAddress
+
+        $normalizedRawUsername = $cyberArkUsername.Trim().ToLowerInvariant()
+
+        $compositeKey = "$normalizedRawUsername|$normalizedAddress"
+
+        if (-not $compositeKeyCounts.ContainsKey($compositeKey)) {
+            $compositeKeyCounts[$compositeKey] = 0
+        }
+
+        $compositeKeyCounts[$compositeKey]++
+
+        $preparedCyberArkRecords.Add(
+            [PSCustomObject]@{
+                SourceRow             = $cyberArkSourceRow
+                CyberArkRecordID      = 'CA-{0:D6}' -f $cyberArkSourceRow
+                Username              = $cyberArkUsername
+                Address               = $cyberArkAddress
+                NormalizedAddress     = $normalizedAddress
+                ShortAddress          = Get-ShortAddress -Address $cyberArkAddress
+                CyberArkCompositeKey  = $compositeKey
+            }
+        )
+    }
+
+    $compositeOccurrenceCounts = @{}
+
+    foreach ($record in $preparedCyberArkRecords) {
+        $key = $record.CyberArkCompositeKey
+
+        if (-not $compositeOccurrenceCounts.ContainsKey($key)) {
+            $compositeOccurrenceCounts[$key] = 0
+        }
+
+        $compositeOccurrenceCounts[$key]++
+
+        $record |
+            Add-Member `
+                -NotePropertyName DuplicateGroupCount `
+                -NotePropertyValue $compositeKeyCounts[$key]
+
+        $record |
+            Add-Member `
+                -NotePropertyName DuplicateOccurrence `
+                -NotePropertyValue $compositeOccurrenceCounts[$key]
+    }
+
+    # --------------------------------------------------------
+    # Parse AD records
     # --------------------------------------------------------
 
     $adRecords = New-Object System.Collections.Generic.List[object]
-    $adRecordNumber = 0
+    $adRowNumber = 0
+    $adParseWarningCount = 0
 
-    foreach ($row in $adCsv) {
-        $adRecordNumber++
+    foreach ($adRow in $adCsv) {
+        $adRowNumber++
 
-        $username = [string]$row.$adUsernameColumn
-        $address = [string]$row.$adAddressColumn
+        $originalADValue = [string]$adRow.$adUsernameColumn
 
-        $normalizedUsername = Get-ADCanonicalUsername `
-            -Username $username
+        $parsedADValue = ConvertFrom-ADUsernameField `
+            -Value $originalADValue
+
+        if (-not [string]::IsNullOrWhiteSpace($parsedADValue.ParseWarning)) {
+            $adParseWarningCount++
+        }
+
+        $normalizedUsername = Get-NormalizedUsername `
+            -Username $parsedADValue.DerivedUsername
 
         $adRecords.Add(
             [PSCustomObject]@{
-                RecordNumber       = $adRecordNumber
-                Username           = $username
-                Address            = $address
+                RecordNumber       = $adRowNumber
+                OriginalADValue    = $originalADValue
+                DerivedUsername    = $parsedADValue.DerivedUsername
+                DerivedAddress     = $parsedADValue.DerivedAddress
                 NormalizedUsername = $normalizedUsername
-                CompactUsername    = Get-CompactUsername `
-                    -Username $normalizedUsername
-                NormalizedAddress  = Get-NormalizedAddress `
-                    -Address $address
-                ShortAddress       = Get-ShortAddress `
-                    -Address $address
+                CompactUsername    = Get-CompactUsername -Username $normalizedUsername
+                NormalizedAddress  = Get-NormalizedAddress -Address $parsedADValue.DerivedAddress
+                ShortAddress       = Get-ShortAddress -Address $parsedADValue.DerivedAddress
+                ParseMethod        = $parsedADValue.ParseMethod
+                ParseWarning       = $parsedADValue.ParseWarning
             }
         )
     }
@@ -967,7 +1246,8 @@ try {
     foreach ($adRecord in $adRecords) {
         if (-not [string]::IsNullOrWhiteSpace($adRecord.NormalizedUsername)) {
             if (-not $adByNormalizedUsername.ContainsKey($adRecord.NormalizedUsername)) {
-                $adByNormalizedUsername[$adRecord.NormalizedUsername] = New-Object System.Collections.ArrayList
+                $adByNormalizedUsername[$adRecord.NormalizedUsername] =
+                    New-Object System.Collections.ArrayList
             }
 
             [void]$adByNormalizedUsername[$adRecord.NormalizedUsername].Add($adRecord)
@@ -975,7 +1255,8 @@ try {
 
         if (-not [string]::IsNullOrWhiteSpace($adRecord.CompactUsername)) {
             if (-not $adByCompactUsername.ContainsKey($adRecord.CompactUsername)) {
-                $adByCompactUsername[$adRecord.CompactUsername] = New-Object System.Collections.ArrayList
+                $adByCompactUsername[$adRecord.CompactUsername] =
+                    New-Object System.Collections.ArrayList
             }
 
             [void]$adByCompactUsername[$adRecord.CompactUsername].Add($adRecord)
@@ -984,7 +1265,8 @@ try {
                 $prefix = $adRecord.CompactUsername.Substring(0, 3)
 
                 if (-not $adByPrefix.ContainsKey($prefix)) {
-                    $adByPrefix[$prefix] = New-Object System.Collections.ArrayList
+                    $adByPrefix[$prefix] =
+                        New-Object System.Collections.ArrayList
                 }
 
                 [void]$adByPrefix[$prefix].Add($adRecord)
@@ -993,7 +1275,8 @@ try {
 
         if (-not [string]::IsNullOrWhiteSpace($adRecord.NormalizedAddress)) {
             if (-not $adByAddress.ContainsKey($adRecord.NormalizedAddress)) {
-                $adByAddress[$adRecord.NormalizedAddress] = New-Object System.Collections.ArrayList
+                $adByAddress[$adRecord.NormalizedAddress] =
+                    New-Object System.Collections.ArrayList
             }
 
             [void]$adByAddress[$adRecord.NormalizedAddress].Add($adRecord)
@@ -1001,7 +1284,8 @@ try {
 
         if (-not [string]::IsNullOrWhiteSpace($adRecord.ShortAddress)) {
             if (-not $adByShortAddress.ContainsKey($adRecord.ShortAddress)) {
-                $adByShortAddress[$adRecord.ShortAddress] = New-Object System.Collections.ArrayList
+                $adByShortAddress[$adRecord.ShortAddress] =
+                    New-Object System.Collections.ArrayList
             }
 
             [void]$adByShortAddress[$adRecord.ShortAddress].Add($adRecord)
@@ -1009,75 +1293,32 @@ try {
     }
 
     # --------------------------------------------------------
-    # Compare CyberArk records
+    # Compare CyberArk records against AD
     # --------------------------------------------------------
 
     $results = New-Object System.Collections.Generic.List[object]
     $matchedADRecordNumbers = @{}
-    $seenAccountIds = @{}
-    $duplicateAccountIds = 0
-    $processedAccounts = 0
+    $processedCyberArkAccounts = 0
 
-    foreach ($row in $cyberArkCsv) {
-        $accountId = ([string]$row.$caAccountIdColumn).Trim()
-        $caUsername = [string]$row.$caUsernameColumn
-        $caAddress = [string]$row.$caAddressColumn
-
-        if ([string]::IsNullOrWhiteSpace($accountId)) {
-            $accountId = "MISSING-ID-$($processedAccounts + 1)"
-        }
-
-        $accountIdKey = $accountId.ToLowerInvariant()
-
-        if ($seenAccountIds.ContainsKey($accountIdKey)) {
-            $duplicateAccountIds++
-            continue
-        }
-
-        $seenAccountIds[$accountIdKey] = $true
-        $processedAccounts++
+    foreach ($cyberArkRecord in $preparedCyberArkRecords) {
+        $processedCyberArkAccounts++
 
         $usernameCandidates = @(
-            Get-CyberArkUsernameCandidates -Username $caUsername
+            Get-CyberArkUsernameCandidates `
+                -Username $cyberArkRecord.Username
         )
 
-        $caRecord = [PSCustomObject]@{
-            AccountID        = $accountId
-            Username         = $caUsername
-            Address          = $caAddress
-            NormalizedAddress = Get-NormalizedAddress `
-                -Address $caAddress
-            ShortAddress = Get-ShortAddress `
-                -Address $caAddress
-        }
-
         $possibleADRecords = New-Object System.Collections.ArrayList
-        $possibleADRecordNumbers = @{}
-
-        function Add-ADCandidates {
-            param(
-                [AllowNull()]
-                [object[]]$Records
-            )
-
-            foreach ($candidateRecord in @($Records)) {
-                if ($null -eq $candidateRecord) {
-                    continue
-                }
-
-                if (-not $possibleADRecordNumbers.ContainsKey($candidateRecord.RecordNumber)) {
-                    $possibleADRecordNumbers[$candidateRecord.RecordNumber] = $true
-                    [void]$possibleADRecords.Add($candidateRecord)
-                }
-            }
-        }
+        $seenPossibleADRecords = @{}
 
         foreach ($usernameCandidate in $usernameCandidates) {
             if (
                 -not [string]::IsNullOrWhiteSpace($usernameCandidate.NormalizedUsername) -and
                 $adByNormalizedUsername.ContainsKey($usernameCandidate.NormalizedUsername)
             ) {
-                Add-ADCandidates `
+                Add-UniqueADRecords `
+                    -TargetList $possibleADRecords `
+                    -SeenRecords $seenPossibleADRecords `
                     -Records $adByNormalizedUsername[$usernameCandidate.NormalizedUsername]
             }
 
@@ -1085,34 +1326,42 @@ try {
                 -not [string]::IsNullOrWhiteSpace($usernameCandidate.CompactUsername) -and
                 $adByCompactUsername.ContainsKey($usernameCandidate.CompactUsername)
             ) {
-                Add-ADCandidates `
+                Add-UniqueADRecords `
+                    -TargetList $possibleADRecords `
+                    -SeenRecords $seenPossibleADRecords `
                     -Records $adByCompactUsername[$usernameCandidate.CompactUsername]
             }
 
             if ($usernameCandidate.CompactUsername.Length -ge 3) {
-                $prefix = $usernameCandidate.CompactUsername.Substring(0, 3)
+                $candidatePrefix = $usernameCandidate.CompactUsername.Substring(0, 3)
 
-                if ($adByPrefix.ContainsKey($prefix)) {
-                    Add-ADCandidates `
-                        -Records $adByPrefix[$prefix]
+                if ($adByPrefix.ContainsKey($candidatePrefix)) {
+                    Add-UniqueADRecords `
+                        -TargetList $possibleADRecords `
+                        -SeenRecords $seenPossibleADRecords `
+                        -Records $adByPrefix[$candidatePrefix]
                 }
             }
         }
 
         if (
-            -not [string]::IsNullOrWhiteSpace($caRecord.NormalizedAddress) -and
-            $adByAddress.ContainsKey($caRecord.NormalizedAddress)
+            -not [string]::IsNullOrWhiteSpace($cyberArkRecord.NormalizedAddress) -and
+            $adByAddress.ContainsKey($cyberArkRecord.NormalizedAddress)
         ) {
-            Add-ADCandidates `
-                -Records $adByAddress[$caRecord.NormalizedAddress]
+            Add-UniqueADRecords `
+                -TargetList $possibleADRecords `
+                -SeenRecords $seenPossibleADRecords `
+                -Records $adByAddress[$cyberArkRecord.NormalizedAddress]
         }
 
         if (
-            -not [string]::IsNullOrWhiteSpace($caRecord.ShortAddress) -and
-            $adByShortAddress.ContainsKey($caRecord.ShortAddress)
+            -not [string]::IsNullOrWhiteSpace($cyberArkRecord.ShortAddress) -and
+            $adByShortAddress.ContainsKey($cyberArkRecord.ShortAddress)
         ) {
-            Add-ADCandidates `
-                -Records $adByShortAddress[$caRecord.ShortAddress]
+            Add-UniqueADRecords `
+                -TargetList $possibleADRecords `
+                -SeenRecords $seenPossibleADRecords `
+                -Records $adByShortAddress[$cyberArkRecord.ShortAddress]
         }
 
         $evaluatedMatches = New-Object System.Collections.Generic.List[object]
@@ -1121,7 +1370,7 @@ try {
             foreach ($usernameCandidate in $usernameCandidates) {
                 $evaluation = Get-MatchEvaluation `
                     -CyberArkCandidate $usernameCandidate `
-                    -CyberArkRecord $caRecord `
+                    -CyberArkRecord $cyberArkRecord `
                     -ADRecord $adRecord
 
                 if ($evaluation.MatchStatus -ne 'Unmatched') {
@@ -1162,124 +1411,162 @@ try {
 
             $bestMatch = $sortedMatches[0]
             $bestADRecord = $bestMatch.ADRecord
-            $bestUsernameCandidate = $bestMatch.UsernameCandidate
+            $bestCandidate = $bestMatch.UsernameCandidate
             $bestEvaluation = $bestMatch.Evaluation
 
-            $equalBestMatches = @(
+            $equalBestADRecords = @(
                 $sortedMatches |
                     Where-Object {
                         $_.Evaluation.ConfidenceScore -eq
                         $bestEvaluation.ConfidenceScore
-                    }
-            ).Count
+                    } |
+                    ForEach-Object {
+                        $_.ADRecord.RecordNumber
+                    } |
+                    Sort-Object -Unique
+            )
 
+            $equalBestCount = $equalBestADRecords.Count
             $matchedADRecordNumbers[$bestADRecord.RecordNumber] = $true
+
+            $reviewRequired = 'No'
+
+            if (
+                $bestEvaluation.MatchStatus -eq 'Likely Matched' -or
+                $equalBestCount -gt 1 -or
+                $cyberArkRecord.DuplicateGroupCount -gt 1 -or
+                -not [string]::IsNullOrWhiteSpace($bestADRecord.ParseWarning)
+            ) {
+                $reviewRequired = 'Yes'
+            }
 
             $results.Add(
                 [PSCustomObject]@{
-                    RecordSource                = 'CyberArk'
-                    MatchStatus                 = $bestEvaluation.MatchStatus
-                    ConfidenceScore             = $bestEvaluation.ConfidenceScore
-                    PresenceInCyberArk           = 'Yes'
-                    CyberArkAccountID            = $accountId
-                    CyberArkOriginalUsername     = $caUsername
-                    CyberArkMatchedCandidate     = $bestUsernameCandidate.CandidateUsername
-                    CyberArkCandidateSource      = $bestUsernameCandidate.CandidateSource
-                    CyberArkNormalizedCandidate  = $bestUsernameCandidate.NormalizedUsername
-                    CyberArkAddress              = $caAddress
-                    ADUsername                   = $bestADRecord.Username
-                    ADNormalizedUsername         = $bestADRecord.NormalizedUsername
-                    ADAddress                    = $bestADRecord.Address
-                    UsernameMatchMethod          = $bestEvaluation.UsernameMethod
-                    UsernameSimilarityPercent    = $bestEvaluation.SimilarityPercent
-                    AddressMatchMethod           = $bestEvaluation.AddressMethod
-                    MatchReason                  = $bestEvaluation.MatchReason
-                    EqualBestMatchCount          = $equalBestMatches
-                    ReviewRequired               = if (
-                        $bestEvaluation.MatchStatus -eq 'Likely Matched' -or
-                        $equalBestMatches -gt 1
-                    ) {
-                        'Yes'
-                    }
-                    else {
-                        'No'
-                    }
+                    RecordSource              = 'CyberArk'
+                    MatchStatus               = $bestEvaluation.MatchStatus
+                    ConfidenceScore           = $bestEvaluation.ConfidenceScore
+                    PresenceInCyberArk         = 'Yes'
+
+                    CyberArkRecordID           = $cyberArkRecord.CyberArkRecordID
+                    CyberArkSourceRow          = $cyberArkRecord.SourceRow
+                    CyberArkOriginalUsername   = $cyberArkRecord.Username
+                    CyberArkMatchedCandidate   = $bestCandidate.CandidateUsername
+                    CyberArkCandidateSource    = $bestCandidate.CandidateSource
+                    CyberArkAddress            = $cyberArkRecord.Address
+                    CyberArkCompositeKey       = $cyberArkRecord.CyberArkCompositeKey
+                    DuplicateGroupCount        = $cyberArkRecord.DuplicateGroupCount
+                    DuplicateOccurrence        = $cyberArkRecord.DuplicateOccurrence
+
+                    ADOriginalUsernameField    = $bestADRecord.OriginalADValue
+                    ADDerivedUsername          = $bestADRecord.DerivedUsername
+                    ADDerivedAddress           = $bestADRecord.DerivedAddress
+                    ADParseMethod              = $bestADRecord.ParseMethod
+                    ADParseWarning             = $bestADRecord.ParseWarning
+
+                    UsernameMatchMethod        = $bestEvaluation.UsernameMethod
+                    UsernameSimilarityPercent  = $bestEvaluation.SimilarityPercent
+                    AddressMatchMethod         = $bestEvaluation.AddressMethod
+                    MatchReason                = $bestEvaluation.MatchReason
+
+                    ADCandidatesConsidered     = $possibleADRecords.Count
+                    EqualBestADMatchCount      = $equalBestCount
+                    ReviewRequired             = $reviewRequired
                 }
             )
         }
         else {
             $candidateDisplay = @(
                 $usernameCandidates |
-                    Select-Object -ExpandProperty CandidateUsername -Unique
+                    Select-Object `
+                        -ExpandProperty CandidateUsername `
+                        -Unique
             ) -join ' | '
 
             $results.Add(
                 [PSCustomObject]@{
-                    RecordSource                = 'CyberArk'
-                    MatchStatus                 = 'Unmatched CyberArk'
-                    ConfidenceScore             = 0
-                    PresenceInCyberArk           = 'Yes'
-                    CyberArkAccountID            = $accountId
-                    CyberArkOriginalUsername     = $caUsername
-                    CyberArkMatchedCandidate     = $candidateDisplay
-                    CyberArkCandidateSource      = 'No matching candidate'
-                    CyberArkNormalizedCandidate  = ''
-                    CyberArkAddress              = $caAddress
-                    ADUsername                   = ''
-                    ADNormalizedUsername         = ''
-                    ADAddress                    = ''
-                    UsernameMatchMethod          = 'No match'
-                    UsernameSimilarityPercent    = 0
-                    AddressMatchMethod           = 'No match'
-                    MatchReason                  = 'No AD record met the username and address matching thresholds.'
-                    EqualBestMatchCount          = 0
-                    ReviewRequired               = 'Yes'
+                    RecordSource              = 'CyberArk'
+                    MatchStatus               = 'Unmatched CyberArk'
+                    ConfidenceScore           = 0
+                    PresenceInCyberArk         = 'Yes'
+
+                    CyberArkRecordID           = $cyberArkRecord.CyberArkRecordID
+                    CyberArkSourceRow          = $cyberArkRecord.SourceRow
+                    CyberArkOriginalUsername   = $cyberArkRecord.Username
+                    CyberArkMatchedCandidate   = $candidateDisplay
+                    CyberArkCandidateSource    = 'No matching candidate'
+                    CyberArkAddress            = $cyberArkRecord.Address
+                    CyberArkCompositeKey       = $cyberArkRecord.CyberArkCompositeKey
+                    DuplicateGroupCount        = $cyberArkRecord.DuplicateGroupCount
+                    DuplicateOccurrence        = $cyberArkRecord.DuplicateOccurrence
+
+                    ADOriginalUsernameField    = ''
+                    ADDerivedUsername          = ''
+                    ADDerivedAddress           = ''
+                    ADParseMethod              = ''
+                    ADParseWarning             = ''
+
+                    UsernameMatchMethod        = 'No match'
+                    UsernameSimilarityPercent  = 0
+                    AddressMatchMethod         = 'No match'
+                    MatchReason                = 'No AD record met the username and address matching thresholds.'
+
+                    ADCandidatesConsidered     = $possibleADRecords.Count
+                    EqualBestADMatchCount      = 0
+                    ReviewRequired             = 'Yes'
                 }
             )
         }
 
-        if (
-            ($processedAccounts % 100) -eq 0 -or
-            $processedAccounts -eq $seenAccountIds.Count
-        ) {
-            Write-Log -Message "Processed CyberArk accounts: $processedAccounts"
+        if (($processedCyberArkAccounts % 100) -eq 0) {
+            Write-Log `
+                -Message "Processed CyberArk records: $processedCyberArkAccounts of $($preparedCyberArkRecords.Count)"
         }
     }
 
     # --------------------------------------------------------
-    # Add AD accounts absent from CyberArk
+    # Add AD records absent from CyberArk
     # --------------------------------------------------------
 
     foreach ($adRecord in $adRecords) {
         if (-not $matchedADRecordNumbers.ContainsKey($adRecord.RecordNumber)) {
             $results.Add(
                 [PSCustomObject]@{
-                    RecordSource                = 'Active Directory'
-                    MatchStatus                 = 'Unmatched AD'
-                    ConfidenceScore             = 0
-                    PresenceInCyberArk           = 'No'
-                    CyberArkAccountID            = ''
-                    CyberArkOriginalUsername     = ''
-                    CyberArkMatchedCandidate     = ''
-                    CyberArkCandidateSource      = ''
-                    CyberArkNormalizedCandidate  = ''
-                    CyberArkAddress              = ''
-                    ADUsername                   = $adRecord.Username
-                    ADNormalizedUsername         = $adRecord.NormalizedUsername
-                    ADAddress                    = $adRecord.Address
-                    UsernameMatchMethod          = 'No match'
-                    UsernameSimilarityPercent    = 0
-                    AddressMatchMethod           = 'No match'
-                    MatchReason                  = 'No CyberArk Account ID matched this AD account.'
-                    EqualBestMatchCount          = 0
-                    ReviewRequired               = 'Yes'
+                    RecordSource              = 'Active Directory'
+                    MatchStatus               = 'Unmatched AD'
+                    ConfidenceScore           = 0
+                    PresenceInCyberArk         = 'No'
+
+                    CyberArkRecordID           = ''
+                    CyberArkSourceRow          = ''
+                    CyberArkOriginalUsername   = ''
+                    CyberArkMatchedCandidate   = ''
+                    CyberArkCandidateSource    = ''
+                    CyberArkAddress            = ''
+                    CyberArkCompositeKey       = ''
+                    DuplicateGroupCount        = ''
+                    DuplicateOccurrence        = ''
+
+                    ADOriginalUsernameField    = $adRecord.OriginalADValue
+                    ADDerivedUsername          = $adRecord.DerivedUsername
+                    ADDerivedAddress           = $adRecord.DerivedAddress
+                    ADParseMethod              = $adRecord.ParseMethod
+                    ADParseWarning             = $adRecord.ParseWarning
+
+                    UsernameMatchMethod        = 'No match'
+                    UsernameSimilarityPercent  = 0
+                    AddressMatchMethod         = 'No match'
+                    MatchReason                = 'No CyberArk CSV row matched this AD record.'
+
+                    ADCandidatesConsidered     = 0
+                    EqualBestADMatchCount      = 0
+                    ReviewRequired             = 'Yes'
                 }
             )
         }
     }
 
     # --------------------------------------------------------
-    # Export
+    # Export reports
     # --------------------------------------------------------
 
     $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
@@ -1300,6 +1587,18 @@ try {
         -Path $OutputFolder `
         -ChildPath "AD_CyberArk_Unmatched_$timestamp.csv"
 
+    $adParsedReportPath = Join-Path `
+        -Path $OutputFolder `
+        -ChildPath "AD_Parsed_Username_Address_$timestamp.csv"
+
+    $cyberArkPreparedReportPath = Join-Path `
+        -Path $OutputFolder `
+        -ChildPath "CyberArk_Prepared_Data_$timestamp.csv"
+
+    $summaryReportPath = Join-Path `
+        -Path $OutputFolder `
+        -ChildPath "AD_CyberArk_Summary_$timestamp.txt"
+
     $orderedResults = @(
         $results |
             Sort-Object `
@@ -1314,8 +1613,8 @@ try {
                         }
                     }
                 },
-                CyberArkAccountID,
-                ADUsername
+                CyberArkSourceRow,
+                ADDerivedUsername
     )
 
     $matchedResults = @(
@@ -1325,7 +1624,7 @@ try {
             }
     )
 
-    $likelyResults = @(
+    $likelyMatchedResults = @(
         $orderedResults |
             Where-Object {
                 $_.MatchStatus -eq 'Likely Matched'
@@ -1340,27 +1639,56 @@ try {
             }
     )
 
-    $orderedResults |
+    $resultColumns = @(
+        $orderedResults[0].PSObject.Properties.Name
+    )
+
+    Export-ResultSet `
+        -Data $orderedResults `
+        -Path $allReportPath `
+        -Columns $resultColumns
+
+    Export-ResultSet `
+        -Data $matchedResults `
+        -Path $matchedReportPath `
+        -Columns $resultColumns
+
+    Export-ResultSet `
+        -Data $likelyMatchedResults `
+        -Path $likelyReportPath `
+        -Columns $resultColumns
+
+    Export-ResultSet `
+        -Data $unmatchedResults `
+        -Path $unmatchedReportPath `
+        -Columns $resultColumns
+
+    $adRecords |
+        Select-Object `
+            RecordNumber,
+            OriginalADValue,
+            DerivedUsername,
+            DerivedAddress,
+            NormalizedUsername,
+            ParseMethod,
+            ParseWarning |
         Export-Csv `
-            -LiteralPath $allReportPath `
+            -LiteralPath $adParsedReportPath `
             -NoTypeInformation `
             -Encoding UTF8
 
-    $matchedResults |
+    $preparedCyberArkRecords |
+        Select-Object `
+            CyberArkRecordID,
+            SourceRow,
+            Username,
+            Address,
+            NormalizedAddress,
+            CyberArkCompositeKey,
+            DuplicateGroupCount,
+            DuplicateOccurrence |
         Export-Csv `
-            -LiteralPath $matchedReportPath `
-            -NoTypeInformation `
-            -Encoding UTF8
-
-    $likelyResults |
-        Export-Csv `
-            -LiteralPath $likelyReportPath `
-            -NoTypeInformation `
-            -Encoding UTF8
-
-    $unmatchedResults |
-        Export-Csv `
-            -LiteralPath $unmatchedReportPath `
+            -LiteralPath $cyberArkPreparedReportPath `
             -NoTypeInformation `
             -Encoding UTF8
 
@@ -1378,24 +1706,80 @@ try {
             }
     ).Count
 
-    Write-Host
-    Write-Log -Level 'SUCCESS' -Message 'Comparison completed successfully.'
-    Write-Log -Message "Unique CyberArk Account IDs : $($seenAccountIds.Count)"
-    Write-Log -Message "Duplicate Account IDs       : $duplicateAccountIds"
-    Write-Log -Message "Matched                     : $($matchedResults.Count)"
-    Write-Log -Message "Likely matched              : $($likelyResults.Count)"
-    Write-Log -Message "Unmatched CyberArk          : $unmatchedCyberArkCount"
-    Write-Log -Message "Unmatched AD                : $unmatchedADCount"
+    $duplicateCyberArkRowCount = @(
+        $preparedCyberArkRecords |
+            Where-Object {
+                $_.DuplicateGroupCount -gt 1
+            }
+    ).Count
+
+    $summary = @"
+CyberArk and Active Directory Account Comparison
+=================================================
+
+Run Date                         : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+
+CyberArk CSV                     : $CyberArkCsvPath
+AD CSV                           : $ADCsvPath
+
+CyberArk Source Rows             : $($preparedCyberArkRecords.Count)
+CyberArk Rows in Duplicate Groups: $duplicateCyberArkRowCount
+Actual CyberArk Account IDs      : Not supplied
+Generated CyberArk Record IDs    : CA-000001 through CA-$('{0:D6}' -f $preparedCyberArkRecords.Count)
+
+AD Source Rows                   : $($adRecords.Count)
+AD Parse Warnings                : $adParseWarningCount
+
+Matched                          : $($matchedResults.Count)
+Likely Matched                   : $($likelyMatchedResults.Count)
+Unmatched CyberArk               : $unmatchedCyberArkCount
+Unmatched AD                     : $unmatchedADCount
+
+Reports
+-------
+All Results                      : $allReportPath
+Matched                          : $matchedReportPath
+Likely Matched                   : $likelyReportPath
+Unmatched                        : $unmatchedReportPath
+Parsed AD Data                   : $adParsedReportPath
+Prepared CyberArk Data           : $cyberArkPreparedReportPath
+"@
+
+    Set-Content `
+        -LiteralPath $summaryReportPath `
+        -Value $summary `
+        -Encoding UTF8
+
+    # --------------------------------------------------------
+    # Completion summary
+    # --------------------------------------------------------
 
     Write-Host
-    Write-Host "All results    : $allReportPath"
-    Write-Host "Matched        : $matchedReportPath"
-    Write-Host "Likely matched : $likelyReportPath"
-    Write-Host "Unmatched      : $unmatchedReportPath"
+    Write-Log `
+        -Level 'SUCCESS' `
+        -Message 'Comparison completed successfully.'
+
+    Write-Log -Message "CyberArk rows          : $($preparedCyberArkRecords.Count)"
+    Write-Log -Message "Matched                : $($matchedResults.Count)"
+    Write-Log -Message "Likely matched         : $($likelyMatchedResults.Count)"
+    Write-Log -Message "Unmatched CyberArk     : $unmatchedCyberArkCount"
+    Write-Log -Message "Unmatched AD           : $unmatchedADCount"
+    Write-Log -Message "Duplicate-group rows   : $duplicateCyberArkRowCount"
+    Write-Log -Message "AD parse warnings      : $adParseWarningCount"
+
+    Write-Host
+    Write-Host "All results          : $allReportPath"
+    Write-Host "Matched              : $matchedReportPath"
+    Write-Host "Likely matched       : $likelyReportPath"
+    Write-Host "Unmatched            : $unmatchedReportPath"
+    Write-Host "Parsed AD data       : $adParsedReportPath"
+    Write-Host "Prepared CyberArk data: $cyberArkPreparedReportPath"
+    Write-Host "Summary              : $summaryReportPath"
     Write-Host
 }
 catch {
     Write-Host
     Write-Log -Level 'ERROR' -Message $_.Exception.Message
+    Write-Log -Level 'ERROR' -Message 'The comparison did not complete.'
     exit 1
 }
