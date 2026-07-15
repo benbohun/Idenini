@@ -1,2 +1,497 @@
-2026-07-15 12:38:12 | INFO  | Starting scheduled-task installation.
-2026-07-15 12:38:12 | ERROR | The installed migration script contains obsolete code 'Invoke-PASRestMethod'. Refusing to schedule 'I:\Script\IDENTITY Script New\Onbarding Project\Move-DisabledAccount.ps1'.
+<#
+.SYNOPSIS
+    Installs or replaces the daily scheduled task for Move-DisabledAccount.ps1.`n`n    Revision: 2026.07.15.3 - exact SHA-256 validation of the verified migration script.
+
+.DESCRIPTION
+    Creates a Windows Scheduled Task that runs the verified CyberArk disabled-account
+    migration script once per day without interactive confirmation.
+
+    The task:
+      - Runs whether the service account is logged on or not.
+      - Runs with highest privileges.
+      - Uses 64-bit Windows PowerShell 5.1.
+      - Starts as soon as possible if the scheduled time is missed.
+      - Prevents overlapping instances.
+      - Retries up to three times after a failure.
+      - Calls Move-DisabledAccount.ps1 directly with no -Execute argument because
+        execution is already the script's default behavior.
+      - Validates the exact SHA-256 of the verified migration build.`n      - Optionally removes legacy tasks that reference previous script filenames.
+
+.NOTES
+    PowerShell: Windows PowerShell 5.1
+    Default script:
+      I:\Script\IDENTITY Script New\Onbarding Project\Move-DisabledAccount.ps1
+
+    Default run-as account:
+      ACU\SVC_IAMCArkWinPrd
+#>
+
+[CmdletBinding()]
+param(
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]$TaskName = "CyberArk - Move Disabled Accounts Daily",
+
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]$TaskPath = "\",
+
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]$ScriptPath = "I:\Script\IDENTITY Script New\Onbarding Project\Move-DisabledAccount.ps1",
+
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]$RunAsUser = "ACU\SVC_IAMCArkWinPrd",
+
+    [Parameter()]
+    [ValidatePattern("^(?:[01]\d|2[0-3]):[0-5]\d$")]
+    [string]$DailyAt = "02:00",
+
+    [Parameter()]
+    [ValidateRange(1, 24)]
+    [int]$ExecutionTimeLimitHours = 6,
+
+    [Parameter()]
+    [ValidateRange(0, 10)]
+    [int]$RestartCount = 3,
+
+    [Parameter()]
+    [ValidateRange(1, 1440)]
+    [int]$RestartIntervalMinutes = 5,
+
+    [Parameter()]
+    [AllowEmptyString()]
+    [string]$ExpectedScriptVersion = "2026.07.15.11",
+
+    [Parameter()]
+    [AllowEmptyString()]
+    [string]$ExpectedScriptHash = "7D3CD8B1C53E254CA87D7346C6C7DD5A4395AE5966FBA95F3A7902C9880ACEAA",
+
+    [Parameter()]
+    [System.Management.Automation.PSCredential]$Credential,
+
+    [Parameter()]
+    [switch]$RunNow,
+
+    [Parameter()]
+    [switch]$KeepLegacyTasks
+)
+
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = "Stop"
+$ConfirmPreference = "None"
+
+function Write-InstallLog {
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet("INFO", "OK", "WARN", "ERROR")]
+        [string]$Level,
+
+        [Parameter(Mandatory)]
+        [string]$Message
+    )
+
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    Write-Host ("{0} | {1,-5} | {2}" -f $timestamp, $Level, $Message)
+}
+
+function Assert-Administrator {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $windowsPrincipal = New-Object Security.Principal.WindowsPrincipal($identity)
+    $administratorRole = [Security.Principal.WindowsBuiltInRole]::Administrator
+
+    if (-not $windowsPrincipal.IsInRole($administratorRole)) {
+        throw "Run this installer from Windows PowerShell 5.1 as Administrator."
+    }
+}
+
+function Normalize-TaskPath {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    $normalized = $Path.Trim()
+
+    if ([string]::IsNullOrWhiteSpace($normalized)) {
+        return "\"
+    }
+
+    if (-not $normalized.StartsWith("\")) {
+        $normalized = "\" + $normalized
+    }
+
+    if (-not $normalized.EndsWith("\")) {
+        $normalized += "\"
+    }
+
+    return $normalized
+}
+
+function Get-ObjectPropertyValue {
+    param(
+        [Parameter()]
+        $InputObject,
+
+        [Parameter(Mandatory)]
+        [string[]]$PropertyNames,
+
+        [Parameter()]
+        $DefaultValue = $null
+    )
+
+    if ($null -eq $InputObject) {
+        return $DefaultValue
+    }
+
+    if ($InputObject -is [System.Collections.IDictionary]) {
+        foreach ($propertyName in $PropertyNames) {
+            foreach ($key in @($InputObject.Keys)) {
+                if ([string]::Equals(
+                        [string]$key,
+                        [string]$propertyName,
+                        [System.StringComparison]::OrdinalIgnoreCase
+                    )) {
+                    return $InputObject[$key]
+                }
+            }
+        }
+    }
+
+    foreach ($propertyName in $PropertyNames) {
+        $property = $InputObject.PSObject.Properties |
+            Where-Object {
+                [string]::Equals(
+                    [string]$_.Name,
+                    [string]$propertyName,
+                    [System.StringComparison]::OrdinalIgnoreCase
+                )
+            } |
+            Select-Object -First 1
+
+        if ($null -ne $property) {
+            return $property.Value
+        }
+    }
+
+    return $DefaultValue
+}
+
+function Get-TaskActionText {
+    param(
+        [Parameter(Mandatory)]
+        $Task
+    )
+
+    $parts = @()
+    $actions = Get-ObjectPropertyValue `
+        -InputObject $Task `
+        -PropertyNames @("Actions") `
+        -DefaultValue @()
+
+    foreach ($action in @($actions)) {
+        if ($null -eq $action) {
+            continue
+        }
+
+        foreach ($propertyName in @(
+                "Execute",
+                "Arguments",
+                "WorkingDirectory",
+                "ClassId",
+                "Data"
+            )) {
+            $value = Get-ObjectPropertyValue `
+                -InputObject $action `
+                -PropertyNames @($propertyName) `
+                -DefaultValue ""
+
+            if (-not [string]::IsNullOrWhiteSpace([string]$value)) {
+                $parts += [string]$value
+            }
+        }
+    }
+
+    return ($parts -join " ")
+}
+
+function Remove-LegacyMigrationTasks {
+    param(
+        [Parameter(Mandatory)]
+        [string]$CurrentTaskName,
+
+        [Parameter(Mandatory)]
+        [string]$CurrentTaskPath
+    )
+
+    $legacyPattern = "(?i)(Move-Disabled1331Accounts|Invoke-Disabled1331DailyTask|Move-DisabledINDAccount|Move-DisabledAccount-v20\d{2})"
+    $currentIdentity = "$CurrentTaskPath$CurrentTaskName"
+
+    $tasks = @(Get-ScheduledTask -ErrorAction SilentlyContinue)
+
+    foreach ($task in $tasks) {
+        $taskIdentity = "$($task.TaskPath)$($task.TaskName)"
+        $actionText = Get-TaskActionText -Task $task
+
+        if (($taskIdentity -ne $currentIdentity) -and ($actionText -match $legacyPattern)) {
+            Write-InstallLog -Level "WARN" -Message "Removing legacy scheduled task '$taskIdentity'."
+            Unregister-ScheduledTask `
+                -TaskName $task.TaskName `
+                -TaskPath $task.TaskPath `
+                -Confirm:$false `
+                -ErrorAction Stop
+        }
+    }
+}
+
+try {
+    Write-InstallLog -Level "INFO" -Message "Starting scheduled-task installation."
+
+    Assert-Administrator
+
+    $TaskPath = Normalize-TaskPath -Path $TaskPath
+    $ScriptPath = [System.IO.Path]::GetFullPath($ScriptPath)
+    $workingDirectory = Split-Path -Path $ScriptPath -Parent
+
+    if (-not (Test-Path -LiteralPath $ScriptPath -PathType Leaf)) {
+        throw "Migration script was not found: '$ScriptPath'."
+    }
+
+    if (-not (Test-Path -LiteralPath $workingDirectory -PathType Container)) {
+        throw "Working directory was not found: '$workingDirectory'."
+    }
+
+    $scriptContent = Get-Content -LiteralPath $ScriptPath -Raw -ErrorAction Stop
+    $scriptHash = (Get-FileHash -LiteralPath $ScriptPath -Algorithm SHA256).Hash.ToUpperInvariant()
+
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedScriptHash)) {
+        $normalizedExpectedHash = $ExpectedScriptHash.Replace(" ", "").ToUpperInvariant()
+
+        if (-not [string]::Equals(
+                $scriptHash,
+                $normalizedExpectedHash,
+                [System.StringComparison]::OrdinalIgnoreCase
+            )) {
+            throw "Migration script hash mismatch. Actual='$scriptHash'; Expected='$normalizedExpectedHash'; Path='$ScriptPath'."
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedScriptVersion)) {
+        if ($scriptContent.IndexOf(
+                $ExpectedScriptVersion,
+                [System.StringComparison]::OrdinalIgnoreCase
+            ) -lt 0) {
+            throw "The migration script does not contain expected version '$ExpectedScriptVersion'."
+        }
+    }
+
+    Write-InstallLog -Level "OK" -Message "Validated migration script: '$ScriptPath'."
+    Write-InstallLog -Level "INFO" -Message "Migration script SHA-256: $scriptHash"
+
+    $powerShellExe = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+
+    if (-not (Test-Path -LiteralPath $powerShellExe -PathType Leaf)) {
+        throw "Windows PowerShell executable was not found: '$powerShellExe'."
+    }
+
+    if (-not $KeepLegacyTasks) {
+        Remove-LegacyMigrationTasks `
+            -CurrentTaskName $TaskName `
+            -CurrentTaskPath $TaskPath
+    }
+
+    $hour = [int]$DailyAt.Substring(0, 2)
+    $minute = [int]$DailyAt.Substring(3, 2)
+    $triggerTime = (Get-Date).Date.AddHours($hour).AddMinutes($minute)
+
+    $actionArguments = "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$ScriptPath`""
+
+    $action = New-ScheduledTaskAction `
+        -Execute $powerShellExe `
+        -Argument $actionArguments `
+        -WorkingDirectory $workingDirectory
+
+    $trigger = New-ScheduledTaskTrigger `
+        -Daily `
+        -At $triggerTime
+
+    $settings = New-ScheduledTaskSettingsSet `
+        -StartWhenAvailable `
+        -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries `
+        -MultipleInstances IgnoreNew `
+        -ExecutionTimeLimit (New-TimeSpan -Hours $ExecutionTimeLimitHours) `
+        -RestartCount $RestartCount `
+        -RestartInterval (New-TimeSpan -Minutes $RestartIntervalMinutes)
+
+    $principal = New-ScheduledTaskPrincipal `
+        -UserId $RunAsUser `
+        -LogonType Password `
+        -RunLevel Highest
+
+    $description = @"
+Runs the CyberArk disabled IND-account retirement workflow daily.
+Script: $ScriptPath
+Validated script SHA-256 at installation: $scriptHash
+The migration script executes by default with no additional confirmation.
+"@
+
+    $taskDefinition = New-ScheduledTask `
+        -Action $action `
+        -Trigger $trigger `
+        -Settings $settings `
+        -Principal $principal `
+        -Description $description
+
+    if ($null -eq $Credential) {
+        Write-InstallLog -Level "INFO" -Message "Enter the password for scheduled-task account '$RunAsUser'."
+        $Credential = Get-Credential `
+            -UserName $RunAsUser `
+            -Message "Enter the password for $RunAsUser"
+    }
+
+    if ($null -eq $Credential) {
+        throw "A credential is required to register the task."
+    }
+
+    if ($Credential.UserName -and ($Credential.UserName -ne $RunAsUser)) {
+        throw "The supplied credential username '$($Credential.UserName)' does not match RunAsUser '$RunAsUser'."
+    }
+
+    $plainPassword = $Credential.GetNetworkCredential().Password
+
+    if ([string]::IsNullOrWhiteSpace($plainPassword)) {
+        throw "The supplied service-account password is empty."
+    }
+
+    Write-InstallLog -Level "INFO" -Message "Registering task '$TaskPath$TaskName'."
+
+    Register-ScheduledTask `
+        -TaskName $TaskName `
+        -TaskPath $TaskPath `
+        -InputObject $taskDefinition `
+        -User $RunAsUser `
+        -Password $plainPassword `
+        -Force `
+        -ErrorAction Stop | Out-Null
+
+    $plainPassword = $null
+    $Credential = $null
+
+    $registeredTask = Get-ScheduledTask `
+        -TaskName $TaskName `
+        -TaskPath $TaskPath `
+        -ErrorAction Stop
+
+    $registeredActions = Get-ObjectPropertyValue `
+        -InputObject $registeredTask `
+        -PropertyNames @("Actions") `
+        -DefaultValue @()
+
+    $registeredAction = @($registeredActions) | Select-Object -First 1
+
+    if ($null -eq $registeredAction) {
+        throw "Task verification failed: no action was returned for '$TaskPath$TaskName'."
+    }
+
+    $registeredExecute = [string](Get-ObjectPropertyValue `
+        -InputObject $registeredAction `
+        -PropertyNames @("Execute") `
+        -DefaultValue "")
+
+    $registeredArguments = [string](Get-ObjectPropertyValue `
+        -InputObject $registeredAction `
+        -PropertyNames @("Arguments") `
+        -DefaultValue "")
+
+    $registeredWorkingDirectory = [string](Get-ObjectPropertyValue `
+        -InputObject $registeredAction `
+        -PropertyNames @("WorkingDirectory") `
+        -DefaultValue "")
+
+    $registeredPrincipal = Get-ObjectPropertyValue `
+        -InputObject $registeredTask `
+        -PropertyNames @("Principal")
+
+    $registeredUserId = [string](Get-ObjectPropertyValue `
+        -InputObject $registeredPrincipal `
+        -PropertyNames @("UserId") `
+        -DefaultValue "")
+
+    if (-not [string]::Equals(
+            $registeredExecute,
+            $powerShellExe,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )) {
+        throw "Task verification failed: unexpected executable '$registeredExecute'."
+    }
+
+    if ($registeredArguments.IndexOf(
+            $ScriptPath,
+            [System.StringComparison]::OrdinalIgnoreCase
+        ) -lt 0) {
+        throw "Task verification failed: the action does not reference '$ScriptPath'."
+    }
+
+    if (-not [string]::Equals(
+            $registeredUserId,
+            $RunAsUser,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )) {
+        throw "Task verification failed: principal is '$registeredUserId', expected '$RunAsUser'."
+    }
+
+    Write-InstallLog -Level "OK" -Message "Scheduled task installed successfully."
+    Write-InstallLog -Level "INFO" -Message "Task              : $TaskPath$TaskName"
+    Write-InstallLog -Level "INFO" -Message "Schedule          : Daily at $DailyAt"
+    Write-InstallLog -Level "INFO" -Message "Run as            : $RunAsUser"
+    Write-InstallLog -Level "INFO" -Message "Executable        : $registeredExecute"
+    Write-InstallLog -Level "INFO" -Message "Arguments         : $registeredArguments"
+    Write-InstallLog -Level "INFO" -Message "Working directory : $registeredWorkingDirectory"
+
+    if ($RunNow) {
+        Write-InstallLog -Level "INFO" -Message "Starting the scheduled task now."
+
+        Start-ScheduledTask `
+            -TaskName $TaskName `
+            -TaskPath $TaskPath `
+            -ErrorAction Stop
+
+        Start-Sleep -Seconds 3
+
+        $taskInfo = Get-ScheduledTaskInfo `
+            -TaskName $TaskName `
+            -TaskPath $TaskPath `
+            -ErrorAction Stop
+
+        Write-InstallLog -Level "OK" -Message "Task start request submitted."
+        Write-InstallLog -Level "INFO" -Message "Last run time      : $($taskInfo.LastRunTime)"
+        Write-InstallLog -Level "INFO" -Message "Last task result   : $($taskInfo.LastTaskResult)"
+        Write-InstallLog -Level "INFO" -Message "Next run time      : $($taskInfo.NextRunTime)"
+    }
+    else {
+        $taskInfo = Get-ScheduledTaskInfo `
+            -TaskName $TaskName `
+            -TaskPath $TaskPath `
+            -ErrorAction Stop
+
+        Write-InstallLog -Level "INFO" -Message "Next run time      : $($taskInfo.NextRunTime)"
+    }
+
+    Write-InstallLog -Level "OK" -Message "Installation completed."
+    exit 0
+}
+catch {
+    Write-InstallLog -Level "ERROR" -Message $_.Exception.Message
+    exit 1
+}
+finally {
+    if (Get-Variable -Name plainPassword -Scope Local -ErrorAction SilentlyContinue) {
+        $plainPassword = $null
+    }
+
+    if (Get-Variable -Name Credential -Scope Local -ErrorAction SilentlyContinue) {
+        $Credential = $null
+    }
+}
