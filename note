@@ -31,6 +31,7 @@
     CSV Prop:<name> columns that are not defined on the target platform are ignored and logged.
     Required Address/Username platform values are satisfied from TargetAddress/TargetUserName when present.
     Direct CSV columns credentialType and mtbAppCode are sent as target platform account properties when supplied.
+    Single-field PATCH requests are explicitly preserved as JSON arrays for Windows PowerShell 5.1 compatibility.
 
 .EXAMPLE
     .\Update-VaultedAccounts.ps1 -Environment dev
@@ -449,23 +450,55 @@ function Get-Sha256Fingerprint {
 
 function Get-WebErrorText {
     <#
-        Extracts API error response text when available.
+        Extracts the HTTP status and CyberArk API response body when available.
+        ErrorDetails.Message is checked first because Windows PowerShell may have
+        already consumed the underlying response stream.
     #>
     param([System.Management.Automation.ErrorRecord]$ErrorRecord)
 
-    $msg = $ErrorRecord.Exception.Message
+    $parts = New-Object System.Collections.Generic.List[string]
+
+    if ($null -ne $ErrorRecord.Exception -and -not (Test-BlankValue $ErrorRecord.Exception.Message)) {
+        [void]$parts.Add($ErrorRecord.Exception.Message)
+    }
+
     $response = $ErrorRecord.Exception.Response
 
     if ($null -ne $response) {
+        try {
+            $statusCode = [int]$response.StatusCode
+            $statusDescription = [string]$response.StatusDescription
+
+            if (-not (Test-BlankValue $statusDescription)) {
+                [void]$parts.Add("HTTPStatus=$statusCode $statusDescription")
+            }
+            else {
+                [void]$parts.Add("HTTPStatus=$statusCode")
+            }
+        }
+        catch {
+            # Status details are optional. Preserve the original exception.
+        }
+    }
+
+    $body = $null
+
+    if ($null -ne $ErrorRecord.ErrorDetails -and -not (Test-BlankValue $ErrorRecord.ErrorDetails.Message)) {
+        $body = [string]$ErrorRecord.ErrorDetails.Message
+    }
+
+    if ((Test-BlankValue $body) -and $null -ne $response) {
         try {
             $stream = $response.GetResponseStream()
 
             if ($null -ne $stream) {
                 $reader = New-Object System.IO.StreamReader($stream)
-                $body = $reader.ReadToEnd()
 
-                if (-not (Test-BlankValue $body)) {
-                    $msg = "$msg | Response: $body"
+                try {
+                    $body = $reader.ReadToEnd()
+                }
+                finally {
+                    $reader.Dispose()
                 }
             }
         }
@@ -474,7 +507,15 @@ function Get-WebErrorText {
         }
     }
 
-    return $msg
+    if (-not (Test-BlankValue $body)) {
+        [void]$parts.Add("Response=$body")
+    }
+
+    if ($parts.Count -eq 0) {
+        return 'Unknown web request error.'
+    }
+
+    return ($parts -join ' | ')
 }
 
 function Get-IdentityBearerToken {
@@ -567,7 +608,10 @@ function Invoke-CyberArkRest {
             $params['Body'] = $Body
         }
         else {
-            $params['Body'] = ($Body | ConvertTo-Json -Depth 30 -Compress)
+            # Do not pipe the object to ConvertTo-Json. In Windows PowerShell 5.1,
+            # pipeline enumeration can unwrap a one-item JSON Patch array and turn
+            # it into a JSON object, which CyberArk rejects with HTTP 400.
+            $params['Body'] = ConvertTo-Json -InputObject $Body -Depth 30 -Compress
         }
     }
 
@@ -1272,7 +1316,10 @@ function New-PatchBody {
         $ops += @{ op = 'replace'; path = '/secretManagement/manualManagementReason'; value = '' }
     }
 
-    return $ops
+    # Prevent Windows PowerShell from unrolling a one-operation array into
+    # a scalar hashtable. CyberArk PATCH requires a JSON array even when only
+    # one field, such as /userName, is being updated.
+    Write-Output -NoEnumerate $ops
 }
 
 function New-AccountCreateBody {
@@ -1404,7 +1451,12 @@ function Add-DeleteCandidateRow {
 
 function Invoke-AccountPatch {
     <#
-        Sends PATCH operations to an account.
+        Sends JSON Patch operations to an account.
+
+        The body is serialized here and passed to the common REST wrapper as a
+        string. This guarantees that a username-only update is sent as:
+            [{"op":"replace","path":"/userName","value":"..."}]
+        rather than as a single JSON object.
     #>
     param(
         [string]$AccountId,
@@ -1412,13 +1464,23 @@ function Invoke-AccountPatch {
         [string]$Token
     )
 
-    if ($PatchOps.Count -eq 0) {
+    $normalizedOps = [object[]]@($PatchOps)
+
+    if ($normalizedOps.Count -eq 0) {
         return $null
     }
 
     $id = [System.Uri]::EscapeDataString($AccountId)
+    $jsonBody = ConvertTo-Json -InputObject $normalizedOps -Depth 30 -Compress
 
-    return Invoke-CyberArkRest -Method PATCH -Path "Accounts/$id/" -Token $Token -Body $PatchOps
+    Write-RunLog 'Invoke-AccountPatch' "AccountID=$AccountId OperationCount=$($normalizedOps.Count) Payload=$jsonBody" 'INFO'
+
+    return Invoke-CyberArkRest `
+        -Method PATCH `
+        -Path "Accounts/$id/" `
+        -Token $Token `
+        -Body $jsonBody `
+        -ContentType 'application/json'
 }
 
 function Invoke-SafeMoveCreate {
@@ -1606,7 +1668,7 @@ function Invoke-RowUpdate {
     $targetPlatformId = Get-RowValue -Row $CsvRow -Names @('TargetPlatformID','Target Platform ID','Migrated Platform ID','New Platform ID','PlatformID')
     $targetName = Get-RowValue -Row $CsvRow -Names @('TargetName','Target Name','Migrated Name','New Name','Name')
     $targetAddress = Get-RowValue -Row $CsvRow -Names @('TargetAddress','Target Address','Migrated Target system address','New Address','Address')
-    $targetUserName = Get-RowValue -Row $CsvRow -Names @('TargetUserName','Target UserName','Target Username','Migrated Target system user name','New UserName','UserName')
+    $targetUserName = Get-RowValue -Row $CsvRow -Names @('TargetUserName','Target UserName','Target Username','Migrated Target system user name','New UserName','UserName','Username')
 
     $enableMgmtRaw = Get-RowValue -Row $CsvRow -Names @('AutomaticManagementEnabled','Automatic Management Enabled')
     $disableMgmtRaw = Get-RowValue -Row $CsvRow -Names @('DisableAutomaticManagement','Disable Automatic Management')
