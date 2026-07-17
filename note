@@ -1,21 +1,24 @@
-
-Based on the logging pattern below for account report, i need a script to generate a report of account linked to
-Database platforms, the report should include accounts with extended properties like Port, database name and other properties
-
-
 <#
 .SYNOPSIS
-    CNA Privilege Cloud Account Report with Account ID
+    CNA Privilege Cloud database account report with extended properties.
 
 .DESCRIPTION
-    - Authenticates to CNA Privilege Cloud using CCP + psPAS Identity Header
-    - Retrieves all accounts visible to the service account
-    - Exports account inventory report
-    - Places CyberArk Account ID directly in the CSV output
+    - Authenticates to CNA Privilege Cloud using CCP + psPAS Identity Header.
+    - Retrieves the regular account-platform inventory.
+    - Identifies database platforms by platform metadata and optional explicit overrides.
+    - Retrieves all visible accounts and keeps accounts assigned to database platforms.
+    - Optionally retrieves the full details of every matching account.
+    - Exports common database fields such as Port, DatabaseName, InstanceName,
+      ServiceName, SID, Schema, DSN, and ConnectionString.
+    - Dynamically creates one CSV column for every populated platform account property.
+    - Exports a second CSV listing the database platforms used for the report.
 
 .NOTES
     This script is report-only.
-    It does not retrieve, change, rotate, verify, reconcile, add, update, or remove accounts.
+    It never retrieves account passwords, keys, or secret values.
+    It does not add, update, verify, reconcile, change, rotate, move, or delete accounts.
+
+    PowerShell compatibility: Windows PowerShell 5.1+
 #>
 
 [CmdletBinding()]
@@ -34,12 +37,36 @@ param(
     [bool]$CCPWindowsAuth      = $false,
 
     # ===== Output paths =====
-    [string]$OutputFolder      = 'E:\Installation Media\Script\OnboardScript\data',
-    [string]$AccountCsvName    = 'AccountReport_WithAccountID.csv',
-    [string]$LogFileName       = 'AccountReport_WithAccountID.log',
+    [string]$OutputFolder           = 'E:\Installation Media\Script\OnboardScript\data',
+    [string]$AccountCsvName         = 'DatabaseAccountReport_ExtendedProperties.csv',
+    [string]$PlatformCsvName        = 'DatabasePlatformInventory.csv',
+    [string]$LogFileName            = 'DatabaseAccountReport.log',
 
     # ===== Retrieval settings =====
-    [int]$PageLimit            = 1000
+    [ValidateRange(1, 1000)]
+    [int]$PageLimit = 1000,
+
+    [bool]$RetrieveFullAccountDetails = $true,
+
+    [ValidateRange(1, 10)]
+    [int]$ApiRetryCount = 3,
+
+    [ValidateRange(0, 60)]
+    [int]$ApiRetryDelaySeconds = 2,
+
+    [ValidateRange(0, 60000)]
+    [int]$AccountDetailDelayMilliseconds = 0,
+
+    # ===== Database platform detection =====
+    # The pattern is checked against platform SystemType, PlatformID, Name,
+    # PlatformBaseID, and Description. Customize it for your tenant if needed.
+    [string]$DatabasePlatformPattern = '(?i)(database|oracle|sql\s*server|sqlserver|mssql|db2|sybase|adaptive\s*server|mysql|mariadb|postgres|postgresql|informix|mongodb|mongo|cassandra|teradata|snowflake|redshift|vertica|hana|sap\s*hana|cosmos\s*db|dynamodb|redis|couchbase|neo4j)',
+
+    # Explicitly include custom database platforms that do not match the pattern.
+    [string[]]$IncludePlatformID = @(),
+
+    # Explicitly exclude platforms that match the pattern but are not databases.
+    [string[]]$ExcludePlatformID = @()
 )
 
 # ============================================
@@ -54,14 +81,22 @@ $ProgressPreference    = 'SilentlyContinue'
 # Paths
 # ============================================
 
-if (-not (Test-Path -Path $OutputFolder)) {
+if (-not (Test-Path -LiteralPath $OutputFolder)) {
     New-Item -ItemType Directory -Path $OutputFolder -Force | Out-Null
 }
 
-$LogFile        = Join-Path $OutputFolder $LogFileName
-$AccountCsvPath = Join-Path $OutputFolder $AccountCsvName
+$LogFile         = Join-Path $OutputFolder $LogFileName
+$AccountCsvPath  = Join-Path $OutputFolder $AccountCsvName
+$PlatformCsvPath = Join-Path $OutputFolder $PlatformCsvName
 
 New-Item -ItemType File -Force -Path $LogFile | Out-Null
+
+# Remove previous CSV outputs so an empty current run cannot leave stale data behind.
+foreach ($existingCsv in @($AccountCsvPath, $PlatformCsvPath)) {
+    if (Test-Path -LiteralPath $existingCsv) {
+        Remove-Item -LiteralPath $existingCsv -Force
+    }
+}
 
 # ============================================
 # Logger
@@ -75,7 +110,7 @@ function Write-Log {
         [ConsoleColor]$Color = 'White'
     )
 
-    $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $ts   = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     $line = "$ts - $Message"
 
     Write-Host $line -ForegroundColor $Color
@@ -83,7 +118,7 @@ function Write-Log {
 }
 
 # ============================================
-# Helper: Normalize Identity Tenant URL
+# Generic Helpers
 # ============================================
 
 function Get-NormalizedIdentityTenant {
@@ -101,13 +136,8 @@ function Get-NormalizedIdentityTenant {
     return $normalized.TrimEnd('/')
 }
 
-# ============================================
-# Helper: Safely get object property
-# ============================================
-
 function Get-ObjectPropertyValue {
     param(
-        [Parameter(Mandatory)]
         [object]$InputObject,
 
         [Parameter(Mandatory)]
@@ -118,26 +148,31 @@ function Get-ObjectPropertyValue {
         return $null
     }
 
+    if ($InputObject -is [System.Collections.IDictionary]) {
+        foreach ($propName in $PropertyNames) {
+            if ($InputObject.Contains($propName)) {
+                return $InputObject[$propName]
+            }
+        }
+    }
+
     foreach ($propName in $PropertyNames) {
-        if ($InputObject.PSObject.Properties.Name -contains $propName) {
-            return $InputObject.$propName
+        $property = $InputObject.PSObject.Properties[$propName]
+
+        if ($null -ne $property) {
+            return $property.Value
         }
     }
 
     return $null
 }
 
-# ============================================
-# Helper: Safely get nested object property
-# ============================================
-
 function Get-NestedPropertyValue {
     param(
-        [Parameter(Mandatory)]
         [object]$InputObject,
 
         [Parameter(Mandatory)]
-        [string]$ParentProperty,
+        [string[]]$ParentProperties,
 
         [Parameter(Mandatory)]
         [string[]]$ChildProperties
@@ -147,28 +182,14 @@ function Get-NestedPropertyValue {
         return $null
     }
 
-    if (-not ($InputObject.PSObject.Properties.Name -contains $ParentProperty)) {
-        return $null
-    }
-
-    $parent = $InputObject.$ParentProperty
+    $parent = Get-ObjectPropertyValue -InputObject $InputObject -PropertyNames $ParentProperties
 
     if ($null -eq $parent) {
         return $null
     }
 
-    foreach ($child in $ChildProperties) {
-        if ($parent.PSObject.Properties.Name -contains $child) {
-            return $parent.$child
-        }
-    }
-
-    return $null
+    return Get-ObjectPropertyValue -InputObject $parent -PropertyNames $ChildProperties
 }
-
-# ============================================
-# Helper: Convert values to report-safe text
-# ============================================
 
 function Convert-ToReportValue {
     param(
@@ -179,28 +200,24 @@ function Convert-ToReportValue {
         return ''
     }
 
-    if ($Value -is [string]) {
-        return $Value
-    }
-
-    if ($Value -is [bool]) {
-        return $Value
-    }
-
-    if ($Value -is [int] -or $Value -is [long] -or $Value -is [decimal]) {
+    if ($Value -is [string] -or
+        $Value -is [bool] -or
+        $Value -is [byte] -or
+        $Value -is [int16] -or
+        $Value -is [int32] -or
+        $Value -is [int64] -or
+        $Value -is [single] -or
+        $Value -is [double] -or
+        $Value -is [decimal]) {
         return $Value
     }
 
     try {
-        return ($Value | ConvertTo-Json -Compress -Depth 10)
+        return ($Value | ConvertTo-Json -Compress -Depth 20)
     } catch {
         return [string]$Value
     }
 }
-
-# ============================================
-# Helper: Convert CyberArk epoch time if possible
-# ============================================
 
 function Convert-CyberArkTime {
     param(
@@ -211,10 +228,25 @@ function Convert-CyberArkTime {
         return ''
     }
 
+    # Preserve values already returned as DateTime objects.
+    if ($Value -is [DateTime]) {
+        return $Value.ToString('yyyy-MM-dd HH:mm:ss')
+    }
+
+    # Preserve ISO-style timestamps returned by some API versions.
+    $parsedDate = [DateTime]::MinValue
+    if ([DateTime]::TryParse([string]$Value, [ref]$parsedDate)) {
+        return $parsedDate.ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss')
+    }
+
     try {
         $raw = [Int64]$Value
 
-        # CyberArk APIs may return epoch seconds or milliseconds depending on field/version.
+        if ($raw -le 0) {
+            return ''
+        }
+
+        # CyberArk fields can be Unix seconds or milliseconds.
         if ($raw -gt 999999999999) {
             $dt = [DateTimeOffset]::FromUnixTimeMilliseconds($raw).LocalDateTime
         } else {
@@ -225,6 +257,120 @@ function Convert-CyberArkTime {
     } catch {
         return [string]$Value
     }
+}
+
+function ConvertTo-PropertyMap {
+    param(
+        [object]$InputObject
+    )
+
+    # PowerShell hashtables are case-insensitive by default.
+    $map = @{}
+
+    if ($null -eq $InputObject) {
+        return $map
+    }
+
+    if ($InputObject -is [System.Collections.IDictionary]) {
+        foreach ($key in $InputObject.Keys) {
+            if ($null -ne $key) {
+                $map[[string]$key] = $InputObject[$key]
+            }
+        }
+
+        return $map
+    }
+
+    foreach ($property in $InputObject.PSObject.Properties) {
+        $map[$property.Name] = $property.Value
+    }
+
+    return $map
+}
+
+function Get-MapValueByAlias {
+    param(
+        [hashtable]$Map,
+
+        [Parameter(Mandatory)]
+        [string[]]$Aliases
+    )
+
+    if ($null -eq $Map) {
+        return ''
+    }
+
+    foreach ($alias in $Aliases) {
+        if ($Map.ContainsKey($alias)) {
+            return Convert-ToReportValue $Map[$alias]
+        }
+    }
+
+    return ''
+}
+
+function ConvertTo-SafeColumnName {
+    param(
+        [Parameter(Mandatory)]
+        [string]$PropertyName
+    )
+
+    $safeName = $PropertyName.Trim()
+    $safeName = $safeName -replace '[^a-zA-Z0-9_]', '_'
+    $safeName = $safeName -replace '_+', '_'
+    $safeName = $safeName.Trim('_')
+
+    if ([string]::IsNullOrWhiteSpace($safeName)) {
+        $safeName = 'UnnamedProperty'
+    }
+
+    return "Property_$safeName"
+}
+
+function Join-PropertyDefinitionNames {
+    param(
+        [object]$DefinitionCollection
+    )
+
+    if ($null -eq $DefinitionCollection) {
+        return ''
+    }
+
+    $names = New-Object System.Collections.Generic.List[string]
+
+    foreach ($definition in @($DefinitionCollection)) {
+        if ($definition -is [string]) {
+            $name = [string]$definition
+        } else {
+            $name = Get-ObjectPropertyValue -InputObject $definition -PropertyNames @('name', 'Name')
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace([string]$name)) {
+            $names.Add([string]$name)
+        }
+    }
+
+    return (($names | Sort-Object -Unique) -join ';')
+}
+
+function Test-StringInList {
+    param(
+        [string]$Value,
+        [string[]]$List
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value) -or $null -eq $List) {
+        return $false
+    }
+
+    foreach ($item in $List) {
+        if (-not [string]::IsNullOrWhiteSpace($item) -and
+            [string]::Equals($Value, $item.Trim(), [StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+    }
+
+    return $false
 }
 
 # ============================================
@@ -238,7 +384,7 @@ try {
     if ($psPASModule) {
         Write-Log ("psPAS module loaded. Version: {0}" -f $psPASModule.Version) 'Green'
     } else {
-        Write-Log "psPAS module loaded." 'Green'
+        Write-Log 'psPAS module loaded.' 'Green'
     }
 } catch {
     Write-Log ("ERROR: Failed to import psPAS module. {0}" -f $_.Exception.Message) 'Red'
@@ -250,8 +396,8 @@ try {
 # ============================================
 
 if (-not (Get-Command Get-IdentityHeader -ErrorAction SilentlyContinue)) {
-    Write-Log "ERROR: Get-IdentityHeader cmdlet was not found. Confirm IdentityCommand module is installed and available." 'Red'
-    throw "Get-IdentityHeader cmdlet not found."
+    Write-Log 'ERROR: Get-IdentityHeader cmdlet was not found. Confirm IdentityCommand module is installed and available.' 'Red'
+    throw 'Get-IdentityHeader cmdlet not found.'
 }
 
 # ============================================
@@ -273,6 +419,9 @@ function Start-PASSessionFromCCP {
     Write-Log ("Retrieving CyberArk API credentials from CCP using Object='{0}'..." -f $ObjectName) 'Cyan'
     Write-Log ("CCP URL: {0}" -f $ccpUrl) 'Gray'
 
+    $resp       = $null
+    $securePass = $null
+
     try {
         $resp = Invoke-RestMethod `
             -Uri $ccpUrl `
@@ -289,15 +438,9 @@ function Start-PASSessionFromCCP {
         throw
     }
 
-    $resolvedUser = $null
+    $resolvedUser = Get-ObjectPropertyValue -InputObject $resp -PropertyNames @('Username', 'UserName')
 
-    if ($resp.PSObject.Properties.Name -contains 'Username') {
-        $resolvedUser = [string]$resp.Username
-    } elseif ($resp.PSObject.Properties.Name -contains 'UserName') {
-        $resolvedUser = [string]$resp.UserName
-    }
-
-    if ([string]::IsNullOrWhiteSpace($resolvedUser)) {
+    if ([string]::IsNullOrWhiteSpace([string]$resolvedUser)) {
         throw 'CCP returned password but no Username/UserName field.'
     }
 
@@ -307,7 +450,7 @@ function Start-PASSessionFromCCP {
         $normalizedTenant = Get-NormalizedIdentityTenant -TenantUrl $IdentityTenantURL
 
         $securePass = ConvertTo-SecureString $resp.Content -AsPlainText -Force
-        $credential = [PSCredential]::new($resolvedUser, $securePass)
+        $credential = New-Object System.Management.Automation.PSCredential($resolvedUser, $securePass)
 
         Write-Log ("Requesting CyberArk PAS authentication using psPAS Identity header as {0}..." -f $resolvedUser) 'Cyan'
         Write-Log ("IdentityTenantURL passed to Get-IdentityHeader: {0}" -f $normalizedTenant) 'Gray'
@@ -330,21 +473,59 @@ function Start-PASSessionFromCCP {
         Write-Log ("ERROR: Failed to authenticate via psPAS Identity header. {0}" -f $_.Exception.Message) 'Red'
         throw
     } finally {
-        if ($resp.PSObject.Properties.Name -contains 'Content') {
+        if ($null -ne $resp -and $null -ne $resp.PSObject.Properties['Content']) {
             $resp.Content = $null
         }
 
-        if ($securePass) {
+        if ($null -ne $securePass) {
             $securePass.Dispose()
         }
     }
 
-    return $resolvedUser
+    return [string]$resolvedUser
 }
 
 # ============================================
-# Retrieve All Accounts
+# PAS API Helpers
 # ============================================
+
+function Invoke-PASGetWithRetry {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Uri,
+
+        [string]$OperationName = 'PAS API GET'
+    )
+
+    if (-not (Get-Command Invoke-PASRestMethod -ErrorAction SilentlyContinue)) {
+        throw 'Invoke-PASRestMethod cmdlet was not found in the installed psPAS module.'
+    }
+
+    $lastError = $null
+
+    for ($attempt = 1; $attempt -le $ApiRetryCount; $attempt++) {
+        try {
+            return Invoke-PASRestMethod -Uri $Uri -Method GET -ErrorAction Stop
+        } catch {
+            $lastError = $_
+
+            if ($attempt -lt $ApiRetryCount) {
+                Write-Log ("WARNING: {0} failed on attempt {1}/{2}. Retrying in {3} second(s). Error: {4}" -f `
+                    $OperationName, $attempt, $ApiRetryCount, $ApiRetryDelaySeconds, $_.Exception.Message) 'Yellow'
+
+                if ($ApiRetryDelaySeconds -gt 0) {
+                    Start-Sleep -Seconds $ApiRetryDelaySeconds
+                }
+            }
+        }
+    }
+
+    if ($null -ne $lastError -and $null -ne $lastError.Exception) {
+        throw $lastError.Exception
+    }
+
+    throw ("{0} failed after {1} attempt(s)." -f $OperationName, $ApiRetryCount)
+}
 
 function Get-AllPASAccounts {
     param(
@@ -353,25 +534,22 @@ function Get-AllPASAccounts {
 
     $allAccounts = New-Object System.Collections.Generic.List[object]
 
-    # Preferred method: direct psPAS REST pagination
     if (Get-Command Invoke-PASRestMethod -ErrorAction SilentlyContinue) {
-        Write-Log "Using Invoke-PASRestMethod with paginated /Accounts API retrieval..." 'Cyan'
+        Write-Log 'Using Invoke-PASRestMethod with paginated /Accounts API retrieval...' 'Cyan'
 
-        $offset = 0
+        $offset     = 0
         $pageNumber = 0
 
         while ($true) {
             $pageNumber++
-
             $relativeUri = "Accounts?limit=$Limit&offset=$offset"
 
             Write-Log ("Retrieving account page {0}. Offset={1}, Limit={2}" -f $pageNumber, $offset, $Limit) 'Gray'
 
             try {
-                $response = Invoke-PASRestMethod `
+                $response = Invoke-PASGetWithRetry `
                     -Uri $relativeUri `
-                    -Method GET `
-                    -ErrorAction Stop
+                    -OperationName ("Account page {0}" -f $pageNumber)
             } catch {
                 Write-Log ("WARNING: Invoke-PASRestMethod account retrieval failed. Falling back to Get-PASAccount. Error: {0}" -f $_.Exception.Message) 'Yellow'
                 $allAccounts.Clear()
@@ -381,10 +559,10 @@ function Get-AllPASAccounts {
             $batch = @()
 
             if ($null -ne $response) {
-                if ($response.PSObject.Properties.Name -contains 'value') {
-                    $batch = @($response.value)
-                } elseif ($response.PSObject.Properties.Name -contains 'accounts') {
-                    $batch = @($response.accounts)
+                $value = Get-ObjectPropertyValue -InputObject $response -PropertyNames @('value', 'Value', 'accounts', 'Accounts')
+
+                if ($null -ne $value) {
+                    $batch = @($value)
                 } elseif ($response -is [array]) {
                     $batch = @($response)
                 } else {
@@ -392,19 +570,15 @@ function Get-AllPASAccounts {
                 }
             }
 
-            if ($null -eq $batch) {
-                $batch = @()
-            }
-
-            foreach ($account in $batch) {
+            foreach ($account in @($batch)) {
                 if ($null -ne $account) {
                     $allAccounts.Add($account)
                 }
             }
 
-            Write-Log ("Retrieved {0} account(s) from page {1}." -f $batch.Count, $pageNumber) 'Green'
+            Write-Log ("Retrieved {0} account(s) from page {1}." -f @($batch).Count, $pageNumber) 'Green'
 
-            if ($batch.Count -lt $Limit) {
+            if (@($batch).Count -lt $Limit) {
                 break
             }
 
@@ -416,8 +590,7 @@ function Get-AllPASAccounts {
         }
     }
 
-    # Fallback method: Get-PASAccount
-    Write-Log "Using Get-PASAccount fallback method..." 'Cyan'
+    Write-Log 'Using Get-PASAccount fallback method...' 'Cyan'
 
     try {
         $accounts = Get-PASAccount -ErrorAction Stop
@@ -433,256 +606,851 @@ function Get-AllPASAccounts {
     }
 }
 
+function Get-AllPASPlatforms {
+    $platforms = @()
+
+    if (Get-Command Invoke-PASRestMethod -ErrorAction SilentlyContinue) {
+        Write-Log 'Retrieving regular account platforms from /Platforms API...' 'Cyan'
+
+        try {
+            $response = Invoke-PASGetWithRetry `
+                -Uri 'Platforms?PlatformType=Regular' `
+                -OperationName 'Platform inventory retrieval'
+
+            $platformValue = Get-ObjectPropertyValue -InputObject $response -PropertyNames @('Platforms', 'platforms', 'value', 'Value')
+
+            if ($null -ne $platformValue) {
+                $platforms = @($platformValue)
+            } elseif ($response -is [array]) {
+                $platforms = @($response)
+            } elseif ($null -ne $response) {
+                $platforms = @($response)
+            }
+        } catch {
+            Write-Log ("WARNING: /Platforms API retrieval failed. Error: {0}" -f $_.Exception.Message) 'Yellow'
+            $platforms = @()
+        }
+    }
+
+    if ($platforms.Count -eq 0 -and (Get-Command Get-PASPlatform -ErrorAction SilentlyContinue)) {
+        Write-Log 'Attempting Get-PASPlatform fallback...' 'Cyan'
+
+        try {
+            $platforms = @(Get-PASPlatform -PlatformType Regular -ErrorAction Stop)
+        } catch {
+            Write-Log ("WARNING: Get-PASPlatform fallback failed. Error: {0}" -f $_.Exception.Message) 'Yellow'
+            $platforms = @()
+        }
+    }
+
+    return @($platforms)
+}
+
+function Get-PASAccountDetailRecord {
+    param(
+        [Parameter(Mandatory)]
+        [string]$AccountID
+    )
+
+    if (Get-Command Invoke-PASRestMethod -ErrorAction SilentlyContinue) {
+        $escapedID = [Uri]::EscapeDataString($AccountID)
+
+        return Invoke-PASGetWithRetry `
+            -Uri ("Accounts/{0}/" -f $escapedID) `
+            -OperationName ("Account detail retrieval for {0}" -f $AccountID)
+    }
+
+    # Fallback for environments where Invoke-PASRestMethod is unavailable.
+    if (Get-Command Get-PASAccount -ErrorAction SilentlyContinue) {
+        return Get-PASAccount -id $AccountID -ErrorAction Stop
+    }
+
+    throw 'Neither Invoke-PASRestMethod nor Get-PASAccount is available for account detail retrieval.'
+}
+
+# ============================================
+# Platform Normalization and Classification
+# ============================================
+
+function ConvertTo-NormalizedPlatform {
+    param(
+        [Parameter(Mandatory)]
+        [object]$Platform
+    )
+
+    $general = Get-ObjectPropertyValue -InputObject $Platform -PropertyNames @('general', 'General')
+
+    if ($null -eq $general) {
+        $details = Get-ObjectPropertyValue -InputObject $Platform -PropertyNames @('details', 'Details')
+        if ($null -ne $details) {
+            $general = Get-ObjectPropertyValue -InputObject $details -PropertyNames @('general', 'General')
+        }
+    }
+
+    if ($null -eq $general) {
+        $general = $Platform
+    }
+
+    $properties = Get-ObjectPropertyValue -InputObject $Platform -PropertyNames @('properties', 'Properties')
+
+    if ($null -eq $properties) {
+        $details = Get-ObjectPropertyValue -InputObject $Platform -PropertyNames @('details', 'Details')
+        if ($null -ne $details) {
+            $properties = Get-ObjectPropertyValue -InputObject $details -PropertyNames @('properties', 'Properties')
+        }
+    }
+
+    $requiredDefinitions = Get-ObjectPropertyValue -InputObject $properties -PropertyNames @('required', 'Required')
+    $optionalDefinitions = Get-ObjectPropertyValue -InputObject $properties -PropertyNames @('optional', 'Optional')
+
+    $platformID = Get-ObjectPropertyValue -InputObject $general -PropertyNames @(
+        'id', 'Id', 'ID', 'platformId', 'PlatformId', 'PlatformID'
+    )
+
+    if ([string]::IsNullOrWhiteSpace([string]$platformID)) {
+        $platformID = Get-ObjectPropertyValue -InputObject $Platform -PropertyNames @(
+            'id', 'Id', 'ID', 'platformId', 'PlatformId', 'PlatformID'
+        )
+    }
+
+    $name = Get-ObjectPropertyValue -InputObject $general -PropertyNames @('name', 'Name', 'platformName', 'PlatformName')
+    if ([string]::IsNullOrWhiteSpace([string]$name)) {
+        $name = Get-ObjectPropertyValue -InputObject $Platform -PropertyNames @('name', 'Name', 'platformName', 'PlatformName')
+    }
+
+    $systemType = Get-ObjectPropertyValue -InputObject $general -PropertyNames @('systemType', 'SystemType')
+    if ([string]::IsNullOrWhiteSpace([string]$systemType)) {
+        $systemType = Get-ObjectPropertyValue -InputObject $Platform -PropertyNames @('systemType', 'SystemType')
+    }
+
+    $active = Get-ObjectPropertyValue -InputObject $general -PropertyNames @('active', 'Active')
+    if ($null -eq $active) {
+        $active = Get-ObjectPropertyValue -InputObject $Platform -PropertyNames @('active', 'Active')
+    }
+
+    $description = Get-ObjectPropertyValue -InputObject $general -PropertyNames @('description', 'Description')
+    if ($null -eq $description) {
+        $description = Get-ObjectPropertyValue -InputObject $Platform -PropertyNames @('description', 'Description')
+    }
+
+    $platformBaseID = Get-ObjectPropertyValue -InputObject $general -PropertyNames @('platformBaseID', 'PlatformBaseID', 'basePlatformID', 'BasePlatformID')
+    if ($null -eq $platformBaseID) {
+        $platformBaseID = Get-ObjectPropertyValue -InputObject $Platform -PropertyNames @('platformBaseID', 'PlatformBaseID', 'basePlatformID', 'BasePlatformID')
+    }
+
+    $platformType = Get-ObjectPropertyValue -InputObject $general -PropertyNames @('platformType', 'PlatformType')
+    if ($null -eq $platformType) {
+        $platformType = Get-ObjectPropertyValue -InputObject $Platform -PropertyNames @('platformType', 'PlatformType')
+    }
+
+    return [PSCustomObject]@{
+        PlatformID          = Convert-ToReportValue $platformID
+        PlatformName        = Convert-ToReportValue $name
+        SystemType          = Convert-ToReportValue $systemType
+        Active              = Convert-ToReportValue $active
+        Description         = Convert-ToReportValue $description
+        PlatformBaseID      = Convert-ToReportValue $platformBaseID
+        PlatformType        = Convert-ToReportValue $platformType
+        RequiredProperties  = Join-PropertyDefinitionNames $requiredDefinitions
+        OptionalProperties  = Join-PropertyDefinitionNames $optionalDefinitions
+        RawPlatformObject   = $Platform
+    }
+}
+
+function Get-DatabasePlatformDetection {
+    param(
+        [Parameter(Mandatory)]
+        [object]$Platform
+    )
+
+    $platformID = [string]$Platform.PlatformID
+
+    if (Test-StringInList -Value $platformID -List $ExcludePlatformID) {
+        return [PSCustomObject]@{
+            IsDatabase = $false
+            Reason     = 'Explicitly excluded by ExcludePlatformID'
+        }
+    }
+
+    if (Test-StringInList -Value $platformID -List $IncludePlatformID) {
+        return [PSCustomObject]@{
+            IsDatabase = $true
+            Reason     = 'Explicitly included by IncludePlatformID'
+        }
+    }
+
+    $fieldsToCheck = [ordered]@{
+        SystemType     = [string]$Platform.SystemType
+        PlatformID     = [string]$Platform.PlatformID
+        PlatformName   = [string]$Platform.PlatformName
+        PlatformBaseID = [string]$Platform.PlatformBaseID
+        Description    = [string]$Platform.Description
+    }
+
+    foreach ($fieldName in $fieldsToCheck.Keys) {
+        $fieldValue = $fieldsToCheck[$fieldName]
+
+        if (-not [string]::IsNullOrWhiteSpace($fieldValue) -and
+            $fieldValue -match $DatabasePlatformPattern) {
+            return [PSCustomObject]@{
+                IsDatabase = $true
+                Reason     = ("{0} matched database pattern: {1}" -f $fieldName, $fieldValue)
+            }
+        }
+    }
+
+    return [PSCustomObject]@{
+        IsDatabase = $false
+        Reason     = 'No database metadata match'
+    }
+}
+
+function Test-AccountPlatformMatch {
+    param(
+        [Parameter(Mandatory)]
+        [string]$PlatformID,
+
+        [hashtable]$DatabasePlatformLookup
+    )
+
+    if (Test-StringInList -Value $PlatformID -List $ExcludePlatformID) {
+        return $false
+    }
+
+    if (Test-StringInList -Value $PlatformID -List $IncludePlatformID) {
+        return $true
+    }
+
+    if ($null -ne $DatabasePlatformLookup -and $DatabasePlatformLookup.ContainsKey($PlatformID)) {
+        return $true
+    }
+
+    # Fallback classification when platform inventory is unavailable or incomplete.
+    if (-not [string]::IsNullOrWhiteSpace($PlatformID) -and
+        $PlatformID -match $DatabasePlatformPattern) {
+        return $true
+    }
+
+    return $false
+}
+
 # ============================================
 # Start Script
 # ============================================
 
-Write-Log "============================================================" 'Gray'
-Write-Log "CNA Account Report with Account ID started." 'Cyan'
-Write-Log ("Identity Tenant URL : {0}" -f $IdentityTenantURL) 'Gray'
-Write-Log ("Privilege Cloud URL : {0}" -f $PrivilegeCloudURL) 'Gray'
-Write-Log ("PCloud Subdomain    : {0}" -f $PCloudSubdomain) 'Gray'
-Write-Log ("CCP Address         : {0}" -f $CCPAddress) 'Gray'
-Write-Log ("CCP AppID           : {0}" -f $CCPAppID) 'Gray'
-Write-Log ("CCP Safe            : {0}" -f $CCPSafe) 'Gray'
-Write-Log ("CCP Object          : {0}" -f $CCPObject) 'Gray'
-Write-Log ("Account CSV         : {0}" -f $AccountCsvPath) 'Gray'
-Write-Log "============================================================" 'Gray'
+Write-Log '============================================================' 'Gray'
+Write-Log 'CNA Database Account Report with Extended Properties started.' 'Cyan'
+Write-Log ("Identity Tenant URL        : {0}" -f $IdentityTenantURL) 'Gray'
+Write-Log ("Privilege Cloud URL        : {0}" -f $PrivilegeCloudURL) 'Gray'
+Write-Log ("PCloud Subdomain           : {0}" -f $PCloudSubdomain) 'Gray'
+Write-Log ("CCP Address                : {0}" -f $CCPAddress) 'Gray'
+Write-Log ("CCP AppID                  : {0}" -f $CCPAppID) 'Gray'
+Write-Log ("CCP Safe                   : {0}" -f $CCPSafe) 'Gray'
+Write-Log ("CCP Object                 : {0}" -f $CCPObject) 'Gray'
+Write-Log ("Retrieve Full Details      : {0}" -f $RetrieveFullAccountDetails) 'Gray'
+Write-Log ("Database Platform Pattern  : {0}" -f $DatabasePlatformPattern) 'Gray'
+Write-Log ("Explicit Include Platforms : {0}" -f (($IncludePlatformID | Where-Object { $_ }) -join ';')) 'Gray'
+Write-Log ("Explicit Exclude Platforms : {0}" -f (($ExcludePlatformID | Where-Object { $_ }) -join ';')) 'Gray'
+Write-Log ("Account CSV                : {0}" -f $AccountCsvPath) 'Gray'
+Write-Log ("Platform CSV               : {0}" -f $PlatformCsvPath) 'Gray'
+Write-Log '============================================================' 'Gray'
 
-# ============================================
-# Authenticate
-# ============================================
+$AuthenticatedUser = $null
+$SessionEstablished = $false
 
 try {
+    # ============================================
+    # Authenticate
+    # ============================================
+
     $AuthenticatedUser = Start-PASSessionFromCCP -ObjectName $CCPObject
-} catch {
-    Write-Log ("FATAL: Authentication failed. {0}" -f $_.Exception.Message) 'Red'
-    exit 1
-}
+    $SessionEstablished = $true
 
-# ============================================
-# Retrieve Accounts
-# ============================================
+    # ============================================
+    # Retrieve and Classify Platforms
+    # ============================================
 
-Write-Log "Retrieving all visible accounts..." 'Yellow'
+    Write-Log 'Retrieving platform inventory...' 'Yellow'
+    $rawPlatforms = @(Get-AllPASPlatforms)
+    Write-Log ("Retrieved {0} platform record(s)." -f $rawPlatforms.Count) 'Green'
 
-try {
-    $Accounts = Get-AllPASAccounts -Limit $PageLimit
+    $normalizedPlatforms = New-Object System.Collections.Generic.List[object]
+    $databasePlatforms   = New-Object System.Collections.Generic.List[object]
+    $platformLookup      = @{}
+    $databasePlatformLookup = @{}
 
-    if ($null -eq $Accounts) {
-        $Accounts = @()
+    foreach ($rawPlatform in $rawPlatforms) {
+        if ($null -eq $rawPlatform) {
+            continue
+        }
+
+        $normalized = ConvertTo-NormalizedPlatform -Platform $rawPlatform
+
+        if ([string]::IsNullOrWhiteSpace([string]$normalized.PlatformID)) {
+            Write-Log 'WARNING: Skipping a platform record because no PlatformID could be resolved.' 'Yellow'
+            continue
+        }
+
+        $detection = Get-DatabasePlatformDetection -Platform $normalized
+
+        $platformRecord = [PSCustomObject]@{
+            PlatformID         = $normalized.PlatformID
+            PlatformName       = $normalized.PlatformName
+            SystemType         = $normalized.SystemType
+            PlatformBaseID     = $normalized.PlatformBaseID
+            PlatformType       = $normalized.PlatformType
+            Active             = $normalized.Active
+            Description        = $normalized.Description
+            RequiredProperties = $normalized.RequiredProperties
+            OptionalProperties = $normalized.OptionalProperties
+            IsDatabasePlatform = $detection.IsDatabase
+            DetectionReason    = $detection.Reason
+        }
+
+        $normalizedPlatforms.Add($platformRecord)
+        $platformLookup[[string]$normalized.PlatformID] = $platformRecord
+
+        if ($detection.IsDatabase) {
+            $databasePlatforms.Add($platformRecord)
+            $databasePlatformLookup[[string]$normalized.PlatformID] = $platformRecord
+        }
+    }
+
+    # Add explicitly included platform IDs that were not returned by the platform API.
+    foreach ($explicitPlatformID in @($IncludePlatformID)) {
+        if ([string]::IsNullOrWhiteSpace($explicitPlatformID)) {
+            continue
+        }
+
+        $explicitPlatformID = $explicitPlatformID.Trim()
+
+        if (-not $databasePlatformLookup.ContainsKey($explicitPlatformID) -and
+            -not (Test-StringInList -Value $explicitPlatformID -List $ExcludePlatformID)) {
+
+            $explicitRecord = [PSCustomObject]@{
+                PlatformID         = $explicitPlatformID
+                PlatformName       = ''
+                SystemType         = ''
+                PlatformBaseID     = ''
+                PlatformType       = 'Regular'
+                Active             = ''
+                Description        = ''
+                RequiredProperties = ''
+                OptionalProperties = ''
+                IsDatabasePlatform = $true
+                DetectionReason    = 'Explicitly included; platform metadata was not returned'
+            }
+
+            $databasePlatforms.Add($explicitRecord)
+            $databasePlatformLookup[$explicitPlatformID] = $explicitRecord
+            $platformLookup[$explicitPlatformID] = $explicitRecord
+        }
+    }
+
+    Write-Log ("Identified {0} database platform(s)." -f $databasePlatforms.Count) 'Green'
+
+    foreach ($databasePlatform in ($databasePlatforms | Sort-Object PlatformID)) {
+        Write-Log ("Database platform: ID='{0}', Name='{1}', SystemType='{2}', Reason='{3}'" -f `
+            $databasePlatform.PlatformID,
+            $databasePlatform.PlatformName,
+            $databasePlatform.SystemType,
+            $databasePlatform.DetectionReason) 'Gray'
+    }
+
+    try {
+        if ($databasePlatforms.Count -gt 0) {
+            $databasePlatforms |
+                Sort-Object PlatformID |
+                Export-Csv -Path $PlatformCsvPath -NoTypeInformation -Encoding UTF8
+        } else {
+            $emptyPlatformHeader = [PSCustomObject][ordered]@{
+                PlatformID         = ''
+                PlatformName       = ''
+                SystemType         = ''
+                PlatformBaseID     = ''
+                PlatformType       = ''
+                Active             = ''
+                Description        = ''
+                RequiredProperties = ''
+                OptionalProperties = ''
+                IsDatabasePlatform = ''
+                DetectionReason    = ''
+            }
+
+            $emptyPlatformHeader | Export-Csv -Path $PlatformCsvPath -NoTypeInformation -Encoding UTF8
+            $platformHeaderLine = Get-Content -Path $PlatformCsvPath -TotalCount 1
+            Set-Content -Path $PlatformCsvPath -Value $platformHeaderLine -Encoding UTF8
+        }
+
+        Write-Log ("Database platform inventory exported to: {0}" -f $PlatformCsvPath) 'Green'
+    } catch {
+        Write-Log ("ERROR: Failed to export database platform inventory. {0}" -f $_.Exception.Message) 'Red'
+        throw
+    }
+
+    # ============================================
+    # Retrieve Accounts
+    # ============================================
+
+    Write-Log 'Retrieving all visible accounts...' 'Yellow'
+    $accounts = @(Get-AllPASAccounts -Limit $PageLimit)
+    Write-Log ("Retrieved {0} account(s)." -f $accounts.Count) 'Green'
+
+    # ============================================
+    # Filter Database Accounts
+    # ============================================
+
+    $databaseAccountSummaries = New-Object System.Collections.Generic.List[object]
+
+    foreach ($account in $accounts) {
+        $platformID = Get-ObjectPropertyValue -InputObject $account -PropertyNames @(
+            'platformId', 'PlatformId', 'platformID', 'PlatformID'
+        )
+
+        if ([string]::IsNullOrWhiteSpace([string]$platformID)) {
+            continue
+        }
+
+        if (Test-AccountPlatformMatch -PlatformID ([string]$platformID) -DatabasePlatformLookup $databasePlatformLookup) {
+            $databaseAccountSummaries.Add($account)
+        }
+    }
+
+    Write-Log ("Found {0} account(s) assigned to database platforms." -f $databaseAccountSummaries.Count) 'Green'
+
+    # ============================================
+    # Retrieve Full Account Details and Discover
+    # Dynamic Extended Property Names
+    # ============================================
+
+    $accountWorkItems = New-Object System.Collections.Generic.List[object]
+    $allExtendedPropertyNames = @{}
+
+    # Seed dynamic columns from the database platform definitions. This preserves
+    # columns for optional properties even when no current account has a value.
+    $coreAccountPropertyNames = @(
+        'Address', 'Username', 'UserName', 'Name', 'AccountName', 'Safe', 'SafeName',
+        'PlatformID', 'PlatformId', 'Secret', 'Password'
+    )
+
+    foreach ($databasePlatform in $databasePlatforms) {
+        $definedPropertyText = @(
+            [string]$databasePlatform.RequiredProperties,
+            [string]$databasePlatform.OptionalProperties
+        ) -join ';'
+
+        foreach ($definedPropertyName in ($definedPropertyText -split ';')) {
+            $definedPropertyName = $definedPropertyName.Trim()
+
+            if ([string]::IsNullOrWhiteSpace($definedPropertyName)) {
+                continue
+            }
+
+            if (Test-StringInList -Value $definedPropertyName -List $coreAccountPropertyNames) {
+                continue
+            }
+
+            if (-not $allExtendedPropertyNames.ContainsKey($definedPropertyName)) {
+                $allExtendedPropertyNames[$definedPropertyName] = $definedPropertyName
+            }
+        }
+    }
+
+    Write-Log ("Seeded {0} extended-property column name(s) from database platform definitions." -f $allExtendedPropertyNames.Count) 'Gray'
+
+    $currentIndex = 0
+    $totalDatabaseAccounts = $databaseAccountSummaries.Count
+
+    foreach ($summaryAccount in $databaseAccountSummaries) {
+        $currentIndex++
+
+        $accountID = Get-ObjectPropertyValue -InputObject $summaryAccount -PropertyNames @(
+            'id', 'Id', 'accountId', 'AccountId', 'AccountID'
+        )
+
+        $accountData  = $summaryAccount
+        $detailSource = 'AccountList'
+        $detailError  = ''
+
+        if ($RetrieveFullAccountDetails -and -not [string]::IsNullOrWhiteSpace([string]$accountID)) {
+            try {
+                $detail = Get-PASAccountDetailRecord -AccountID ([string]$accountID)
+
+                if ($detail -is [array]) {
+                    $detail = @($detail)[0]
+                }
+
+                if ($null -ne $detail) {
+                    $accountData  = $detail
+                    $detailSource = 'AccountDetailAPI'
+                }
+            } catch {
+                $detailError = $_.Exception.Message
+                Write-Log ("WARNING: Full details could not be retrieved for AccountID='{0}'. Using account-list data. Error: {1}" -f `
+                    $accountID, $detailError) 'Yellow'
+            }
+
+            if ($AccountDetailDelayMilliseconds -gt 0) {
+                Start-Sleep -Milliseconds $AccountDetailDelayMilliseconds
+            }
+        }
+
+        $platformPropertiesObject = Get-ObjectPropertyValue -InputObject $accountData -PropertyNames @(
+            'platformAccountProperties', 'PlatformAccountProperties'
+        )
+
+        # Some psPAS outputs may wrap the API result in a value/details property.
+        if ($null -eq $platformPropertiesObject) {
+            $wrappedAccount = Get-ObjectPropertyValue -InputObject $accountData -PropertyNames @('value', 'Value', 'details', 'Details')
+
+            if ($null -ne $wrappedAccount) {
+                $possibleWrappedAccount = if ($wrappedAccount -is [array]) { @($wrappedAccount)[0] } else { $wrappedAccount }
+
+                $wrappedProperties = Get-ObjectPropertyValue -InputObject $possibleWrappedAccount -PropertyNames @(
+                    'platformAccountProperties', 'PlatformAccountProperties'
+                )
+
+                if ($null -ne $wrappedProperties) {
+                    $accountData = $possibleWrappedAccount
+                    $platformPropertiesObject = $wrappedProperties
+                }
+            }
+        }
+
+        $propertyMap = ConvertTo-PropertyMap -InputObject $platformPropertiesObject
+
+        foreach ($propertyName in $propertyMap.Keys) {
+            if (-not $allExtendedPropertyNames.ContainsKey([string]$propertyName)) {
+                $allExtendedPropertyNames[[string]$propertyName] = [string]$propertyName
+            }
+        }
+
+        $accountWorkItems.Add([PSCustomObject]@{
+            SummaryAccount = $summaryAccount
+            AccountData    = $accountData
+            PropertyMap    = $propertyMap
+            DetailSource   = $detailSource
+            DetailError    = $detailError
+        })
+
+        if (($currentIndex % 100) -eq 0 -or $currentIndex -eq $totalDatabaseAccounts) {
+            Write-Log ("Prepared {0}/{1} database account(s). Discovered {2} unique extended property name(s)." -f `
+                $currentIndex, $totalDatabaseAccounts, $allExtendedPropertyNames.Count) 'Gray'
+        }
+    }
+
+    # ============================================
+    # Create Stable, Unique CSV Column Names for
+    # Every Extended Property
+    # ============================================
+
+    $propertyColumnMap = [ordered]@{}
+    $usedColumnNames   = @{}
+
+    foreach ($originalPropertyName in ($allExtendedPropertyNames.Values | Sort-Object)) {
+        $baseColumnName = ConvertTo-SafeColumnName -PropertyName $originalPropertyName
+        $columnName     = $baseColumnName
+        $suffix         = 2
+
+        while ($usedColumnNames.ContainsKey($columnName)) {
+            $columnName = "${baseColumnName}_$suffix"
+            $suffix++
+        }
+
+        $usedColumnNames[$columnName] = $true
+        $propertyColumnMap[$originalPropertyName] = $columnName
+    }
+
+    Write-Log ("Created {0} dynamic extended-property CSV column(s)." -f $propertyColumnMap.Count) 'Green'
+
+    # ============================================
+    # Build Database Account Report
+    # ============================================
+
+    $databaseAccountReport = New-Object System.Collections.Generic.List[object]
+    $currentIndex = 0
+
+    foreach ($workItem in $accountWorkItems) {
+        $currentIndex++
+
+        $account = $workItem.AccountData
+        $summary = $workItem.SummaryAccount
+        $propertyMap = $workItem.PropertyMap
+
+        $accountID = Get-ObjectPropertyValue -InputObject $account -PropertyNames @(
+            'id', 'Id', 'accountId', 'AccountId', 'AccountID'
+        )
+        if ([string]::IsNullOrWhiteSpace([string]$accountID)) {
+            $accountID = Get-ObjectPropertyValue -InputObject $summary -PropertyNames @(
+                'id', 'Id', 'accountId', 'AccountId', 'AccountID'
+            )
+        }
+
+        $accountName = Get-ObjectPropertyValue -InputObject $account -PropertyNames @(
+            'name', 'Name', 'accountName', 'AccountName'
+        )
+        if ([string]::IsNullOrWhiteSpace([string]$accountName)) {
+            $accountName = Get-ObjectPropertyValue -InputObject $summary -PropertyNames @(
+                'name', 'Name', 'accountName', 'AccountName'
+            )
+        }
+
+        $safeName = Get-ObjectPropertyValue -InputObject $account -PropertyNames @(
+            'safeName', 'SafeName', 'safe', 'Safe'
+        )
+        if ([string]::IsNullOrWhiteSpace([string]$safeName)) {
+            $safeName = Get-ObjectPropertyValue -InputObject $summary -PropertyNames @(
+                'safeName', 'SafeName', 'safe', 'Safe'
+            )
+        }
+
+        $userName = Get-ObjectPropertyValue -InputObject $account -PropertyNames @(
+            'userName', 'UserName', 'username', 'Username'
+        )
+        if ([string]::IsNullOrWhiteSpace([string]$userName)) {
+            $userName = Get-ObjectPropertyValue -InputObject $summary -PropertyNames @(
+                'userName', 'UserName', 'username', 'Username'
+            )
+        }
+
+        $address = Get-ObjectPropertyValue -InputObject $account -PropertyNames @('address', 'Address')
+        if ([string]::IsNullOrWhiteSpace([string]$address)) {
+            $address = Get-ObjectPropertyValue -InputObject $summary -PropertyNames @('address', 'Address')
+        }
+
+        $platformID = Get-ObjectPropertyValue -InputObject $account -PropertyNames @(
+            'platformId', 'PlatformId', 'platformID', 'PlatformID'
+        )
+        if ([string]::IsNullOrWhiteSpace([string]$platformID)) {
+            $platformID = Get-ObjectPropertyValue -InputObject $summary -PropertyNames @(
+                'platformId', 'PlatformId', 'platformID', 'PlatformID'
+            )
+        }
+
+        $secretType = Get-ObjectPropertyValue -InputObject $account -PropertyNames @('secretType', 'SecretType')
+        if ([string]::IsNullOrWhiteSpace([string]$secretType)) {
+            $secretType = Get-ObjectPropertyValue -InputObject $summary -PropertyNames @('secretType', 'SecretType')
+        }
+
+        $createdTime = Get-ObjectPropertyValue -InputObject $account -PropertyNames @(
+            'createdTime', 'CreatedTime', 'creationTime', 'CreationTime'
+        )
+
+        $categoryModificationTime = Get-ObjectPropertyValue -InputObject $account -PropertyNames @(
+            'CategoryModificationTime', 'categoryModificationTime', 'modifiedTime', 'ModifiedTime'
+        )
+
+        $automaticManagementEnabled = Get-NestedPropertyValue `
+            -InputObject $account `
+            -ParentProperties @('secretManagement', 'SecretManagement') `
+            -ChildProperties @('automaticManagementEnabled', 'AutomaticManagementEnabled')
+
+        $manualManagementReason = Get-NestedPropertyValue `
+            -InputObject $account `
+            -ParentProperties @('secretManagement', 'SecretManagement') `
+            -ChildProperties @('manualManagementReason', 'ManualManagementReason')
+
+        $cpmStatus = Get-NestedPropertyValue `
+            -InputObject $account `
+            -ParentProperties @('secretManagement', 'SecretManagement') `
+            -ChildProperties @('status', 'Status', 'cpmStatus', 'CPMStatus')
+
+        $cpmLastModifiedTime = Get-NestedPropertyValue `
+            -InputObject $account `
+            -ParentProperties @('secretManagement', 'SecretManagement') `
+            -ChildProperties @('lastModifiedTime', 'LastModifiedTime')
+
+        $lastReconciledTime = Get-NestedPropertyValue `
+            -InputObject $account `
+            -ParentProperties @('secretManagement', 'SecretManagement') `
+            -ChildProperties @('lastReconciledTime', 'LastReconciledTime', 'lastSuccessfulReconcile', 'LastSuccessfulReconcile')
+
+        $lastVerifiedTime = Get-NestedPropertyValue `
+            -InputObject $account `
+            -ParentProperties @('secretManagement', 'SecretManagement') `
+            -ChildProperties @('lastVerifiedTime', 'LastVerifiedTime', 'lastSuccessfulVerification', 'LastSuccessfulVerification')
+
+        $lastSuccessfulChange = Get-NestedPropertyValue `
+            -InputObject $account `
+            -ParentProperties @('secretManagement', 'SecretManagement') `
+            -ChildProperties @('lastSuccessfulChange', 'LastSuccessfulChange')
+
+        $remoteMachines = Get-NestedPropertyValue `
+            -InputObject $account `
+            -ParentProperties @('remoteMachinesAccess', 'RemoteMachinesAccess') `
+            -ChildProperties @('remoteMachines', 'RemoteMachines')
+
+        $accessRestrictedToRemoteMachines = Get-NestedPropertyValue `
+            -InputObject $account `
+            -ParentProperties @('remoteMachinesAccess', 'RemoteMachinesAccess') `
+            -ChildProperties @('accessRestrictedToRemoteMachines', 'AccessRestrictedToRemoteMachines')
+
+        $platformMetadata = $null
+        if (-not [string]::IsNullOrWhiteSpace([string]$platformID) -and $platformLookup.ContainsKey([string]$platformID)) {
+            $platformMetadata = $platformLookup[[string]$platformID]
+        }
+
+        $extendedPropertiesJson = ''
+        if ($propertyMap.Count -gt 0) {
+            try {
+                $extendedPropertiesJson = ($propertyMap | ConvertTo-Json -Compress -Depth 20)
+            } catch {
+                $extendedPropertiesJson = [string]$propertyMap
+            }
+        }
+
+        $row = [ordered]@{
+            AccountID                       = Convert-ToReportValue $accountID
+            SafeName                        = Convert-ToReportValue $safeName
+            AccountName                     = Convert-ToReportValue $accountName
+            UserName                        = Convert-ToReportValue $userName
+            Address                         = Convert-ToReportValue $address
+            PlatformID                      = Convert-ToReportValue $platformID
+            PlatformName                    = if ($null -ne $platformMetadata) { $platformMetadata.PlatformName } else { '' }
+            PlatformSystemType              = if ($null -ne $platformMetadata) { $platformMetadata.SystemType } else { '' }
+            PlatformBaseID                  = if ($null -ne $platformMetadata) { $platformMetadata.PlatformBaseID } else { '' }
+            PlatformActive                  = if ($null -ne $platformMetadata) { $platformMetadata.Active } else { '' }
+            PlatformDetectionReason         = if ($null -ne $platformMetadata) { $platformMetadata.DetectionReason } else { 'PlatformID matched fallback database pattern' }
+            PlatformRequiredProperties      = if ($null -ne $platformMetadata) { $platformMetadata.RequiredProperties } else { '' }
+            PlatformOptionalProperties      = if ($null -ne $platformMetadata) { $platformMetadata.OptionalProperties } else { '' }
+            SecretType                      = Convert-ToReportValue $secretType
+
+            # Common database fields resolved from multiple likely property names.
+            Port                            = Get-MapValueByAlias -Map $propertyMap -Aliases @('Port', 'Database Port', 'DatabasePort', 'DB Port', 'DBPort', 'TCP Port', 'TCPPort', 'OraclePort', 'MSSQLPort')
+            DatabaseName                    = Get-MapValueByAlias -Map $propertyMap -Aliases @('Database Name', 'DatabaseName', 'Database', 'DB Name', 'DBName', 'Initial Catalog', 'InitialCatalog', 'Catalog', 'SQLDatabase', 'OracleDatabase')
+            InstanceName                    = Get-MapValueByAlias -Map $propertyMap -Aliases @('Instance Name', 'InstanceName', 'Instance', 'SQL Instance', 'SQLInstance', 'DB Instance', 'DBInstance', 'ServerInstance')
+            ServiceName                     = Get-MapValueByAlias -Map $propertyMap -Aliases @('Service Name', 'ServiceName', 'Oracle Service Name', 'OracleServiceName', 'DB Service Name', 'DBServiceName')
+            SID                             = Get-MapValueByAlias -Map $propertyMap -Aliases @('SID', 'Oracle SID', 'OracleSID')
+            TNSAlias                        = Get-MapValueByAlias -Map $propertyMap -Aliases @('TNS Alias', 'TNSAlias', 'TNS Name', 'TNSName', 'OracleTNSAlias')
+            Schema                          = Get-MapValueByAlias -Map $propertyMap -Aliases @('Schema', 'Schema Name', 'SchemaName', 'Database Schema', 'DatabaseSchema')
+            DSN                             = Get-MapValueByAlias -Map $propertyMap -Aliases @('DSN', 'Data Source Name', 'DataSourceName')
+            ConnectionString                = Get-MapValueByAlias -Map $propertyMap -Aliases @('Connection String', 'ConnectionString', 'DB Connection String', 'DBConnectionString', 'Database Connection String', 'DatabaseConnectionString')
+            DatabaseRole                    = Get-MapValueByAlias -Map $propertyMap -Aliases @('Role', 'Database Role', 'DatabaseRole', 'DB Role', 'DBRole')
+
+            CPMStatus                       = Convert-ToReportValue $cpmStatus
+            AutomaticManagementEnabled      = Convert-ToReportValue $automaticManagementEnabled
+            ManualManagementReason          = Convert-ToReportValue $manualManagementReason
+            CreatedTime                     = Convert-CyberArkTime $createdTime
+            CategoryModificationTime        = Convert-CyberArkTime $categoryModificationTime
+            CPMLastModifiedTime             = Convert-CyberArkTime $cpmLastModifiedTime
+            LastSuccessfulChange            = Convert-CyberArkTime $lastSuccessfulChange
+            LastReconciledTime              = Convert-CyberArkTime $lastReconciledTime
+            LastVerifiedTime                = Convert-CyberArkTime $lastVerifiedTime
+            RemoteMachines                  = Convert-ToReportValue $remoteMachines
+            AccessRestrictedToRemoteMachines = Convert-ToReportValue $accessRestrictedToRemoteMachines
+            ExtendedPropertyCount           = $propertyMap.Count
+            ExtendedPropertiesJson          = $extendedPropertiesJson
+            DetailSource                    = $workItem.DetailSource
+            DetailRetrievalError            = $workItem.DetailError
+        }
+
+        # Add every extended property as an individual CSV column.
+        foreach ($originalPropertyName in $propertyColumnMap.Keys) {
+            $columnName = $propertyColumnMap[$originalPropertyName]
+
+            if ($propertyMap.ContainsKey($originalPropertyName)) {
+                $row[$columnName] = Convert-ToReportValue $propertyMap[$originalPropertyName]
+            } else {
+                $row[$columnName] = ''
+            }
+        }
+
+        $databaseAccountReport.Add([PSCustomObject]$row)
+
+        if (($currentIndex % 250) -eq 0 -or $currentIndex -eq $accountWorkItems.Count) {
+            Write-Log ("Built {0}/{1} database account report row(s)." -f $currentIndex, $accountWorkItems.Count) 'Gray'
+        }
+    }
+
+    # ============================================
+    # Export Database Account Report
+    # ============================================
+
+    Write-Log 'Exporting database account report with extended properties...' 'Yellow'
+
+    if ($databaseAccountReport.Count -gt 0) {
+        $databaseAccountReport |
+            Sort-Object PlatformID, SafeName, Address, UserName, AccountName |
+            Export-Csv -Path $AccountCsvPath -NoTypeInformation -Encoding UTF8
     } else {
-        $Accounts = @($Accounts)
+        # Export a header-only CSV so the output location is still predictable.
+        $emptyHeader = [PSCustomObject][ordered]@{
+            AccountID = ''
+            SafeName = ''
+            AccountName = ''
+            UserName = ''
+            Address = ''
+            PlatformID = ''
+            PlatformName = ''
+            PlatformSystemType = ''
+            PlatformBaseID = ''
+            PlatformActive = ''
+            PlatformDetectionReason = ''
+            PlatformRequiredProperties = ''
+            PlatformOptionalProperties = ''
+            SecretType = ''
+            Port = ''
+            DatabaseName = ''
+            InstanceName = ''
+            ServiceName = ''
+            SID = ''
+            TNSAlias = ''
+            Schema = ''
+            DSN = ''
+            ConnectionString = ''
+            DatabaseRole = ''
+            CPMStatus = ''
+            AutomaticManagementEnabled = ''
+            ManualManagementReason = ''
+            CreatedTime = ''
+            CategoryModificationTime = ''
+            CPMLastModifiedTime = ''
+            LastSuccessfulChange = ''
+            LastReconciledTime = ''
+            LastVerifiedTime = ''
+            RemoteMachines = ''
+            AccessRestrictedToRemoteMachines = ''
+            ExtendedPropertyCount = ''
+            ExtendedPropertiesJson = ''
+            DetailSource = ''
+            DetailRetrievalError = ''
+        }
+
+        $emptyHeader | Export-Csv -Path $AccountCsvPath -NoTypeInformation -Encoding UTF8
+
+        # Remove the empty data row but preserve the header.
+        $headerLine = Get-Content -Path $AccountCsvPath -TotalCount 1
+        Set-Content -Path $AccountCsvPath -Value $headerLine -Encoding UTF8
     }
 
-    Write-Log ("Retrieved {0} account(s)." -f $Accounts.Count) 'Green'
+    Write-Log ("Database account report exported to: {0}" -f $AccountCsvPath) 'Green'
+
+    # ============================================
+    # Completion
+    # ============================================
+
+    Write-Log '============================================================' 'Gray'
+    Write-Log 'CNA Database Account Report with Extended Properties completed.' 'Green'
+    Write-Log ("Authenticated User             : {0}" -f $AuthenticatedUser) 'Gray'
+    Write-Log ("Total Platforms Retrieved      : {0}" -f $rawPlatforms.Count) 'Gray'
+    Write-Log ("Database Platforms Identified  : {0}" -f $databasePlatforms.Count) 'Green'
+    Write-Log ("Total Accounts Retrieved       : {0}" -f $accounts.Count) 'Gray'
+    Write-Log ("Database Accounts Exported     : {0}" -f $databaseAccountReport.Count) 'Green'
+    Write-Log ("Dynamic Property Columns       : {0}" -f $propertyColumnMap.Count) 'Green'
+    Write-Log ("Account Report                 : {0}" -f $AccountCsvPath) 'Gray'
+    Write-Log ("Platform Inventory             : {0}" -f $PlatformCsvPath) 'Gray'
+    Write-Log '============================================================' 'Gray'
 } catch {
-    Write-Log ("FATAL: Failed to retrieve accounts. {0}" -f $_.Exception.Message) 'Red'
-
-    try {
-        Close-PASSession | Out-Null
-    } catch {}
-
+    Write-Log ("FATAL: Database account report failed. {0}" -f $_.Exception.Message) 'Red'
+    Write-Log ("FATAL DETAILS: {0}" -f ($_ | Out-String).Trim()) 'Red'
     exit 1
-}
-
-# ============================================
-# Build Account Report
-# ============================================
-
-$AccountReport = New-Object System.Collections.Generic.List[object]
-
-$currentIndex = 0
-$totalAccounts = $Accounts.Count
-
-foreach ($Account in $Accounts) {
-    $currentIndex++
-
-    $accountId = Get-ObjectPropertyValue -InputObject $Account -PropertyNames @(
-        'id',
-        'Id',
-        'accountId',
-        'AccountId',
-        'AccountID'
-    )
-
-    $accountName = Get-ObjectPropertyValue -InputObject $Account -PropertyNames @(
-        'name',
-        'Name',
-        'accountName',
-        'AccountName'
-    )
-
-    $safeName = Get-ObjectPropertyValue -InputObject $Account -PropertyNames @(
-        'safeName',
-        'SafeName',
-        'safe',
-        'Safe'
-    )
-
-    $userName = Get-ObjectPropertyValue -InputObject $Account -PropertyNames @(
-        'userName',
-        'UserName',
-        'username',
-        'Username'
-    )
-
-    $address = Get-ObjectPropertyValue -InputObject $Account -PropertyNames @(
-        'address',
-        'Address'
-    )
-
-    $platformId = Get-ObjectPropertyValue -InputObject $Account -PropertyNames @(
-        'platformId',
-        'PlatformId',
-        'platformID',
-        'PlatformID'
-    )
-
-    $secretType = Get-ObjectPropertyValue -InputObject $Account -PropertyNames @(
-        'secretType',
-        'SecretType'
-    )
-
-    $createdTime = Get-ObjectPropertyValue -InputObject $Account -PropertyNames @(
-        'createdTime',
-        'CreatedTime',
-        'creationTime',
-        'CreationTime'
-    )
-
-    $modifiedTime = Get-ObjectPropertyValue -InputObject $Account -PropertyNames @(
-        'modifiedTime',
-        'ModifiedTime',
-        'lastModifiedTime',
-        'LastModifiedTime'
-    )
-
-    $automaticManagementEnabled = Get-NestedPropertyValue `
-        -InputObject $Account `
-        -ParentProperty 'secretManagement' `
-        -ChildProperties @(
-            'automaticManagementEnabled',
-            'AutomaticManagementEnabled'
-        )
-
-    $manualManagementReason = Get-NestedPropertyValue `
-        -InputObject $Account `
-        -ParentProperty 'secretManagement' `
-        -ChildProperties @(
-            'manualManagementReason',
-            'ManualManagementReason'
-        )
-
-    $cpmStatus = Get-NestedPropertyValue `
-        -InputObject $Account `
-        -ParentProperty 'secretManagement' `
-        -ChildProperties @(
-            'status',
-            'Status',
-            'cpmStatus',
-            'CPMStatus'
-        )
-
-    $lastModifiedByCPM = Get-NestedPropertyValue `
-        -InputObject $Account `
-        -ParentProperty 'secretManagement' `
-        -ChildProperties @(
-            'lastModifiedTime',
-            'LastModifiedTime'
-        )
-
-    $lastSuccessfulChange = Get-NestedPropertyValue `
-        -InputObject $Account `
-        -ParentProperty 'secretManagement' `
-        -ChildProperties @(
-            'lastSuccessfulChange',
-            'LastSuccessfulChange'
-        )
-
-    $lastSuccessfulVerification = Get-NestedPropertyValue `
-        -InputObject $Account `
-        -ParentProperty 'secretManagement' `
-        -ChildProperties @(
-            'lastSuccessfulVerification',
-            'LastSuccessfulVerification'
-        )
-
-    $platformAccountProperties = Get-ObjectPropertyValue -InputObject $Account -PropertyNames @(
-        'platformAccountProperties',
-        'PlatformAccountProperties'
-    )
-
-    $remoteMachinesAccess = Get-ObjectPropertyValue -InputObject $Account -PropertyNames @(
-        'remoteMachinesAccess',
-        'RemoteMachinesAccess'
-    )
-
-    $AccountReport.Add([PSCustomObject]@{
-        AccountID                   = Convert-ToReportValue $accountId
-        SafeName                    = Convert-ToReportValue $safeName
-        AccountName                 = Convert-ToReportValue $accountName
-        UserName                    = Convert-ToReportValue $userName
-        Address                     = Convert-ToReportValue $address
-        PlatformID                  = Convert-ToReportValue $platformId
-        SecretType                  = Convert-ToReportValue $secretType
-        CPMStatus                   = Convert-ToReportValue $cpmStatus
-        AutomaticManagementEnabled  = Convert-ToReportValue $automaticManagementEnabled
-        ManualManagementReason      = Convert-ToReportValue $manualManagementReason
-        CreatedTime                 = Convert-CyberArkTime $createdTime
-        ModifiedTime                = Convert-CyberArkTime $modifiedTime
-        CPMLastModifiedTime         = Convert-CyberArkTime $lastModifiedByCPM
-        LastSuccessfulChange        = Convert-CyberArkTime $lastSuccessfulChange
-        LastSuccessfulVerification  = Convert-CyberArkTime $lastSuccessfulVerification
-        PlatformAccountProperties   = Convert-ToReportValue $platformAccountProperties
-        RemoteMachinesAccess        = Convert-ToReportValue $remoteMachinesAccess
-    })
-
-    if (($currentIndex % 500) -eq 0) {
-        Write-Log ("Processed {0}/{1} account(s) into report..." -f $currentIndex, $totalAccounts) 'Gray'
+} finally {
+    if ($SessionEstablished) {
+        try {
+            Close-PASSession | Out-Null
+            Write-Log 'PAS session closed.' 'Gray'
+        } catch {
+            Write-Log ("WARNING: Could not close PAS session cleanly. {0}" -f $_.Exception.Message) 'Yellow'
+        }
     }
 }
-
-# ============================================
-# Export Account Report
-# ============================================
-
-try {
-    Write-Log "Exporting account report with Account ID..." 'Yellow'
-
-    $AccountReport |
-        Sort-Object SafeName, AccountName, UserName, Address |
-        Export-Csv -Path $AccountCsvPath -NoTypeInformation -Encoding UTF8
-
-    Write-Log ("Account report exported to: {0}" -f $AccountCsvPath) 'Green'
-} catch {
-    Write-Log ("ERROR: Failed to export account report CSV. {0}" -f $_.Exception.Message) 'Red'
-
-    try {
-        Close-PASSession | Out-Null
-    } catch {}
-
-    exit 1
-}
-
-# ============================================
-# Close Session
-# ============================================
-
-try {
-    Close-PASSession | Out-Null
-    Write-Log "PAS session closed." 'Gray'
-} catch {
-    Write-Log ("WARNING: Could not close PAS session cleanly. {0}" -f $_.Exception.Message) 'Yellow'
-}
-
-# ============================================
-# Completion
-# ============================================
-
-Write-Log "============================================================" 'Gray'
-Write-Log "CNA Account Report with Account ID completed." 'Green'
-Write-Log ("Authenticated User      : {0}" -f $AuthenticatedUser) 'Gray'
-Write-Log ("Total Accounts Exported : {0}" -f $AccountReport.Count) 'Green'
-Write-Log ("Account Report          : {0}" -f $AccountCsvPath) 'Gray'
-Write-Log "============================================================" 'Gray'
