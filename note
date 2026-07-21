@@ -1,213 +1,222 @@
-Scoped Limited Auditor — Team Test Setup
-Example test objects
+# Bulk_Release_And_Enable_CPM_CyberArk_Accounts.ps1
+# Purpose:
+#   1. Read CyberArk AccountIDs from account_ids.txt
+#   2. Try to release/unlock each account
+#   3. If already unlocked or unlock fails, still attempt to enable CPM management
+#   4. Export report
 
-Use the following naming pattern:
+$ErrorActionPreference = "Stop"
 
-AD group: CA_PAM_AUD_<TEAM>
-Test auditor: One non-PAM administrative user
-Team account Safe: Existing Safe containing the team’s accounts
-Recording Safe: PSMREC_<TEAM>
-Platform: The platform assigned to the team’s test account
-1. Create the auditor AD group
+# ---------------- CONFIG ----------------
 
-Create an AD security group such as:
+$TenantSubdomain = "mtbank"
+$AccountIdFile   = "account_idss.txt"
+$ReportFile      = ".\CyberArk_Unlock_EnableCPM_Report_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss")
 
-CA_PAM_AUD_LINUXTEAM
+# Proxy
+[System.Net.WebRequest]::DefaultWebProxy = New-Object System.Net.WebProxy("http://proxy.prod.mtb.com:8080")
+[System.Net.WebRequest]::DefaultWebProxy.UseDefaultCredentials = $true
 
-Add only the test auditor account to the group and confirm the group is synchronized into CyberArk Identity.
+# Behavior
+$TryCheckInFallback = $true
 
-Keep the group in the normal Privilege Cloud Users role required for portal access, but do not add it to:
+# This is the key change:
+# CPM will be enabled even if the account is already unlocked or unlock fails.
+$EnableCPMAfterUnlockAttempt = $true
 
-Privilege Cloud Auditors
-Privilege Cloud Session Risk Managers
-Privilege Cloud Safe Managers
-Global Auditor
-Privilege Cloud Administrators
+# ---------------- FUNCTIONS ----------------
 
-The Privilege Cloud Auditor role provides broad access to audits, reports, and recordings, while Global Auditor provides access to the shared Audit service. Neither is appropriate for a team-scoped test.
+function Write-Log {
+    param(
+        [string]$Message,
+        [string]$Level = "INFO"
+    )
 
-2. Grant access to the team’s account Safe
+    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    Write-Host "$ts [$Level] $Message"
+}
 
-Navigate to:
+function Add-Result {
+    param(
+        [System.Collections.Generic.List[object]]$Results,
+        [string]$AccountID,
+        [string]$Action,
+        [string]$Status,
+        [string]$Message
+    )
 
-Privilege Cloud Portal
-→ Administration
-→ Safe Management
-→ Select the team Safe
-→ Members
-→ Add member
+    $Results.Add([PSCustomObject]@{
+        TimeStamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        AccountID = $AccountID
+        Action    = $Action
+        Status    = $Status
+        Message   = $Message
+    })
+}
 
-Add:
+# ---------------- MAIN ----------------
 
-CA_PAM_AUD_LINUXTEAM
+Write-Log "CyberArk bulk release and CPM enable script starting."
 
-Grant only:
+if (-not (Get-Command New-PASSession -ErrorAction SilentlyContinue)) {
+    throw "psPAS module is not loaded or installed. Run: Import-Module psPAS"
+}
 
-Account Safe permission	Setting
-List accounts/files	Yes
-View audit	Yes
-Use accounts	No
-Retrieve accounts/files	No
-Add accounts	No
-Update account properties	No
-Update account content	No
-Initiate CPM operations	No
-Specify next password	No
-Delete accounts	No
-Unlock accounts	No
-Manage Safe	No
-Manage Safe members	No
-Confirm requests	No
-Access Safe without confirmation	No
+if (-not (Test-Path $AccountIdFile)) {
+    throw "Account ID file not found: $AccountIdFile"
+}
 
-List accounts/files allows access to recording links from the Account Details page, while View audit provides activity visibility for that Safe. Do not grant Use accounts or Retrieve accounts/files, because those permissions could allow connections or secret retrieval.
+$accountIds = Get-Content $AccountIdFile | ForEach-Object {
+    $_.Trim()
+} | Where-Object {
+    -not [string]::IsNullOrWhiteSpace($_)
+} | Select-Object -Unique
 
-3. Configure a team-specific recording Safe
+if ($accountIds.Count -eq 0) {
+    throw "No AccountIDs found in $AccountIdFile"
+}
 
-Navigate to:
+Write-Log "Loaded $($accountIds.Count) unique AccountID(s)."
 
-Administration
-→ Platform Management
-→ Locate the team platform
-→ More options
-→ Edit
-→ Target Account Platform
-→ UI & Workflows
-→ Privileged Session Management
+$cred = Get-Credential -Message "Enter API account username and password"
 
-Configure:
+try {
+    Write-Log "Connecting to CyberArk Privilege Cloud tenant: $TenantSubdomain"
+    New-PASSession -Credential $cred -TenantSubdomain $TenantSubdomain -ServiceUser
+    Write-Log "Connected to CyberArk."
 
-SessionRecorderSafe = PSMREC_LINUXTEAM
-SessionRecorderSafeRetention = 30
+    $results = New-Object System.Collections.Generic.List[object]
 
-Save the platform.
+    foreach ($id in $accountIds) {
+        Write-Log "Processing AccountID: $id"
 
-CyberArk creates the recording Safe when the first recording for that platform is uploaded. Recordings created before this change remain in the previous recording Safe, normally PSMRecordings.
+        $unlockSucceeded = $false
+        $checkInSucceeded = $false
+        $unlockAttempted = $false
+        $unlockMessage = ""
 
-Important for a shared platform
+        # ---------------- TRY RELEASE / UNLOCK ----------------
 
-Do not assign a single team recording Safe to a platform used by multiple unrelated teams. That would place all future sessions using that platform into the same recording Safe.
+        try {
+            $unlockAttempted = $true
 
-For a shared platform, use one of these approaches:
+            Unlock-PASAccount -AccountID $id -Unlock -ErrorAction Stop
 
-SessionRecorderSafe = PSM-{AccountSafeName}
+            $unlockSucceeded = $true
+            $unlockMessage = "Account released/unlocked successfully."
 
-This creates separate recording Safes based on the account Safe name.
+            Write-Log "SUCCESS: Released/unlocked AccountID $id" "SUCCESS"
 
-Alternatively, clone the platform and assign the team’s accounts to the cloned platform. CyberArk supports static recording Safe names and dynamic names containing {AccountSafeName}.
+            Add-Result `
+                -Results $results `
+                -AccountID $id `
+                -Action "Unlock" `
+                -Status "Success" `
+                -Message $unlockMessage
+        }
+        catch {
+            $unlockMessage = $_.Exception.Message
 
-4. Generate the first test recording
+            Write-Log "Unlock did not complete for AccountID $id. Message: $unlockMessage" "WARN"
 
-Using a normal privileged user—not the auditor:
+            Add-Result `
+                -Results $results `
+                -AccountID $id `
+                -Action "Unlock" `
+                -Status "FailedOrNotRequired" `
+                -Message $unlockMessage
 
-Connect through PSM to an account assigned to the selected platform.
-Perform a harmless test action.
-End the session.
-Confirm that PSMREC_LINUXTEAM appears under Safe Management.
-Confirm that the recording appears under Monitoring.
+            if ($TryCheckInFallback) {
+                try {
+                    Write-Log "Trying CheckIn fallback for AccountID $id"
 
-The Monitoring menu may not appear for the auditor until at least one session recording exists.
+                    # Fallback for exclusive access / checked-out accounts.
+                    Unlock-PASAccount -AccountID $id -ErrorAction Stop
 
-5. Grant access to the recording Safe
+                    $checkInSucceeded = $true
 
-Navigate to:
+                    Write-Log "SUCCESS: CheckIn fallback completed for AccountID $id" "SUCCESS"
 
-Administration
-→ Safe Management
-→ PSMREC_LINUXTEAM
-→ Members
-→ Add member
+                    Add-Result `
+                        -Results $results `
+                        -AccountID $id `
+                        -Action "CheckInFallback" `
+                        -Status "Success" `
+                        -Message "CheckIn fallback completed."
+                }
+                catch {
+                    $checkInError = $_.Exception.Message
 
-Add:
+                    Write-Log "CheckIn fallback did not complete for AccountID $id. Message: $checkInError" "WARN"
 
-CA_PAM_AUD_LINUXTEAM
+                    Add-Result `
+                        -Results $results `
+                        -AccountID $id `
+                        -Action "CheckInFallback" `
+                        -Status "FailedOrNotRequired" `
+                        -Message $checkInError
+                }
+            }
+        }
 
-Grant only:
+        # ---------------- ENABLE CPM MANAGEMENT ----------------
+        # This will run even if the account was already unlocked or unlock failed.
 
-Recording Safe permission	Setting
-Retrieve accounts/files	Yes
-List accounts/files	Yes
-View audit	Yes
-Use accounts	No
-Add accounts	No
-Update account properties	No
-Update account content	No
-Delete accounts	No
-Manage Safe	No
-Manage Safe members	No
+        if ($EnableCPMAfterUnlockAttempt) {
+            try {
+                Write-Log "Enabling CPM automatic management for AccountID $id"
 
-CyberArk requires Retrieve accounts/files, List accounts/files, and View audit on the recording Safe for granular recording access. The auditor does not need membership in the Privilege Cloud Auditor role.
+                [array]$operations = @(
+                    @{
+                        op    = "replace"
+                        path  = "/secretManagement/automaticManagementEnabled"
+                        value = $true
+                    },
+                    @{
+                        op    = "replace"
+                        path  = "/secretManagement/manualManagementReason"
+                        value = ""
+                    }
+                )
 
-6. Test the auditor account
+                Set-PASAccount -ID $id -operations $operations -ErrorAction Stop
 
-Sign in using the Limited Auditor test account.
+                Write-Log "SUCCESS: CPM automatic management enabled for AccountID $id" "SUCCESS"
 
-Navigate to:
+                Add-Result `
+                    -Results $results `
+                    -AccountID $id `
+                    -Action "EnableCPM" `
+                    -Status "Success" `
+                    -Message "CPM automatic management enabled and manual management reason cleared."
+            }
+            catch {
+                $enableError = $_.Exception.Message
 
-Privilege Cloud Portal
-→ Monitoring
+                Write-Log "FAILED: Could not enable CPM management for AccountID $id. Error: $enableError" "ERROR"
 
-Confirm the auditor can:
+                Add-Result `
+                    -Results $results `
+                    -AccountID $id `
+                    -Action "EnableCPM" `
+                    -Status "Failed" `
+                    -Message $enableError
+            }
+        }
+    }
 
-See the team’s recording.
-Search by user, target address, connection type, or date.
-View session start time and duration.
-Open and play the recording.
-Review the activity timeline.
-View account activity for the authorized account Safe.
+    $results | Export-Csv -Path $ReportFile -NoTypeInformation -Encoding UTF8
 
-CyberArk’s Monitoring page supports searching recordings by session properties, activities, and date ranges.
+    Write-Log "Report exported to: $ReportFile"
+}
+finally {
+    try {
+        Close-PASSession
+        Write-Log "CyberArk session closed."
+    }
+    catch {
+        Write-Log "Close-PASSession failed or session was already closed. $($_.Exception.Message)" "WARN"
+    }
+}
 
-7. Perform negative testing
-
-Confirm the auditor cannot:
-
-View recordings from another team’s recording Safe.
-View accounts from another team’s account Safe.
-Show or copy passwords.
-Connect using the account.
-Change or reconcile passwords.
-Modify account properties.
-Add or delete accounts.
-Add or remove Safe members.
-Modify platforms.
-Terminate active sessions.
-Access tenant-wide Audit and Reports information.
-
-Also verify that the user does not inherit broader access from another nested AD group.
-
-8. Test non-session audit visibility
-
-For this scoped model, use the team account Safe’s View audit permission.
-
-The auditor should be able to review activity associated with accounts in that Safe, such as:
-
-Account usage
-PSM connections
-Password management activity
-Account changes
-User and timestamp information
-
-Do not assign Global Auditor for this test. Global Auditor provides access to the shared Audit space, including activity searches, reports, and SIEM integration capabilities, and is not Safe-scoped.
-
-Final permission model
-AD Group:
-CA_PAM_AUD_LINUXTEAM
-
-Account Safe:
-List accounts/files = Yes
-View audit = Yes
-
-Recording Safe:
-Retrieve accounts/files = Yes
-List accounts/files = Yes
-View audit = Yes
-
-Excluded roles:
-Privilege Cloud Auditors
-Global Auditor
-Session Risk Managers
-Safe Managers
-Administrators
-
-This gives the selected team access to its PSM recordings and Safe-level activity without providing password retrieval, connection, account management, platform management, or tenant-wide audit access.
+Write-Log "Script completed."
