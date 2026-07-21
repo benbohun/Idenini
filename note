@@ -1,221 +1,763 @@
-# Bulk_Release_And_Enable_CPM_CyberArk_Accounts.ps1
-# Purpose:
-#   1. Read CyberArk AccountIDs from account_ids.txt
-#   2. Try to release/unlock each account
-#   3. If already unlocked or unlock fails, still attempt to enable CPM management
-#   4. Export report
+#Requires -Version 5.1
+
+<#
+.SYNOPSIS
+    Bulk release locked CyberArk accounts, enable CPM management for those
+    locked accounts, and trigger an immediate reconciliation.
+
+.DESCRIPTION
+    Reads CyberArk AccountIDs from a text file and processes each account:
+
+    - If the account is already unlocked:
+        * Skip Unlock.
+        * Skip Check-In.
+        * Skip enabling CPM / clearing manualManagementReason.
+        * Trigger Reconcile only.
+
+    - If the account is locked:
+        * Attempt Unlock.
+        * If Unlock fails and fallback is enabled, attempt Check-In.
+        * Enable CPM automatic management and clear manualManagementReason.
+        * Trigger Reconcile.
+
+    A detailed CSV report is generated for every action.
+
+.NOTES
+    - PowerShell 5.1 compatible.
+    - Requires the psPAS module.
+    - The API user requires appropriate Safe permissions, including:
+        * List accounts
+        * Unlock accounts, when unlocking another user's lock
+        * Initiate CPM password management operations
+        * Update account properties/content as required to enable CPM
+
+    Default input file:
+        account_idss.txt
+
+    Input file format:
+        One CyberArk AccountID per line, for example:
+
+        2889_9
+        2883_3
+
+        Blank lines and lines beginning with # are ignored.
+#>
+
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $false)]
+    [ValidateNotNullOrEmpty()]
+    [string]$TenantSubdomain = "mtbank",
+
+    [Parameter(Mandatory = $false)]
+    [ValidateNotNullOrEmpty()]
+    [string]$AccountIdFile = "account_idss.txt",
+
+    [Parameter(Mandatory = $false)]
+    [ValidateNotNullOrEmpty()]
+    [string]$ProxyUri = "http://proxy.prod.mtb.com:8080",
+
+    [Parameter(Mandatory = $false)]
+    [bool]$TryCheckInFallback = $true,
+
+    [Parameter(Mandatory = $false)]
+    [bool]$ContinueAfterReleaseFailure = $true
+)
 
 $ErrorActionPreference = "Stop"
 
-# ---------------- CONFIG ----------------
+# ---------------------------------------------------------------------------
+# PATHS
+# ---------------------------------------------------------------------------
 
-$TenantSubdomain = "mtbank"
-$AccountIdFile   = "account_idss.txt"
-$ReportFile      = ".\CyberArk_Unlock_EnableCPM_Report_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss")
+$ScriptDirectory = if ([string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+    (Get-Location).Path
+}
+else {
+    $PSScriptRoot
+}
 
-# Proxy
-[System.Net.WebRequest]::DefaultWebProxy = New-Object System.Net.WebProxy("http://proxy.prod.mtb.com:8080")
-[System.Net.WebRequest]::DefaultWebProxy.UseDefaultCredentials = $true
+if (-not [System.IO.Path]::IsPathRooted($AccountIdFile)) {
+    $AccountIdFile = Join-Path -Path $ScriptDirectory -ChildPath $AccountIdFile
+}
 
-# Behavior
-$TryCheckInFallback = $true
+$ReportFile = Join-Path `
+    -Path $ScriptDirectory `
+    -ChildPath (
+        "CyberArk_Release_EnableCPM_Reconcile_Report_{0}.csv" -f `
+            (Get-Date -Format "yyyyMMdd_HHmmss")
+    )
 
-# This is the key change:
-# CPM will be enabled even if the account is already unlocked or unlock fails.
-$EnableCPMAfterUnlockAttempt = $true
+# ---------------------------------------------------------------------------
+# PROXY
+# ---------------------------------------------------------------------------
 
-# ---------------- FUNCTIONS ----------------
+if (-not [string]::IsNullOrWhiteSpace($ProxyUri)) {
+    [System.Net.WebRequest]::DefaultWebProxy = New-Object `
+        System.Net.WebProxy($ProxyUri)
+
+    [System.Net.WebRequest]::DefaultWebProxy.UseDefaultCredentials = $true
+}
+
+# ---------------------------------------------------------------------------
+# FUNCTIONS
+# ---------------------------------------------------------------------------
 
 function Write-Log {
+    [CmdletBinding()]
     param(
+        [Parameter(Mandatory = $true)]
         [string]$Message,
+
+        [Parameter(Mandatory = $false)]
+        [ValidateSet("INFO", "SUCCESS", "WARN", "ERROR")]
         [string]$Level = "INFO"
     )
 
-    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    Write-Host "$ts [$Level] $Message"
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $line = "$timestamp [$Level] $Message"
+
+    switch ($Level) {
+        "SUCCESS" {
+            Write-Host $line -ForegroundColor Green
+        }
+
+        "WARN" {
+            Write-Host $line -ForegroundColor Yellow
+        }
+
+        "ERROR" {
+            Write-Host $line -ForegroundColor Red
+        }
+
+        default {
+            Write-Host $line
+        }
+    }
+}
+
+function Get-PropertyValue {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $false)]
+        [AllowNull()]
+        [object]$InputObject,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string[]]$PropertyNames
+    )
+
+    if ($null -eq $InputObject) {
+        return $null
+    }
+
+    foreach ($propertyName in $PropertyNames) {
+        $property = $InputObject.PSObject.Properties |
+            Where-Object {
+                $_.Name -ieq $propertyName
+            } |
+            Select-Object -First 1
+
+        if ($null -ne $property) {
+            return $property.Value
+        }
+    }
+
+    return $null
+}
+
+function Resolve-AccountObject {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$AccountResult,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$AccountID
+    )
+
+    $valueProperty = $AccountResult.PSObject.Properties |
+        Where-Object {
+            $_.Name -ieq "value"
+        } |
+        Select-Object -First 1
+
+    if ($null -ne $valueProperty) {
+        $candidateAccounts = @($valueProperty.Value)
+    }
+    else {
+        $candidateAccounts = @($AccountResult)
+    }
+
+    $matchingAccount = $candidateAccounts |
+        Where-Object {
+            $returnedID = Get-PropertyValue `
+                -InputObject $_ `
+                -PropertyNames @("id", "AccountID")
+
+            [string]$returnedID -eq [string]$AccountID
+        } |
+        Select-Object -First 1
+
+    if ($null -ne $matchingAccount) {
+        return $matchingAccount
+    }
+
+    if ($candidateAccounts.Count -eq 1) {
+        return $candidateAccounts[0]
+    }
+
+    throw "CyberArk did not return an exact account object for AccountID '$AccountID'."
 }
 
 function Add-Result {
+    [CmdletBinding()]
     param(
+        [Parameter(Mandatory = $true)]
         [System.Collections.Generic.List[object]]$Results,
+
+        [Parameter(Mandatory = $true)]
         [string]$AccountID,
+
+        [Parameter(Mandatory = $false)]
+        [AllowNull()]
+        [object]$Account,
+
+        [Parameter(Mandatory = $false)]
+        [AllowNull()]
+        [string]$InitialLockedBy,
+
+        [Parameter(Mandatory = $true)]
         [string]$Action,
+
+        [Parameter(Mandatory = $true)]
         [string]$Status,
+
+        [Parameter(Mandatory = $true)]
         [string]$Message
     )
 
-    $Results.Add([PSCustomObject]@{
-        TimeStamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-        AccountID = $AccountID
-        Action    = $Action
-        Status    = $Status
-        Message   = $Message
-    })
+    $accountName = $null
+    $safeName = $null
+    $platformID = $null
+    $userName = $null
+    $address = $null
+
+    if ($null -ne $Account) {
+        $accountName = Get-PropertyValue `
+            -InputObject $Account `
+            -PropertyNames @("name", "AccountName")
+
+        $safeName = Get-PropertyValue `
+            -InputObject $Account `
+            -PropertyNames @("safeName", "Safe")
+
+        $platformID = Get-PropertyValue `
+            -InputObject $Account `
+            -PropertyNames @("platformId", "PlatformID", "PolicyID")
+
+        $userName = Get-PropertyValue `
+            -InputObject $Account `
+            -PropertyNames @("userName", "Username")
+
+        $address = Get-PropertyValue `
+            -InputObject $Account `
+            -PropertyNames @("address", "Address")
+    }
+
+    [void]$Results.Add(
+        [PSCustomObject]@{
+            TimeStamp       = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            AccountID       = $AccountID
+            AccountName     = $accountName
+            SafeName        = $safeName
+            PlatformID      = $platformID
+            UserName        = $userName
+            Address         = $address
+            InitialLockedBy = $InitialLockedBy
+            Action          = $Action
+            Status          = $Status
+            Message         = $Message
+        }
+    )
 }
 
-# ---------------- MAIN ----------------
+function Enable-CPMManagement {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$AccountID
+    )
 
-Write-Log "CyberArk bulk release and CPM enable script starting."
+    # Use the purpose-built psPAS cmdlet when available. It enables automatic
+    # CPM management and clears manualManagementReason in one API request.
+    if (Get-Command Enable-PASCPMAutoManagement -ErrorAction SilentlyContinue) {
+        Enable-PASCPMAutoManagement `
+            -AccountID $AccountID `
+            -ErrorAction Stop
 
-if (-not (Get-Command New-PASSession -ErrorAction SilentlyContinue)) {
-    throw "psPAS module is not loaded or installed. Run: Import-Module psPAS"
+        return
+    }
+
+    # Compatibility fallback for older psPAS releases.
+    [hashtable[]]$operations = @(
+        @{
+            op    = "replace"
+            path  = "/secretManagement/automaticManagementEnabled"
+            value = $true
+        },
+        @{
+            op    = "replace"
+            path  = "/secretManagement/manualManagementReason"
+            value = ""
+        }
+    )
+
+    Set-PASAccount `
+        -AccountID $AccountID `
+        -operations $operations `
+        -Confirm:$false `
+        -ErrorAction Stop
 }
 
-if (-not (Test-Path $AccountIdFile)) {
-    throw "Account ID file not found: $AccountIdFile"
+# ---------------------------------------------------------------------------
+# VALIDATION
+# ---------------------------------------------------------------------------
+
+Write-Log "CyberArk bulk release, CPM enable, and reconcile script starting."
+Write-Log "Tenant              : $TenantSubdomain"
+Write-Log "Account ID file     : $AccountIdFile"
+Write-Log "Report file         : $ReportFile"
+Write-Log "Check-In fallback   : $TryCheckInFallback"
+Write-Log "Continue on release failure: $ContinueAfterReleaseFailure"
+
+try {
+    Import-Module psPAS -ErrorAction Stop
+}
+catch {
+    throw "Unable to import the psPAS module. Error: $($_.Exception.Message)"
 }
 
-$accountIds = Get-Content $AccountIdFile | ForEach-Object {
-    $_.Trim()
-} | Where-Object {
-    -not [string]::IsNullOrWhiteSpace($_)
-} | Select-Object -Unique
+$requiredCommands = @(
+    "New-PASSession",
+    "Get-PASAccount",
+    "Unlock-PASAccount",
+    "Set-PASAccount",
+    "Invoke-PASCPMOperation",
+    "Close-PASSession"
+)
+
+foreach ($commandName in $requiredCommands) {
+    if (-not (Get-Command $commandName -ErrorAction SilentlyContinue)) {
+        throw "Required psPAS command was not found: $commandName"
+    }
+}
+
+if (-not (Test-Path -LiteralPath $AccountIdFile -PathType Leaf)) {
+    throw "Account ID file was not found: $AccountIdFile"
+}
+
+[array]$accountIds = @(
+    Get-Content -LiteralPath $AccountIdFile |
+        ForEach-Object {
+            $_.Trim()
+        } |
+        Where-Object {
+            -not [string]::IsNullOrWhiteSpace($_) -and
+            -not $_.StartsWith("#")
+        } |
+        Select-Object -Unique
+)
 
 if ($accountIds.Count -eq 0) {
-    throw "No AccountIDs found in $AccountIdFile"
+    throw "No AccountIDs were found in $AccountIdFile"
 }
 
 Write-Log "Loaded $($accountIds.Count) unique AccountID(s)."
 
-$cred = Get-Credential -Message "Enter API account username and password"
+$credential = Get-Credential `
+    -Message "Enter CyberArk API account username and password"
+
+$results = New-Object System.Collections.Generic.List[object]
+$sessionCreated = $false
+
+# ---------------------------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------------------------
 
 try {
     Write-Log "Connecting to CyberArk Privilege Cloud tenant: $TenantSubdomain"
-    New-PASSession -Credential $cred -TenantSubdomain $TenantSubdomain -ServiceUser
-    Write-Log "Connected to CyberArk."
 
-    $results = New-Object System.Collections.Generic.List[object]
+    New-PASSession `
+        -Credential $credential `
+        -TenantSubdomain $TenantSubdomain `
+        -ServiceUser `
+        -ErrorAction Stop
 
-    foreach ($id in $accountIds) {
-        Write-Log "Processing AccountID: $id"
+    $sessionCreated = $true
+    Write-Log "Connected to CyberArk successfully." "SUCCESS"
 
-        $unlockSucceeded = $false
-        $checkInSucceeded = $false
-        $unlockAttempted = $false
-        $unlockMessage = ""
+    $currentNumber = 0
 
-        # ---------------- TRY RELEASE / UNLOCK ----------------
+    foreach ($accountID in $accountIds) {
+        $currentNumber++
+
+        Write-Log (
+            "[$currentNumber/$($accountIds.Count)] Processing AccountID: $accountID"
+        )
+
+        $account = $null
+        $lockedBy = $null
+        $isLocked = $false
+        $releaseSucceeded = $false
+        $releaseAttempted = $false
+        $continueWithLockedAccountActions = $true
+
+        # -------------------------------------------------------------------
+        # RETRIEVE CURRENT ACCOUNT STATE
+        # -------------------------------------------------------------------
 
         try {
-            $unlockAttempted = $true
+            $accountResult = Get-PASAccount `
+                -id $accountID `
+                -ErrorAction Stop
 
-            Unlock-PASAccount -AccountID $id -Unlock -ErrorAction Stop
+            $account = Resolve-AccountObject `
+                -AccountResult $accountResult `
+                -AccountID $accountID
 
-            $unlockSucceeded = $true
-            $unlockMessage = "Account released/unlocked successfully."
+            $lockedByValue = Get-PropertyValue `
+                -InputObject $account `
+                -PropertyNames @("lockedBy", "LockedBy")
 
-            Write-Log "SUCCESS: Released/unlocked AccountID $id" "SUCCESS"
+            if ($null -ne $lockedByValue) {
+                $lockedBy = [string]$lockedByValue
+            }
 
-            Add-Result `
-                -Results $results `
-                -AccountID $id `
-                -Action "Unlock" `
-                -Status "Success" `
-                -Message $unlockMessage
+            $isLocked = -not [string]::IsNullOrWhiteSpace($lockedBy)
+
+            if ($isLocked) {
+                Write-Log (
+                    "AccountID $accountID is locked by '$lockedBy'."
+                ) "WARN"
+
+                Add-Result `
+                    -Results $results `
+                    -AccountID $accountID `
+                    -Account $account `
+                    -InitialLockedBy $lockedBy `
+                    -Action "AccountState" `
+                    -Status "Locked" `
+                    -Message "Account is locked by '$lockedBy'."
+            }
+            else {
+                Write-Log (
+                    "AccountID $accountID is already unlocked. " +
+                    "Skipping Unlock, Check-In, and CPM enable. " +
+                    "Reconcile will be triggered."
+                ) "SUCCESS"
+
+                Add-Result `
+                    -Results $results `
+                    -AccountID $accountID `
+                    -Account $account `
+                    -InitialLockedBy "" `
+                    -Action "AccountState" `
+                    -Status "AlreadyUnlocked" `
+                    -Message (
+                        "Account is already unlocked. Only reconciliation " +
+                        "will be initiated."
+                    )
+            }
         }
         catch {
-            $unlockMessage = $_.Exception.Message
+            $lookupError = $_.Exception.Message
 
-            Write-Log "Unlock did not complete for AccountID $id. Message: $unlockMessage" "WARN"
+            Write-Log (
+                "FAILED: Could not retrieve AccountID $accountID. " +
+                "Error: $lookupError"
+            ) "ERROR"
 
             Add-Result `
                 -Results $results `
-                -AccountID $id `
-                -Action "Unlock" `
-                -Status "FailedOrNotRequired" `
-                -Message $unlockMessage
+                -AccountID $accountID `
+                -Account $null `
+                -InitialLockedBy "" `
+                -Action "AccountLookup" `
+                -Status "Failed" `
+                -Message $lookupError
 
-            if ($TryCheckInFallback) {
-                try {
-                    Write-Log "Trying CheckIn fallback for AccountID $id"
-
-                    # Fallback for exclusive access / checked-out accounts.
-                    Unlock-PASAccount -AccountID $id -ErrorAction Stop
-
-                    $checkInSucceeded = $true
-
-                    Write-Log "SUCCESS: CheckIn fallback completed for AccountID $id" "SUCCESS"
-
-                    Add-Result `
-                        -Results $results `
-                        -AccountID $id `
-                        -Action "CheckInFallback" `
-                        -Status "Success" `
-                        -Message "CheckIn fallback completed."
-                }
-                catch {
-                    $checkInError = $_.Exception.Message
-
-                    Write-Log "CheckIn fallback did not complete for AccountID $id. Message: $checkInError" "WARN"
-
-                    Add-Result `
-                        -Results $results `
-                        -AccountID $id `
-                        -Action "CheckInFallback" `
-                        -Status "FailedOrNotRequired" `
-                        -Message $checkInError
-                }
-            }
+            continue
         }
 
-        # ---------------- ENABLE CPM MANAGEMENT ----------------
-        # This will run even if the account was already unlocked or unlock failed.
+        # -------------------------------------------------------------------
+        # LOCKED ACCOUNT: RELEASE / UNLOCK
+        # -------------------------------------------------------------------
 
-        if ($EnableCPMAfterUnlockAttempt) {
+        if ($isLocked) {
             try {
-                Write-Log "Enabling CPM automatic management for AccountID $id"
+                $releaseAttempted = $true
 
-                [array]$operations = @(
-                    @{
-                        op    = "replace"
-                        path  = "/secretManagement/automaticManagementEnabled"
-                        value = $true
-                    },
-                    @{
-                        op    = "replace"
-                        path  = "/secretManagement/manualManagementReason"
-                        value = ""
-                    }
+                Write-Log (
+                    "Attempting Unlock for AccountID $accountID."
                 )
 
-                Set-PASAccount -ID $id -operations $operations -ErrorAction Stop
+                Unlock-PASAccount `
+                    -AccountID $accountID `
+                    -Unlock `
+                    -Confirm:$false `
+                    -ErrorAction Stop
 
-                Write-Log "SUCCESS: CPM automatic management enabled for AccountID $id" "SUCCESS"
+                $releaseSucceeded = $true
+
+                Write-Log (
+                    "SUCCESS: AccountID $accountID was unlocked."
+                ) "SUCCESS"
 
                 Add-Result `
                     -Results $results `
-                    -AccountID $id `
-                    -Action "EnableCPM" `
+                    -AccountID $accountID `
+                    -Account $account `
+                    -InitialLockedBy $lockedBy `
+                    -Action "Unlock" `
                     -Status "Success" `
-                    -Message "CPM automatic management enabled and manual management reason cleared."
+                    -Message "Account was unlocked successfully."
             }
             catch {
-                $enableError = $_.Exception.Message
+                $unlockError = $_.Exception.Message
 
-                Write-Log "FAILED: Could not enable CPM management for AccountID $id. Error: $enableError" "ERROR"
+                Write-Log (
+                    "Unlock did not complete for AccountID $accountID. " +
+                    "Error: $unlockError"
+                ) "WARN"
 
                 Add-Result `
                     -Results $results `
-                    -AccountID $id `
-                    -Action "EnableCPM" `
+                    -AccountID $accountID `
+                    -Account $account `
+                    -InitialLockedBy $lockedBy `
+                    -Action "Unlock" `
                     -Status "Failed" `
-                    -Message $enableError
+                    -Message $unlockError
+
+                if ($TryCheckInFallback) {
+                    try {
+                        Write-Log (
+                            "Attempting Check-In fallback for " +
+                            "AccountID $accountID."
+                        )
+
+                        Unlock-PASAccount `
+                            -AccountID $accountID `
+                            -CheckIn `
+                            -Confirm:$false `
+                            -ErrorAction Stop
+
+                        $releaseSucceeded = $true
+
+                        Write-Log (
+                            "SUCCESS: Check-In fallback completed for " +
+                            "AccountID $accountID."
+                        ) "SUCCESS"
+
+                        Add-Result `
+                            -Results $results `
+                            -AccountID $accountID `
+                            -Account $account `
+                            -InitialLockedBy $lockedBy `
+                            -Action "CheckInFallback" `
+                            -Status "Success" `
+                            -Message "Check-In fallback completed successfully."
+                    }
+                    catch {
+                        $checkInError = $_.Exception.Message
+
+                        Write-Log (
+                            "Check-In fallback did not complete for " +
+                            "AccountID $accountID. Error: $checkInError"
+                        ) "WARN"
+
+                        Add-Result `
+                            -Results $results `
+                            -AccountID $accountID `
+                            -Account $account `
+                            -InitialLockedBy $lockedBy `
+                            -Action "CheckInFallback" `
+                            -Status "Failed" `
+                            -Message $checkInError
+                    }
+                }
+            }
+
+            if (
+                $releaseAttempted -and
+                -not $releaseSucceeded -and
+                -not $ContinueAfterReleaseFailure
+            ) {
+                $continueWithLockedAccountActions = $false
+
+                Write-Log (
+                    "Skipping CPM enable and reconcile for AccountID " +
+                    "$accountID because release failed and " +
+                    "ContinueAfterReleaseFailure is False."
+                ) "WARN"
+
+                Add-Result `
+                    -Results $results `
+                    -AccountID $accountID `
+                    -Account $account `
+                    -InitialLockedBy $lockedBy `
+                    -Action "RemainingActions" `
+                    -Status "Skipped" `
+                    -Message (
+                        "Release failed and ContinueAfterReleaseFailure " +
+                        "was set to False."
+                    )
+            }
+
+            # ---------------------------------------------------------------
+            # LOCKED ACCOUNT: ENABLE CPM MANAGEMENT
+            # ---------------------------------------------------------------
+
+            if ($continueWithLockedAccountActions) {
+                try {
+                    Write-Log (
+                        "Enabling CPM automatic management for " +
+                        "AccountID $accountID."
+                    )
+
+                    Enable-CPMManagement -AccountID $accountID
+
+                    Write-Log (
+                        "SUCCESS: CPM automatic management enabled for " +
+                        "AccountID $accountID."
+                    ) "SUCCESS"
+
+                    Add-Result `
+                        -Results $results `
+                        -AccountID $accountID `
+                        -Account $account `
+                        -InitialLockedBy $lockedBy `
+                        -Action "EnableCPM" `
+                        -Status "Success" `
+                        -Message (
+                            "CPM automatic management enabled and " +
+                            "manualManagementReason cleared."
+                        )
+                }
+                catch {
+                    $enableError = $_.Exception.Message
+
+                    Write-Log (
+                        "FAILED: Could not enable CPM management for " +
+                        "AccountID $accountID. Error: $enableError"
+                    ) "ERROR"
+
+                    Add-Result `
+                        -Results $results `
+                        -AccountID $accountID `
+                        -Account $account `
+                        -InitialLockedBy $lockedBy `
+                        -Action "EnableCPM" `
+                        -Status "Failed" `
+                        -Message $enableError
+                }
+            }
+        }
+
+        # -------------------------------------------------------------------
+        # RECONCILE
+        #
+        # Already-unlocked accounts come directly here without Unlock,
+        # Check-In, CPM enable, or clearing manualManagementReason.
+        # -------------------------------------------------------------------
+
+        if (-not $isLocked -or $continueWithLockedAccountActions) {
+            try {
+                Write-Log (
+                    "Initiating immediate reconcile for AccountID $accountID."
+                )
+
+                Invoke-PASCPMOperation `
+                    -AccountID $accountID `
+                    -ReconcileTask `
+                    -Confirm:$false `
+                    -ErrorAction Stop
+
+                Write-Log (
+                    "SUCCESS: Reconcile initiated for AccountID $accountID."
+                ) "SUCCESS"
+
+                Add-Result `
+                    -Results $results `
+                    -AccountID $accountID `
+                    -Account $account `
+                    -InitialLockedBy $lockedBy `
+                    -Action "Reconcile" `
+                    -Status "Success" `
+                    -Message "Immediate CPM reconciliation was initiated."
+            }
+            catch {
+                $reconcileError = $_.Exception.Message
+
+                Write-Log (
+                    "FAILED: Could not initiate reconcile for " +
+                    "AccountID $accountID. Error: $reconcileError"
+                ) "ERROR"
+
+                Add-Result `
+                    -Results $results `
+                    -AccountID $accountID `
+                    -Account $account `
+                    -InitialLockedBy $lockedBy `
+                    -Action "Reconcile" `
+                    -Status "Failed" `
+                    -Message $reconcileError
             }
         }
     }
-
-    $results | Export-Csv -Path $ReportFile -NoTypeInformation -Encoding UTF8
-
-    Write-Log "Report exported to: $ReportFile"
+}
+catch {
+    Write-Log "Fatal processing error: $($_.Exception.Message)" "ERROR"
+    throw
 }
 finally {
+    # Export everything collected even if a later account causes a fatal error.
     try {
-        Close-PASSession
-        Write-Log "CyberArk session closed."
+        if ($results.Count -gt 0) {
+            $results |
+                Export-Csv `
+                    -LiteralPath $ReportFile `
+                    -NoTypeInformation `
+                    -Encoding UTF8
+
+            Write-Log "Report exported to: $ReportFile" "SUCCESS"
+        }
+        else {
+            Write-Log "No report rows were generated." "WARN"
+        }
     }
     catch {
-        Write-Log "Close-PASSession failed or session was already closed. $($_.Exception.Message)" "WARN"
+        Write-Log (
+            "FAILED: Could not export report. Error: " +
+            "$($_.Exception.Message)"
+        ) "ERROR"
+    }
+
+    if ($sessionCreated) {
+        try {
+            Close-PASSession -ErrorAction Stop
+            Write-Log "CyberArk session closed."
+        }
+        catch {
+            Write-Log (
+                "Close-PASSession failed or the session was already closed. " +
+                "$($_.Exception.Message)"
+            ) "WARN"
+        }
     }
 }
 
