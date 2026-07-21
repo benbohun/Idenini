@@ -1,3 +1,389 @@
-I have safe list that ends with OMNG in a list, i need to validate a CyberArk full safe list to compare if they have their Pair ending with AMNG exist
-e.g AP-CL9-P-C1-OMNG and AP-CL9-P-C1-AMNG
-Do a quick script, prompt to select OMNG safe csv, then prompt CyberArk full inventory list
+<#
+.SYNOPSIS
+    Validates whether each CyberArk Safe ending in OMNG has a corresponding
+    Safe ending in AMNG.
+
+.EXAMPLE
+    AP-CL9-P-C1-OMNG
+    Expected pair:
+    AP-CL9-P-C1-AMNG
+
+.REQUIREMENTS
+    PowerShell 5.1
+#>
+
+[CmdletBinding()]
+param()
+
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = "Stop"
+
+Add-Type -AssemblyName System.Windows.Forms
+
+# ============================================================
+# FUNCTIONS
+# ============================================================
+
+function Write-Log {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Message,
+
+        [ValidateSet("INFO", "WARNING", "ERROR", "SUCCESS")]
+        [string]$Level = "INFO"
+    )
+
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    Write-Host "$timestamp | $Level | $Message"
+}
+
+function Select-CsvFile {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Title
+    )
+
+    $dialog = New-Object System.Windows.Forms.OpenFileDialog
+    $dialog.Title = $Title
+    $dialog.Filter = "CSV files (*.csv)|*.csv|All files (*.*)|*.*"
+    $dialog.Multiselect = $false
+    $dialog.CheckFileExists = $true
+    $dialog.RestoreDirectory = $true
+
+    $result = $dialog.ShowDialog()
+
+    if ($result -ne [System.Windows.Forms.DialogResult]::OK) {
+        throw "File selection was cancelled."
+    }
+
+    return $dialog.FileName
+}
+
+function Get-SafeNameColumn {
+    param(
+        [Parameter(Mandatory)]
+        [object[]]$CsvData,
+
+        [Parameter(Mandatory)]
+        [string]$SourceDescription
+    )
+
+    if ($CsvData.Count -eq 0) {
+        throw "$SourceDescription does not contain any records."
+    }
+
+    $columns = @($CsvData[0].PSObject.Properties.Name)
+
+    if ($columns.Count -eq 0) {
+        throw "No CSV columns were detected in $SourceDescription."
+    }
+
+    $preferredColumns = @(
+        "SafeName",
+        "Safe Name",
+        "Safe",
+        "safeName",
+        "safe",
+        "Name",
+        "Safename"
+    )
+
+    foreach ($preferredColumn in $preferredColumns) {
+        $matchedColumn = $columns |
+            Where-Object {
+                $_.Trim() -ieq $preferredColumn.Trim()
+            } |
+            Select-Object -First 1
+
+        if ($matchedColumn) {
+            return $matchedColumn
+        }
+    }
+
+    # If only one column exists, use it automatically.
+    if ($columns.Count -eq 1) {
+        return $columns[0]
+    }
+
+    # Look for any column containing the word "safe".
+    $safeColumn = $columns |
+        Where-Object {
+            $_ -match "(?i)safe"
+        } |
+        Select-Object -First 1
+
+    if ($safeColumn) {
+        return $safeColumn
+    }
+
+    throw @"
+Unable to determine the Safe-name column in $SourceDescription.
+
+Detected columns:
+$($columns -join ", ")
+
+Use a column named SafeName, Safe Name, Safe, or Name.
+"@
+}
+
+function Get-CleanSafeNames {
+    param(
+        [Parameter(Mandatory)]
+        [object[]]$CsvData,
+
+        [Parameter(Mandatory)]
+        [string]$ColumnName
+    )
+
+    return @(
+        $CsvData |
+            ForEach-Object {
+                $value = $_.$ColumnName
+
+                if ($null -ne $value) {
+                    $cleanValue = ([string]$value).Trim().Trim('"')
+
+                    if (-not [string]::IsNullOrWhiteSpace($cleanValue)) {
+                        $cleanValue
+                    }
+                }
+            } |
+            Sort-Object -Unique
+    )
+}
+
+# ============================================================
+# MAIN PROCESS
+# ============================================================
+
+try {
+    Write-Log "CyberArk OMNG-to-AMNG Safe pair validation starting."
+
+    Write-Host ""
+    Write-Host "STEP 1 OF 2 - Select the CSV containing the OMNG Safe list." -ForegroundColor Cyan
+
+    $omngCsvPath = Select-CsvFile `
+        -Title "Select the CSV containing the OMNG Safe list"
+
+    Write-Host ""
+    Write-Host "STEP 2 OF 2 - Select the CyberArk full Safe inventory CSV." -ForegroundColor Cyan
+
+    $inventoryCsvPath = Select-CsvFile `
+        -Title "Select the CyberArk full Safe inventory CSV"
+
+    Write-Log "OMNG input file          : $omngCsvPath"
+    Write-Log "CyberArk inventory file : $inventoryCsvPath"
+
+    # Import CSV files
+    Write-Log "Importing OMNG Safe CSV..."
+    $omngCsvData = @(Import-Csv -LiteralPath $omngCsvPath)
+
+    Write-Log "Importing CyberArk full Safe inventory CSV..."
+    $inventoryCsvData = @(Import-Csv -LiteralPath $inventoryCsvPath)
+
+    # Detect Safe-name columns
+    $omngSafeColumn = Get-SafeNameColumn `
+        -CsvData $omngCsvData `
+        -SourceDescription "the OMNG Safe CSV"
+
+    $inventorySafeColumn = Get-SafeNameColumn `
+        -CsvData $inventoryCsvData `
+        -SourceDescription "the CyberArk Safe inventory CSV"
+
+    Write-Log "OMNG Safe-name column     : $omngSafeColumn"
+    Write-Log "Inventory Safe-name column: $inventorySafeColumn"
+
+    # Extract and normalize Safe names
+    $allOmngSafeNames = @(
+        Get-CleanSafeNames `
+            -CsvData $omngCsvData `
+            -ColumnName $omngSafeColumn
+    )
+
+    $inventorySafeNames = @(
+        Get-CleanSafeNames `
+            -CsvData $inventoryCsvData `
+            -ColumnName $inventorySafeColumn
+    )
+
+    if ($allOmngSafeNames.Count -eq 0) {
+        throw "No Safe names were found in the OMNG Safe CSV."
+    }
+
+    if ($inventorySafeNames.Count -eq 0) {
+        throw "No Safe names were found in the CyberArk inventory CSV."
+    }
+
+    Write-Log "Unique Safe names in OMNG file : $($allOmngSafeNames.Count)"
+    Write-Log "Unique Safe names in inventory : $($inventorySafeNames.Count)"
+
+    # Use a case-insensitive HashSet for fast matching.
+    $inventoryHashSet = New-Object `
+        "System.Collections.Generic.HashSet[string]" `
+        ([System.StringComparer]::OrdinalIgnoreCase)
+
+    foreach ($safeName in $inventorySafeNames) {
+        [void]$inventoryHashSet.Add($safeName)
+    }
+
+    # Validate OMNG input and create report.
+    $results = New-Object System.Collections.Generic.List[object]
+
+    foreach ($omngSafeName in $allOmngSafeNames) {
+        $endsWithOmng = $omngSafeName.EndsWith(
+            "-OMNG",
+            [System.StringComparison]::OrdinalIgnoreCase
+        )
+
+        if (-not $endsWithOmng) {
+            $results.Add(
+                [pscustomobject][ordered]@{
+                    OMNGSafeName       = $omngSafeName
+                    ExpectedAMNGSafe   = ""
+                    OMNGExistsInFullList = $inventoryHashSet.Contains($omngSafeName)
+                    AMNGPairExists     = $false
+                    Status             = "Invalid OMNG Name"
+                    Notes              = "Safe name does not end with -OMNG."
+                }
+            )
+
+            continue
+        }
+
+        # Replace only the ending OMNG suffix.
+        $expectedAmngSafe = $omngSafeName.Substring(
+            0,
+            $omngSafeName.Length - 5
+        ) + "-AMNG"
+
+        $omngExists = $inventoryHashSet.Contains($omngSafeName)
+        $amngExists = $inventoryHashSet.Contains($expectedAmngSafe)
+
+        if ($amngExists) {
+            $status = "Pair Exists"
+            $notes = "Expected AMNG Safe was found in the CyberArk inventory."
+        }
+        else {
+            $status = "AMNG Pair Missing"
+            $notes = "Expected AMNG Safe was not found in the CyberArk inventory."
+        }
+
+        if (-not $omngExists) {
+            $notes += " The source OMNG Safe was also not found in the full inventory."
+        }
+
+        $results.Add(
+            [pscustomobject][ordered]@{
+                OMNGSafeName         = $omngSafeName
+                ExpectedAMNGSafe     = $expectedAmngSafe
+                OMNGExistsInFullList = $omngExists
+                AMNGPairExists       = $amngExists
+                Status               = $status
+                Notes                = $notes
+            }
+        )
+    }
+
+    # ========================================================
+    # EXPORT REPORTS
+    # ========================================================
+
+    $outputFolder = Split-Path -Parent $omngCsvPath
+    $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+
+    $fullReportPath = Join-Path `
+        $outputFolder `
+        "CyberArk_OMNG_AMNG_Pair_Validation_$timestamp.csv"
+
+    $missingReportPath = Join-Path `
+        $outputFolder `
+        "CyberArk_Missing_AMNG_Pairs_$timestamp.csv"
+
+    $results |
+        Export-Csv `
+            -LiteralPath $fullReportPath `
+            -NoTypeInformation `
+            -Encoding UTF8
+
+    $missingPairs = @(
+        $results |
+            Where-Object {
+                $_.Status -eq "AMNG Pair Missing"
+            }
+    )
+
+    $missingPairs |
+        Export-Csv `
+            -LiteralPath $missingReportPath `
+            -NoTypeInformation `
+            -Encoding UTF8
+
+    # ========================================================
+    # SUMMARY
+    # ========================================================
+
+    $validOmngCount = @(
+        $results |
+            Where-Object {
+                $_.Status -ne "Invalid OMNG Name"
+            }
+    ).Count
+
+    $pairExistsCount = @(
+        $results |
+            Where-Object {
+                $_.Status -eq "Pair Exists"
+            }
+    ).Count
+
+    $pairMissingCount = $missingPairs.Count
+
+    $invalidNameCount = @(
+        $results |
+            Where-Object {
+                $_.Status -eq "Invalid OMNG Name"
+            }
+    ).Count
+
+    $sourceOmngMissingCount = @(
+        $results |
+            Where-Object {
+                $_.OMNGExistsInFullList -eq $false
+            }
+    ).Count
+
+    Write-Host ""
+    Write-Host "============================================================" -ForegroundColor Green
+    Write-Host "VALIDATION SUMMARY" -ForegroundColor Green
+    Write-Host "============================================================" -ForegroundColor Green
+    Write-Host "OMNG records reviewed       : $($results.Count)"
+    Write-Host "Valid OMNG names            : $validOmngCount"
+    Write-Host "AMNG pairs found            : $pairExistsCount"
+    Write-Host "AMNG pairs missing          : $pairMissingCount"
+    Write-Host "Invalid OMNG Safe names     : $invalidNameCount"
+    Write-Host "Source OMNG missing in full : $sourceOmngMissingCount"
+    Write-Host ""
+    Write-Host "Full validation report:" -ForegroundColor Cyan
+    Write-Host $fullReportPath
+    Write-Host ""
+    Write-Host "Missing AMNG pairs report:" -ForegroundColor Yellow
+    Write-Host $missingReportPath
+    Write-Host "============================================================" -ForegroundColor Green
+
+    Write-Log "CyberArk OMNG-to-AMNG Safe pair validation completed." "SUCCESS"
+
+    # Open the report folder.
+    Start-Process explorer.exe -ArgumentList "`"$outputFolder`""
+}
+catch {
+    Write-Log $_.Exception.Message "ERROR"
+
+    [System.Windows.Forms.MessageBox]::Show(
+        $_.Exception.Message,
+        "CyberArk Safe Validation Error",
+        [System.Windows.Forms.MessageBoxButtons]::OK,
+        [System.Windows.Forms.MessageBoxIcon]::Error
+    ) | Out-Null
+
+    exit 1
+}
