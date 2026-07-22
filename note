@@ -1,15 +1,21 @@
-Update script to delete account based on app ID
-update the delete csv template to include app id, even if APP ID is the only one provided in the sheet.
-
 <#
 .SYNOPSIS
-    Deletes CyberArk accounts from a CSV by matching CyberArk username and address.
+    Deletes CyberArk accounts from a CSV by matching AccountID, Username + Address, or AppID.
 
 .DESCRIPTION
-    Read CSV rows containing Username and CyberArk Address.
-    For each row, the script searches CyberArk accounts and filters to exact matches where:
-        account.userName == CSV Username  (case-insensitive)
+    Read CSV rows containing any of the following matching inputs:
+        - AccountID
+        - Username + CyberArk Address
+        - AppID only
+        - Username + CyberArk Address + AppID
+
+    For Username + Address rows, the script searches CyberArk accounts and filters to exact matches where:
+        account.userName == CSV Username          (case-insensitive)
         account.address  == CSV CyberArk Address  (case-insensitive)
+
+    For AppID rows, the script searches/reads accessible CyberArk accounts and filters where the account's
+    AppID/custom property equals the CSV AppID value. Supported AppID property aliases include:
+        mtbAppCode, AppCode, AppID, App ID, ApplicationID, Application ID, ApplicationCode, Application Code
 
     Login/config pattern matches the account field updater:
       1. Load shared .env and selected env\<dev|prod>.env.
@@ -17,7 +23,7 @@ update the delete csv template to include app id, even if APP ID is the only one
       3. Prompt for CyberArk Identity service-user credentials.
       4. Request OAuth bearer token from /oauth2/platformtoken.
       5. Keep token only in memory and log only SHA256 fingerprint prefix.
-      6. Search CyberArk accounts by username/address.
+      6. Search CyberArk accounts by AccountID, Username/Address, or AppID.
       7. Preview by default.
       8. Delete only when -Execute -ConfirmDelete YES is supplied.
       9. No per-account confirmation prompt is used.
@@ -47,8 +53,8 @@ param(
     [ValidateSet('NO','YES')]
     [string]$ConfirmDelete = 'NO',
 
-    # By default, rows with multiple exact CyberArk matches are skipped.
-    # Supply this switch only when you intentionally want every exact match deleted.
+    # By default, Username + Address rows with multiple exact CyberArk matches are skipped.
+    # Supply this switch only when you intentionally want every exact Username + Address match deleted.
     [switch]$DeleteAllExactMatches,
 
     # Uses the logged-in Windows identity for proxy authentication.
@@ -56,6 +62,12 @@ param(
 
     # Maximum number of candidate accounts to read from each API search.
     [int]$MaxSearchResults = 1000,
+
+    # Maximum number of accounts to enumerate when matching AppID-only rows.
+    [int]$MaxAppIdEnumeration = 50000,
+
+    # Disables full account enumeration for AppID-only rows. When supplied, AppID-only rows search by AppID text only.
+    [switch]$DisableFullAppIdScan,
 
     # Where CSV reports are written.
     [string]$ReportFolder = (Join-Path $PSScriptRoot 'reports'),
@@ -89,6 +101,7 @@ $script:ReportFile = $null
 $script:DeleteReportFile = $null
 $script:CandidateReportFile = $null
 $script:Config = $null
+$script:AllAccountCache = $null
 
 function Test-BlankValue {
     param([object]$Value)
@@ -524,23 +537,19 @@ function Get-CsvRows {
     }
 
     $first = @($rows)[0]
+    $hasMatchColumn = $false
 
-    $hasUser = $false
-    foreach ($name in @('Username','UserName','CyberArk Username','CyberArk UserName','CurrentCyberArkUsername')) {
-        if ($first.PSObject.Properties[$name]) { $hasUser = $true }
+    foreach ($name in @(
+        'AccountID','Account ID','id','ID',
+        'Username','UserName','CyberArk Username','CyberArk UserName','CurrentCyberArkUsername',
+        'CyberArk Address','CyberArkAddress','Address','TargetAddress',
+        'AppID','APP ID','App ID','ApplicationID','Application ID','AppCode','App Code','mtbAppCode','MTB App Code'
+    )) {
+        if ($first.PSObject.Properties[$name]) { $hasMatchColumn = $true }
     }
 
-    $hasAddress = $false
-    foreach ($name in @('CyberArk Address','Address','TargetAddress','CyberArkAddress')) {
-        if ($first.PSObject.Properties[$name]) { $hasAddress = $true }
-    }
-
-    if (-not $hasUser) {
-        throw 'CSV is missing required Username column. Accepted aliases: Username, UserName, CyberArk Username, CyberArk UserName, CurrentCyberArkUsername.'
-    }
-
-    if (-not $hasAddress) {
-        throw 'CSV is missing required CyberArk Address column. Accepted aliases: CyberArk Address, CyberArkAddress, Address, TargetAddress.'
+    if (-not $hasMatchColumn) {
+        throw 'CSV must include at least one matching column: AccountID, Username + CyberArk Address, or AppID.'
     }
 
     Write-RunLog 'Get-CsvRows' "Imported $(@($rows).Count) row(s) from $CsvFile" 'INFO'
@@ -624,15 +633,56 @@ function Search-Accounts {
     return @($found.Values)
 }
 
-function Get-SearchVariants {
-    <#
-        Builds case variants for CyberArk search.
+function Get-AllAccessibleAccounts {
+    param([string]$Token)
 
-        The final match is already case-insensitive using -ieq.
-        This function also makes the API candidate search more tolerant in case
-        the CyberArk search endpoint behaves differently with upper/lower case
-        in a tenant or proxy path.
-    #>
+    if ($null -ne $script:AllAccountCache) {
+        return @($script:AllAccountCache)
+    }
+
+    $found = @{}
+    $limit = 1000
+    $offset = 0
+    $totalRead = 0
+
+    Write-RunLog 'Get-AllAccessibleAccounts' "Enumerating accessible accounts for AppID matching. MaxAppIdEnumeration=$MaxAppIdEnumeration" 'WARN'
+
+    do {
+        $path = "Accounts?limit=$limit&offset=$offset"
+        $response = Invoke-CyberArkRest -Method GET -Path $path -Token $Token
+        $items = @(ConvertTo-AccountList -Response $response)
+
+        foreach ($item in $items) {
+            Add-UniqueAccountById -Table $found -Account $item
+        }
+
+        $totalRead += $items.Count
+        $offset += $limit
+
+        if ($totalRead -ge $MaxAppIdEnumeration) {
+            Write-RunLog 'Get-AllAccessibleAccounts' "Stopped enumeration after MaxAppIdEnumeration=$MaxAppIdEnumeration." 'WARN'
+            break
+        }
+    } while ($items.Count -eq $limit)
+
+    $script:AllAccountCache = @($found.Values)
+
+    Write-RunLog 'Get-AllAccessibleAccounts' "Cached $($script:AllAccountCache.Count) accessible account candidate(s)." 'INFO'
+
+    return @($script:AllAccountCache)
+}
+
+function Get-AccountById {
+    param(
+        [string]$AccountId,
+        [string]$Token
+    )
+
+    $id = [System.Uri]::EscapeDataString($AccountId)
+    return Invoke-CyberArkRest -Method GET -Path "Accounts/$id/" -Token $Token
+}
+
+function Get-SearchVariants {
     param([string]$Value)
 
     if (Test-BlankValue $Value) {
@@ -649,10 +699,6 @@ function Get-SearchVariants {
 }
 
 function Get-NormalizedCompareValue {
-    <#
-        Normalizes values only for comparison.
-        The script still reports the original CyberArk and CSV values.
-    #>
     param([object]$Value)
 
     if ($null -eq $Value) {
@@ -660,6 +706,100 @@ function Get-NormalizedCompareValue {
     }
 
     return $Value.ToString().Trim().ToUpperInvariant()
+}
+
+function Get-AccountField {
+    param(
+        [object]$Account,
+        [string[]]$Names
+    )
+
+    foreach ($name in $Names) {
+        $p = $Account.PSObject.Properties[$name]
+        if ($null -ne $p -and -not (Test-BlankValue $p.Value)) {
+            return $p.Value.ToString()
+        }
+    }
+
+    return ''
+}
+
+function Get-AccountAppIdValues {
+    param([object]$Account)
+
+    $values = @()
+    $aliases = @(
+        'mtbAppCode',
+        'MtbAppCode',
+        'MTBAppCode',
+        'MTB App Code',
+        'AppID',
+        'APP ID',
+        'App ID',
+        'appID',
+        'appId',
+        'ApplicationID',
+        'Application ID',
+        'ApplicationId',
+        'applicationId',
+        'AppCode',
+        'APPCode',
+        'App Code',
+        'applicationCode',
+        'ApplicationCode',
+        'Application Code'
+    )
+
+    foreach ($alias in $aliases) {
+        $p = $Account.PSObject.Properties[$alias]
+        if ($null -ne $p -and -not (Test-BlankValue $p.Value)) {
+            $values += [pscustomobject]@{ Name = $alias; Value = $p.Value.ToString().Trim() }
+        }
+    }
+
+    if ($null -ne $Account.PSObject.Properties['platformAccountProperties']) {
+        $props = $Account.platformAccountProperties
+
+        if ($null -ne $props) {
+            foreach ($alias in $aliases) {
+                $p = $props.PSObject.Properties[$alias]
+                if ($null -ne $p -and -not (Test-BlankValue $p.Value)) {
+                    $values += [pscustomobject]@{ Name = $alias; Value = $p.Value.ToString().Trim() }
+                }
+            }
+        }
+    }
+
+    return @($values)
+}
+
+function Test-AccountMatchesAppId {
+    param(
+        [object]$Account,
+        [string]$AppId
+    )
+
+    $target = Get-NormalizedCompareValue -Value $AppId
+
+    foreach ($pair in @(Get-AccountAppIdValues -Account $Account)) {
+        if ((Get-NormalizedCompareValue -Value $pair.Value) -eq $target) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Get-AppIdMatchText {
+    param([object]$Account)
+
+    $pairs = @()
+
+    foreach ($pair in @(Get-AccountAppIdValues -Account $Account)) {
+        $pairs += "$($pair.Name)=$($pair.Value)"
+    }
+
+    return ($pairs -join '; ')
 }
 
 function Get-ExactAccountMatches {
@@ -689,20 +829,76 @@ function Get-ExactAccountMatches {
     $matches = @()
 
     foreach ($account in $candidateMap.Values) {
-        $acctUser = ''
-        $acctAddress = ''
-
-        if ($account.PSObject.Properties['userName']) { $acctUser = [string]$account.userName }
-        elseif ($account.PSObject.Properties['username']) { $acctUser = [string]$account.username }
-
-        if ($account.PSObject.Properties['address']) { $acctAddress = [string]$account.address }
-        elseif ($account.PSObject.Properties['Address']) { $acctAddress = [string]$account.Address }
+        $acctUser = Get-AccountField -Account $account -Names @('userName','username')
+        $acctAddress = Get-AccountField -Account $account -Names @('address','Address')
 
         $compareUser = Get-NormalizedCompareValue -Value $acctUser
         $compareAddress = Get-NormalizedCompareValue -Value $acctAddress
 
         if (($compareUser -eq $targetUser) -and ($compareAddress -eq $targetAddress)) {
             $matches += $account
+        }
+    }
+
+    return @($matches | Sort-Object id -Unique)
+}
+
+function Get-AccountIdMatches {
+    param(
+        [string]$AccountId,
+        [string]$Token
+    )
+
+    try {
+        $account = Get-AccountById -AccountId $AccountId -Token $Token
+        return @($account)
+    }
+    catch {
+        Write-RunLog 'Get-AccountIdMatches' "AccountID=$AccountId was not found or could not be read. $($_.Exception.Message)" 'WARN'
+        return @()
+    }
+}
+
+function Get-AppIdAccountMatches {
+    param(
+        [string]$AppId,
+        [string]$Token
+    )
+
+    $candidateMap = @{}
+
+    foreach ($searchText in @(Get-SearchVariants -Value $AppId)) {
+        foreach ($candidate in @(Search-Accounts -SearchText $searchText -Token $Token)) {
+            Add-UniqueAccountById -Table $candidateMap -Account $candidate
+        }
+    }
+
+    if (-not $DisableFullAppIdScan) {
+        foreach ($candidate in @(Get-AllAccessibleAccounts -Token $Token)) {
+            Add-UniqueAccountById -Table $candidateMap -Account $candidate
+        }
+    }
+
+    $matches = @()
+
+    foreach ($account in $candidateMap.Values) {
+        $workingAccount = $account
+
+        # If search/list did not return platformAccountProperties, read the full account before AppID comparison.
+        if ($null -eq $workingAccount.PSObject.Properties['platformAccountProperties']) {
+            $id = Get-AccountField -Account $workingAccount -Names @('id','ID','accountId')
+            if (-not (Test-BlankValue $id)) {
+                try {
+                    $workingAccount = Get-AccountById -AccountId $id -Token $Token
+                }
+                catch {
+                    Write-RunLog 'Get-AppIdAccountMatches' "Could not read full account details for AccountID=$id. $($_.Exception.Message)" 'WARN'
+                }
+            }
+        }
+
+        if (Test-AccountMatchesAppId -Account $workingAccount -AppId $AppId) {
+            $matches += $workingAccount
         }
     }
 
@@ -733,32 +929,46 @@ function Add-CsvRow {
     }
 }
 
-function Get-AccountField {
-    param(
-        [object]$Account,
-        [string[]]$Names
-    )
-
-    foreach ($name in $Names) {
-        $p = $Account.PSObject.Properties[$name]
-        if ($null -ne $p -and -not (Test-BlankValue $p.Value)) {
-            return $p.Value.ToString()
-        }
-    }
-
-    return ''
-}
-
 function New-CandidateText {
     param([array]$Accounts)
 
     $parts = @()
 
     foreach ($a in $Accounts) {
-        $parts += "ID=$(Get-AccountField -Account $a -Names @('id','ID','accountId')); Safe=$(Get-AccountField -Account $a -Names @('safeName','SafeName')); Name=$(Get-AccountField -Account $a -Names @('name','Name')); User=$(Get-AccountField -Account $a -Names @('userName','username')); Address=$(Get-AccountField -Account $a -Names @('address','Address')); Platform=$(Get-AccountField -Account $a -Names @('platformId','platformID'))"
+        $parts += "ID=$(Get-AccountField -Account $a -Names @('id','ID','accountId')); Safe=$(Get-AccountField -Account $a -Names @('safeName','SafeName')); Name=$(Get-AccountField -Account $a -Names @('name','Name')); User=$(Get-AccountField -Account $a -Names @('userName','username')); Address=$(Get-AccountField -Account $a -Names @('address','Address')); Platform=$(Get-AccountField -Account $a -Names @('platformId','platformID')); AppID=$(Get-AppIdMatchText -Account $a)"
     }
 
     return ($parts -join ' || ')
+}
+
+function Write-CandidateRows {
+    param(
+        [array]$Matches,
+        [int]$RowNumber,
+        [string]$AdAccountName,
+        [string]$Username,
+        [string]$Address,
+        [string]$AppId,
+        [string]$MatchMode
+    )
+
+    foreach ($match in $Matches) {
+        Add-CsvRow -Path $script:CandidateReportFile -Row ([pscustomobject]@{
+            Row = $RowNumber
+            MatchMode = $MatchMode
+            ADAccountName = $AdAccountName
+            CsvCyberArkUsername = $Username
+            CsvCyberArkAddress = $Address
+            CsvAppID = $AppId
+            AccountID = Get-AccountField -Account $match -Names @('id','ID','accountId')
+            SafeName = Get-AccountField -Account $match -Names @('safeName','SafeName')
+            CyberArkAccountName = Get-AccountField -Account $match -Names @('name','Name')
+            MatchedUserName = Get-AccountField -Account $match -Names @('userName','username')
+            MatchedAddress = Get-AccountField -Account $match -Names @('address','Address')
+            MatchedAppIDValues = Get-AppIdMatchText -Account $match
+            PlatformID = Get-AccountField -Account $match -Names @('platformId','platformID')
+        })
+    }
 }
 
 function Invoke-RowDelete {
@@ -769,14 +979,19 @@ function Invoke-RowDelete {
     )
 
     $adAccountName = Get-RowValue -Row $CsvRow -Names @('Account Name','ADAccountName','AD Account Name','ADAccount','AccountName')
+    $accountId = Get-RowValue -Row $CsvRow -Names @('AccountID','Account ID','id','ID')
     $username = Get-RowValue -Row $CsvRow -Names @('Username','UserName','CyberArk Username','CyberArk UserName','CurrentCyberArkUsername')
     $address = Get-RowValue -Row $CsvRow -Names @('CyberArk Address','CyberArkAddress','Address','TargetAddress')
+    $appId = Get-RowValue -Row $CsvRow -Names @('AppID','APP ID','App ID','ApplicationID','Application ID','AppCode','App Code','mtbAppCode','MTB App Code')
 
     $baseResult = [ordered]@{
         Row = $RowNumber
+        MatchMode = ''
         ADAccountName = $adAccountName
+        CsvAccountID = $accountId
         CyberArkUsername = $username
         CyberArkAddress = $address
+        AppID = $appId
         ExactMatchCount = 0
         MatchStatus = ''
         Action = ''
@@ -787,45 +1002,73 @@ function Invoke-RowDelete {
     }
 
     try {
-        if (Test-BlankValue $username) { throw 'Username is blank.' }
-        if (Test-BlankValue $address) { throw 'CyberArk Address is blank.' }
+        $matches = @()
 
-        $matches = @(Get-ExactAccountMatches -Username $username -Address $address -Token $Token)
+        if (-not (Test-BlankValue $accountId)) {
+            $baseResult.MatchMode = 'AccountID'
+            $matches = @(Get-AccountIdMatches -AccountId $accountId -Token $Token)
+
+            if (-not (Test-BlankValue $appId)) {
+                $matches = @($matches | Where-Object { Test-AccountMatchesAppId -Account $_ -AppId $appId })
+            }
+        }
+        elseif ((-not (Test-BlankValue $username)) -and (-not (Test-BlankValue $address))) {
+            $baseResult.MatchMode = if (Test-BlankValue $appId) { 'UsernameAddress' } else { 'UsernameAddressAppID' }
+            $matches = @(Get-ExactAccountMatches -Username $username -Address $address -Token $Token)
+
+            if (-not (Test-BlankValue $appId)) {
+                $enriched = @()
+                foreach ($account in $matches) {
+                    $id = Get-AccountField -Account $account -Names @('id','ID','accountId')
+                    try { $enriched += Get-AccountById -AccountId $id -Token $Token } catch { $enriched += $account }
+                }
+                $matches = @($enriched | Where-Object { Test-AccountMatchesAppId -Account $_ -AppId $appId })
+            }
+        }
+        elseif (-not (Test-BlankValue $appId)) {
+            $baseResult.MatchMode = 'AppIDOnly'
+            $matches = @(Get-AppIdAccountMatches -AppId $appId -Token $Token)
+        }
+        else {
+            throw 'CSV row must include AccountID, Username + CyberArk Address, or AppID.'
+        }
+
         $baseResult.ExactMatchCount = $matches.Count
         $baseResult.CandidateDetails = New-CandidateText -Accounts $matches
 
-        foreach ($match in $matches) {
-            Add-CsvRow -Path $script:CandidateReportFile -Row ([pscustomobject]@{
-                Row = $RowNumber
-                ADAccountName = $adAccountName
-                CyberArkUsername = $username
-                CyberArkAddress = $address
-                AccountID = Get-AccountField -Account $match -Names @('id','ID','accountId')
-                SafeName = Get-AccountField -Account $match -Names @('safeName','SafeName')
-                CyberArkAccountName = Get-AccountField -Account $match -Names @('name','Name')
-                MatchedUserName = Get-AccountField -Account $match -Names @('userName','username')
-                MatchedAddress = Get-AccountField -Account $match -Names @('address','Address')
-                PlatformID = Get-AccountField -Account $match -Names @('platformId','platformID')
-            })
-        }
+        Write-CandidateRows -Matches $matches `
+            -RowNumber $RowNumber `
+            -AdAccountName $adAccountName `
+            -Username $username `
+            -Address $address `
+            -AppId $appId `
+            -MatchMode $baseResult.MatchMode
 
         if ($matches.Count -eq 0) {
-            $baseResult.MatchStatus = 'NO_EXACT_MATCH'
+            $baseResult.MatchStatus = 'NO_MATCH'
             $baseResult.Action = 'None'
             $baseResult.Result = 'SKIPPED'
-            $baseResult.Message = 'No CyberArk account matched exact Username + Address.'
+            $baseResult.Message = 'No CyberArk account matched the supplied row criteria.'
             return [pscustomobject]$baseResult
         }
 
-        if ($matches.Count -gt 1 -and -not $DeleteAllExactMatches) {
+        if ($baseResult.MatchMode -in @('UsernameAddress','UsernameAddressAppID') -and $matches.Count -gt 1 -and -not $DeleteAllExactMatches) {
             $baseResult.MatchStatus = 'MULTIPLE_EXACT_MATCHES'
             $baseResult.Action = 'None'
             $baseResult.Result = 'SKIPPED'
-            $baseResult.Message = 'Multiple exact matches found. Supply -DeleteAllExactMatches to delete every exact match for this row.'
+            $baseResult.Message = 'Multiple exact Username + Address matches found. Supply -DeleteAllExactMatches to delete every exact match for this row.'
             return [pscustomobject]$baseResult
         }
 
-        $baseResult.MatchStatus = if ($matches.Count -eq 1) { 'EXACT_MATCH' } else { 'MULTIPLE_EXACT_MATCHES' }
+        if ($matches.Count -eq 1) {
+            $baseResult.MatchStatus = 'SINGLE_MATCH'
+        }
+        elseif ($baseResult.MatchMode -eq 'AppIDOnly') {
+            $baseResult.MatchStatus = 'MULTIPLE_APPID_MATCHES'
+        }
+        else {
+            $baseResult.MatchStatus = 'MULTIPLE_MATCHES'
+        }
 
         if (-not $Execute) {
             $baseResult.Action = 'PreviewDelete'
@@ -849,18 +1092,27 @@ function Invoke-RowDelete {
             $safeName = Get-AccountField -Account $account -Names @('safeName','SafeName')
             $accountName = Get-AccountField -Account $account -Names @('name','Name')
             $platformId = Get-AccountField -Account $account -Names @('platformId','platformID')
+            $matchedUser = Get-AccountField -Account $account -Names @('userName','username')
+            $matchedAddress = Get-AccountField -Account $account -Names @('address','Address')
+            $matchedAppIdValues = Get-AppIdMatchText -Account $account
 
             Remove-AccountById -AccountId $id -Token $Token
             $deletedIds += $id
 
             Add-CsvRow -Path $script:DeleteReportFile -Row ([pscustomobject]@{
                 Row = $RowNumber
+                MatchMode = $baseResult.MatchMode
                 ADAccountName = $adAccountName
-                CyberArkUsername = $username
-                CyberArkAddress = $address
+                CsvAccountID = $accountId
+                CsvCyberArkUsername = $username
+                CsvCyberArkAddress = $address
+                CsvAppID = $appId
                 DeletedAccountID = $id
                 SafeName = $safeName
                 CyberArkAccountName = $accountName
+                MatchedUserName = $matchedUser
+                MatchedAddress = $matchedAddress
+                MatchedAppIDValues = $matchedAppIdValues
                 PlatformID = $platformId
                 DeletedTime = (Get-Date -Format s)
             })
@@ -869,7 +1121,7 @@ function Invoke-RowDelete {
         $baseResult.Action = 'DeleteAccount'
         $baseResult.Result = 'SUCCESS'
         $baseResult.DeletedAccountIDs = ($deletedIds -join '; ')
-        $baseResult.Message = "Deleted $($deletedIds.Count) exact matching account(s)."
+        $baseResult.Message = "Deleted $($deletedIds.Count) matching account(s)."
 
         return [pscustomobject]$baseResult
     }
@@ -896,7 +1148,11 @@ function Start-DeleteRun {
     }
 
     if ($DeleteAllExactMatches) {
-        Write-RunLog 'Start-DeleteRun' 'DeleteAllExactMatches enabled. Rows with multiple exact matches will delete every exact match.' 'WARN'
+        Write-RunLog 'Start-DeleteRun' 'DeleteAllExactMatches enabled. Username + Address rows with multiple exact matches will delete every exact match.' 'WARN'
+    }
+
+    if ($DisableFullAppIdScan) {
+        Write-RunLog 'Start-DeleteRun' 'DisableFullAppIdScan supplied. AppID-only rows will rely on Accounts?search=<AppID> candidates only.' 'WARN'
     }
 
     Write-RunLog 'Start-DeleteRun' "Using CSV file: $CsvFile" 'INFO'
@@ -913,13 +1169,13 @@ function Start-DeleteRun {
         Add-CsvRow -Path $script:ReportFile -Row $outcome
 
         if ($outcome.Result -eq 'FAILED') {
-            Write-RunLog 'Start-DeleteRun' "Row $rowNumber failed. User=$($outcome.CyberArkUsername) Address=$($outcome.CyberArkAddress) Message=$($outcome.Message)" 'ERROR'
+            Write-RunLog 'Start-DeleteRun' "Row $rowNumber failed. Mode=$($outcome.MatchMode) User=$($outcome.CyberArkUsername) Address=$($outcome.CyberArkAddress) AppID=$($outcome.AppID) Message=$($outcome.Message)" 'ERROR'
         }
         elseif ($outcome.Result -eq 'SUCCESS') {
-            Write-RunLog 'Start-DeleteRun' "Row $rowNumber deleted. AccountIDs=$($outcome.DeletedAccountIDs)" 'WARN'
+            Write-RunLog 'Start-DeleteRun' "Row $rowNumber deleted. Mode=$($outcome.MatchMode) AccountIDs=$($outcome.DeletedAccountIDs)" 'WARN'
         }
         else {
-            Write-RunLog 'Start-DeleteRun' "Row $rowNumber $($outcome.Result). Status=$($outcome.MatchStatus) Message=$($outcome.Message)" 'INFO'
+            Write-RunLog 'Start-DeleteRun' "Row $rowNumber $($outcome.Result). Mode=$($outcome.MatchMode) Status=$($outcome.MatchStatus) Message=$($outcome.Message)" 'INFO'
         }
 
         $rowNumber++
