@@ -19,14 +19,13 @@
      11. For platform device-type mismatch, automatically recreate the account using the target platform.
      12. Retrieve the current secret only for the detected recreate path because account creation requires a secret value.
      13. Keep the source account by default.
-     14. Create duplicated/recreated target accounts as onboard-only with Automatic Password Management enabled.
+     14. Create duplicated/recreated target accounts with Automatic Password Management disabled to prevent immediate CPM change.
      15. Do not invoke a manual Change/Reconcile action after creating the duplicated/recreated target account.
-     16. Remove copied CPM action flags such as ResetImmediately=ChangeTask from create payloads.
-     17. Optionally disable CPM on the source account after successful migration.
-     18. Optionally delete the source account only when both delete switches are supplied.
-     19. Include custom CSV fields credentialType and mtbAppCode as target platform account properties.
-     20. Ignore CSV Prop:<name> values not defined on the selected target platform and log the skipped properties.
-     21. Write normal results, recreated-account list, and delete-candidate list to CSV reports.
+     16. Optionally disable CPM on the source account after successful migration.
+     17. Optionally delete the source account only when both delete switches are supplied.
+     18. Include custom CSV fields credentialType and mtbAppCode as target platform account properties.
+     19. Ignore CSV Prop:<name> values not defined on the selected target platform and log the skipped properties.
+     20. Write normal results, recreated-account list, and delete-candidate list to CSV reports.
 
 .NOTES
     Designed for Windows PowerShell 5.1.
@@ -35,9 +34,8 @@
     Required Address/Username platform values are satisfied from TargetAddress/TargetUserName when present.
     Direct CSV columns credentialType and mtbAppCode are sent as target platform account properties when supplied.
     Single-field PATCH requests are explicitly preserved as JSON arrays for Windows PowerShell 5.1 compatibility.
-    Duplicated/recreated target accounts are onboarded with Automatic Password Management enabled.
+    Duplicated/recreated target accounts are created with Automatic Password Management disabled.
     The script does not call Change/Reconcile or add any manual change action after create.
-    Copied CPM action flags such as ResetImmediately=ChangeTask are removed from duplicated/recreated account payloads.
 
 .EXAMPLE
     .\Update-VaultedAccounts.ps1 -Environment dev
@@ -100,6 +98,9 @@ param(
 
     # Reason supplied during password retrieval and source CPM disablement.
     [string]$SafeMoveReason = 'Approved account migration',
+
+    # Manual management reason placed on duplicated/recreated target accounts when CPM is disabled on create.
+    [string]$NewAccountManualManagementReason = 'Duplicated/recreated account created with Automatic Password Management disabled to prevent immediate CPM action.',
 
     # Allows CSV Prop:<name> values that are not advertised in the platform definition.
     [switch]$AllowUnknownPlatformProperties,
@@ -1332,74 +1333,50 @@ function New-PatchBody {
 
 function Remove-CreateOnlyCpmActionProperties {
     <#
-        Removes CPM task/action flags from platformAccountProperties before creating
-        a duplicated/recreated target account.
+        Removes copied CPM task/action flags from platformAccountProperties before
+        creating a duplicated/recreated target account.
 
-        Why this is needed:
-            Same-platform/SafeMoveCreate paths can copy source account
-            platformAccountProperties. If the source account has a pending CPM task
-            such as ResetImmediately=ChangeTask, blindly copying that property
-            causes the duplicated target account to inherit the immediate change task.
-
-        This function is only used for POST /Accounts create payloads. It does not
-        modify the source account and it does not remove normal custom properties
-        like credentialType or mtbAppCode.
+        This is defensive only. The primary protection in this version is that
+        duplicated/recreated target accounts are created with Automatic Password
+        Management disabled.
     #>
     param(
         [hashtable]$Properties,
-        [string]$Context = 'CreateAccount'
+        [string]$Context
     )
 
-    $clean = @{}
-
-    if ($null -eq $Properties) {
-        return $clean
+    if ($null -eq $Properties -or $Properties.Count -eq 0) {
+        return
     }
 
-    # Known CyberArk/CPM action flags that should never be copied into a newly
-    # duplicated/recreated account. ResetImmediately=ChangeTask is the key issue
-    # observed in production.
     $blockedNames = @(
         'ResetImmediately',
         'ManagementAction',
-        'managementAction',
         'CPMAction',
-        'cpmAction',
-        'ImmediateAction',
-        'TaskAction',
         'ChangeTask',
         'VerifyTask',
-        'ReconcileTask'
+        'ReconcileTask',
+        'ResetTask',
+        'SecretManagementAction',
+        'ImmediateChange',
+        'ChangeImmediately'
     )
 
-    foreach ($key in $Properties.Keys) {
-        $blocked = $false
+    $removeList = @()
 
+    foreach ($existingKey in @($Properties.Keys)) {
         foreach ($blockedName in $blockedNames) {
-            if ($key -ieq $blockedName) {
-                $blocked = $true
+            if ($existingKey -ieq $blockedName) {
+                $removeList += $existingKey
                 break
             }
         }
-
-        if ($blocked) {
-            Write-RunLog $Context "Removed create-only CPM action property '$key' from duplicated/recreated account payload." 'WARN'
-            continue
-        }
-
-        $value = $Properties[$key]
-
-        # Extra guard: if any custom field accidentally carries the exact CPM task
-        # value, do not allow that create-only task to propagate either.
-        if ($null -ne $value -and $value.ToString().Trim() -ieq 'ChangeTask' -and $key -match '^(Reset|Action|Task|CPM|Management)') {
-            Write-RunLog $Context "Removed create-only CPM task value from property '$key' because value was 'ChangeTask'." 'WARN'
-            continue
-        }
-
-        $clean[$key] = $value
     }
 
-    return $clean
+    foreach ($key in $removeList) {
+        $Properties.Remove($key)
+        Write-RunLog $Context "Removed copied CPM action property '$key' from duplicated/recreated account create payload." 'WARN'
+    }
 }
 
 function New-AccountCreateBody {
@@ -1439,10 +1416,7 @@ function New-AccountCreateBody {
         $finalProps = Merge-PlatformProperties -CurrentProperties $CurrentAccount.platformAccountProperties -CsvProperties $PlatformProperties
     }
 
-    # Never carry over CPM immediate task/action flags into a newly created duplicate.
-    # This prevents copied properties such as ResetImmediately=ChangeTask from
-    # triggering an immediate manual change after onboarding.
-    $finalProps = Remove-CreateOnlyCpmActionProperties -Properties $finalProps -Context 'New-AccountCreateBody'
+    Remove-CreateOnlyCpmActionProperties -Properties $finalProps -Context 'New-AccountCreateBody'
 
     $autoMgmt = $true
 
@@ -1593,8 +1567,9 @@ function Invoke-SafeMoveCreate {
     if (Test-BlankValue $secret) {
         throw 'Retrieved secret was empty. New account was not created.'
     }
-    # Onboard-only behavior: keep Automatic Password Management enabled, but do not invoke any manual Change/Reconcile action.
-    # Create payload is sanitized in New-AccountCreateBody so copied CPM action flags like ResetImmediately=ChangeTask are not carried over.
+    # Safe behavior: create the duplicated/recreated target account with Automatic Password Management disabled.
+    # This prevents CPM from immediately consuming copied task flags or platform scheduling after account creation.
+    # The script still does not call Accounts/{id}/Change or Accounts/{id}/Reconcile.
 
     $body = New-AccountCreateBody -CurrentAccount $CurrentAccount `
         -TargetSafe $TargetSafe `
@@ -1603,8 +1578,8 @@ function Invoke-SafeMoveCreate {
         -TargetUserName $TargetUserName `
         -TargetPlatformId $TargetPlatformId `
         -Secret $secret `
-        -AutomaticManagement $true `
-        -ManualManagementReason $null `
+        -AutomaticManagement $false `
+        -ManualManagementReason $NewAccountManualManagementReason `
         -PlatformProperties $PlatformProperties
 
     return Invoke-CyberArkRest -Method POST -Path 'Accounts?AllowAccountDuplications=false' -Token $Token -Body $body
@@ -1653,8 +1628,9 @@ function Invoke-DeviceTypeMigrationCreate {
     if (Test-BlankValue $secret) {
         throw 'Retrieved secret was empty. New account was not created.'
     }
-    # Onboard-only behavior: keep Automatic Password Management enabled, but do not invoke any manual Change/Reconcile action.
-    # Create payload is sanitized in New-AccountCreateBody so copied CPM action flags like ResetImmediately=ChangeTask are not carried over.
+    # Safe behavior: create the duplicated/recreated target account with Automatic Password Management disabled.
+    # This prevents CPM from immediately consuming copied task flags or platform scheduling after account creation.
+    # The script still does not call Accounts/{id}/Change or Accounts/{id}/Reconcile.
 
     $body = New-AccountCreateBody -CurrentAccount $CurrentAccount `
         -TargetSafe $TargetSafe `
@@ -1663,8 +1639,8 @@ function Invoke-DeviceTypeMigrationCreate {
         -TargetUserName $TargetUserName `
         -TargetPlatformId $TargetPlatformId `
         -Secret $secret `
-        -AutomaticManagement $true `
-        -ManualManagementReason $null `
+        -AutomaticManagement $false `
+        -ManualManagementReason $NewAccountManualManagementReason `
         -PlatformProperties $PlatformProperties `
         -UseProvidedPlatformPropertiesOnly
 
@@ -1894,7 +1870,7 @@ function Invoke-RowUpdate {
                 TargetPlatform = $targetPlatformId
                 SourceDeviceType = $currentDeviceType
                 TargetDeviceType = $targetDeviceType
-                NewAccountAutomaticManagement = 'EnabledOnboardOnly_ResetImmediatelyRemoved'
+                NewAccountAutomaticManagement = 'DisabledOnCreate_NoImmediateCpmAction'
                 CreatedTime = (Get-Date -Format s)
             })
 
@@ -1953,7 +1929,7 @@ function Invoke-RowUpdate {
             Write-RunLog 'Invoke-RowUpdate' "SOURCE review. SourceAccountID=$($current.id) NewAccountID=$($newAccount.id) Status=$deleteStatus Note=$sourceNote" 'WARN'
 
             $result.Result = 'SUCCESS'
-            $newAccountCpmNote = 'New account onboarded with Automatic Password Management enabled; no manual Change/Reconcile action invoked and copied ResetImmediately/CPM action flags removed by script.'
+            $newAccountCpmNote = 'New account created with Automatic Password Management disabled; no manual Change/Reconcile action invoked by script.'
             $result.Message = "Device-type migration created new account. NewAccountID=$($newAccount.id). $newAccountCpmNote $sourceNote"
 
             return [pscustomobject]$result
@@ -2009,14 +1985,14 @@ function Invoke-RowUpdate {
                 TargetPlatform = $targetPlatformId
                 SourceDeviceType = $currentDeviceType
                 TargetDeviceType = $targetDeviceType
-                NewAccountAutomaticManagement = 'EnabledOnboardOnly_ResetImmediatelyRemoved'
+                NewAccountAutomaticManagement = 'DisabledOnCreate_NoImmediateCpmAction'
                 CreatedTime = (Get-Date -Format s)
             })
 
             try {
                 $deleteNote = Remove-SourceAccountAfterMove -AccountId $current.id -Token $Token
                 $result.Result = 'SUCCESS'
-                $newAccountCpmNote = 'New account onboarded with Automatic Password Management enabled; no manual Change/Reconcile action invoked and copied ResetImmediately/CPM action flags removed by script.'
+                $newAccountCpmNote = 'New account created with Automatic Password Management disabled; no manual Change/Reconcile action invoked by script.'
                 $result.Message = "Created target Safe account. NewAccountID=$($newAccount.id). $newAccountCpmNote $deleteNote"
 
                 Add-DeleteCandidateRow -Row ([pscustomobject]@{
@@ -2098,7 +2074,7 @@ function Start-AccountUpdateRun {
     }
 
     Write-RunLog 'Start-AccountUpdateRun' 'Device-type migration auto-detection is enabled. Source accounts are kept unless delete confirmation is explicitly supplied.' 'INFO'
-    Write-RunLog 'Start-AccountUpdateRun' 'Duplicated/recreated target accounts will be onboarded with Automatic Password Management enabled. No manual Change/Reconcile action is invoked after create, and copied ResetImmediately/CPM action flags are removed from create payloads.' 'INFO'
+    Write-RunLog 'Start-AccountUpdateRun' 'Duplicated/recreated target accounts will be created with Automatic Password Management disabled. No manual Change/Reconcile action is invoked by this script after create.' 'WARN'
 
     Write-RunLog 'Start-AccountUpdateRun' "Using CSV file: $CsvFile" 'INFO'
 
