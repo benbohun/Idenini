@@ -1,27 +1,36 @@
-#requires -Version 5.1
-<#!
+<#
 .SYNOPSIS
-    Clears/cancels CyberArk manually scheduled password change state by AccountID.
+    Disables CyberArk Automatic Password Management for accounts listed by AccountID.
 
 .DESCRIPTION
-    CSV requires AccountID only.
+    This utility is intended for accounts showing messages such as:
+        "The password for this account has been manually scheduled for change"
 
-    This version avoids nested /platformAccountProperties/<property> remove operations because
-    some CyberArk tenants return 500 CAWS00001E for nested platform property PATCH paths.
+    Research finding:
+      - ResetImmediately=ChangeTask is an internal CyberArk/CPM property.
+      - In Privilege Cloud v10 account APIs, internal properties are not normal platformAccountProperties.
+      - There is no supported Privilege Cloud REST endpoint found to directly cancel/delete ResetImmediately.
 
-    Workflow:
-      1. Read each account directly by AccountID.
-      2. Detect scheduled-action values such as ResetImmediately=ChangeTask.
-      3. If action values are in platformAccountProperties, replace the whole platformAccountProperties object
-         with a cleaned object that excludes those action flags.
-      4. Disable Automatic Password Management by default using a separate PATCH request.
-      5. Do not retrieve password.
-      6. Do not call Change, Verify, Reconcile, SetNextPassword, or Delete.
+    Therefore, this script does the supported safe action:
+      - Reads each account by AccountID.
+      - Disables Automatic Password Management on the account.
+      - Does not retrieve the password.
+      - Does not call Change, Verify, Reconcile, SetNextPassword, or Delete.
+      - Does not try to remove ResetImmediately as a platform property.
+
+    The script uses multiple PATCH shapes because some CyberArk tenants/versions respond differently:
+      1. Replace the whole /secretManagement object.
+      2. Replace /secretManagement/automaticManagementEnabled only.
+      3. Replace /secretManagement/manualManagementReason only, optional.
 
 .NOTES
     Designed for Windows PowerShell 5.1.
-    KeepAutomaticManagementEnabled can be used only if you want to remove action flags while leaving AMD unchanged.
+    CSV requires only AccountID.
+    If the account is already inProcess and CPM has picked up the ChangeTask, there may be no REST API cancel.
+    In that case, the script records IN_PROCESS_RETRY_LATER or PATCH_FAILED and does not mask the failure.
 #>
+
+#requires -Version 5.1
 [CmdletBinding()]
 param(
     [string]$CsvFile = (Join-Path $PSScriptRoot 'samples\clear-scheduled-change-template.csv'),
@@ -36,13 +45,14 @@ param(
     [ValidateSet('NO','YES')]
     [string]$ConfirmClear = 'NO',
 
-    # Default safety is to disable AMD. Use this only when you intentionally want AMD unchanged.
-    [switch]$KeepAutomaticManagementEnabled,
+    [string]$DisableReason = 'Manual scheduled password change cleanup: Automatic Password Management disabled to prevent CPM from processing a pending ChangeTask.',
 
-    # Manual reason is NOT patched by default because some tenants return CAWS00001E while CPM task state is pending.
+    # Optional. Some tenants reject manualManagementReason updates while the account has an active CPM task.
+    # By default, the script first tries disabling AMD without touching the reason.
     [switch]$SetManualManagementReason,
 
-    [string]$ManualManagementReason = 'Manual scheduled password change cancelled by PAM cleanup script. Automatic Password Management disabled to prevent immediate CPM action.',
+    # Optional. If the account is checked out/locked, this attempts a check-in before the AMD PATCH.
+    [switch]$TryCheckInBeforePatch,
 
     [switch]$ProxyUseDefaultCredentials,
 
@@ -55,6 +65,14 @@ param(
 
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+$proxyUri = 'Placehold'
+if ($proxyUri -and $proxyUri.Trim() -notmatch '^(Placehold|Placeholder|YOUR-|<.*>|CHANGEME)$') {
+    $proxy = New-Object System.Net.WebProxy($proxyUri, $true)
+    [System.Net.WebRequest]::DefaultWebProxy = $proxy
+    [System.Net.WebRequest]::DefaultWebProxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials
+    [System.Net.WebRequest]::DefaultWebProxy.Address | Out-Null
+}
 
 $script:Config = $null
 $script:LogFile = $null
@@ -130,7 +148,7 @@ function Normalize-PvwaApiBase {
     param([string]$PvwaValue)
     $base = $PvwaValue.Trim().TrimEnd('/')
     $base = $base -replace '/PrivilegeCloud$', ''
-    $base = $base -replace '/PasswordVault/API/Accounts.*$', '/PasswordVault/API'
+    $base = $base -replace '/PasswordVault/API/Accounts/?$', '/PasswordVault/API'
     $base = $base -replace '/PasswordVault/API/.+$', '/PasswordVault/API'
     if ($base -match '/PasswordVault/API$') { return $base }
     if ($base -match '/PasswordVault$') { return "$base/API" }
@@ -150,7 +168,8 @@ function Resolve-IdentityBase {
 
 function Get-ProxyFromSettings {
     param([hashtable]$Settings)
-    if (-not (Test-BlankValue $Settings['PROXY'])) { return $Settings['PROXY'].Trim() }
+    $proxy = $Settings['PROXY']
+    if (-not (Test-BlankValue $proxy)) { return $proxy.Trim() }
     $proxyAddress = $Settings['PROXY_ADDRESS']
     if (Test-BlankValue $proxyAddress) { $proxyAddress = $Settings['ROXY_ADDRESS'] }
     $proxyPort = $Settings['PROXY_PORT']
@@ -165,12 +184,13 @@ function Import-RunConfig {
     $envFile1 = Join-Path $EnvFolder "$Environment.env"
     $envFile2 = Join-Path $PSScriptRoot "$Environment.env"
     $base = Read-DotEnvFile -Path $baseFile
+    $envSpecific = @{}
     if (Test-Path $envFile1) { $envSpecific = Read-DotEnvFile -Path $envFile1 }
     elseif (Test-Path $envFile2) { $envSpecific = Read-DotEnvFile -Path $envFile2 }
     else { throw "Could not find environment file for '$Environment'. Expected $envFile1 or $envFile2" }
     $settings = Join-EnvValues -Maps @($base, $envSpecific)
     if (Test-BlankValue $settings['PVWA']) {
-        if (Test-BlankValue $settings['SUB_DOMAIN']) { throw 'PVWA is missing and SUB_DOMAIN is not set.' }
+        if (Test-BlankValue $settings['SUB_DOMAIN']) { throw 'PVWA is missing and SUB_DOMAIN is not set. Set PVWA in dev.env/prod.env or SUB_DOMAIN in .env.' }
         $settings['PVWA'] = "https://$($settings['SUB_DOMAIN']).privilegecloud.cyberark.cloud"
     }
     $identityBase = Resolve-IdentityBase -Settings $settings
@@ -188,14 +208,16 @@ function Import-RunConfig {
         ApiBase = $apiBase
         Proxy = $proxyFromEnv
     }
-    Write-RunLog 'Import-RunConfig' "Environment=$Environment IdentityBase=$identityBase ApiBase=$apiBase ProxyConfigured=$([bool]$proxyFromEnv)"
+    Write-RunLog 'Import-RunConfig' "Environment=$Environment IdentityBase=$identityBase ApiBase=$apiBase ProxyConfigured=$([bool]$proxyFromEnv)" 'INFO'
 }
 
 function ConvertTo-FormBody {
     param([hashtable]$Body)
     $pairs = @()
     foreach ($key in $Body.Keys) {
-        $pairs += "$([System.Uri]::EscapeDataString([string]$key))=$([System.Uri]::EscapeDataString([string]$Body[$key]))"
+        $k = [System.Uri]::EscapeDataString([string]$key)
+        $v = [System.Uri]::EscapeDataString([string]$Body[$key])
+        $pairs += "$k=$v"
     }
     return ($pairs -join '&')
 }
@@ -203,35 +225,59 @@ function ConvertTo-FormBody {
 function Get-Sha256Fingerprint {
     param([string]$Text)
     $sha = [System.Security.Cryptography.SHA256]::Create()
-    try { return (($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Text)) | ForEach-Object { $_.ToString('x2') }) -join '') }
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
+        $hash = $sha.ComputeHash($bytes)
+        return (($hash | ForEach-Object { $_.ToString('x2') }) -join '')
+    }
     finally { $sha.Dispose() }
 }
 
 function Get-WebErrorText {
     param([System.Management.Automation.ErrorRecord]$ErrorRecord)
     $parts = New-Object System.Collections.Generic.List[string]
-    if ($ErrorRecord.Exception -and -not (Test-BlankValue $ErrorRecord.Exception.Message)) { [void]$parts.Add($ErrorRecord.Exception.Message) }
-    if ($ErrorRecord.ErrorDetails -and -not (Test-BlankValue $ErrorRecord.ErrorDetails.Message)) { [void]$parts.Add("Response=$($ErrorRecord.ErrorDetails.Message)") }
+    if ($null -ne $ErrorRecord.Exception -and -not (Test-BlankValue $ErrorRecord.Exception.Message)) { [void]$parts.Add($ErrorRecord.Exception.Message) }
     $response = $ErrorRecord.Exception.Response
-    if ($response) {
+    if ($null -ne $response) {
+        try {
+            $statusCode = [int]$response.StatusCode
+            $statusDescription = [string]$response.StatusDescription
+            if (-not (Test-BlankValue $statusDescription)) { [void]$parts.Add("HTTPStatus=$statusCode $statusDescription") }
+            else { [void]$parts.Add("HTTPStatus=$statusCode") }
+        } catch {}
+    }
+    $body = $null
+    if ($null -ne $ErrorRecord.ErrorDetails -and -not (Test-BlankValue $ErrorRecord.ErrorDetails.Message)) { $body = [string]$ErrorRecord.ErrorDetails.Message }
+    if ((Test-BlankValue $body) -and $null -ne $response) {
         try {
             $stream = $response.GetResponseStream()
-            if ($stream) {
+            if ($null -ne $stream) {
                 $reader = New-Object System.IO.StreamReader($stream)
-                try { $body = $reader.ReadToEnd(); if (-not (Test-BlankValue $body)) { [void]$parts.Add("ResponseStream=$body") } }
-                finally { $reader.Dispose() }
+                try { $body = $reader.ReadToEnd() } finally { $reader.Dispose() }
             }
         } catch {}
     }
+    if (-not (Test-BlankValue $body)) { [void]$parts.Add("Response=$body") }
     if ($parts.Count -eq 0) { return 'Unknown web request error.' }
     return ($parts -join ' | ')
 }
 
 function Get-IdentityBearerToken {
-    Write-RunLog 'Get-IdentityBearerToken' 'Prompting for CyberArk Identity service-user credentials'
+    Write-RunLog 'Get-IdentityBearerToken' 'Prompting for CyberArk Identity service-user credentials' 'INFO'
     $credential = Get-Credential -Message 'Enter CyberArk Identity service-user credentials'
-    $body = ConvertTo-FormBody -Body @{ grant_type = 'client_credentials'; client_id = $credential.UserName; client_secret = $credential.GetNetworkCredential().Password }
-    $params = @{ Method='Post'; Uri=$script:Config.TokenUrl; Body=$body; ContentType='application/x-www-form-urlencoded'; Headers=@{Accept='application/json'}; ErrorAction='Stop' }
+    $body = ConvertTo-FormBody -Body @{
+        grant_type = 'client_credentials'
+        client_id = $credential.UserName
+        client_secret = $credential.GetNetworkCredential().Password
+    }
+    $params = @{
+        Method = 'Post'
+        Uri = $script:Config.TokenUrl
+        Body = $body
+        ContentType = 'application/x-www-form-urlencoded'
+        Headers = @{ Accept = 'application/json' }
+        ErrorAction = 'Stop'
+    }
     if (-not (Test-BlankValue $script:Config.Proxy)) { $params['Proxy'] = $script:Config.Proxy }
     if ($ProxyUseDefaultCredentials) { $params['ProxyUseDefaultCredentials'] = $true }
     try { $response = Invoke-RestMethod @params }
@@ -239,7 +285,7 @@ function Get-IdentityBearerToken {
     if ($null -eq $response.access_token) { throw 'Identity token response did not include access_token.' }
     $token = [string]$response.access_token
     $fingerprint = Get-Sha256Fingerprint -Text $token
-    Write-RunLog 'Get-IdentityBearerToken' "Token acquired. SHA256 fingerprint=$($fingerprint.Substring(0,16))... ExpiresIn=$($response.expires_in)"
+    Write-RunLog 'Get-IdentityBearerToken' "Token acquired. SHA256 fingerprint=$($fingerprint.Substring(0,16))... ExpiresIn=$($response.expires_in)" 'INFO'
     return $token
 }
 
@@ -252,31 +298,55 @@ function Invoke-CyberArkRest {
         [object]$Body = $null,
         [string]$ContentType = 'application/json'
     )
-    if ($Path -match '^https?://') { $uri = $Path } else { $uri = "$($script:Config.ApiBase)/$($Path.TrimStart('/'))" }
-    $params = @{ Method=$Method; Uri=$uri; Headers=@{Authorization="Bearer $Token"}; ErrorAction='Stop' }
+    if ($Path -match '^https?://') { $uri = $Path }
+    else { $uri = "$($script:Config.ApiBase)/$($Path.TrimStart('/'))" }
+    $params = @{
+        Method = $Method
+        Uri = $uri
+        Headers = @{ Authorization = "Bearer $Token"; Accept = 'application/json' }
+        ErrorAction = 'Stop'
+    }
     if ($Method -ne 'GET' -and $Method -ne 'DELETE') { $params['ContentType'] = $ContentType }
-    if ($null -ne $Body) { if ($Body -is [string]) { $params['Body'] = $Body } else { $params['Body'] = ConvertTo-Json -InputObject $Body -Depth 50 -Compress } }
+    if ($null -ne $Body) {
+        if ($Body -is [string]) { $params['Body'] = $Body }
+        else { $params['Body'] = ConvertTo-Json -InputObject $Body -Depth 30 -Compress }
+    }
     if (-not (Test-BlankValue $script:Config.Proxy)) { $params['Proxy'] = $script:Config.Proxy }
     if ($ProxyUseDefaultCredentials) { $params['ProxyUseDefaultCredentials'] = $true }
     try { return Invoke-RestMethod @params }
     catch { throw "REST call failed. Method=$Method Uri=$uri $(Get-WebErrorText -ErrorRecord $_)" }
 }
 
+function Invoke-CyberArkPatchRaw {
+    param(
+        [string]$AccountId,
+        [object[]]$Operations,
+        [string]$Token,
+        [string]$MethodName
+    )
+    $id = [System.Uri]::EscapeDataString($AccountId)
+    $jsonBody = ConvertTo-Json -InputObject ([object[]]$Operations) -Depth 30 -Compress
+    Write-RunLog 'Invoke-CyberArkPatchRaw' "AccountID=$AccountId Method=$MethodName Payload=$jsonBody" 'INFO'
+    return Invoke-CyberArkRest -Method PATCH -Path "Accounts/$id/" -Token $Token -Body $jsonBody -ContentType 'application/json'
+}
+
 function Get-CsvRows {
     if (-not (Test-Path $CsvFile)) { throw "CSV file not found: $CsvFile" }
     if ((Get-Item $CsvFile).Length -eq 0) { throw "CSV file is empty: $CsvFile" }
-    $rows = Import-Csv -Path $CsvFile | Where-Object { ($_.PSObject.Properties.Value | Where-Object { $null -ne $_ -and $_.ToString().Trim().Length -gt 0 }).Count -gt 0 }
+    $rows = Import-Csv -Path $CsvFile | Where-Object {
+        ($_.PSObject.Properties.Value | Where-Object { $null -ne $_ -and $_.ToString().Trim().Length -gt 0 }).Count -gt 0
+    }
     if ($null -eq $rows -or @($rows).Count -eq 0) { throw "CSV contains no data rows: $CsvFile" }
     $first = @($rows)[0]
     $hasAccountId = $false
-    foreach ($name in @('AccountID','Account ID','AccountId','accountId','id','ID')) { if ($first.PSObject.Properties[$name]) { $hasAccountId = $true } }
-    if (-not $hasAccountId) { throw 'CSV is missing required AccountID column. Accepted aliases: AccountID, Account ID, AccountId, accountId, id, ID.' }
-    Write-RunLog 'Get-CsvRows' "Imported $(@($rows).Count) row(s) from $CsvFile"
+    foreach ($name in @('AccountID','Account ID','id','ID')) { if ($first.PSObject.Properties[$name]) { $hasAccountId = $true } }
+    if (-not $hasAccountId) { throw 'CSV is missing required AccountID column. Accepted aliases: AccountID, Account ID, id, ID.' }
+    Write-RunLog 'Get-CsvRows' "Imported $(@($rows).Count) row(s) from $CsvFile" 'INFO'
     return @($rows)
 }
 
 function Get-RowValue {
-    param([pscustomobject]$Row,[string[]]$Names)
+    param([pscustomobject]$Row, [string[]]$Names)
     foreach ($name in $Names) {
         $p = $Row.PSObject.Properties[$name]
         if ($null -ne $p -and -not (Test-BlankValue $p.Value)) { return $p.Value.ToString().Trim() }
@@ -285,213 +355,223 @@ function Get-RowValue {
 }
 
 function Add-CsvRow {
-    param([string]$Path,[pscustomobject]$Row)
+    param([string]$Path, [pscustomobject]$Row)
     if (-not (Test-Path $Path)) { $Row | Export-Csv -Path $Path -NoTypeInformation }
     else { $Row | Export-Csv -Path $Path -NoTypeInformation -Append }
 }
 
 function Get-AccountById {
-    param([string]$AccountId,[string]$Token)
+    param([string]$AccountId, [string]$Token)
     $id = [System.Uri]::EscapeDataString($AccountId)
     return Invoke-CyberArkRest -Method GET -Path "Accounts/$id/" -Token $Token
 }
 
-function Get-AccountField {
-    param([object]$Account,[string[]]$Names)
-    foreach ($name in $Names) {
-        $p = $Account.PSObject.Properties[$name]
-        if ($null -ne $p -and -not (Test-BlankValue $p.Value)) { return $p.Value.ToString() }
+function Try-CheckInAccount {
+    param([string]$AccountId, [string]$Token)
+    $id = [System.Uri]::EscapeDataString($AccountId)
+    try {
+        Invoke-CyberArkRest -Method POST -Path "Accounts/$id/CheckIn/" -Token $Token -Body @{} | Out-Null
+        Write-RunLog 'Try-CheckInAccount' "AccountID=$AccountId check-in/release call succeeded." 'INFO'
+        return $true
     }
-    return ''
-}
-
-function Convert-ObjectPropertiesToHashtable {
-    param([object]$Object)
-    $h = @{}
-    if ($null -eq $Object) { return $h }
-    if ($Object -is [hashtable]) { foreach ($k in $Object.Keys) { $h[[string]$k] = $Object[$k] }; return $h }
-    foreach ($p in $Object.PSObject.Properties) {
-        if (-not (Test-BlankValue $p.Name)) { $h[$p.Name] = $p.Value }
+    catch {
+        Write-RunLog 'Try-CheckInAccount' "AccountID=$AccountId check-in/release call failed but cleanup will continue. $($_.Exception.Message)" 'WARN'
+        return $false
     }
-    return $h
 }
 
-function Test-CpmActionProperty {
-    param([string]$Name,[object]$Value)
-    $n = if ($null -eq $Name) { '' } else { $Name.Trim() }
-    $v = if ($null -eq $Value) { '' } else { $Value.ToString().Trim() }
-    if ($n -match '^(ResetImmediately|ManagementAction|CPMAction|CPMTask|CPMOperation|ChangeTask|VerifyTask|ReconcileTask|PendingTask|PendingOperation|ImmediateChange|ScheduledChange)$') { return $true }
-    if ($n -match 'ResetImmediately') { return $true }
-    if ($v -match '^(ChangeTask|VerifyTask|ReconcileTask)$') { return $true }
-    return $false
-}
+function Disable-AccountAutomaticManagement {
+    param([object]$Account, [string]$Token)
 
-function Get-CpmActionProperties {
-    param([hashtable]$Properties)
-    $matches = @()
-    foreach ($k in @($Properties.Keys)) {
-        if (Test-CpmActionProperty -Name $k -Value $Properties[$k]) {
-            $matches += [pscustomobject]@{ Name=$k; Value=if ($null -eq $Properties[$k]) { '' } else { $Properties[$k].ToString() } }
+    $accountId = [string]$Account.id
+    $status = ''
+    $currentAutomatic = ''
+    $currentReason = ''
+
+    if ($null -ne $Account.secretManagement) {
+        if ($null -ne $Account.secretManagement.status) { $status = [string]$Account.secretManagement.status }
+        if ($null -ne $Account.secretManagement.automaticManagementEnabled) { $currentAutomatic = [string]$Account.secretManagement.automaticManagementEnabled }
+        if ($null -ne $Account.secretManagement.manualManagementReason) { $currentReason = [string]$Account.secretManagement.manualManagementReason }
+    }
+
+    if ($currentAutomatic -ieq 'False') {
+        return [pscustomobject]@{
+            Success = $true
+            Method = 'AlreadyDisabled'
+            Message = 'Automatic Password Management is already disabled.'
         }
     }
-    return @($matches)
-}
 
-function Remove-CpmActionPropertiesFromHashtable {
-    param([hashtable]$Properties)
-    $clean = @{}
-    foreach ($k in @($Properties.Keys)) {
-        if (-not (Test-CpmActionProperty -Name $k -Value $Properties[$k])) { $clean[$k] = $Properties[$k] }
+    if ($TryCheckInBeforePatch) {
+        Try-CheckInAccount -AccountId $accountId -Token $Token | Out-Null
     }
-    return $clean
-}
 
-function ConvertTo-JsonPatchString {
-    param([object[]]$Operations)
-    $ops = New-Object System.Collections.Generic.List[object]
-    foreach ($op in @($Operations)) {
-        if ($null -eq $op) { continue }
-        if ($op -is [System.Collections.IDictionary] -and $op.Contains('op') -and $op.Contains('path')) { [void]$ops.Add($op); continue }
-        $opProp = $op.PSObject.Properties['op']
-        $pathProp = $op.PSObject.Properties['path']
-        if ($null -ne $opProp -and $null -ne $pathProp) { [void]$ops.Add($op); continue }
-        throw "Invalid JSON Patch operation object detected before send: $($op | Out-String)"
-    }
-    $arr = [object[]]$ops.ToArray()
-    $json = ConvertTo-Json -InputObject $arr -Depth 50 -Compress
-    if ($json -match '"Count"\s*:' -or $json -match '"value"\s*:\s*\[') {
-        throw "Internal serialization error. Refusing to send wrapped JSON Patch payload: $json"
-    }
-    return $json
-}
+    $attemptMessages = New-Object System.Collections.Generic.List[string]
 
-function Invoke-JsonPatch {
-    param(
-        [string]$AccountId,
-        [object[]]$Operations,
-        [string]$Token,
-        [string]$Context
-    )
-    if ($null -eq $Operations -or @($Operations).Count -eq 0) { return $null }
-    $json = ConvertTo-JsonPatchString -Operations $Operations
-    Write-RunLog 'Invoke-JsonPatch' "AccountID=$AccountId Context=$Context OperationCount=$(@($Operations).Count) Payload=$json"
-    return Invoke-CyberArkRest -Method PATCH -Path "Accounts/$([System.Uri]::EscapeDataString($AccountId))/" -Token $Token -Body $json -ContentType 'application/json'
+    # Method 1: replace the whole secretManagement object.
+    # This avoids tenants that throw errors when only a nested field is changed.
+    try {
+        $secretManagementValue = [ordered]@{
+            automaticManagementEnabled = $false
+        }
+        if ($SetManualManagementReason) {
+            $secretManagementValue['manualManagementReason'] = $DisableReason
+        }
+
+        Invoke-CyberArkPatchRaw -AccountId $accountId -Token $Token -MethodName 'ReplaceSecretManagementObject' -Operations @(
+            @{ op = 'replace'; path = '/secretManagement'; value = $secretManagementValue }
+        ) | Out-Null
+
+        return [pscustomobject]@{
+            Success = $true
+            Method = 'ReplaceSecretManagementObject'
+            Message = 'Automatic Password Management disabled by replacing /secretManagement.'
+        }
+    }
+    catch {
+        [void]$attemptMessages.Add("ReplaceSecretManagementObject failed: $($_.Exception.Message)")
+        Write-RunLog 'Disable-AccountAutomaticManagement' "AccountID=$accountId ReplaceSecretManagementObject failed. $($_.Exception.Message)" 'WARN'
+    }
+
+    # Method 2: replace only the nested AMD boolean, with no manual reason.
+    try {
+        Invoke-CyberArkPatchRaw -AccountId $accountId -Token $Token -MethodName 'ReplaceAutomaticManagementOnly' -Operations @(
+            @{ op = 'replace'; path = '/secretManagement/automaticManagementEnabled'; value = $false }
+        ) | Out-Null
+
+        if ($SetManualManagementReason) {
+            try {
+                Invoke-CyberArkPatchRaw -AccountId $accountId -Token $Token -MethodName 'ReplaceManualManagementReasonOnly' -Operations @(
+                    @{ op = 'replace'; path = '/secretManagement/manualManagementReason'; value = $DisableReason }
+                ) | Out-Null
+            }
+            catch {
+                Write-RunLog 'Disable-AccountAutomaticManagement' "AccountID=$accountId AMD disabled, but manualManagementReason update failed. $($_.Exception.Message)" 'WARN'
+            }
+        }
+
+        return [pscustomobject]@{
+            Success = $true
+            Method = 'ReplaceAutomaticManagementOnly'
+            Message = 'Automatic Password Management disabled by replacing /secretManagement/automaticManagementEnabled.'
+        }
+    }
+    catch {
+        [void]$attemptMessages.Add("ReplaceAutomaticManagementOnly failed: $($_.Exception.Message)")
+        Write-RunLog 'Disable-AccountAutomaticManagement' "AccountID=$accountId ReplaceAutomaticManagementOnly failed. $($_.Exception.Message)" 'WARN'
+    }
+
+    # Method 3: some older tenant paths treat JSON patch value as string.
+    # This is last because boolean is the documented v10 shape.
+    try {
+        Invoke-CyberArkPatchRaw -AccountId $accountId -Token $Token -MethodName 'ReplaceAutomaticManagementStringFalse' -Operations @(
+            @{ op = 'replace'; path = '/secretManagement/automaticManagementEnabled'; value = 'false' }
+        ) | Out-Null
+
+        return [pscustomobject]@{
+            Success = $true
+            Method = 'ReplaceAutomaticManagementStringFalse'
+            Message = 'Automatic Password Management disabled using string false fallback.'
+        }
+    }
+    catch {
+        [void]$attemptMessages.Add("ReplaceAutomaticManagementStringFalse failed: $($_.Exception.Message)")
+        Write-RunLog 'Disable-AccountAutomaticManagement' "AccountID=$accountId ReplaceAutomaticManagementStringFalse failed. $($_.Exception.Message)" 'WARN'
+    }
+
+    $finalMessage = ($attemptMessages.ToArray() -join ' || ')
+
+    if ($status -ieq 'inProcess') {
+        $finalMessage = "Account secretManagement.status is inProcess. CPM may have already picked up the task; no supported REST cancel endpoint was found. Wait for CPM to finish/fail, then rerun. Attempts: $finalMessage"
+    }
+
+    return [pscustomobject]@{
+        Success = $false
+        Method = 'None'
+        Message = $finalMessage
+    }
 }
 
 function Invoke-RowClear {
-    param([pscustomobject]$CsvRow,[int]$RowNumber,[string]$Token)
+    param([pscustomobject]$CsvRow, [int]$RowNumber, [string]$Token)
 
-    $id = Get-RowValue -Row $CsvRow -Names @('AccountID','Account ID','AccountId','accountId','id','ID')
+    $accountId = Get-RowValue -Row $CsvRow -Names @('AccountID','Account ID','id','ID')
+
     $result = [ordered]@{
         Row = $RowNumber
-        AccountID = $id
+        AccountID = $accountId
         SafeName = ''
         AccountName = ''
+        PlatformID = ''
         UserName = ''
         Address = ''
-        PlatformID = ''
-        AutomaticManagementBefore = ''
-        AutomaticManagementAfter = ''
-        CpmActionPropertiesFound = ''
+        BeforeAutomaticManagementEnabled = ''
+        BeforeSecretManagementStatus = ''
         Action = ''
         Result = ''
+        Method = ''
         Message = ''
     }
 
     try {
-        if (Test-BlankValue $id) { throw 'AccountID is blank.' }
+        if (Test-BlankValue $accountId) { throw 'AccountID is blank.' }
 
-        $acct = Get-AccountById -AccountId $id -Token $Token
-        $result.SafeName = Get-AccountField -Account $acct -Names @('safeName','SafeName')
-        $result.AccountName = Get-AccountField -Account $acct -Names @('name','Name')
-        $result.UserName = Get-AccountField -Account $acct -Names @('userName','username')
-        $result.Address = Get-AccountField -Account $acct -Names @('address','Address')
-        $result.PlatformID = Get-AccountField -Account $acct -Names @('platformId','platformID')
+        $account = Get-AccountById -AccountId $accountId -Token $Token
+        $result.SafeName = $account.safeName
+        $result.AccountName = $account.name
+        $result.PlatformID = $account.platformId
+        $result.UserName = $account.userName
+        $result.Address = $account.address
 
-        if ($acct.secretManagement -and $null -ne $acct.secretManagement.automaticManagementEnabled) {
-            $result.AutomaticManagementBefore = [string][bool]$acct.secretManagement.automaticManagementEnabled
+        if ($null -ne $account.secretManagement) {
+            $result.BeforeAutomaticManagementEnabled = [string]$account.secretManagement.automaticManagementEnabled
+            $result.BeforeSecretManagementStatus = [string]$account.secretManagement.status
         }
-        else {
-            $result.AutomaticManagementBefore = 'Unknown'
-        }
-
-        $props = Convert-ObjectPropertiesToHashtable -Object $acct.platformAccountProperties
-        $actionProps = @(Get-CpmActionProperties -Properties $props)
-        $result.CpmActionPropertiesFound = (($actionProps | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join '; ')
-
-        $wouldPatchPropertyObject = ($actionProps.Count -gt 0)
-        $wouldDisableAmd = (-not $KeepAutomaticManagementEnabled)
-
-        if (-not $wouldPatchPropertyObject -and -not $wouldDisableAmd) {
-            $result.Action = 'NoChange'
-            $result.Result = 'SKIPPED'
-            $result.AutomaticManagementAfter = $result.AutomaticManagementBefore
-            $result.Message = 'No scheduled-action properties found and AMD was left unchanged.'
-            return [pscustomobject]$result
-        }
-
-        $result.Action = if ($wouldPatchPropertyObject -and $wouldDisableAmd) { 'ReplacePlatformPropertiesAndDisableAMD' }
-            elseif ($wouldPatchPropertyObject) { 'ReplacePlatformPropertiesOnly' }
-            else { 'DisableAMDOnly' }
 
         if (-not $Execute) {
+            $result.Action = 'PreviewDisableAMD'
             $result.Result = 'PREVIEW'
-            $result.AutomaticManagementAfter = if ($wouldDisableAmd) { 'False' } else { $result.AutomaticManagementBefore }
-            $result.Message = 'Preview only. No PATCH request sent.'
+            $result.Message = 'Preview only. No account update sent because -Execute was not supplied.'
             return [pscustomobject]$result
         }
 
         if ($ConfirmClear -ne 'YES') {
+            $result.Action = 'None'
             $result.Result = 'SKIPPED'
-            $result.AutomaticManagementAfter = $result.AutomaticManagementBefore
-            $result.Message = 'Execute supplied, but ConfirmClear was not YES.'
+            $result.Message = 'Execute was supplied, but ConfirmClear was not YES.'
             return [pscustomobject]$result
         }
 
-        # Method 1: replace the whole platformaccountproperties object if any CPM action property is in platformAccountProperties.
-        if ($wouldPatchPropertyObject) {
-            $cleanProps = Remove-CpmActionPropertiesFromHashtable -Properties $props
-            $propertyOps = @(
-                @{ op='add'; path='/platformaccountproperties'; value=$cleanProps }
-            )
-            Invoke-JsonPatch -AccountId $id -Operations $propertyOps -Token $Token -Context 'ReplaceCleanedPlatformAccountProperties' | Out-Null
-        }
+        $disableResult = Disable-AccountAutomaticManagement -Account $account -Token $Token
+        $result.Action = 'DisableAutomaticPasswordManagement'
+        $result.Method = $disableResult.Method
+        $result.Message = $disableResult.Message
 
-        # Method 2: disable AMD separately. Keep it as a single operation to avoid PVWA null-reference behavior seen with mixed operations.
-        if ($wouldDisableAmd) {
-            $amdOps = @(
-                @{ op='replace'; path='/secretManagement/automaticManagementEnabled'; value=$false }
-            )
-            Invoke-JsonPatch -AccountId $id -Operations $amdOps -Token $Token -Context 'DisableAutomaticPasswordManagement' | Out-Null
-
-            if ($SetManualManagementReason) {
-                try {
-                    $reasonOps = @(
-                        @{ op='replace'; path='/secretManagement/manualManagementReason'; value=$ManualManagementReason }
-                    )
-                    Invoke-JsonPatch -AccountId $id -Operations $reasonOps -Token $Token -Context 'SetManualManagementReason' | Out-Null
-                }
-                catch {
-                    Write-RunLog 'Invoke-RowClear' "AccountID=$id AMD was disabled, but setting manualManagementReason failed. Continuing. Error=$($_.Exception.Message)" 'WARN'
-                }
-            }
-        }
-
-        $updated = Get-AccountById -AccountId $id -Token $Token
-        if ($updated.secretManagement -and $null -ne $updated.secretManagement.automaticManagementEnabled) {
-            $result.AutomaticManagementAfter = [string][bool]$updated.secretManagement.automaticManagementEnabled
+        if ($disableResult.Success) {
+            $result.Result = if ($disableResult.Method -eq 'AlreadyDisabled') { 'SKIPPED' } else { 'SUCCESS' }
+            Add-CsvRow -Path $script:ChangedReportFile -Row ([pscustomobject]@{
+                Row = $RowNumber
+                AccountID = $accountId
+                SafeName = $result.SafeName
+                AccountName = $result.AccountName
+                PlatformID = $result.PlatformID
+                UserName = $result.UserName
+                Address = $result.Address
+                BeforeAutomaticManagementEnabled = $result.BeforeAutomaticManagementEnabled
+                BeforeSecretManagementStatus = $result.BeforeSecretManagementStatus
+                Method = $disableResult.Method
+                ChangedTime = (Get-Date -Format s)
+                Message = $disableResult.Message
+            })
         }
         else {
-            $result.AutomaticManagementAfter = 'Unknown'
+            $result.Result = 'FAILED'
         }
 
-        $result.Result = 'SUCCESS'
-        $result.Message = 'Cleanup completed. AMD disabled unless KeepAutomaticManagementEnabled was supplied. No password retrieve/change/reconcile call was made.'
-        Add-CsvRow -Path $script:ChangedReportFile -Row ([pscustomobject]$result)
         return [pscustomobject]$result
     }
     catch {
-        $result.Action = 'ClearScheduledPasswordChange'
+        $result.Action = 'DisableAutomaticPasswordManagement'
         $result.Result = 'FAILED'
         $result.Message = $_.Exception.Message
         return [pscustomobject]$result
@@ -502,53 +582,43 @@ function Start-ClearRun {
     New-RunLog
     Import-RunConfig
 
-    if (-not $Execute) { Write-RunLog 'Start-ClearRun' 'Preview mode. No accounts will be patched.' 'WARN' }
-    elseif ($ConfirmClear -ne 'YES') { Write-RunLog 'Start-ClearRun' 'Execute supplied but ConfirmClear is not YES. No accounts will be patched.' 'WARN' }
-    else { Write-RunLog 'Start-ClearRun' 'CLEAR MODE ENABLED. No per-account prompt will be used.' 'WARN' }
+    if (-not $Execute) {
+        Write-RunLog 'Start-ClearRun' 'Preview mode. No accounts will be updated because -Execute was not supplied.' 'WARN'
+    }
+    elseif ($ConfirmClear -ne 'YES') {
+        Write-RunLog 'Start-ClearRun' 'Execute was supplied, but ConfirmClear is not YES. No accounts will be updated.' 'WARN'
+    }
+    else {
+        Write-RunLog 'Start-ClearRun' 'CLEAR MODE ENABLED. No per-account prompt will be used.' 'WARN'
+        Write-RunLog 'Start-ClearRun' 'Supported cleanup action: disable Automatic Password Management. Internal ResetImmediately is not patched directly.' 'WARN'
+    }
 
-    if ($KeepAutomaticManagementEnabled) { Write-RunLog 'Start-ClearRun' 'KeepAutomaticManagementEnabled supplied. AMD will not be disabled.' 'WARN' }
-    else { Write-RunLog 'Start-ClearRun' 'Default safety mode: AMD will be disabled using a separate PATCH operation.' 'WARN' }
+    Write-RunLog 'Start-ClearRun' "Using CSV file: $CsvFile" 'INFO'
 
-    if ($SetManualManagementReason) { Write-RunLog 'Start-ClearRun' 'SetManualManagementReason supplied. Script will attempt reason patch after AMD disable, but will continue if only the reason patch fails.' 'WARN' }
-
-    Write-RunLog 'Start-ClearRun' "Using CSV file: $CsvFile"
     $rows = Get-CsvRows
     $token = Get-IdentityBearerToken
-    $seen = @{}
+
     $rowNumber = 1
-
     foreach ($row in $rows) {
-        $id = Get-RowValue -Row $row -Names @('AccountID','Account ID','AccountId','accountId','id','ID')
-        if (-not (Test-BlankValue $id) -and $seen.ContainsKey($id)) {
-            Add-CsvRow -Path $script:ReportFile -Row ([pscustomobject]@{
-                Row=$rowNumber; AccountID=$id; SafeName=''; AccountName=''; UserName=''; Address=''; PlatformID='';
-                AutomaticManagementBefore=''; AutomaticManagementAfter=''; CpmActionPropertiesFound=''; Action='DuplicateRow';
-                Result='SKIPPED'; Message="Duplicate AccountID. First seen at row $($seen[$id])."
-            })
-            $rowNumber++
-            continue
-        }
-        if (-not (Test-BlankValue $id)) { $seen[$id] = $rowNumber }
-
-        Write-RunLog 'Start-ClearRun' "Processing CSV row $rowNumber AccountID=$id"
+        $accountId = Get-RowValue -Row $row -Names @('AccountID','Account ID','id','ID')
+        Write-RunLog 'Start-ClearRun' "Processing CSV row $rowNumber AccountID=$accountId" 'INFO'
         $outcome = Invoke-RowClear -CsvRow $row -RowNumber $rowNumber -Token $token
         Add-CsvRow -Path $script:ReportFile -Row $outcome
-
         if ($outcome.Result -eq 'FAILED') {
             Write-RunLog 'Start-ClearRun' "Row $rowNumber failed. AccountID=$($outcome.AccountID) Message=$($outcome.Message)" 'ERROR'
         }
         elseif ($outcome.Result -eq 'SUCCESS') {
-            Write-RunLog 'Start-ClearRun' "Row $rowNumber success. AccountID=$($outcome.AccountID) AMD_Before=$($outcome.AutomaticManagementBefore) AMD_After=$($outcome.AutomaticManagementAfter) Cleared='$($outcome.CpmActionPropertiesFound)'" 'WARN'
+            Write-RunLog 'Start-ClearRun' "Row $rowNumber updated. AccountID=$($outcome.AccountID) Method=$($outcome.Method)" 'WARN'
         }
         else {
-            Write-RunLog 'Start-ClearRun' "Row $rowNumber $($outcome.Result). AccountID=$($outcome.AccountID) Message=$($outcome.Message)"
+            Write-RunLog 'Start-ClearRun' "Row $rowNumber $($outcome.Result). AccountID=$($outcome.AccountID) Message=$($outcome.Message)" 'INFO'
         }
         $rowNumber++
     }
 
-    Write-RunLog 'Start-ClearRun' "Run completed. MainReport=$script:ReportFile"
-    Write-RunLog 'Start-ClearRun' "ChangedReport=$script:ChangedReportFile"
-    Write-RunLog 'Start-ClearRun' "Log=$script:LogFile"
+    Write-RunLog 'Start-ClearRun' "Run completed. MainReport=$script:ReportFile" 'INFO'
+    Write-RunLog 'Start-ClearRun' "ChangedReport=$script:ChangedReportFile" 'INFO'
+    Write-RunLog 'Start-ClearRun' "Log=$script:LogFile" 'INFO'
 }
 
 Start-ClearRun
