@@ -1,12 +1,1032 @@
-Develop a new script, let this be intuitive and super wonderful
-I have a cyberark discovery rule set to move accounts starting with SVC to a defined safe and platform
-Safe
-AP-WPA-P-C1-AMNG-DISCOVERY
-Platform
-WIN-DOMAIN-E-PR0NENR-DISC
+<#
+.SYNOPSIS
+    Remediates discovered CyberArk SVC service accounts into app-code mapped AMNG Safes.
 
-Each SVC account start with SVC followed by their app code (a 3 letter)
-The 3 letter appcode have corresponds with existing safe that starts with AP-<appcode> and -P-C1-AMNG example AP-WBK-P-C1-AMNG
-I want the script to identify each discovered service account, lookup their matching safe,
-duplicate or create account to the safe matching their appcode based on format above, set newly created platform to WIN-DOMAIN-E-PR0NENR-STATIC
-if service account already exist in the matching safe, ignore duplication and delete from discovery
+.DESCRIPTION
+    Live one-time run script.
+
+    Source discovery Safe:
+        AP-WPA-P-C1-AMNG-DISCOVERY
+
+    Source discovery Platform:
+        WIN-DOMAIN-E-PR0NENR-DISC
+
+    Target Safe mapping:
+        SVC + 3-letter app code -> AP-<appcode>-P-C1-AMNG
+
+        Example:
+            Username    : SVCWBK_SQL_APP
+            App code    : WBK
+            Target Safe : AP-WBK-P-C1-AMNG
+
+    Target platform for newly created target accounts:
+        WIN-DOMAIN-E-PR0NENR-STATIC
+
+    Behavior:
+      - Reads accounts from discovery Safe only.
+      - Processes accounts whose username begins with SVC plus 3 letters.
+      - Finds matching target Safe from the app code.
+      - If the service account already exists in the matching Safe, deletes the discovery copy.
+      - If the service account does not exist in the matching Safe, creates it there, then deletes the discovery copy.
+      - If the discovery account has no retrievable secret, creates the target account with a generated temporary placeholder secret.
+      - No preview mode.
+      - No per-account prompt.
+      - Requires -ConfirmRun YES as a batch safety gate.
+
+.NOTES
+    Designed for Windows PowerShell 5.1.
+    The script does not log service-user passwords, bearer tokens, or retrieved secrets.
+#>
+
+#requires -Version 5.1
+[CmdletBinding()]
+param(
+    [ValidateSet('dev','prod')]
+    [string]$Environment = 'prod',
+
+    [string]$EnvFolder = (Join-Path $PSScriptRoot 'env'),
+
+    [string]$SourceSafe = 'AP-WPA-P-C1-AMNG-DISCOVERY',
+
+    [string]$SourcePlatformId = 'WIN-DOMAIN-E-PR0NENR-DISC',
+
+    [string]$TargetPlatformId = 'WIN-DOMAIN-E-PR0NENR-STATIC',
+
+    [string]$TargetSafeFormat = 'AP-{0}-P-C1-AMNG',
+
+    [string]$ServiceAccountRegex = '^SVC(?<AppCode>[A-Za-z]{3})',
+
+    [ValidateSet('UsernameAndAddress','UsernameOnly')]
+    [string]$ExistingMatchMode = 'UsernameAndAddress',
+
+    [bool]$TargetAutomaticManagementEnabled = $false,
+
+    [string]$TargetManualManagementReason = 'Onboarded from discovery to static platform. Automatic Password Management disabled by remediation script.',
+
+    [string]$RetrieveReason = 'Approved discovery service account remediation',
+
+    # If the source discovery account has no retrievable secret, still onboard the target account using a generated temporary placeholder secret.
+    [bool]$UseGeneratedPlaceholderSecretWhenSourceSecretMissing = $true,
+
+    # Prefix used only to identify that a generated placeholder was used. The full generated secret is never logged.
+    [string]$GeneratedPlaceholderPrefix = 'CyberArkDiscoveryPlaceholder',
+
+    [int]$PageLimit = 1000,
+
+    [switch]$ProxyUseDefaultCredentials,
+
+    [ValidateSet('NO','YES')]
+    [string]$ConfirmRun = 'NO',
+
+    [switch]$AllowSourcePlatformMismatch,
+
+    [string]$ReportFolder = (Join-Path $PSScriptRoot 'reports'),
+
+    [string]$LogFolder = (Join-Path $PSScriptRoot 'logs'),
+
+    [string]$LogId = ''
+)
+
+$ErrorActionPreference = 'Stop'
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+$script:LogFile = $null
+$script:ReportFile = $null
+$script:CreatedReportFile = $null
+$script:DeletedDiscoveryReportFile = $null
+$script:SkippedReportFile = $null
+$script:Config = $null
+$script:SafeExistsCache = @{}
+
+function Test-BlankValue {
+    param([object]$Value)
+    if ($null -eq $Value) { return $true }
+    $text = $Value.ToString().Trim()
+    if ($text.Length -eq 0) { return $true }
+    if ($text -match '^(Placehold|Placeholder|YOUR-|<.*>|CHANGEME)$') { return $true }
+    return $false
+}
+
+function New-RunLog {
+    if (-not (Test-Path $LogFolder)) { New-Item -Path $LogFolder -ItemType Directory -Force | Out-Null }
+    if (-not (Test-Path $ReportFolder)) { New-Item -Path $ReportFolder -ItemType Directory -Force | Out-Null }
+
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $suffix = if (Test-BlankValue $LogId) { '' } else { "_$LogId" }
+
+    $script:LogFile = Join-Path $LogFolder "Remediate-DiscoverySvcAccounts_$stamp$suffix.log"
+    $script:ReportFile = Join-Path $ReportFolder "Remediate-DiscoverySvcAccounts_Report_$stamp$suffix.csv"
+    $script:CreatedReportFile = Join-Path $ReportFolder "Remediate-DiscoverySvcAccounts_Created_$stamp$suffix.csv"
+    $script:DeletedDiscoveryReportFile = Join-Path $ReportFolder "Remediate-DiscoverySvcAccounts_DeletedDiscovery_$stamp$suffix.csv"
+    $script:SkippedReportFile = Join-Path $ReportFolder "Remediate-DiscoverySvcAccounts_Skipped_$stamp$suffix.csv"
+
+    Set-Content -Path $script:LogFile -Value "$(Get-Date -Format s) source=New-RunLog [INFO] Starting discovery SVC account remediation"
+}
+
+function Write-RunLog {
+    param(
+        [string]$Source,
+        [string]$Message,
+        [ValidateSet('DEBUG','INFO','WARN','ERROR','SUCCESS')]
+        [string]$Level = 'INFO'
+    )
+
+    $line = "$(Get-Date -Format s) source=$Source [$Level] $Message"
+    Add-Content -Path $script:LogFile -Value $line
+
+    if ($Level -eq 'ERROR') { Write-Host $line -ForegroundColor Red }
+    elseif ($Level -eq 'WARN') { Write-Host $line -ForegroundColor Yellow }
+    elseif ($Level -eq 'SUCCESS') { Write-Host $line -ForegroundColor Green }
+    else { Write-Host $line }
+}
+
+function Read-DotEnvFile {
+    param([string]$Path)
+
+    $result = @{}
+    if (-not (Test-Path $Path)) { return $result }
+
+    foreach ($line in (Get-Content -Path $Path -ErrorAction Stop)) {
+        $trimmed = $line.Trim()
+        if ($trimmed.Length -eq 0) { continue }
+        if ($trimmed.StartsWith('#')) { continue }
+        if ($trimmed -notmatch '=') { continue }
+
+        $parts = $trimmed.Split('=', 2)
+        $key = $parts[0].Trim()
+        $value = $parts[1].Trim()
+
+        if ($value.Length -ge 2) {
+            if (
+                ($value.StartsWith('"') -and $value.EndsWith('"')) -or
+                ($value.StartsWith("'") -and $value.EndsWith("'"))
+            ) {
+                $value = $value.Substring(1, $value.Length - 2)
+            }
+        }
+
+        if (-not (Test-BlankValue $key)) { $result[$key] = $value }
+    }
+
+    return $result
+}
+
+function Join-EnvValues {
+    param([hashtable[]]$Maps)
+
+    $merged = @{}
+    foreach ($map in $Maps) {
+        foreach ($key in $map.Keys) { $merged[$key] = $map[$key] }
+    }
+    return $merged
+}
+
+function Normalize-PvwaApiBase {
+    param([string]$PvwaValue)
+
+    $base = $PvwaValue.Trim().TrimEnd('/')
+    $base = $base -replace '/PrivilegeCloud$', ''
+    $base = $base -replace '/PasswordVault/API/Accounts/?$', '/PasswordVault/API'
+    $base = $base -replace '/PasswordVault/API/.+$', '/PasswordVault/API'
+
+    if ($base -match '/PasswordVault/API$') { return $base }
+    if ($base -match '/PasswordVault$') { return "$base/API" }
+    return "$base/PasswordVault/API"
+}
+
+function Resolve-IdentityBase {
+    param([hashtable]$Settings)
+
+    $tenant = $Settings['TENANT_ID']
+    if (Test-BlankValue $tenant) {
+        throw 'TENANT_ID is missing. Example: TENANT_ID=abq4289 or TENANT_ID=https://abq4289.id.cyberark.cloud'
+    }
+
+    $tenant = $tenant.Trim().TrimEnd('/')
+    if ($tenant -match '^https?://') { return $tenant }
+    if ($tenant -match '\.id\.cyberark\.cloud$') { return "https://$tenant" }
+    if ($tenant -match '\.') { return "https://$tenant" }
+    return "https://$tenant.id.cyberark.cloud"
+}
+
+function Get-ProxyFromSettings {
+    param([hashtable]$Settings)
+
+    $proxy = $Settings['PROXY']
+    if (-not (Test-BlankValue $proxy)) { return $proxy.Trim() }
+
+    $proxyAddress = $Settings['PROXY_ADDRESS']
+    if (Test-BlankValue $proxyAddress) { $proxyAddress = $Settings['ROXY_ADDRESS'] }
+
+    $proxyPort = $Settings['PROXY_PORT']
+    if ((Test-BlankValue $proxyAddress) -or (Test-BlankValue $proxyPort)) { return $null }
+
+    $proxyAddress = $proxyAddress.Trim().TrimEnd('/')
+    if ($proxyAddress -notmatch '^https?://') { $proxyAddress = "http://$proxyAddress" }
+
+    return "$proxyAddress`:$($proxyPort.Trim())"
+}
+
+function Import-RunConfig {
+    $baseFile = Join-Path $PSScriptRoot '.env'
+    $envFile1 = Join-Path $EnvFolder "$Environment.env"
+    $envFile2 = Join-Path $PSScriptRoot "$Environment.env"
+
+    $base = Read-DotEnvFile -Path $baseFile
+
+    if (Test-Path $envFile1) {
+        $envSpecific = Read-DotEnvFile -Path $envFile1
+    }
+    elseif (Test-Path $envFile2) {
+        $envSpecific = Read-DotEnvFile -Path $envFile2
+    }
+    else {
+        throw "Could not find environment file for '$Environment'. Expected $envFile1 or $envFile2"
+    }
+
+    $settings = Join-EnvValues -Maps @($base, $envSpecific)
+
+    if (Test-BlankValue $settings['PVWA']) {
+        if (Test-BlankValue $settings['SUB_DOMAIN']) {
+            throw 'PVWA is missing and SUB_DOMAIN is not set.'
+        }
+
+        $settings['PVWA'] = "https://$($settings['SUB_DOMAIN']).privilegecloud.cyberark.cloud"
+    }
+
+    $identityBase = Resolve-IdentityBase -Settings $settings
+    $apiBase = Normalize-PvwaApiBase -PvwaValue $settings['PVWA']
+    $proxyFromEnv = Get-ProxyFromSettings -Settings $settings
+
+    if (-not (Test-BlankValue $proxyFromEnv)) {
+        $webProxy = New-Object System.Net.WebProxy($proxyFromEnv, $true)
+
+        if ($ProxyUseDefaultCredentials) {
+            $webProxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials
+        }
+
+        [System.Net.WebRequest]::DefaultWebProxy = $webProxy
+    }
+
+    $script:Config = [pscustomobject]@{
+        Environment = $Environment
+        IdentityBase = $identityBase
+        TokenUrl = "$identityBase/oauth2/platformtoken"
+        ApiBase = $apiBase
+        Proxy = $proxyFromEnv
+    }
+
+    Write-RunLog 'Import-RunConfig' "Environment=$Environment IdentityBase=$identityBase ApiBase=$apiBase ProxyConfigured=$([bool]$proxyFromEnv)" 'INFO'
+}
+
+function ConvertTo-FormBody {
+    param([hashtable]$Body)
+
+    $pairs = @()
+    foreach ($key in $Body.Keys) {
+        $k = [System.Uri]::EscapeDataString([string]$key)
+        $v = [System.Uri]::EscapeDataString([string]$Body[$key])
+        $pairs += "$k=$v"
+    }
+    return ($pairs -join '&')
+}
+
+function Get-Sha256Fingerprint {
+    param([string]$Text)
+
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
+        $hash = $sha.ComputeHash($bytes)
+        return (($hash | ForEach-Object { $_.ToString('x2') }) -join '')
+    }
+    finally {
+        $sha.Dispose()
+    }
+}
+
+function Get-WebErrorText {
+    param([System.Management.Automation.ErrorRecord]$ErrorRecord)
+
+    $parts = New-Object System.Collections.Generic.List[string]
+
+    if ($null -ne $ErrorRecord.Exception -and -not (Test-BlankValue $ErrorRecord.Exception.Message)) {
+        [void]$parts.Add($ErrorRecord.Exception.Message)
+    }
+
+    $response = $ErrorRecord.Exception.Response
+
+    if ($null -ne $response) {
+        try {
+            [void]$parts.Add("HTTPStatus=$([int]$response.StatusCode) $($response.StatusDescription)")
+        }
+        catch {}
+    }
+
+    $body = $null
+
+    if ($null -ne $ErrorRecord.ErrorDetails -and -not (Test-BlankValue $ErrorRecord.ErrorDetails.Message)) {
+        $body = [string]$ErrorRecord.ErrorDetails.Message
+    }
+
+    if ((Test-BlankValue $body) -and $null -ne $response) {
+        try {
+            $stream = $response.GetResponseStream()
+            if ($null -ne $stream) {
+                $reader = New-Object System.IO.StreamReader($stream)
+                try { $body = $reader.ReadToEnd() } finally { $reader.Dispose() }
+            }
+        }
+        catch {}
+    }
+
+    if (-not (Test-BlankValue $body)) { [void]$parts.Add("Response=$body") }
+
+    if ($parts.Count -eq 0) { return 'Unknown web request error.' }
+
+    return ($parts -join ' | ')
+}
+
+function Get-IdentityBearerToken {
+    Write-RunLog 'Get-IdentityBearerToken' 'Prompting for CyberArk Identity service-user credentials' 'INFO'
+
+    $credential = Get-Credential -Message 'Enter CyberArk Identity service-user credentials'
+
+    $body = ConvertTo-FormBody -Body @{
+        grant_type = 'client_credentials'
+        client_id = $credential.UserName
+        client_secret = $credential.GetNetworkCredential().Password
+    }
+
+    $params = @{
+        Method = 'Post'
+        Uri = $script:Config.TokenUrl
+        Body = $body
+        ContentType = 'application/x-www-form-urlencoded'
+        Headers = @{ Accept = 'application/json' }
+        ErrorAction = 'Stop'
+    }
+
+    if (-not (Test-BlankValue $script:Config.Proxy)) { $params['Proxy'] = $script:Config.Proxy }
+    if ($ProxyUseDefaultCredentials) { $params['ProxyUseDefaultCredentials'] = $true }
+
+    try {
+        $response = Invoke-RestMethod @params
+    }
+    catch {
+        throw "Identity token request failed. $(Get-WebErrorText -ErrorRecord $_)"
+    }
+
+    if ($null -eq $response.access_token) {
+        throw 'Identity token response did not include access_token.'
+    }
+
+    $token = [string]$response.access_token
+    $fingerprint = Get-Sha256Fingerprint -Text $token
+
+    Write-RunLog 'Get-IdentityBearerToken' "Token acquired. SHA256 fingerprint=$($fingerprint.Substring(0,16))... ExpiresIn=$($response.expires_in)" 'INFO'
+
+    return $token
+}
+
+function Invoke-CyberArkRest {
+    param(
+        [ValidateSet('GET','POST','DELETE')]
+        [string]$Method,
+        [string]$Path,
+        [string]$Token,
+        [object]$Body = $null
+    )
+
+    if ($Path -match '^https?://') {
+        $uri = $Path
+    }
+    else {
+        $uri = "$($script:Config.ApiBase)/$($Path.TrimStart('/'))"
+    }
+
+    $params = @{
+        Method = $Method
+        Uri = $uri
+        Headers = @{ Authorization = "Bearer $Token" }
+        ErrorAction = 'Stop'
+    }
+
+    if ($Method -ne 'GET' -and $Method -ne 'DELETE') {
+        $params['ContentType'] = 'application/json'
+    }
+
+    if ($null -ne $Body) {
+        if ($Body -is [string]) {
+            $params['Body'] = $Body
+        }
+        else {
+            $params['Body'] = ConvertTo-Json -InputObject $Body -Depth 30 -Compress
+        }
+    }
+
+    if (-not (Test-BlankValue $script:Config.Proxy)) { $params['Proxy'] = $script:Config.Proxy }
+    if ($ProxyUseDefaultCredentials) { $params['ProxyUseDefaultCredentials'] = $true }
+
+    try {
+        return Invoke-RestMethod @params
+    }
+    catch {
+        throw "REST call failed. Method=$Method Uri=$uri $(Get-WebErrorText -ErrorRecord $_)"
+    }
+}
+
+function ConvertTo-AccountList {
+    param([object]$Response)
+
+    if ($null -eq $Response) { return @() }
+    if ($Response -is [System.Array]) { return @($Response) }
+
+    foreach ($name in @('value','accounts','Accounts')) {
+        $p = $Response.PSObject.Properties[$name]
+        if ($null -ne $p) { return @($p.Value) }
+    }
+
+    return @($Response)
+}
+
+function Get-AccountField {
+    param(
+        [object]$Account,
+        [string[]]$Names
+    )
+
+    if ($null -eq $Account) { return '' }
+
+    foreach ($name in $Names) {
+        $p = $Account.PSObject.Properties[$name]
+        if ($null -ne $p -and -not (Test-BlankValue $p.Value)) {
+            return $p.Value.ToString()
+        }
+    }
+
+    return ''
+}
+
+function Add-UniqueAccount {
+    param(
+        [hashtable]$Table,
+        [object]$Account
+    )
+
+    $id = Get-AccountField -Account $Account -Names @('id','ID','accountId','AccountID')
+
+    if (Test-BlankValue $id) { return }
+
+    if (-not $Table.ContainsKey($id)) {
+        $Table[$id] = $Account
+    }
+}
+
+function Get-AccountsFromSafe {
+    param(
+        [string]$SafeName,
+        [string]$Token,
+        [string]$SearchText = $null
+    )
+
+    $found = @{}
+    $offset = 0
+
+    do {
+        $filterText = "safeName eq $SafeName"
+        $path = "Accounts?offset=$offset&limit=$PageLimit&filter=$([System.Uri]::EscapeDataString($filterText))"
+
+        if (-not (Test-BlankValue $SearchText)) {
+            $path += "&search=$([System.Uri]::EscapeDataString($SearchText))&searchType=contains"
+        }
+
+        $response = Invoke-CyberArkRest -Method GET -Path $path -Token $Token
+        $items = @(ConvertTo-AccountList -Response $response)
+
+        foreach ($item in $items) {
+            Add-UniqueAccount -Table $found -Account $item
+        }
+
+        $offset += $PageLimit
+    } while ($items.Count -eq $PageLimit)
+
+    return @($found.Values)
+}
+
+function Get-AccountById {
+    param(
+        [string]$AccountId,
+        [string]$Token
+    )
+
+    $id = [System.Uri]::EscapeDataString($AccountId)
+    return Invoke-CyberArkRest -Method GET -Path "Accounts/$id/" -Token $Token
+}
+
+function Get-AccountSecretValue {
+    param(
+        [string]$AccountId,
+        [string]$Token
+    )
+
+    $id = [System.Uri]::EscapeDataString($AccountId)
+    $body = @{ reason = $RetrieveReason }
+
+    $response = Invoke-CyberArkRest -Method POST -Path "Accounts/$id/Password/Retrieve/" -Token $Token -Body $body
+
+    if ($response -is [string]) { return $response }
+
+    foreach ($name in @('Content','Password','Value','secret')) {
+        $p = $response.PSObject.Properties[$name]
+        if ($null -ne $p -and -not (Test-BlankValue $p.Value)) {
+            return [string]$p.Value
+        }
+    }
+
+    return [string]$response
+}
+
+function New-GeneratedPlaceholderSecret {
+    <#
+        Generates a temporary placeholder secret when the discovered source
+        account has no retrievable password/content.
+
+        The full generated value is never written to logs or reports.
+    #>
+    param(
+        [string]$SourceAccountId,
+        [string]$UserName
+    )
+
+    $guidText = ([guid]::NewGuid().ToString('N'))
+    $stamp = Get-Date -Format 'yyyyMMddHHmmss'
+    $safeUser = if (Test-BlankValue $UserName) { 'UnknownUser' } else { ($UserName -replace '[^A-Za-z0-9]', '') }
+
+    return "$GeneratedPlaceholderPrefix-$safeUser-$stamp-$($guidText.Substring(0,16))!"
+}
+
+function Get-AccountSecretForCreate {
+    <#
+        Retrieves the source secret when available.
+
+        If retrieval fails or returns blank and placeholder mode is enabled,
+        the script still onboards the target account using a generated temporary
+        placeholder secret. This supports discovery accounts that were discovered
+        without usable password content.
+    #>
+    param(
+        [object]$SourceAccount,
+        [string]$Token
+    )
+
+    $sourceId = Get-AccountField -Account $SourceAccount -Names @('id','ID','accountId','AccountID')
+    $userName = Get-AccountField -Account $SourceAccount -Names @('userName','username','UserName')
+
+    try {
+        $secret = Get-AccountSecretValue -AccountId $sourceId -Token $Token
+
+        if (-not (Test-BlankValue $secret)) {
+            return [pscustomobject]@{
+                Secret = $secret
+                SecretSource = 'SourceSecretRetrieved'
+                SecretNote = 'Source secret was retrieved and used for target account creation.'
+            }
+        }
+
+        Write-RunLog 'Get-AccountSecretForCreate' "SourceAccountID=$sourceId returned a blank secret." 'WARN'
+    }
+    catch {
+        Write-RunLog 'Get-AccountSecretForCreate' "SourceAccountID=$sourceId secret retrieval failed. Target account can still be created with generated placeholder when enabled. Error=$($_.Exception.Message)" 'WARN'
+    }
+
+    if (-not $UseGeneratedPlaceholderSecretWhenSourceSecretMissing) {
+        throw "SourceAccountID=$sourceId has no retrievable secret and UseGeneratedPlaceholderSecretWhenSourceSecretMissing is false."
+    }
+
+    $placeholder = New-GeneratedPlaceholderSecret -SourceAccountId $sourceId -UserName $userName
+
+    return [pscustomobject]@{
+        Secret = $placeholder
+        SecretSource = 'GeneratedPlaceholder'
+        SecretNote = 'Source secret was not retrievable. Generated temporary placeholder secret was used. Validate/update password before enabling CPM.'
+    }
+}
+
+
+function Remove-AccountById {
+    param(
+        [string]$AccountId,
+        [string]$Token
+    )
+
+    $id = [System.Uri]::EscapeDataString($AccountId)
+    Invoke-CyberArkRest -Method DELETE -Path "Accounts/$id/" -Token $Token | Out-Null
+}
+
+function Test-SafeExists {
+    param(
+        [string]$SafeName,
+        [string]$Token
+    )
+
+    if ($script:SafeExistsCache.ContainsKey($SafeName)) {
+        return [bool]$script:SafeExistsCache[$SafeName]
+    }
+
+    $safeId = [System.Uri]::EscapeDataString($SafeName)
+
+    try {
+        Invoke-CyberArkRest -Method GET -Path "Safes/$safeId" -Token $Token | Out-Null
+        $script:SafeExistsCache[$SafeName] = $true
+        return $true
+    }
+    catch {
+        $script:SafeExistsCache[$SafeName] = $false
+        return $false
+    }
+}
+
+function Get-AppCodeFromUserName {
+    param([string]$UserName)
+
+    if (Test-BlankValue $UserName) { return $null }
+
+    $m = [regex]::Match(
+        $UserName.Trim(),
+        $ServiceAccountRegex,
+        [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+    )
+
+    if (-not $m.Success) { return $null }
+
+    return $m.Groups['AppCode'].Value.ToUpperInvariant()
+}
+
+function Get-TargetSafeName {
+    param([string]$AppCode)
+
+    return [string]::Format($TargetSafeFormat, $AppCode.ToUpperInvariant())
+}
+
+function Get-NormalizedValue {
+    param([object]$Value)
+
+    if ($null -eq $Value) { return '' }
+
+    return $Value.ToString().Trim().ToUpperInvariant()
+}
+
+function Find-ExistingTargetAccount {
+    param(
+        [object]$SourceAccount,
+        [string]$TargetSafe,
+        [string]$Token
+    )
+
+    $sourceUser = Get-AccountField -Account $SourceAccount -Names @('userName','username','UserName')
+    $sourceAddress = Get-AccountField -Account $SourceAccount -Names @('address','Address')
+
+    $candidateAccounts = @(Get-AccountsFromSafe -SafeName $TargetSafe -Token $Token -SearchText $sourceUser)
+
+    $sourceUserNorm = Get-NormalizedValue -Value $sourceUser
+    $sourceAddressNorm = Get-NormalizedValue -Value $sourceAddress
+
+    $matches = @()
+
+    foreach ($candidate in $candidateAccounts) {
+        $candidateUser = Get-AccountField -Account $candidate -Names @('userName','username','UserName')
+        $candidateAddress = Get-AccountField -Account $candidate -Names @('address','Address')
+
+        if ((Get-NormalizedValue -Value $candidateUser) -ne $sourceUserNorm) {
+            continue
+        }
+
+        if ($ExistingMatchMode -eq 'UsernameOnly') {
+            $matches += $candidate
+            continue
+        }
+
+        if ((Get-NormalizedValue -Value $candidateAddress) -eq $sourceAddressNorm) {
+            $matches += $candidate
+        }
+    }
+
+    return @($matches)
+}
+
+function ConvertTo-HashtableFromObject {
+    param([object]$Object)
+
+    $hash = @{}
+
+    if ($null -eq $Object) { return $hash }
+
+    foreach ($p in $Object.PSObject.Properties) {
+        if (-not (Test-BlankValue $p.Name) -and $null -ne $p.Value) {
+            $hash[$p.Name] = $p.Value
+        }
+    }
+
+    return $hash
+}
+
+function Remove-CpmTaskProperties {
+    param([hashtable]$Properties)
+
+    $blockedNames = @(
+        'ResetImmediately',
+        'ManagementAction',
+        'CPMAction',
+        'ChangeTask',
+        'VerifyTask',
+        'ReconcileTask',
+        'ImmediateChange',
+        'PerformImmediateChange'
+    )
+
+    foreach ($key in @($Properties.Keys)) {
+        foreach ($blocked in $blockedNames) {
+            if ($key -ieq $blocked) {
+                $Properties.Remove($key)
+                break
+            }
+        }
+    }
+}
+
+function New-TargetAccountBody {
+    param(
+        [object]$SourceAccount,
+        [string]$TargetSafe,
+        [string]$Secret
+    )
+
+    $props = ConvertTo-HashtableFromObject -Object $SourceAccount.platformAccountProperties
+    Remove-CpmTaskProperties -Properties $props
+
+    $name = Get-AccountField -Account $SourceAccount -Names @('name','Name')
+    $address = Get-AccountField -Account $SourceAccount -Names @('address','Address')
+    $userName = Get-AccountField -Account $SourceAccount -Names @('userName','username','UserName')
+    $secretType = Get-AccountField -Account $SourceAccount -Names @('secretType','SecretType')
+
+    if (Test-BlankValue $secretType) { $secretType = 'Password' }
+
+    $manualReason = $null
+    if (-not $TargetAutomaticManagementEnabled) {
+        $manualReason = $TargetManualManagementReason
+    }
+
+    $body = [ordered]@{
+        name = $name
+        address = $address
+        userName = $userName
+        platformId = $TargetPlatformId
+        safeName = $TargetSafe
+        secretType = $secretType
+        secret = $Secret
+        platformAccountProperties = $props
+        secretManagement = @{
+            automaticManagementEnabled = [bool]$TargetAutomaticManagementEnabled
+            manualManagementReason = $manualReason
+        }
+    }
+
+    if ($null -ne $SourceAccount.remoteMachinesAccess) {
+        $body['remoteMachinesAccess'] = $SourceAccount.remoteMachinesAccess
+    }
+
+    return $body
+}
+
+function New-TargetAccount {
+    param(
+        [object]$SourceAccount,
+        [string]$TargetSafe,
+        [string]$Token
+    )
+
+    $secretChoice = Get-AccountSecretForCreate -SourceAccount $SourceAccount -Token $Token
+
+    if (Test-BlankValue $secretChoice.Secret) {
+        throw 'Secret selected for create is blank. Target account was not created.'
+    }
+
+    $body = New-TargetAccountBody -SourceAccount $SourceAccount -TargetSafe $TargetSafe -Secret $secretChoice.Secret
+
+    $created = Invoke-CyberArkRest -Method POST -Path 'Accounts?AllowAccountDuplications=false' -Token $Token -Body $body
+
+    return [pscustomobject]@{
+        Account = $created
+        SecretSource = $secretChoice.SecretSource
+        SecretNote = $secretChoice.SecretNote
+    }
+}
+
+function Add-CsvRow {
+    param(
+        [string]$Path,
+        [pscustomobject]$Row
+    )
+
+    if (-not (Test-Path $Path)) {
+        $Row | Export-Csv -Path $Path -NoTypeInformation
+    }
+    else {
+        $Row | Export-Csv -Path $Path -NoTypeInformation -Append
+    }
+}
+
+function Write-ReportRows {
+    param([pscustomobject]$Row)
+
+    Add-CsvRow -Path $script:ReportFile -Row $Row
+
+    switch ($Row.Result) {
+        'CREATED_AND_DELETED_DISCOVERY' {
+            Add-CsvRow -Path $script:CreatedReportFile -Row $Row
+            Add-CsvRow -Path $script:DeletedDiscoveryReportFile -Row $Row
+        }
+        'EXISTING_TARGET_DELETED_DISCOVERY' {
+            Add-CsvRow -Path $script:DeletedDiscoveryReportFile -Row $Row
+        }
+        default {
+            Add-CsvRow -Path $script:SkippedReportFile -Row $Row
+        }
+    }
+}
+
+function Invoke-OneAccountRemediation {
+    param(
+        [object]$CandidateAccount,
+        [int]$RowNumber,
+        [string]$Token
+    )
+
+    $sourceId = Get-AccountField -Account $CandidateAccount -Names @('id','ID','accountId','AccountID')
+
+    $result = [ordered]@{
+        Row = $RowNumber
+        SourceAccountID = $sourceId
+        SourceSafe = $SourceSafe
+        SourcePlatform = ''
+        SourceName = ''
+        UserName = ''
+        Address = ''
+        AppCode = ''
+        TargetSafe = ''
+        TargetPlatform = $TargetPlatformId
+        ExistingTargetCount = 0
+        ExistingTargetAccountIDs = ''
+        NewAccountID = ''
+        SecretSource = ''
+        SecretNote = ''
+        DiscoveryDeleted = 'No'
+        Action = ''
+        Result = ''
+        Message = ''
+    }
+
+    try {
+        if (Test-BlankValue $sourceId) {
+            throw 'Account list item did not include an Account ID.'
+        }
+
+        $source = Get-AccountById -AccountId $sourceId -Token $Token
+
+        $result.SourcePlatform = Get-AccountField -Account $source -Names @('platformId','platformID')
+        $result.SourceName = Get-AccountField -Account $source -Names @('name','Name')
+        $result.UserName = Get-AccountField -Account $source -Names @('userName','username','UserName')
+        $result.Address = Get-AccountField -Account $source -Names @('address','Address')
+
+        if (-not $AllowSourcePlatformMismatch -and $result.SourcePlatform -ine $SourcePlatformId) {
+            $result.Action = 'Skip'
+            $result.Result = 'SKIPPED_SOURCE_PLATFORM_MISMATCH'
+            $result.Message = "Source platform '$($result.SourcePlatform)' does not match expected '$SourcePlatformId'."
+            return [pscustomobject]$result
+        }
+
+        $appCode = Get-AppCodeFromUserName -UserName $result.UserName
+
+        if (Test-BlankValue $appCode) {
+            $result.Action = 'Skip'
+            $result.Result = 'SKIPPED_NOT_SVC_APPCODE'
+            $result.Message = "Username '$($result.UserName)' does not match '$ServiceAccountRegex'."
+            return [pscustomobject]$result
+        }
+
+        $result.AppCode = $appCode
+        $targetSafe = Get-TargetSafeName -AppCode $appCode
+        $result.TargetSafe = $targetSafe
+
+        if (-not (Test-SafeExists -SafeName $targetSafe -Token $Token)) {
+            $result.Action = 'Skip'
+            $result.Result = 'TARGET_SAFE_NOT_FOUND'
+            $result.Message = "Mapped target Safe '$targetSafe' was not found or the API user cannot access it. Discovery copy kept."
+            return [pscustomobject]$result
+        }
+
+        $existingAccounts = @(Find-ExistingTargetAccount -SourceAccount $source -TargetSafe $targetSafe -Token $Token)
+        $result.ExistingTargetCount = $existingAccounts.Count
+        $result.ExistingTargetAccountIDs = (($existingAccounts | ForEach-Object {
+            Get-AccountField -Account $_ -Names @('id','ID','accountId','AccountID')
+        }) -join '; ')
+
+        if ($existingAccounts.Count -gt 0) {
+            Remove-AccountById -AccountId $sourceId -Token $Token
+
+            $result.Action = 'DeleteDiscoveryExistingTarget'
+            $result.Result = 'EXISTING_TARGET_DELETED_DISCOVERY'
+            $result.DiscoveryDeleted = 'Yes'
+            $result.Message = "Matching target account already exists in '$targetSafe'. Deleted discovery copy."
+            return [pscustomobject]$result
+        }
+
+        $newAccountResult = New-TargetAccount -SourceAccount $source -TargetSafe $targetSafe -Token $Token
+        $newAccount = $newAccountResult.Account
+        $newAccountId = Get-AccountField -Account $newAccount -Names @('id','ID','accountId','AccountID')
+
+        if (Test-BlankValue $newAccountId -and $null -ne $newAccount.id) {
+            $newAccountId = [string]$newAccount.id
+        }
+
+        Remove-AccountById -AccountId $sourceId -Token $Token
+
+        $result.Action = 'CreateTargetDeleteDiscovery'
+        $result.Result = 'CREATED_AND_DELETED_DISCOVERY'
+        $result.NewAccountID = $newAccountId
+        $result.SecretSource = $newAccountResult.SecretSource
+        $result.SecretNote = $newAccountResult.SecretNote
+        $result.DiscoveryDeleted = 'Yes'
+        $result.Message = "Created target account in '$targetSafe' on '$TargetPlatformId', then deleted discovery copy. TargetAutomaticManagementEnabled=$TargetAutomaticManagementEnabled SecretSource=$($newAccountResult.SecretSource). $($newAccountResult.SecretNote)"
+        return [pscustomobject]$result
+    }
+    catch {
+        $result.Action = 'Error'
+        $result.Result = 'FAILED'
+        $result.Message = $_.Exception.Message
+        return [pscustomobject]$result
+    }
+}
+
+function Start-DiscoverySvcRemediation {
+    New-RunLog
+    Import-RunConfig
+
+    if ($ConfirmRun -ne 'YES') {
+        throw "This script has no preview mode. Re-run with -ConfirmRun YES after confirming SourceSafe='$SourceSafe', SourcePlatform='$SourcePlatformId', TargetPlatform='$TargetPlatformId', TargetSafeFormat='$TargetSafeFormat'."
+    }
+
+    Write-RunLog 'Start-DiscoverySvcRemediation' 'LIVE MODE ENABLED. No preview and no per-account prompt will be used.' 'WARN'
+    Write-RunLog 'Start-DiscoverySvcRemediation' "SourceSafe=$SourceSafe SourcePlatform=$SourcePlatformId TargetPlatform=$TargetPlatformId TargetSafeFormat=$TargetSafeFormat ExistingMatchMode=$ExistingMatchMode TargetAutomaticManagementEnabled=$TargetAutomaticManagementEnabled UseGeneratedPlaceholderSecretWhenSourceSecretMissing=$UseGeneratedPlaceholderSecretWhenSourceSecretMissing" 'INFO'
+
+    $token = Get-IdentityBearerToken
+
+    if (-not (Test-SafeExists -SafeName $SourceSafe -Token $token)) {
+        throw "Source discovery Safe '$SourceSafe' was not found or API user cannot access it."
+    }
+
+    Write-RunLog 'Start-DiscoverySvcRemediation' "Loading source candidates from discovery Safe '$SourceSafe' using search text 'SVC'." 'INFO'
+
+    $candidates = @(Get-AccountsFromSafe -SafeName $SourceSafe -Token $token -SearchText 'SVC')
+
+    Write-RunLog 'Start-DiscoverySvcRemediation' "Loaded $($candidates.Count) source candidate account(s)." 'INFO'
+
+    $seen = @{}
+    $rowNumber = 1
+
+    foreach ($candidate in $candidates) {
+        $candidateId = Get-AccountField -Account $candidate -Names @('id','ID','accountId','AccountID')
+
+        if (-not (Test-BlankValue $candidateId)) {
+            if ($seen.ContainsKey($candidateId)) { continue }
+            $seen[$candidateId] = $true
+        }
+
+        Write-RunLog 'Start-DiscoverySvcRemediation' "Processing row $rowNumber AccountID=$candidateId" 'INFO'
+
+        $outcome = Invoke-OneAccountRemediation -CandidateAccount $candidate -RowNumber $rowNumber -Token $token
+        Write-ReportRows -Row $outcome
+
+        if ($outcome.Result -eq 'FAILED') {
+            Write-RunLog 'Start-DiscoverySvcRemediation' "Row $rowNumber FAILED. AccountID=$($outcome.SourceAccountID) User=$($outcome.UserName) Message=$($outcome.Message)" 'ERROR'
+        }
+        elseif ($outcome.Result -match '^SKIPPED|NOT_FOUND') {
+            Write-RunLog 'Start-DiscoverySvcRemediation' "Row $rowNumber $($outcome.Result). AccountID=$($outcome.SourceAccountID) User=$($outcome.UserName) Message=$($outcome.Message)" 'WARN'
+        }
+        else {
+            Write-RunLog 'Start-DiscoverySvcRemediation' "Row $rowNumber $($outcome.Result). SourceAccountID=$($outcome.SourceAccountID) TargetSafe=$($outcome.TargetSafe) NewAccountID=$($outcome.NewAccountID)" 'SUCCESS'
+        }
+
+        $rowNumber++
+    }
+
+    Write-RunLog 'Start-DiscoverySvcRemediation' "Run completed. MainReport=$script:ReportFile" 'INFO'
+    Write-RunLog 'Start-DiscoverySvcRemediation' "CreatedReport=$script:CreatedReportFile" 'INFO'
+    Write-RunLog 'Start-DiscoverySvcRemediation' "DeletedDiscoveryReport=$script:DeletedDiscoveryReportFile" 'INFO'
+    Write-RunLog 'Start-DiscoverySvcRemediation' "SkippedReport=$script:SkippedReportFile" 'INFO'
+    Write-RunLog 'Start-DiscoverySvcRemediation' "Log=$script:LogFile" 'INFO'
+}
+
+Start-DiscoverySvcRemediation
