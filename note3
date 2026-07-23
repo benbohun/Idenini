@@ -1,209 +1,987 @@
-I have AD service account data, i need a compare script to lookup service account in CyberArk and validate vaulted and not vaulted.
-Consider upper case and lower case
-
-
 <#
-SafeMemberReport_IdentityServiceUser.ps1
+.SYNOPSIS
+    Compares an Active Directory service-account CSV against CyberArk Privilege Cloud
+    and reports which accounts are vaulted or not vaulted.
 
-- Auth: CCP → Identity Shared Services → ServiceUser (same method as your APP/IND scripts)
-- Enumerates all Safes via Get-PASSafe
-- For each Safe, enumerates members via Get-PASSafeMember
-- Exports full membership + permissions report to CSV
+.DESCRIPTION
+    Authentication:
+      CCP -> CyberArk Identity Shared Services -> Privilege Cloud ServiceUser session.
+
+    Matching behavior:
+      - Case-insensitive.
+      - Trims leading/trailing whitespace.
+      - Treats DOMAIN\username, username@domain, and username as possible equivalents.
+      - Optionally validates the AD Address/Domain against the CyberArk account Address.
+      - Preserves all source CSV columns in the summary report with an "AD_" prefix.
+      - Does not retrieve passwords or modify any CyberArk account.
+
+    Output:
+      1. *_Summary.csv     - One row per AD source record.
+      2. *_Matches.csv     - One row per CyberArk account match.
+      3. *_NotVaulted.csv  - AD records with no visible CyberArk match.
+      4. *.log             - Execution log.
+
+    IMPORTANT:
+      "NotVaulted" means the API service user could not see a matching account.
+      The service user must have List Accounts permission in every relevant Safe.
+
+.NOTES
+    Compatible with Windows PowerShell 5.1.
 #>
 
 [CmdletBinding()]
 param(
-    # ===== Identity / Privilege Cloud (Shared Services) =====
-    [string]$IdentityTenantURL  = "https://aak4521.my.idaptive.app",
-    [string]$PrivilegeCloudURL  = "https://alliantcredit.privilegecloud.cyberark.cloud",
+    # ===== Identity / Privilege Cloud =====
+    [string]$IdentityTenantURL = "https://aak4521.my.idaptive.app",
+    [string]$PrivilegeCloudURL = "https://alliantcredit.privilegecloud.cyberark.cloud",
 
-    # ===== CCP settings (for API Service User stored in Vault) =====
-    [string]$CCPAddress         = "https://aam.alliantcreditunion.com",
-    [string]$CCPLocation        = "AIMWebService",
-    [string]$CCPAppID           = "ACURestAPI",
-    [string]$CCPSafe            = "ACU-VAULT-API",
-    [string]$CCPObject          = "Application-CyberArkVaultRestAPI-alliantcredit.cyberark.cloud",
-    [bool]  $CCPWindowsAuth     = $false,
+    # ===== CCP settings =====
+    [string]$CCPAddress     = "https://aam.alliantcreditunion.com",
+    [string]$CCPLocation    = "AIMWebService",
+    [string]$CCPAppID       = "ACURestAPI",
+    [string]$CCPSafe        = "ACU-VAULT-API",
+    [string]$CCPObject      = "Application-CyberArkVaultRestAPI-alliantcredit.cyberark.cloud",
+    [bool]$CCPWindowsAuth   = $false,
+
+    # ===== Input =====
+    [string]$InputCsvPath,
+
+    # Leave blank to auto-detect.
+    [string]$UsernameColumn,
+    [string]$AddressColumn,
+
+    # Bulk retrieves the visible CyberArk inventory once.
+    # Search queries CyberArk once per unique AD username.
+    [ValidateSet("Bulk", "Search")]
+    [string]$LookupMode = "Bulk",
+
+    # When enabled, a username match with a different address is not classified as Vaulted.
+    [switch]$RequireAddressMatch,
 
     # ===== Output =====
-    [string]$CsvFilePath        = "I:\Script\IDENTITY Script New\csv\SafeMembersReport.csv",
-    [string]$LogFile            = "SafeMemberAudit.log"
+    [string]$OutputDirectory,
+    [string]$OutputBaseName = "AD_ServiceAccount_CyberArk_Comparison"
 )
 
-# --- TLS & modules ---
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-Import-Module psPAS           -ErrorAction Stop
-Import-Module IdentityCommand -ErrorAction Stop
+# =====================================================================
+# General helpers
+# =====================================================================
 
-$ErrorActionPreference = 'Stop'
-
-# --- Logging helper ---
 function Write-Log {
+    [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][string]$Message,
-        [ConsoleColor]$Color = [ConsoleColor]::White
+        [Parameter(Mandatory = $true)]
+        [string]$Message,
+
+        [ValidateSet("INFO", "WARN", "ERROR", "SUCCESS")]
+        [string]$Level = "INFO"
     )
+
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $entry     = "$timestamp | $Message"
-    Add-Content -Path $LogFile -Value $entry
-    Write-Host $entry -ForegroundColor $Color
+    $entry = "{0} | {1,-7} | {2}" -f $timestamp, $Level, $Message
+
+    if ($script:LogFile) {
+        Add-Content -LiteralPath $script:LogFile -Value $entry -Encoding UTF8
+    }
+
+    switch ($Level) {
+        "SUCCESS" { Write-Host $entry -ForegroundColor Green }
+        "WARN"    { Write-Host $entry -ForegroundColor Yellow }
+        "ERROR"   { Write-Host $entry -ForegroundColor Red }
+        default   { Write-Host $entry -ForegroundColor Cyan }
+    }
 }
 
-Write-Log "🔹 Safe Member Report (Identity Service User) starting..." 'Cyan'
+function Select-InputCsvFile {
+    [CmdletBinding()]
+    param()
 
-# --- CCP → PSCredential (API Service User) ---
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+
+        $dialog = New-Object System.Windows.Forms.OpenFileDialog
+        $dialog.Title = "Select the Active Directory service-account CSV"
+        $dialog.Filter = "CSV files (*.csv)|*.csv|All files (*.*)|*.*"
+        $dialog.Multiselect = $false
+        $dialog.CheckFileExists = $true
+        $dialog.CheckPathExists = $true
+
+        if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+            return $dialog.FileName
+        }
+
+        throw "No input CSV was selected."
+    }
+    catch {
+        $path = Read-Host "Enter the full path to the AD service-account CSV"
+        if ([string]::IsNullOrWhiteSpace($path)) {
+            throw "No input CSV path was provided."
+        }
+
+        return $path.Trim('"')
+    }
+}
+
+function Get-PropertyNameCaseInsensitive {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$InputObject,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$CandidateNames
+    )
+
+    $availableNames = @($InputObject.PSObject.Properties.Name)
+
+    foreach ($candidate in $CandidateNames) {
+        foreach ($availableName in $availableNames) {
+            if ([string]::Equals(
+                    [string]$availableName,
+                    [string]$candidate,
+                    [System.StringComparison]::OrdinalIgnoreCase
+                )) {
+                return [string]$availableName
+            }
+        }
+    }
+
+    return $null
+}
+
+function Get-ObjectPropertyValue {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$InputObject,
+
+        [Parameter(Mandatory = $true)]
+        [string]$PropertyName
+    )
+
+    foreach ($property in $InputObject.PSObject.Properties) {
+        if ([string]::Equals(
+                [string]$property.Name,
+                [string]$PropertyName,
+                [System.StringComparison]::OrdinalIgnoreCase
+            )) {
+            return $property.Value
+        }
+    }
+
+    return $null
+}
+
+function ConvertTo-NormalizedText {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [object]$Value
+    )
+
+    if ($null -eq $Value) {
+        return ""
+    }
+
+    return ([string]$Value).Trim().ToUpperInvariant()
+}
+
+function Get-UsernameKeys {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [object]$Username
+    )
+
+    $value = ConvertTo-NormalizedText -Value $Username
+    $keys = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::OrdinalIgnoreCase)
+
+    if ([string]::IsNullOrWhiteSpace($value)) {
+        return @()
+    }
+
+    [void]$keys.Add($value)
+
+    # DOMAIN\username -> username
+    if ($value.Contains("\")) {
+        $samValue = $value.Substring($value.LastIndexOf("\") + 1).Trim()
+        if (-not [string]::IsNullOrWhiteSpace($samValue)) {
+            [void]$keys.Add($samValue)
+        }
+    }
+
+    # username@domain -> username
+    if ($value.Contains("@")) {
+        $upnSamValue = $value.Substring(0, $value.IndexOf("@")).Trim()
+        if (-not [string]::IsNullOrWhiteSpace($upnSamValue)) {
+            [void]$keys.Add($upnSamValue)
+        }
+    }
+
+    return @($keys)
+}
+
+function ConvertTo-NormalizedAddress {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [object]$Value
+    )
+
+    if ($null -eq $Value) {
+        return ""
+    }
+
+    $text = ([string]$Value).Trim()
+
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        return ""
+    }
+
+    # Distinguished name, for example:
+    # CN=svcAccount,OU=Service Accounts,DC=prod,DC=example,DC=com
+    if ($text -match "(?i)(^|,)DC=") {
+        $dcParts = @()
+
+        foreach ($part in ($text -split ",")) {
+            $trimmedPart = $part.Trim()
+
+            if ($trimmedPart -match "^(?i)DC=(.+)$") {
+                $dcParts += $Matches[1].Trim()
+            }
+        }
+
+        if ($dcParts.Count -gt 0) {
+            return (($dcParts -join ".").Trim(".")).ToUpperInvariant()
+        }
+    }
+
+    # UPN or email address -> domain portion.
+    if ($text.Contains("@")) {
+        $domainPart = $text.Substring($text.LastIndexOf("@") + 1).Trim()
+        if (-not [string]::IsNullOrWhiteSpace($domainPart)) {
+            return $domainPart.Trim(".").ToUpperInvariant()
+        }
+    }
+
+    # Normalize common URL forms without changing ordinary DNS names.
+    $text = $text -replace "^(?i)https?://", ""
+    $text = $text.Trim().TrimEnd("/").TrimEnd(".")
+
+    return $text.ToUpperInvariant()
+}
+
+function Get-FirstNonEmptySourceValue {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Row,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$CandidateColumns
+    )
+
+    foreach ($candidate in $CandidateColumns) {
+        $propertyName = Get-PropertyNameCaseInsensitive -InputObject $Row -CandidateNames @($candidate)
+
+        if ($propertyName) {
+            $value = Get-ObjectPropertyValue -InputObject $Row -PropertyName $propertyName
+
+            if ($null -ne $value -and -not [string]::IsNullOrWhiteSpace([string]$value)) {
+                return [PSCustomObject]@{
+                    Column = $propertyName
+                    Value  = $value
+                }
+            }
+        }
+    }
+
+    return $null
+}
+
+function Get-CyberArkAccountUniqueKey {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Account
+    )
+
+    $id = Get-ObjectPropertyValue -InputObject $Account -PropertyName "id"
+
+    if (-not [string]::IsNullOrWhiteSpace([string]$id)) {
+        return "ID::{0}" -f ([string]$id).Trim().ToUpperInvariant()
+    }
+
+    $safeName = Get-ObjectPropertyValue -InputObject $Account -PropertyName "safeName"
+    $platform = Get-ObjectPropertyValue -InputObject $Account -PropertyName "platformId"
+    $username = Get-ObjectPropertyValue -InputObject $Account -PropertyName "userName"
+    $address  = Get-ObjectPropertyValue -InputObject $Account -PropertyName "address"
+    $name     = Get-ObjectPropertyValue -InputObject $Account -PropertyName "name"
+
+    return "OBJECT::{0}|{1}|{2}|{3}|{4}" -f `
+        (ConvertTo-NormalizedText $safeName),
+        (ConvertTo-NormalizedText $platform),
+        (ConvertTo-NormalizedText $username),
+        (ConvertTo-NormalizedAddress $address),
+        (ConvertTo-NormalizedText $name)
+}
+
+function Join-UniqueValues {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [object[]]$Values
+    )
+
+    $set = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::OrdinalIgnoreCase)
+
+    foreach ($value in @($Values)) {
+        if ($null -eq $value) {
+            continue
+        }
+
+        $text = ([string]$value).Trim()
+
+        if (-not [string]::IsNullOrWhiteSpace($text)) {
+            [void]$set.Add($text)
+        }
+    }
+
+    return (@($set) -join "; ")
+}
+
+# =====================================================================
+# Authentication helpers
+# =====================================================================
+
 function Get-ServiceUserCredentialFromCCP {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][string]$CCPAddress,
-        [Parameter(Mandatory)][string]$Location,
-        [Parameter(Mandatory)][string]$AppID,
-        [Parameter(Mandatory)][string]$Safe,
-        [Parameter(Mandatory)][string]$Object,
+        [Parameter(Mandatory = $true)]
+        [string]$CCPAddress,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Location,
+
+        [Parameter(Mandatory = $true)]
+        [string]$AppID,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Safe,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Object,
+
         [bool]$WindowsAuth = $false
     )
 
-    $base = $CCPAddress.TrimEnd('/')
-    $loc  = $Location.Trim('/')
+    $base = $CCPAddress.TrimEnd("/")
+    $locationValue = $Location.Trim("/")
 
-    $url  = "{0}/{1}/api/Accounts?AppID={2}&Safe={3}&Object={4}" -f $base, $loc, $AppID, $Safe, $Object
+    $url = "{0}/{1}/api/Accounts?AppID={2}&Safe={3}&Object={4}" -f `
+        $base,
+        $locationValue,
+        [uri]::EscapeDataString($AppID),
+        [uri]::EscapeDataString($Safe),
+        [uri]::EscapeDataString($Object)
 
-    Write-Log "🛠  Retrieving Service User credential from CCP: $url" 'Cyan'
+    Write-Log -Message "Retrieving the Privilege Cloud service-user credential from CCP."
 
-    $headers = @{ "Content-Type" = "application/json" }
+    $response = Invoke-RestMethod `
+        -Uri $url `
+        -Method Get `
+        -Headers @{ "Content-Type" = "application/json" } `
+        -UseDefaultCredentials:$WindowsAuth `
+        -ErrorAction Stop
 
-    $resp = Invoke-RestMethod -Uri $url -Method GET -Headers $headers -UseDefaultCredentials:$WindowsAuth -ErrorAction Stop
-
-    if (-not $resp.UserName -or -not $resp.Content) {
-        throw "CCP response missing UserName/Content. Raw: $($resp | ConvertTo-Json -Depth 5)"
+    if (-not $response.UserName -or -not $response.Content) {
+        throw "The CCP response did not include UserName and Content."
     }
 
-    Write-Log ("✅ CCP returned service user: {0}" -f $resp.UserName) 'Green'
+    Write-Log -Message ("CCP returned service user '{0}'." -f $response.UserName) -Level "SUCCESS"
 
-    $sec = ConvertTo-SecureString $resp.Content -AsPlainText -Force
-    return [PSCredential]::new($resp.UserName, $sec)
+    $securePassword = ConvertTo-SecureString $response.Content -AsPlainText -Force
+    return New-Object System.Management.Automation.PSCredential($response.UserName, $securePassword)
 }
 
-# --- MAIN ---
-$sessionCreated    = $false
-$SafeMembersReport = @()
+# =====================================================================
+# CyberArk account retrieval
+# =====================================================================
+
+function ConvertTo-FlatAccountCollection {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [object[]]$InputCollection
+    )
+
+    $results = New-Object "System.Collections.Generic.List[object]"
+
+    foreach ($item in @($InputCollection)) {
+        if ($null -eq $item) {
+            continue
+        }
+
+        $valueProperty = $item.PSObject.Properties["value"]
+        $accountsProperty = $item.PSObject.Properties["Accounts"]
+
+        if ($valueProperty -and $valueProperty.Value) {
+            foreach ($account in @($valueProperty.Value)) {
+                if ($null -ne $account) {
+                    [void]$results.Add($account)
+                }
+            }
+        }
+        elseif ($accountsProperty -and $accountsProperty.Value) {
+            foreach ($account in @($accountsProperty.Value)) {
+                if ($null -ne $account) {
+                    [void]$results.Add($account)
+                }
+            }
+        }
+        else {
+            [void]$results.Add($item)
+        }
+    }
+
+    return @($results)
+}
+
+function Get-AllVisibleCyberArkAccounts {
+    [CmdletBinding()]
+    param()
+
+    Write-Log -Message "Retrieving the visible CyberArk account inventory once using Get-PASAccount."
+
+    $rawResults = @(Get-PASAccount -ErrorAction Stop)
+    $accounts = @(ConvertTo-FlatAccountCollection -InputCollection $rawResults)
+
+    Write-Log -Message ("Retrieved {0} visible CyberArk account(s)." -f $accounts.Count) -Level "SUCCESS"
+    return $accounts
+}
+
+function Search-VisibleCyberArkAccounts {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$SearchTerms
+    )
+
+    $command = Get-Command Get-PASAccount -ErrorAction Stop
+    $supportsSearchType = $command.Parameters.ContainsKey("searchType")
+    $cache = @{}
+    $allFound = New-Object "System.Collections.Generic.List[object]"
+    $globalUnique = @{}
+
+    $terms = @(
+        $SearchTerms |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+            Sort-Object -Unique
+    )
+
+    $current = 0
+
+    foreach ($term in $terms) {
+        $current++
+        $normalizedTerm = ConvertTo-NormalizedText $term
+
+        if ($cache.ContainsKey($normalizedTerm)) {
+            $searchResults = @($cache[$normalizedTerm])
+        }
+        else {
+            Write-Log -Message ("Searching CyberArk [{0}/{1}] for username '{2}'." -f $current, $terms.Count, $term)
+
+            $parameters = @{
+                search      = $term
+                ErrorAction = "Stop"
+            }
+
+            if ($supportsSearchType) {
+                $parameters["searchType"] = "contains"
+            }
+
+            $rawResults = @(Get-PASAccount @parameters)
+            $searchResults = @(ConvertTo-FlatAccountCollection -InputCollection $rawResults)
+            $cache[$normalizedTerm] = $searchResults
+        }
+
+        foreach ($account in $searchResults) {
+            $uniqueKey = Get-CyberArkAccountUniqueKey -Account $account
+
+            if (-not $globalUnique.ContainsKey($uniqueKey)) {
+                $globalUnique[$uniqueKey] = $true
+                [void]$allFound.Add($account)
+            }
+        }
+    }
+
+    Write-Log -Message ("Search mode returned {0} unique visible CyberArk account(s)." -f $allFound.Count) -Level "SUCCESS"
+    return @($allFound)
+}
+
+function New-CyberArkUsernameLookup {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$Accounts
+    )
+
+    $lookup = @{}
+
+    foreach ($account in $Accounts) {
+        $cyberUsername = Get-ObjectPropertyValue -InputObject $account -PropertyName "userName"
+        $keys = @(Get-UsernameKeys -Username $cyberUsername)
+
+        foreach ($key in $keys) {
+            if (-not $lookup.ContainsKey($key)) {
+                $lookup[$key] = New-Object "System.Collections.Generic.List[object]"
+            }
+
+            [void]$lookup[$key].Add($account)
+        }
+    }
+
+    return $lookup
+}
+
+# =====================================================================
+# Main
+# =====================================================================
+
+$sessionCreated = $false
+$script:LogFile = $null
 
 try {
-    # 1) Get Service User creds from CCP
-    $serviceCred = Get-ServiceUserCredentialFromCCP `
+    Import-Module psPAS -ErrorAction Stop
+    Import-Module IdentityCommand -ErrorAction Stop
+
+    $psPASModule = Get-Module psPAS
+    Write-Host ("Loaded psPAS version: {0}" -f $psPASModule.Version) -ForegroundColor Cyan
+
+    if ([string]::IsNullOrWhiteSpace($InputCsvPath)) {
+        $InputCsvPath = Select-InputCsvFile
+    }
+
+    $InputCsvPath = [Environment]::ExpandEnvironmentVariables($InputCsvPath.Trim('"'))
+
+    if (-not (Test-Path -LiteralPath $InputCsvPath -PathType Leaf)) {
+        throw "Input CSV not found: $InputCsvPath"
+    }
+
+    if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
+        $OutputDirectory = Split-Path -Path $InputCsvPath -Parent
+    }
+
+    if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
+        $OutputDirectory = (Get-Location).Path
+    }
+
+    if (-not (Test-Path -LiteralPath $OutputDirectory -PathType Container)) {
+        New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
+    }
+
+    $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    $summaryCsv = Join-Path $OutputDirectory ("{0}_Summary_{1}.csv" -f $OutputBaseName, $timestamp)
+    $matchesCsv = Join-Path $OutputDirectory ("{0}_Matches_{1}.csv" -f $OutputBaseName, $timestamp)
+    $notVaultedCsv = Join-Path $OutputDirectory ("{0}_NotVaulted_{1}.csv" -f $OutputBaseName, $timestamp)
+    $script:LogFile = Join-Path $OutputDirectory ("{0}_{1}.log" -f $OutputBaseName, $timestamp)
+
+    Write-Log -Message "============================================================"
+    Write-Log -Message "AD service-account to CyberArk comparison starting."
+    Write-Log -Message ("Input CSV           : {0}" -f $InputCsvPath)
+    Write-Log -Message ("Output directory     : {0}" -f $OutputDirectory)
+    Write-Log -Message ("Lookup mode          : {0}" -f $LookupMode)
+    Write-Log -Message ("Require address match: {0}" -f [bool]$RequireAddressMatch)
+
+    $adRows = @(Import-Csv -LiteralPath $InputCsvPath -ErrorAction Stop)
+
+    if ($adRows.Count -eq 0) {
+        throw "The input CSV contains no data rows."
+    }
+
+    Write-Log -Message ("Imported {0} AD source row(s)." -f $adRows.Count) -Level "SUCCESS"
+
+    $firstRow = $adRows[0]
+
+    if ([string]::IsNullOrWhiteSpace($UsernameColumn)) {
+        $usernameCandidates = @(
+            "Username",
+            "SamAccountName",
+            "sAMAccountName",
+            "AccountName",
+            "Account Name",
+            "ServiceAccount",
+            "Service Account",
+            "User",
+            "Name"
+        )
+
+        $UsernameColumn = Get-PropertyNameCaseInsensitive `
+            -InputObject $firstRow `
+            -CandidateNames $usernameCandidates
+    }
+    else {
+        $UsernameColumn = Get-PropertyNameCaseInsensitive `
+            -InputObject $firstRow `
+            -CandidateNames @($UsernameColumn)
+    }
+
+    if ([string]::IsNullOrWhiteSpace($UsernameColumn)) {
+        $availableColumns = @($firstRow.PSObject.Properties.Name) -join ", "
+        throw "Could not identify the username column. Available columns: $availableColumns"
+    }
+
+    if ([string]::IsNullOrWhiteSpace($AddressColumn)) {
+        $addressCandidates = @(
+            "Address",
+            "Domain",
+            "DNSDomain",
+            "DNS Domain",
+            "FQDN",
+            "UserPrincipalName",
+            "UPN",
+            "DistinguishedName",
+            "Distinguished Name"
+        )
+
+        $AddressColumn = Get-PropertyNameCaseInsensitive `
+            -InputObject $firstRow `
+            -CandidateNames $addressCandidates
+    }
+    else {
+        $AddressColumn = Get-PropertyNameCaseInsensitive `
+            -InputObject $firstRow `
+            -CandidateNames @($AddressColumn)
+
+        if ([string]::IsNullOrWhiteSpace($AddressColumn)) {
+            throw "The specified address column was not found in the CSV."
+        }
+    }
+
+    Write-Log -Message ("Username column      : {0}" -f $UsernameColumn)
+    Write-Log -Message ("Address column       : {0}" -f $(if ($AddressColumn) { $AddressColumn } else { "<not detected>" }))
+
+    $serviceCredential = Get-ServiceUserCredentialFromCCP `
         -CCPAddress $CCPAddress `
-        -Location   $CCPLocation `
-        -AppID      $CCPAppID `
-        -Safe       $CCPSafe `
-        -Object     $CCPObject `
+        -Location $CCPLocation `
+        -AppID $CCPAppID `
+        -Safe $CCPSafe `
+        -Object $CCPObject `
         -WindowsAuth:$CCPWindowsAuth
 
-    # 2) Authenticate via Identity Shared Services using SERVICE USER
-    Write-Log "🛠  Authenticating to Privilege Cloud via Identity (Service User)..." 'Cyan'
+    Write-Log -Message "Authenticating to Privilege Cloud through Identity Shared Services."
 
     New-PASSession `
         -IdentityTenantURL $IdentityTenantURL `
         -PrivilegeCloudURL $PrivilegeCloudURL `
-        -Credential        $serviceCred `
+        -Credential $serviceCredential `
         -ServiceUser `
         -ErrorAction Stop | Out-Null
 
-    if (-not (Get-PASSession)) { throw "psPAS session not established via ServiceUser." }
+    if (-not (Get-PASSession)) {
+        throw "The psPAS Privilege Cloud session was not established."
+    }
 
     $sessionCreated = $true
-    Write-Log ("✅ Authenticated to {0} as service user: {1}" -f $PrivilegeCloudURL, $serviceCred.UserName) 'Green'
+    Write-Log -Message ("Authenticated to {0} as {1}." -f $PrivilegeCloudURL, $serviceCredential.UserName) -Level "SUCCESS"
 
-    # 3) Get all Safes
-    Write-Log "🛠  Retrieving safes via Get-PASSafe..." 'Cyan'
-    $Safes = Get-PASSafe -ErrorAction Stop
+    $cyberAccounts = @()
 
-    if (-not $Safes -or $Safes.Count -eq 0) {
-        Write-Log "⚠️  No safes returned from Get-PASSafe." 'Yellow'
-        return
-    }
-
-    Write-Log ("📦 Retrieved {0} safes." -f $Safes.Count) 'Green'
-
-    # 4) For each Safe, get Safe Members and permissions
-    $i = 0
-    foreach ($Safe in $Safes) {
-        $i++
-        $SafeName = $Safe.SafeName
-        Write-Log ("🔹 [{0}/{1}] Retrieving members for Safe: {2}" -f $i, $Safes.Count, $SafeName) 'Cyan'
-
-        try {
-            $SafeMembers = Get-PASSafeMember -SafeName $SafeName -ErrorAction Stop
-
-            if (-not $SafeMembers -or $SafeMembers.Count -eq 0) {
-                Write-Log ("⚠️  No members found for Safe: {0}" -f $SafeName) 'Yellow'
-                continue
-            }
-
-            foreach ($Member in $SafeMembers) {
-
-                # Defensive null-check on Permissions so script doesn't blow up on weird entries
-                $perm = $Member.Permissions
-
-                $SafeMembersReport += [PSCustomObject]@{
-                    SafeName                               = $SafeName
-                    Member                                 = $Member.MemberName
-                    MemberType                             = $Member.MemberType
-
-                    UseAccounts                            = $perm.useAccounts
-                    RetrieveAccounts                       = $perm.retrieveAccounts
-                    ListAccounts                           = $perm.listAccounts
-                    AddAccounts                            = $perm.addAccounts
-                    UpdateAccountContent                   = $perm.updateAccountContent
-                    UpdateAccountProperties                = $perm.updateAccountProperties
-                    InitiateCPMAccountManagementOperations = $perm.initiateCPMAccountManagementOperations
-                    SpecifyNextAccountContent              = $perm.specifyNextAccountContent
-                    RenameAccounts                         = $perm.renameAccounts
-                    DeleteAccounts                         = $perm.deleteAccounts
-                    UnlockAccounts                         = $perm.unlockAccounts
-                    ManageSafe                             = $perm.manageSafe
-                    ManageSafeMembers                      = $perm.manageSafeMembers
-                    BackupSafe                             = $perm.backupSafe
-                    ViewAuditLog                           = $perm.viewAuditLog
-                    ViewSafeMembers                        = $perm.viewSafeMembers
-                    AccessWithoutConfirmation              = $perm.accessWithoutConfirmation
-                    CreateFolders                          = $perm.createFolders
-                    DeleteFolders                          = $perm.deleteFolders
-                    MoveAccountsAndFolders                 = $perm.moveAccountsAndFolders
-                    RequestsAuthorizationLevel1            = $perm.requestsAuthorizationLevel1
-                    RequestsAuthorizationLevel2            = $perm.requestsAuthorizationLevel2
-                }
-            }
-
-            Write-Log ("✅ Retrieved {0} member(s) for Safe: {1}" -f $SafeMembers.Count, $SafeName) 'Green'
-        }
-        catch {
-            Write-Log ("❌ ERROR: Failed to retrieve members for Safe: {0} - {1}" -f $SafeName, $_.Exception.Message) 'Red'
-        }
-    }
-
-    # 5) Export to CSV
-    if (-not $SafeMembersReport -or $SafeMembersReport.Count -eq 0) {
-        Write-Log "⚠️  No Safe Member data collected; skipping CSV export." 'Yellow'
+    if ($LookupMode -eq "Bulk") {
+        $cyberAccounts = @(Get-AllVisibleCyberArkAccounts)
     }
     else {
-        Write-Log ("🛠  Exporting Safe Member Report to: {0}" -f $CsvFilePath) 'Cyan'
-        $SafeMembersReport | Export-Csv -Path $CsvFilePath -NoTypeInformation -Encoding UTF8
-        Write-Log "✅ Safe Member Report successfully exported." 'Green'
+        $searchTerms = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::OrdinalIgnoreCase)
+
+        foreach ($row in $adRows) {
+            $sourceUsername = Get-ObjectPropertyValue -InputObject $row -PropertyName $UsernameColumn
+
+            foreach ($key in @(Get-UsernameKeys -Username $sourceUsername)) {
+                [void]$searchTerms.Add($key)
+            }
+        }
+
+        $cyberAccounts = @(Search-VisibleCyberArkAccounts -SearchTerms @($searchTerms))
     }
 
-    Write-Log "🔹 Safe Member Report generation completed." 'Cyan'
+    $usernameLookup = New-CyberArkUsernameLookup -Accounts $cyberAccounts
+
+    $summaryResults = New-Object "System.Collections.Generic.List[object]"
+    $matchDetails = New-Object "System.Collections.Generic.List[object]"
+
+    $rowNumber = 0
+
+    foreach ($adRow in $adRows) {
+        $rowNumber++
+
+        $sourceUsername = Get-ObjectPropertyValue -InputObject $adRow -PropertyName $UsernameColumn
+        $sourceAddress = $null
+
+        if ($AddressColumn) {
+            $sourceAddress = Get-ObjectPropertyValue -InputObject $adRow -PropertyName $AddressColumn
+        }
+
+        $usernameKeys = @(Get-UsernameKeys -Username $sourceUsername)
+        $normalizedAddress = ConvertTo-NormalizedAddress -Value $sourceAddress
+
+        $matchedById = @{}
+
+        foreach ($key in $usernameKeys) {
+            if ($usernameLookup.ContainsKey($key)) {
+                foreach ($account in @($usernameLookup[$key])) {
+                    $accountKey = Get-CyberArkAccountUniqueKey -Account $account
+                    $matchedById[$accountKey] = $account
+                }
+            }
+        }
+
+        $usernameMatches = @($matchedById.Values)
+        $addressMatches = @()
+        $addressMismatches = @()
+
+        if (-not [string]::IsNullOrWhiteSpace($normalizedAddress)) {
+            foreach ($account in $usernameMatches) {
+                $cyberAddress = Get-ObjectPropertyValue -InputObject $account -PropertyName "address"
+                $normalizedCyberAddress = ConvertTo-NormalizedAddress -Value $cyberAddress
+
+                if ([string]::Equals(
+                        $normalizedAddress,
+                        $normalizedCyberAddress,
+                        [System.StringComparison]::OrdinalIgnoreCase
+                    )) {
+                    $addressMatches += $account
+                }
+                else {
+                    $addressMismatches += $account
+                }
+            }
+        }
+
+        $selectedMatches = @()
+        $vaultStatus = ""
+        $addressValidation = ""
+        $matchBasis = ""
+
+        if ($usernameKeys.Count -eq 0) {
+            $vaultStatus = "InvalidInput"
+            $addressValidation = "NotEvaluated"
+            $matchBasis = "UsernameMissing"
+        }
+        elseif ($usernameMatches.Count -eq 0) {
+            $vaultStatus = "NotVaulted"
+            $addressValidation = $(if ($normalizedAddress) { "NoUsernameMatch" } else { "NotProvided" })
+            $matchBasis = "NoMatch"
+        }
+        elseif ($RequireAddressMatch -and -not [string]::IsNullOrWhiteSpace($normalizedAddress)) {
+            if ($addressMatches.Count -gt 0) {
+                $selectedMatches = @($addressMatches)
+                $vaultStatus = $(if ($selectedMatches.Count -gt 1) { "VaultedMultiple" } else { "Vaulted" })
+                $addressValidation = "Matched"
+                $matchBasis = "UsernameAndAddress"
+            }
+            else {
+                $selectedMatches = @($usernameMatches)
+                $vaultStatus = "UsernameFoundAddressMismatch"
+                $addressValidation = "Mismatch"
+                $matchBasis = "UsernameOnly"
+            }
+        }
+        else {
+            $selectedMatches = @($usernameMatches)
+            $vaultStatus = $(if ($selectedMatches.Count -gt 1) { "VaultedMultiple" } else { "Vaulted" })
+
+            if ([string]::IsNullOrWhiteSpace($normalizedAddress)) {
+                $addressValidation = "NotProvided"
+                $matchBasis = "Username"
+            }
+            elseif ($addressMatches.Count -gt 0) {
+                $addressValidation = "Matched"
+                $matchBasis = "UsernameAndAddress"
+            }
+            else {
+                $addressValidation = "Mismatch"
+                $matchBasis = "Username"
+            }
+        }
+
+        $summary = [ordered]@{
+            SourceRow                    = $rowNumber
+            ADUsername                   = [string]$sourceUsername
+            ADAddress                    = [string]$sourceAddress
+            NormalizedUsernameKeys       = ($usernameKeys -join "; ")
+            NormalizedAddress            = $normalizedAddress
+            VaultStatus                  = $vaultStatus
+            MatchBasis                   = $matchBasis
+            AddressValidation            = $addressValidation
+            CyberArkMatchCount           = $selectedMatches.Count
+            CyberArkAccountIDs           = Join-UniqueValues -Values @($selectedMatches | ForEach-Object { Get-ObjectPropertyValue $_ "id" })
+            CyberArkUsernames            = Join-UniqueValues -Values @($selectedMatches | ForEach-Object { Get-ObjectPropertyValue $_ "userName" })
+            CyberArkAddresses            = Join-UniqueValues -Values @($selectedMatches | ForEach-Object { Get-ObjectPropertyValue $_ "address" })
+            CyberArkSafeNames            = Join-UniqueValues -Values @($selectedMatches | ForEach-Object { Get-ObjectPropertyValue $_ "safeName" })
+            CyberArkPlatformIDs          = Join-UniqueValues -Values @($selectedMatches | ForEach-Object { Get-ObjectPropertyValue $_ "platformId" })
+            AutomaticManagementEnabled   = Join-UniqueValues -Values @(
+                $selectedMatches | ForEach-Object {
+                    $secretManagement = Get-ObjectPropertyValue $_ "secretManagement"
+                    if ($secretManagement) {
+                        Get-ObjectPropertyValue $secretManagement "automaticManagementEnabled"
+                    }
+                }
+            )
+            ManualManagementReason       = Join-UniqueValues -Values @(
+                $selectedMatches | ForEach-Object {
+                    $secretManagement = Get-ObjectPropertyValue $_ "secretManagement"
+                    if ($secretManagement) {
+                        Get-ObjectPropertyValue $secretManagement "manualManagementReason"
+                    }
+                }
+            )
+        }
+
+        # Preserve all original AD columns.
+        foreach ($sourceProperty in $adRow.PSObject.Properties) {
+            $outputPropertyName = "AD_{0}" -f $sourceProperty.Name
+
+            if (-not $summary.Contains($outputPropertyName)) {
+                $summary[$outputPropertyName] = $sourceProperty.Value
+            }
+        }
+
+        [void]$summaryResults.Add([PSCustomObject]$summary)
+
+        foreach ($account in $selectedMatches) {
+            $cyberAddress = Get-ObjectPropertyValue -InputObject $account -PropertyName "address"
+            $secretManagement = Get-ObjectPropertyValue -InputObject $account -PropertyName "secretManagement"
+            $thisAddressMatch = $false
+
+            if (-not [string]::IsNullOrWhiteSpace($normalizedAddress)) {
+                $thisAddressMatch = [string]::Equals(
+                    $normalizedAddress,
+                    (ConvertTo-NormalizedAddress -Value $cyberAddress),
+                    [System.StringComparison]::OrdinalIgnoreCase
+                )
+            }
+
+            $detail = [ordered]@{
+                SourceRow                   = $rowNumber
+                ADUsername                  = [string]$sourceUsername
+                ADAddress                   = [string]$sourceAddress
+                VaultStatus                 = $vaultStatus
+                MatchBasis                  = $matchBasis
+                AddressMatches              = $thisAddressMatch
+                CyberArkAccountID           = Get-ObjectPropertyValue $account "id"
+                CyberArkAccountName         = Get-ObjectPropertyValue $account "name"
+                CyberArkUsername            = Get-ObjectPropertyValue $account "userName"
+                CyberArkAddress             = $cyberAddress
+                CyberArkSafeName            = Get-ObjectPropertyValue $account "safeName"
+                CyberArkPlatformID          = Get-ObjectPropertyValue $account "platformId"
+                CyberArkSecretType          = Get-ObjectPropertyValue $account "secretType"
+                AutomaticManagementEnabled  = $(if ($secretManagement) { Get-ObjectPropertyValue $secretManagement "automaticManagementEnabled" } else { $null })
+                ManualManagementReason      = $(if ($secretManagement) { Get-ObjectPropertyValue $secretManagement "manualManagementReason" } else { $null })
+                ManagementStatus            = $(if ($secretManagement) { Get-ObjectPropertyValue $secretManagement "status" } else { $null })
+            }
+
+            [void]$matchDetails.Add([PSCustomObject]$detail)
+        }
+
+        if (($rowNumber % 100) -eq 0 -or $rowNumber -eq $adRows.Count) {
+            Write-Log -Message ("Compared {0}/{1} AD row(s)." -f $rowNumber, $adRows.Count)
+        }
+    }
+
+    $summaryResults |
+        Export-Csv -LiteralPath $summaryCsv -NoTypeInformation -Encoding UTF8
+
+    if ($matchDetails.Count -gt 0) {
+        $matchDetails |
+            Export-Csv -LiteralPath $matchesCsv -NoTypeInformation -Encoding UTF8
+    }
+    else {
+        "SourceRow,ADUsername,ADAddress,VaultStatus" |
+            Set-Content -LiteralPath $matchesCsv -Encoding UTF8
+    }
+
+    $notVaultedResults = @(
+        $summaryResults |
+            Where-Object {
+                $_.VaultStatus -eq "NotVaulted" -or
+                $_.VaultStatus -eq "InvalidInput" -or
+                $_.VaultStatus -eq "UsernameFoundAddressMismatch"
+            }
+    )
+
+    if ($notVaultedResults.Count -gt 0) {
+        $notVaultedResults |
+            Export-Csv -LiteralPath $notVaultedCsv -NoTypeInformation -Encoding UTF8
+    }
+    else {
+        "No not-vaulted records were found." |
+            Set-Content -LiteralPath $notVaultedCsv -Encoding UTF8
+    }
+
+    $vaultedCount = @(
+        $summaryResults |
+            Where-Object {
+                $_.VaultStatus -eq "Vaulted" -or
+                $_.VaultStatus -eq "VaultedMultiple"
+            }
+    ).Count
+
+    $notVaultedCount = @(
+        $summaryResults |
+            Where-Object { $_.VaultStatus -eq "NotVaulted" }
+    ).Count
+
+    $multipleCount = @(
+        $summaryResults |
+            Where-Object { $_.VaultStatus -eq "VaultedMultiple" }
+    ).Count
+
+    $addressMismatchCount = @(
+        $summaryResults |
+            Where-Object {
+                $_.AddressValidation -eq "Mismatch" -or
+                $_.VaultStatus -eq "UsernameFoundAddressMismatch"
+            }
+    ).Count
+
+    Write-Log -Message "============================================================"
+    Write-Log -Message ("Total AD rows         : {0}" -f $summaryResults.Count) -Level "SUCCESS"
+    Write-Log -Message ("Vaulted               : {0}" -f $vaultedCount) -Level "SUCCESS"
+    Write-Log -Message ("Not vaulted           : {0}" -f $notVaultedCount) -Level $(if ($notVaultedCount -gt 0) { "WARN" } else { "SUCCESS" })
+    Write-Log -Message ("Multiple matches       : {0}" -f $multipleCount) -Level $(if ($multipleCount -gt 0) { "WARN" } else { "SUCCESS" })
+    Write-Log -Message ("Address mismatches     : {0}" -f $addressMismatchCount) -Level $(if ($addressMismatchCount -gt 0) { "WARN" } else { "SUCCESS" })
+    Write-Log -Message ("Summary report         : {0}" -f $summaryCsv)
+    Write-Log -Message ("Match details          : {0}" -f $matchesCsv)
+    Write-Log -Message ("Not-vaulted report     : {0}" -f $notVaultedCsv)
+    Write-Log -Message ("Log file               : {0}" -f $script:LogFile)
+    Write-Log -Message "Comparison completed." -Level "SUCCESS"
 }
 catch {
-    Write-Log ("❌ FATAL ERROR: {0}" -f $_.Exception.Message) 'Red'
+    $errorMessage = $_.Exception.Message
+
+    if ($script:LogFile) {
+        Write-Log -Message ("FATAL: {0}" -f $errorMessage) -Level "ERROR"
+    }
+    else {
+        Write-Host ("FATAL: {0}" -f $errorMessage) -ForegroundColor Red
+    }
+
+    throw
 }
 finally {
     if ($sessionCreated) {
         try {
             Close-PASSession | Out-Null
-            Write-Log "✅ Logged off from Privilege Cloud." 'Green'
-        } catch {
-            Write-Log ("⚠️  Logoff warning: {0}" -f $_.Exception.Message) 'Yellow'
+            Write-Log -Message "Logged off from Privilege Cloud." -Level "SUCCESS"
+        }
+        catch {
+            if ($script:LogFile) {
+                Write-Log -Message ("Logoff warning: {0}" -f $_.Exception.Message) -Level "WARN"
+            }
         }
     }
 }
