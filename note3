@@ -1,36 +1,39 @@
 #requires -Version 5.1
 <#
 .SYNOPSIS
-    Repairs or creates a Windows local profile for a domain/local user who is being signed in with a temporary profile.
+    Rebuilds a missing or broken local Windows profile for a domain or local account.
 
 .DESCRIPTION
+    Designed for the condition where the account resolves to a SID, but no usable
+    Win32_UserProfile/ProfileList entry exists and Windows signs the user in with
+    a temporary profile (Events 1511/1515).
+
     The script:
-      - Resolves the account SID.
-      - Logs off any remaining session for the affected user.
-      - Backs up ProfileList/ProfileGUID registry data.
-      - Repairs a matching .bak ProfileList entry when present.
-      - Preserves partial profile folders by renaming them instead of deleting them.
-      - Verifies the Default profile hive and clears read-only attributes.
-      - Adds the minimum standard read access needed to copy C:\Users\Default.
-      - Creates the user's local profile with the supported Windows CreateProfile API when no profile exists.
+      - Resolves the account and SID.
+      - Ensures the affected user is signed out.
+      - Backs up ProfileList and ProfileGUID.
+      - Preserves stale profile folders instead of deleting them.
+      - Removes stale SID, SID.bak, and ProfileGUID registrations.
+      - Validates the Default profile hive.
+      - Builds a fresh profile from C:\Users\Default.
+      - Registers the profile directly under ProfileList.
+      - Applies profile ACLs for the affected SID.
+      - Optionally restarts the server.
 
-    The script does not disable UAC and does not change CyberArk CPM settings.
-
-.EXAMPLE
-    .\Repair-TemporaryUserProfile.ps1
-
-.EXAMPLE
-    .\Repair-TemporaryUserProfile.ps1 -UserName 'DOMAIN\CAF9456'
+    Run from a DIFFERENT administrator account.
 
 .EXAMPLE
-    .\Repair-TemporaryUserProfile.ps1 -UserName 'CAF9456' -RestartServer
+    .\Repair-TemporaryUserProfile-v3.ps1 -UserName 'CNAW2K\CAF9456'
+
+.EXAMPLE
+    .\Repair-TemporaryUserProfile-v3.ps1 -UserName 'CNAW2K\CAF9456' -RestartServer
 #>
 
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $false)]
     [ValidateNotNullOrEmpty()]
-    [string]$UserName = 'CAF9456',
+    [string]$UserName = 'CNAW2K\CAF9456',
 
     [Parameter(Mandatory = $false)]
     [switch]$RestartServer
@@ -40,8 +43,9 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 $TimeStamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+$SafeUserName = $UserName -replace '[\\/:*?"<>|]', '_'
 $WorkRoot = Join-Path $env:ProgramData 'WindowsProfileRepair'
-$RunFolder = Join-Path $WorkRoot ("{0}_{1}" -f (($UserName -replace '[\\/:*?"<>|]', '_')), $TimeStamp)
+$RunFolder = Join-Path $WorkRoot ("{0}_{1}" -f $SafeUserName, $TimeStamp)
 $LogFile = Join-Path $RunFolder 'Repair-TemporaryUserProfile.log'
 
 function Write-Log {
@@ -82,22 +86,9 @@ function Export-RegistryKey {
     }
 }
 
-function Get-HResultHex {
-    param([int]$HResult)
-
-    $Bytes = [System.BitConverter]::GetBytes($HResult)
-    $Unsigned = [System.BitConverter]::ToUInt32($Bytes, 0)
-    return ('0x{0:X8}' -f $Unsigned)
-}
-
 function Get-TargetSessions {
     param([string]$SamAccountName)
 
-    # Do not query QUSER by username. QUSER writes "No User exists" to
-    # stderr when the user has no current session. With the script-wide
-    # ErrorActionPreference set to Stop, PowerShell converts that expected
-    # condition into a terminating NativeCommandError. Query all sessions
-    # through cmd.exe, suppress stderr, and then filter the output instead.
     $Sessions = @()
     $CmdPath = Join-Path $env:SystemRoot 'System32\cmd.exe'
     $RawOutput = @(& $CmdPath /D /C 'quser.exe 2>NUL')
@@ -109,18 +100,14 @@ function Get-TargetSessions {
 
     foreach ($Line in @($RawOutput | Select-Object -Skip 1)) {
         $LineText = [string]$Line
-
-        # Handles rows with or without a SessionName column, for example:
-        # >ADMINUSER       console      1  Active
-        #  CAF9456                      4  Disc
         if ($LineText -match '^\s*>?\s*(?<User>\S+)\s+(?:(?<Session>\S+)\s+)?(?<Id>\d+)\s+(?<State>Active|Disc|Disconnected|Idle|Listen)\b') {
             if ($Matches.User -ieq $SamAccountName) {
                 $Sessions += [pscustomobject]@{
-                    UserName   = $Matches.User
+                    UserName    = $Matches.User
                     SessionName = $Matches.Session
-                    SessionId  = [int]$Matches.Id
-                    State      = $Matches.State
-                    Raw        = $LineText.Trim()
+                    SessionId   = [int]$Matches.Id
+                    State       = $Matches.State
+                    Raw         = $LineText.Trim()
                 }
             }
         }
@@ -166,7 +153,7 @@ function Rename-PreservedFolder {
     }
 
     Rename-Item -LiteralPath $Path -NewName (Split-Path -Path $Destination -Leaf) -Force
-    Write-Log "Preserved existing profile folder by renaming '$Path' to '$Destination'." 'SUCCESS'
+    Write-Log "Preserved existing folder by renaming '$Path' to '$Destination'." 'SUCCESS'
     return $Destination
 }
 
@@ -186,47 +173,104 @@ function Clear-ReadOnlyAttribute {
 }
 
 function Test-RegistryHiveFile {
-    param([string]$HiveFile)
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$HiveFile,
 
-    $TemporaryHiveName = 'ProfileRepairTest_{0}' -f $PID
+        [Parameter(Mandatory = $true)]
+        [string]$Label
+    )
+
+    $TemporaryHiveName = 'ProfileRepairTest_{0}_{1}' -f $PID, ([guid]::NewGuid().ToString('N'))
     $TemporaryHivePath = "HKU\$TemporaryHiveName"
+    $Loaded = $false
 
     try {
         $LoadOutput = & reg.exe load $TemporaryHivePath $HiveFile 2>&1
         if ($LASTEXITCODE -ne 0) {
-            throw "Default profile registry hive could not be loaded. Output: $($LoadOutput -join ' ')"
+            throw "$Label registry hive could not be loaded. Output: $($LoadOutput -join ' ')"
         }
 
-        Write-Log "Successfully validated registry hive '$HiveFile'." 'SUCCESS'
+        $Loaded = $true
+        Write-Log "Successfully validated $Label registry hive '$HiveFile'." 'SUCCESS'
     }
     finally {
-        & reg.exe unload $TemporaryHivePath *> $null
+        if ($Loaded) {
+            & reg.exe unload $TemporaryHivePath *> $null
+        }
     }
 }
 
 function Write-RecentProfileEvents {
     param([datetime]$Since)
 
-    try {
-        $Events = Get-WinEvent -FilterHashtable @{
-            LogName      = 'Application'
-            ProviderName = 'Microsoft-Windows-User Profiles Service'
-            StartTime    = $Since
-        } -ErrorAction SilentlyContinue |
-            Where-Object { $_.Id -in @(1500, 1502, 1505, 1508, 1509, 1511, 1515, 1542) } |
-            Select-Object -First 20 TimeCreated, Id, LevelDisplayName, Message
+    $EventFile = Join-Path $RunFolder 'Recent-UserProfileService-Events.txt'
+    $Collected = $false
 
-        if ($Events) {
-            Add-Content -LiteralPath $LogFile -Value "`r`nRecent User Profile Service events:" -Encoding UTF8
-            foreach ($Event in $Events) {
-                Add-Content -LiteralPath $LogFile -Value ("[{0}] Event {1} {2}`r`n{3}`r`n" -f $Event.TimeCreated, $Event.Id, $Event.LevelDisplayName, $Event.Message) -Encoding UTF8
+    foreach ($LogName in @(
+        'Application',
+        'Microsoft-Windows-User Profile Service/Operational'
+    )) {
+        try {
+            if ($LogName -eq 'Application') {
+                $Events = Get-WinEvent -FilterHashtable @{
+                    LogName      = $LogName
+                    ProviderName = 'Microsoft-Windows-User Profiles Service'
+                    StartTime    = $Since
+                } -ErrorAction SilentlyContinue
             }
-            Write-Log 'Recent User Profile Service events were added to the log.' 'INFO'
+            else {
+                $Events = Get-WinEvent -FilterHashtable @{
+                    LogName   = $LogName
+                    StartTime = $Since
+                } -ErrorAction SilentlyContinue
+            }
+
+            $Events = @($Events | Select-Object -First 100 TimeCreated, Id, LevelDisplayName, Message)
+            if ($Events.Count -gt 0) {
+                Add-Content -LiteralPath $EventFile -Value "`r`n===== $LogName =====" -Encoding UTF8
+                foreach ($Event in $Events) {
+                    Add-Content -LiteralPath $EventFile -Value ("[{0}] Event {1} {2}`r`n{3}`r`n" -f $Event.TimeCreated, $Event.Id, $Event.LevelDisplayName, $Event.Message) -Encoding UTF8
+                }
+                $Collected = $true
+            }
+        }
+        catch {
+            Add-Content -LiteralPath $EventFile -Value "Could not read '$LogName': $($_.Exception.Message)" -Encoding UTF8
+        }
+    }
+
+    if ($Collected) {
+        Write-Log "Recent User Profile Service events saved to: $EventFile" 'INFO'
+    }
+}
+
+function Get-DomainProfilePath {
+    param(
+        [string]$ResolvedAccount,
+        [string]$SamAccountName
+    )
+
+    if ($ResolvedAccount -notmatch '\\') {
+        return $null
+    }
+
+    try {
+        $Searcher = New-Object System.DirectoryServices.DirectorySearcher
+        $EscapedSam = $SamAccountName.Replace('\\', '\5c').Replace('*', '\2a').Replace('(', '\28').Replace(')', '\29').Replace([char]0, '\00')
+        $Searcher.Filter = "(&(objectCategory=person)(objectClass=user)(sAMAccountName=$EscapedSam))"
+        [void]$Searcher.PropertiesToLoad.Add('profilePath')
+        $Result = $Searcher.FindOne()
+
+        if ($null -ne $Result -and $Result.Properties['profilepath'].Count -gt 0) {
+            return [string]$Result.Properties['profilepath'][0]
         }
     }
     catch {
-        Write-Log "Could not collect recent profile events: $($_.Exception.Message)" 'WARNING'
+        Write-Log "Could not query the account's AD profilePath attribute: $($_.Exception.Message)" 'WARNING'
     }
+
+    return $null
 }
 
 try {
@@ -234,12 +278,12 @@ try {
     New-Item -Path $LogFile -ItemType File -Force | Out-Null
 
     Write-Log '============================================================'
-    Write-Log 'Windows temporary profile repair starting.'
+    Write-Log 'Windows temporary profile rebuild starting.'
     Write-Log "Requested account : $UserName"
     Write-Log "Log folder        : $RunFolder"
 
     if (-not (Test-IsAdministrator)) {
-        throw 'Run this script from Windows PowerShell 5.1 using Run as administrator.'
+        throw 'Run this script from 64-bit Windows PowerShell 5.1 using Run as administrator.'
     }
 
     if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) {
@@ -257,15 +301,14 @@ try {
 
     $CurrentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     if ($CurrentSid -eq $Sid) {
-        throw 'You are currently running the script as the affected user. Sign out and run it using a different administrator account.'
+        throw 'The script is running as the affected user. Sign that user out and run the script using a different administrator account.'
     }
 
-    # FSLogix profile containers require container-level troubleshooting rather than local-profile recreation.
     $FsLogixPath = 'HKLM:\SOFTWARE\FSLogix\Profiles'
     if (Test-Path -LiteralPath $FsLogixPath) {
         $FsLogix = Get-ItemProperty -LiteralPath $FsLogixPath -ErrorAction SilentlyContinue
         if ($null -ne $FsLogix -and $FsLogix.PSObject.Properties.Name -contains 'Enabled' -and [int]$FsLogix.Enabled -eq 1) {
-            throw 'FSLogix Profiles is enabled on this server. Do not recreate the local profile; repair or unlock the user profile container instead.'
+            throw 'FSLogix Profiles is enabled. Repair or unlock the profile container instead of creating a local profile.'
         }
     }
 
@@ -277,25 +320,31 @@ try {
     $FreeGB = [math]::Round(($SystemDrive.FreeSpace / 1GB), 2)
     Write-Log "System drive free : $FreeGB GB"
     if ($FreeGB -lt 2) {
-        throw "Only $FreeGB GB is free on $($env:SystemDrive). Free at least 2 GB before creating a new profile."
+        throw "Only $FreeGB GB is free on $($env:SystemDrive). Free at least 2 GB and rerun the script."
     }
 
-    # End any remaining session for the affected account.
     $TargetSessions = @(Get-TargetSessions -SamAccountName $SamAccountName)
     if ($TargetSessions.Count -eq 0) {
-        Write-Log "No active or disconnected Windows session was found for '$ResolvedAccount'. Continuing with profile repair."
+        Write-Log "No active or disconnected Windows session was found for '$ResolvedAccount'."
     }
 
     foreach ($Session in $TargetSessions) {
         Write-Log "Logging off session $($Session.SessionId): $($Session.Raw)" 'WARNING'
-        & logoff.exe $Session.SessionId 2>&1 | ForEach-Object { Write-Log $_ 'INFO' }
+        $LogoffOutput = & logoff.exe $Session.SessionId 2>&1
         if ($LASTEXITCODE -ne 0) {
-            throw "Failed to log off session ID $($Session.SessionId)."
+            throw "Failed to log off session ID $($Session.SessionId). Output: $($LogoffOutput -join ' ')"
         }
     }
 
     if ($TargetSessions.Count -gt 0) {
         Start-Sleep -Seconds 5
+    }
+
+    $LoadedProfile = Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue |
+        Where-Object { $_.SID -eq $Sid -and $_.Loaded } |
+        Select-Object -First 1
+    if ($null -ne $LoadedProfile) {
+        throw "The affected profile is still loaded at '$($LoadedProfile.LocalPath)'. Restart the server or fully log off the session, then rerun the script."
     }
 
     $ProfileListPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
@@ -310,248 +359,216 @@ try {
 
     $ProfileListProperties = Get-ItemProperty -LiteralPath $ProfileListPath
     $ProfilesDirectory = [Environment]::ExpandEnvironmentVariables([string]$ProfileListProperties.ProfilesDirectory)
-    $DefaultProfile = Join-Path $ProfilesDirectory 'Default'
+    $DefaultProfile = if ($ProfileListProperties.PSObject.Properties.Name -contains 'Default') {
+        [Environment]::ExpandEnvironmentVariables([string]$ProfileListProperties.Default)
+    }
+    else {
+        Join-Path $ProfilesDirectory 'Default'
+    }
+
     $DefaultNtUser = Join-Path $DefaultProfile 'NTUSER.DAT'
     $DefaultUsrClass = Join-Path $DefaultProfile 'AppData\Local\Microsoft\Windows\UsrClass.dat'
+    $TargetProfilePath = Join-Path $ProfilesDirectory $SamAccountName
 
-    Write-Log "Profiles directory  : $ProfilesDirectory"
-    Write-Log "Default profile     : $DefaultProfile"
+    Write-Log "Profiles directory : $ProfilesDirectory"
+    Write-Log "Default profile    : $DefaultProfile"
+    Write-Log "New profile path   : $TargetProfilePath"
 
     foreach ($RequiredPath in @($ProfilesDirectory, $DefaultProfile, $DefaultNtUser, $DefaultUsrClass)) {
         if (-not (Test-Path -LiteralPath $RequiredPath)) {
-            throw "Required profile component is missing: $RequiredPath. Copy the Default profile only from a healthy server with the same Windows Server version/build, then rerun the script."
+            throw "Required profile component is missing: $RequiredPath"
         }
     }
 
     Clear-ReadOnlyAttribute -Path $DefaultNtUser
     Clear-ReadOnlyAttribute -Path $DefaultUsrClass
+    Test-RegistryHiveFile -HiveFile $DefaultNtUser -Label 'Default profile'
 
-    # Add, but do not remove, the standard access needed to read the Default profile.
-    # This intentionally avoids recursively resetting ACLs across the whole profile tree.
-    $DefaultAclOutput = & icacls.exe $DefaultProfile /grant '*S-1-5-18:(OI)(CI)(F)' '*S-1-5-32-544:(OI)(CI)(F)' '*S-1-5-32-545:(OI)(CI)(RX)' /C /Q 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        throw "Failed to validate/repair permissions on '$DefaultProfile'. Output: $($DefaultAclOutput -join ' ')"
-    }
-
-    foreach ($CriticalDefaultFile in @($DefaultNtUser, $DefaultUsrClass)) {
-        $CriticalAclOutput = & icacls.exe $CriticalDefaultFile /grant '*S-1-5-18:(F)' '*S-1-5-32-544:(F)' '*S-1-5-32-545:(R)' /C /Q 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            throw "Failed to validate/repair permissions on '$CriticalDefaultFile'. Output: $($CriticalAclOutput -join ' ')"
+    $RoamingProfilePath = Get-DomainProfilePath -ResolvedAccount $ResolvedAccount -SamAccountName $SamAccountName
+    if (-not [string]::IsNullOrWhiteSpace($RoamingProfilePath)) {
+        Write-Log "AD roaming profile path is configured: $RoamingProfilePath" 'WARNING'
+        if (-not (Test-Path -LiteralPath $RoamingProfilePath -ErrorAction SilentlyContinue)) {
+            Write-Log 'The configured roaming profile path is not currently reachable from this server. The new local cached profile may still be removed or overridden by domain policy.' 'WARNING'
         }
     }
-    Write-Log 'Validated standard SYSTEM, Administrators, and Users access on the Default profile and its registry hives.' 'SUCCESS'
-
-    $ProfilesRootAclOutput = & icacls.exe $ProfilesDirectory /grant '*S-1-5-18:(F)' '*S-1-5-32-544:(F)' '*S-1-5-32-545:(RX)' /C /Q 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        throw "Failed to validate/repair permissions on '$ProfilesDirectory'. Output: $($ProfilesRootAclOutput -join ' ')"
-    }
-
-    Test-RegistryHiveFile -HiveFile $DefaultNtUser
 
     $ExactProfileKey = Join-Path $ProfileListPath $Sid
     $BakProfileKey = Join-Path $ProfileListPath ($Sid + '.bak')
-    $ProfileRepaired = $false
-    $ProfilePath = $null
 
-    # If a .bak profile exists, restore it first.
-    if (Test-Path -LiteralPath $BakProfileKey) {
-        Write-Log "A .bak ProfileList entry exists for $Sid." 'WARNING'
-
-        if (Test-Path -LiteralPath $ExactProfileKey) {
-            Remove-Item -LiteralPath $ExactProfileKey -Recurse -Force
-            Write-Log 'Removed the temporary duplicate SID registry entry after backing up ProfileList.' 'SUCCESS'
+    foreach ($ProfileKey in @($ExactProfileKey, $BakProfileKey)) {
+        if (Test-Path -LiteralPath $ProfileKey) {
+            $OldProperties = Get-ItemProperty -LiteralPath $ProfileKey -ErrorAction SilentlyContinue
+            if ($null -ne $OldProperties -and $OldProperties.PSObject.Properties.Name -contains 'ProfileImagePath') {
+                $OldPath = [Environment]::ExpandEnvironmentVariables([string]$OldProperties.ProfileImagePath)
+                Write-Log "Removing stale profile registration '$ProfileKey' pointing to '$OldPath'." 'WARNING'
+            }
+            else {
+                Write-Log "Removing stale profile registration '$ProfileKey'." 'WARNING'
+            }
+            Remove-Item -LiteralPath $ProfileKey -Recurse -Force
         }
-
-        Rename-Item -LiteralPath $BakProfileKey -NewName $Sid -Force
-        New-ItemProperty -LiteralPath $ExactProfileKey -Name 'State' -PropertyType DWord -Value 0 -Force | Out-Null
-        New-ItemProperty -LiteralPath $ExactProfileKey -Name 'RefCount' -PropertyType DWord -Value 0 -Force | Out-Null
-
-        $RestoredProperties = Get-ItemProperty -LiteralPath $ExactProfileKey
-        if (-not ($RestoredProperties.PSObject.Properties.Name -contains 'ProfileImagePath') -or
-            [string]::IsNullOrWhiteSpace([string]$RestoredProperties.ProfileImagePath)) {
-            throw 'The restored .bak registry entry does not contain ProfileImagePath.'
-        }
-        $ProfilePath = [Environment]::ExpandEnvironmentVariables([string]$RestoredProperties.ProfileImagePath)
-
-        if (-not (Test-Path -LiteralPath $ProfilePath)) {
-            throw "The restored registry entry points to a missing profile folder: $ProfilePath"
-        }
-
-        Clear-ReadOnlyAttribute -Path (Join-Path $ProfilePath 'NTUSER.DAT')
-        Clear-ReadOnlyAttribute -Path (Join-Path $ProfilePath 'AppData\Local\Microsoft\Windows\UsrClass.dat')
-        $ProfileRepaired = $true
-        Write-Log "Restored the existing profile at '$ProfilePath'." 'SUCCESS'
     }
 
-    if (-not $ProfileRepaired -and (Test-Path -LiteralPath $ExactProfileKey)) {
-        $ExistingProperties = Get-ItemProperty -LiteralPath $ExactProfileKey
-        $ExistingProfilePath = $null
-        $ExistingNtUser = $null
-        if ($ExistingProperties.PSObject.Properties.Name -contains 'ProfileImagePath' -and
-            -not [string]::IsNullOrWhiteSpace([string]$ExistingProperties.ProfileImagePath)) {
-            $ExistingProfilePath = [Environment]::ExpandEnvironmentVariables([string]$ExistingProperties.ProfileImagePath)
-            $ExistingNtUser = Join-Path $ExistingProfilePath 'NTUSER.DAT'
-        }
-        $CimProfile = Get-CimInstance Win32_UserProfile | Where-Object { $_.SID -eq $Sid } | Select-Object -First 1
-
-        if ($null -ne $CimProfile -and $CimProfile.Loaded) {
-            throw "The profile is still loaded at '$($CimProfile.LocalPath)'. Ensure every session is logged off, then rerun the script."
-        }
-
-        if (-not [string]::IsNullOrWhiteSpace($ExistingProfilePath) -and
-            (Test-Path -LiteralPath $ExistingProfilePath) -and
-            (Test-Path -LiteralPath $ExistingNtUser)) {
-            New-ItemProperty -LiteralPath $ExactProfileKey -Name 'State' -PropertyType DWord -Value 0 -Force | Out-Null
-            New-ItemProperty -LiteralPath $ExactProfileKey -Name 'RefCount' -PropertyType DWord -Value 0 -Force | Out-Null
-            Clear-ReadOnlyAttribute -Path $ExistingNtUser
-            Clear-ReadOnlyAttribute -Path (Join-Path $ExistingProfilePath 'AppData\Local\Microsoft\Windows\UsrClass.dat')
-            $ProfilePath = $ExistingProfilePath
-            $ProfileRepaired = $true
-            Write-Log "Repaired the existing registered profile at '$ProfilePath'." 'SUCCESS'
-        }
-        else {
-            $DisplayedExistingPath = if ([string]::IsNullOrWhiteSpace($ExistingProfilePath)) { '<missing ProfileImagePath>' } else { $ExistingProfilePath }
-            Write-Log "The existing profile registration is incomplete or points to a missing/corrupt folder: '$DisplayedExistingPath'." 'WARNING'
-
-            if ($null -ne $CimProfile) {
-                $CimProfile | Remove-CimInstance
-                Write-Log 'Removed the incomplete Win32_UserProfile registration.' 'SUCCESS'
-            }
-            elseif (Test-Path -LiteralPath $ExactProfileKey) {
-                Remove-Item -LiteralPath $ExactProfileKey -Recurse -Force
-                Write-Log 'Removed the incomplete ProfileList registry entry.' 'SUCCESS'
-            }
-
-            if (-not [string]::IsNullOrWhiteSpace($ExistingProfilePath) -and
-                (Test-Path -LiteralPath $ExistingProfilePath)) {
-                Rename-PreservedFolder -Path $ExistingProfilePath -Suffix $TimeStamp | Out-Null
+    if (Test-Path -LiteralPath $ProfileGuidPath) {
+        foreach ($GuidKey in Get-ChildItem -LiteralPath $ProfileGuidPath -ErrorAction SilentlyContinue) {
+            $GuidProperties = Get-ItemProperty -LiteralPath $GuidKey.PSPath -ErrorAction SilentlyContinue
+            if ($null -ne $GuidProperties -and
+                $GuidProperties.PSObject.Properties.Name -contains 'SidString' -and
+                [string]$GuidProperties.SidString -eq $Sid) {
+                Remove-Item -LiteralPath $GuidKey.PSPath -Recurse -Force
+                Write-Log "Removed stale ProfileGUID entry '$($GuidKey.PSChildName)'." 'SUCCESS'
             }
         }
     }
 
-    if (-not $ProfileRepaired) {
-        # Remove ProfileGUID records that still reference the user's SID.
-        if (Test-Path -LiteralPath $ProfileGuidPath) {
-            foreach ($GuidKey in Get-ChildItem -LiteralPath $ProfileGuidPath -ErrorAction SilentlyContinue) {
-                $GuidProperties = Get-ItemProperty -LiteralPath $GuidKey.PSPath -ErrorAction SilentlyContinue
-                if ($null -ne $GuidProperties -and
-                    $GuidProperties.PSObject.Properties.Name -contains 'SidString' -and
-                    [string]$GuidProperties.SidString -eq $Sid) {
-                    Remove-Item -LiteralPath $GuidKey.PSPath -Recurse -Force
-                    Write-Log "Removed stale ProfileGUID entry '$($GuidKey.PSChildName)' for $Sid." 'SUCCESS'
-                }
-            }
-        }
+    $CandidateFolders = @(Get-ChildItem -LiteralPath $ProfilesDirectory -Directory -Force -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.Name -ieq $SamAccountName -or
+            $_.Name -ilike ($SamAccountName + '.*')
+        })
 
-        # Preserve folders that could block CreateProfile from selecting a clean profile path.
-        $CandidateFolders = @(Get-ChildItem -LiteralPath $ProfilesDirectory -Directory -Force -ErrorAction SilentlyContinue |
-            Where-Object {
-                $_.Name -ieq $SamAccountName -or $_.Name -ilike ($SamAccountName + '.*')
-            })
-
-        foreach ($Folder in $CandidateFolders) {
-            Rename-PreservedFolder -Path $Folder.FullName -Suffix $TimeStamp | Out-Null
-        }
-
-        # A TEMP folder is touched only when its NTFS owner is the affected user's SID.
-        $OwnedTempFolders = @(Get-ChildItem -LiteralPath $ProfilesDirectory -Directory -Force -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -ilike 'TEMP*' } |
-            Where-Object { (Get-FolderOwnerSid -Path $_.FullName) -eq $Sid })
-
-        foreach ($Folder in $OwnedTempFolders) {
-            Rename-PreservedFolder -Path $Folder.FullName -Suffix $TimeStamp | Out-Null
-        }
-
-        if (-not ('NativeUserProfile' -as [type])) {
-            Add-Type -TypeDefinition @'
-using System;
-using System.Text;
-using System.Runtime.InteropServices;
-
-public static class NativeUserProfile
-{
-    [DllImport("userenv.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    public static extern int CreateProfile(
-        string pszUserSid,
-        string pszUserName,
-        StringBuilder pszProfilePath,
-        uint cchProfilePath
-    );
-}
-'@
-        }
-
-        $PathBuffer = New-Object System.Text.StringBuilder 1024
-        Write-Log "Creating a clean local Windows profile for '$ResolvedAccount'."
-        $HResult = [NativeUserProfile]::CreateProfile($Sid, $SamAccountName, $PathBuffer, [uint32]$PathBuffer.Capacity)
-        $HResultHex = Get-HResultHex -HResult $HResult
-
-        if ($HResult -ne 0 -and $HResultHex -ne '0x800700B7') {
-            throw "Windows CreateProfile failed with HRESULT $HResultHex. Review '$LogFile' and recent User Profile Service events."
-        }
-
-        $ProfilePath = $PathBuffer.ToString()
-        if ([string]::IsNullOrWhiteSpace($ProfilePath) -and (Test-Path -LiteralPath $ExactProfileKey)) {
-            $CreatedProperties = Get-ItemProperty -LiteralPath $ExactProfileKey
-            $ProfilePath = [Environment]::ExpandEnvironmentVariables([string]$CreatedProperties.ProfileImagePath)
-        }
-
-        if ([string]::IsNullOrWhiteSpace($ProfilePath)) {
-            throw 'CreateProfile did not return or register a profile path.'
-        }
-
-        if (-not (Test-Path -LiteralPath $ProfilePath)) {
-            throw "CreateProfile returned '$ProfilePath', but the folder does not exist."
-        }
-
-        if (-not (Test-Path -LiteralPath $ExactProfileKey)) {
-            throw "The profile folder was created, but ProfileList does not contain SID '$Sid'."
-        }
-
-        New-ItemProperty -LiteralPath $ExactProfileKey -Name 'State' -PropertyType DWord -Value 0 -Force | Out-Null
-        New-ItemProperty -LiteralPath $ExactProfileKey -Name 'RefCount' -PropertyType DWord -Value 0 -Force | Out-Null
-
-        Write-Log "Created a clean profile at '$ProfilePath'." 'SUCCESS'
+    foreach ($Folder in $CandidateFolders) {
+        Rename-PreservedFolder -Path $Folder.FullName -Suffix $TimeStamp | Out-Null
     }
 
-    # Final validation.
+    $OwnedTempFolders = @(Get-ChildItem -LiteralPath $ProfilesDirectory -Directory -Force -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -ilike 'TEMP*' } |
+        Where-Object { (Get-FolderOwnerSid -Path $_.FullName) -eq $Sid })
+
+    foreach ($Folder in $OwnedTempFolders) {
+        Rename-PreservedFolder -Path $Folder.FullName -Suffix $TimeStamp | Out-Null
+    }
+
+    Write-Log "Copying the Default profile to '$TargetProfilePath'."
+    New-Item -Path $TargetProfilePath -ItemType Directory -Force | Out-Null
+
+    $RobocopyLog = Join-Path $RunFolder 'Robocopy-DefaultProfile.log'
+    $RobocopyArguments = @(
+        $DefaultProfile,
+        $TargetProfilePath,
+        '/E',
+        '/COPY:DAT',
+        '/DCOPY:DAT',
+        '/XJ',
+        '/R:2',
+        '/W:1',
+        '/NP',
+        '/TEE',
+        "/LOG:$RobocopyLog"
+    )
+
+    & robocopy.exe @RobocopyArguments | Out-Null
+    $RobocopyExitCode = $LASTEXITCODE
+    if ($RobocopyExitCode -ge 8) {
+        throw "Robocopy failed with exit code $RobocopyExitCode. Review '$RobocopyLog'."
+    }
+    Write-Log "Default profile copied successfully. Robocopy exit code: $RobocopyExitCode" 'SUCCESS'
+
+    $TargetNtUser = Join-Path $TargetProfilePath 'NTUSER.DAT'
+    $TargetUsrClass = Join-Path $TargetProfilePath 'AppData\Local\Microsoft\Windows\UsrClass.dat'
+    foreach ($RequiredTargetPath in @($TargetNtUser, $TargetUsrClass)) {
+        if (-not (Test-Path -LiteralPath $RequiredTargetPath)) {
+            throw "The profile copy is incomplete. Missing: $RequiredTargetPath"
+        }
+        Clear-ReadOnlyAttribute -Path $RequiredTargetPath
+    }
+
+    Write-Log 'Applying profile folder permissions.'
+
+    $InheritanceArguments = @('/inheritance:e', '/T', '/C', '/Q')
+    $AclOutput = & icacls.exe $TargetProfilePath @InheritanceArguments 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw "icacls failed while enabling inheritance on '$TargetProfilePath'. Output: $($AclOutput -join ' ')"
+    }
+
+    $GrantArguments = @(
+        '/grant:r',
+        "*$Sid`:(OI)(CI)(F)",
+        '*S-1-5-18:(OI)(CI)(F)',
+        '*S-1-5-32-544:(OI)(CI)(F)',
+        '/T',
+        '/C',
+        '/Q'
+    )
+    $AclOutput = & icacls.exe $TargetProfilePath @GrantArguments 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw "icacls failed while granting permissions on '$TargetProfilePath'. Output: $($AclOutput -join ' ')"
+    }
+
+    $OwnerArguments = @('/setowner', "*$Sid", '/T', '/C', '/Q')
+    $AclOutput = & icacls.exe $TargetProfilePath @OwnerArguments 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw "icacls failed while setting ownership on '$TargetProfilePath'. Output: $($AclOutput -join ' ')"
+    }
+
+    Write-Log "Applied Full Control for '$ResolvedAccount', SYSTEM, and local Administrators on the new profile." 'SUCCESS'
+
+    Test-RegistryHiveFile -HiveFile $TargetNtUser -Label 'new user profile'
+
+    Write-Log 'Creating the ProfileList registration.'
+    New-Item -Path $ExactProfileKey -Force | Out-Null
+
+    $SidBytes = New-Object byte[] $SidObject.BinaryLength
+    $SidObject.GetBinaryForm($SidBytes, 0)
+    $ProfileGuid = [guid]::NewGuid().ToString('B')
+
+    New-ItemProperty -LiteralPath $ExactProfileKey -Name 'ProfileImagePath' -PropertyType ExpandString -Value $TargetProfilePath -Force | Out-Null
+    New-ItemProperty -LiteralPath $ExactProfileKey -Name 'Flags' -PropertyType DWord -Value 0 -Force | Out-Null
+    New-ItemProperty -LiteralPath $ExactProfileKey -Name 'State' -PropertyType DWord -Value 0 -Force | Out-Null
+    New-ItemProperty -LiteralPath $ExactProfileKey -Name 'RefCount' -PropertyType DWord -Value 0 -Force | Out-Null
+    New-ItemProperty -LiteralPath $ExactProfileKey -Name 'FullProfile' -PropertyType DWord -Value 1 -Force | Out-Null
+    New-ItemProperty -LiteralPath $ExactProfileKey -Name 'Sid' -PropertyType Binary -Value $SidBytes -Force | Out-Null
+    New-ItemProperty -LiteralPath $ExactProfileKey -Name 'Guid' -PropertyType String -Value $ProfileGuid -Force | Out-Null
+
+    New-Item -Path $ProfileGuidPath -Force | Out-Null
+    $NewProfileGuidKey = Join-Path $ProfileGuidPath $ProfileGuid
+    New-Item -Path $NewProfileGuidKey -Force | Out-Null
+    New-ItemProperty -LiteralPath $NewProfileGuidKey -Name 'SidString' -PropertyType String -Value $Sid -Force | Out-Null
+
+    Write-Log "Registered SID '$Sid' to '$TargetProfilePath'." 'SUCCESS'
+
     $FinalRegistry = Get-ItemProperty -LiteralPath $ExactProfileKey
-    $FinalProfilePath = [Environment]::ExpandEnvironmentVariables([string]$FinalRegistry.ProfileImagePath)
-    $FinalCimProfile = Get-CimInstance Win32_UserProfile | Where-Object { $_.SID -eq $Sid } | Select-Object -First 1
+    $FinalPath = [Environment]::ExpandEnvironmentVariables([string]$FinalRegistry.ProfileImagePath)
+    if ($FinalPath -ne $TargetProfilePath -or -not (Test-Path -LiteralPath $FinalPath)) {
+        throw 'Final profile registration validation failed.'
+    }
 
-    if (-not (Test-Path -LiteralPath $FinalProfilePath)) {
-        throw "Final validation failed because '$FinalProfilePath' does not exist."
+    $FinalCimProfile = Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue |
+        Where-Object { $_.SID -eq $Sid } |
+        Select-Object -First 1
+
+    if ($null -ne $FinalCimProfile) {
+        Write-Log "Win32_UserProfile now reports: LocalPath='$($FinalCimProfile.LocalPath)', Loaded='$($FinalCimProfile.Loaded)', Status='$($FinalCimProfile.Status)'." 'SUCCESS'
+    }
+    else {
+        Write-Log 'Win32_UserProfile has not refreshed yet; the registry and profile folder are valid. A server restart will refresh the User Profile Service state.' 'WARNING'
+    }
+
+    Export-RegistryKey -RegistryPath $ProfileListNative -Destination (Join-Path $RunFolder 'ProfileList-After.reg')
+    if (Test-Path -LiteralPath $ProfileGuidPath) {
+        Export-RegistryKey -RegistryPath $ProfileGuidNative -Destination (Join-Path $RunFolder 'ProfileGUID-After.reg')
     }
 
     Write-Log '============================================================'
-    Write-Log 'PROFILE REPAIR COMPLETED SUCCESSFULLY.' 'SUCCESS'
-    Write-Log "Account            : $ResolvedAccount" 'SUCCESS'
-    Write-Log "SID                : $Sid" 'SUCCESS'
-    Write-Log "Profile path       : $FinalProfilePath" 'SUCCESS'
-    if ($null -ne $FinalCimProfile) {
-        Write-Log "Win32_UserProfile  : Registered; Loaded=$($FinalCimProfile.Loaded); Status=$($FinalCimProfile.Status)" 'SUCCESS'
-    }
-    else {
-        Write-Log 'Win32_UserProfile has not refreshed yet, but the ProfileList entry and profile folder are present.' 'WARNING'
-    }
-    Write-Log 'The user may now sign in again. Do not use a previously disconnected RDP session.' 'SUCCESS'
-    Write-Log "Backups and log are stored in: $RunFolder"
+    Write-Log 'PROFILE REBUILD COMPLETED SUCCESSFULLY.' 'SUCCESS'
+    Write-Log "Profile path: $TargetProfilePath" 'SUCCESS'
 
     if ($RestartServer) {
-        Write-Log 'RestartServer was specified. The server will restart in 15 seconds.' 'WARNING'
-        shutdown.exe /r /t 15 /c "Windows user profile repair completed for $ResolvedAccount"
+        Write-Log 'Restarting the server in 15 seconds. The affected user must wait until the restart completes.' 'WARNING'
+        shutdown.exe /r /t 15 /c "Restart after repairing the Windows profile for $ResolvedAccount" | Out-Null
+    }
+    else {
+        Write-Log 'Restart the server before the affected user signs in again. This is strongly recommended after the RPC 0x800706F7 failure.' 'WARNING'
     }
 }
 catch {
-    if (-not (Test-Path -LiteralPath $RunFolder)) {
-        New-Item -Path $RunFolder -ItemType Directory -Force | Out-Null
+    try {
+        Write-Log "FATAL: $($_.Exception.Message)" 'ERROR'
+        Write-RecentProfileEvents -Since (Get-Date).AddHours(-2)
+        Write-Log "Review the log: $LogFile" 'ERROR'
     }
-    if (-not (Test-Path -LiteralPath $LogFile)) {
-        New-Item -Path $LogFile -ItemType File -Force | Out-Null
+    catch {
+        Write-Error $_.Exception.Message
     }
-
-    Write-Log "FATAL: $($_.Exception.Message)" 'ERROR'
-    Write-RecentProfileEvents -Since (Get-Date).AddHours(-2)
-    Write-Log "Review the log: $LogFile" 'ERROR'
     throw
 }
