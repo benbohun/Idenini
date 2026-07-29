@@ -1,32 +1,45 @@
-Leveraging the same login login, i need a script that shows all domant safe that are not assigned any account
-
 <# =====================================================================
-DisabledAccountDetectAllWinRc1331_FAST.ps1
+Get-DormantEmptySafes.ps1
 
-- CCP -> Identity Header -> psPAS (same login approach)
-- Find ALL accounts that match winRc=1331 / account disabled
-- Faster approach:
-    1) FAST-PATH: match on account-level secretManagement/lastTask fields (no activity call)
-    2) SLOW-PATH: only for likely failures, pull limited activities and match Reason/MoreInfo/Message/Details (no ConvertTo-Json)
+Purpose
+-------
+Uses the existing CCP -> CyberArk Identity Header -> psPAS login method to:
+  1. Retrieve every Safe visible to the API identity.
+  2. Retrieve the visible CyberArk account inventory once using paging.
+  3. Count accounts by Safe.
+  4. Export Safes that contain zero visible accounts.
 
-Outputs:
-  E:\Installation Media\Script\OnboardScript\data\Disabled_Account.csv
-  E:\Installation Media\Script\OnboardScript\data\Disabled_Account.log
+Outputs
+-------
+E:\Installation Media\Script\OnboardScript\data\Dormant_Safes_Without_Accounts.csv
+E:\Installation Media\Script\OnboardScript\data\Dormant_Safes_Without_Accounts.log
+
+Important
+---------
+The result is limited to Safes and accounts visible to CA_PAMDiscovery_SVC.
+For authoritative tenant-wide results, this identity must be able to list all
+required Safes and list accounts in those Safes.
 ===================================================================== #>
 
 [CmdletBinding()]
 param(
-    [ValidateRange(1,1000)]
+    [ValidateRange(1, 1000)]
     [int]$PageSize = 500,
 
-    [ValidateRange(1,200000)]
-    [int]$MaxAccountsToInspect = 50000,
+    # Safety limit. The script stops instead of producing a potentially
+    # inaccurate empty-Safe report if this limit is exceeded.
+    [ValidateRange(1, 500000)]
+    [int]$MaxAccountsToInspect = 200000,
 
-    [ValidateRange(1,500)]
-    [int]$MaxActivitiesToInspect = 60,
+    # Optional Safe-name filter. Examples:
+    #   *                  = all visible Safes
+    #   AP-*-P-C1-AMNG     = only AMNG application Safes
+    [ValidateNotNullOrEmpty()]
+    [string]$SafeNameLike = '*',
 
-    # If you want speed over coverage, set this to skip full inventory fallback
-    [switch]$SkipInventoryFallback
+    # Optional regular expression for Safe names to exclude.
+    # Example: '^(System|VaultInternal|PSM)'
+    [string]$ExcludeSafeNameRegex = ''
 )
 
 # =========================
@@ -36,329 +49,568 @@ param(
 $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'
 
-Import-Module psPAS -Force
+Import-Module psPAS -Force -ErrorAction Stop
 
 # =========================
 # Output paths
 # =========================
-$OutDir = "E:\Installation Media\Script\OnboardScript\data"
-if (-not (Test-Path $OutDir)) { New-Item -ItemType Directory -Path $OutDir -Force | Out-Null }
+$OutDir = 'E:\Installation Media\Script\OnboardScript\data'
+if (-not (Test-Path -LiteralPath $OutDir)) {
+    New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
+}
 
-$LogFile = Join-Path $OutDir "Disabled_Account.log"
-$CsvFile = Join-Path $OutDir "Disabled_Account.csv"
-New-Item -ItemType File -Force -Path $LogFile | Out-Null
+$LogFile = Join-Path $OutDir 'Dormant_Safes_Without_Accounts.log'
+$CsvFile = Join-Path $OutDir 'Dormant_Safes_Without_Accounts.csv'
+New-Item -ItemType File -Path $LogFile -Force | Out-Null
 
 function Write-Log {
-    param([string]$Message, [ConsoleColor]$Color = 'White')
-    $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    $line = "$ts - $Message"
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Message,
+
+        [ConsoleColor]$Color = 'White'
+    )
+
+    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $line = "$timestamp - $Message"
     Write-Host $line -ForegroundColor $Color
-    Add-Content -Path $LogFile -Value $line
+    Add-Content -LiteralPath $LogFile -Value $line
 }
 
 # =========================
-# CCP / Identity config (your values)
+# CCP / Identity configuration
+# Retained from the supplied login script
 # =========================
-$CCPAddress    = "https://vskau1p1231.cna.com"
-$location      = "AIMWebService"
-$application   = "PAMDiscovery"
-$safeCCP       = "CA_PCloud_Admins"
-$windowsAuth   = $false
-$headers       = @{ 'Content-Type' = 'application/json' }
+$CCPAddress  = 'https://vskau1p1231.cna.com'
+$Location    = 'AIMWebService'
+$Application = 'PAMDiscovery'
+$SafeCCP     = 'CA_PCloud_Admins'
+$WindowsAuth = $false
+$Headers     = @{ 'Content-Type' = 'application/json' }
 
-$IdentityTenantURL = "aat4012.id.cyberark.cloud"
-$PCloudSubdomain   = "cna-prod"
+$IdentityTenantURL = 'aat4012.id.cyberark.cloud'
+$PCloudSubdomain   = 'cna-prod'
+
+$CCPObjectName = 'cna.com-CA_PAMDiscovery_SVC'
+$IdentityUser  = 'CA_PAMDiscovery_SVC'
 
 # =========================
-# Match logic (regex catches variations)
+# General helpers
 # =========================
-$NeedleRegex = "(?i)winRc\s*=\s*1331|account\s+is\s+currently\s+disabled|error_account_disabled"
+function Test-CommandParameter {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$CommandName,
+
+        [Parameter(Mandatory)]
+        [string]$ParameterName
+    )
+
+    $command = Get-Command -Name $CommandName -ErrorAction Stop
+    return $command.Parameters.ContainsKey($ParameterName)
+}
+
+function ConvertTo-FlatCollection {
+    [CmdletBinding()]
+    param(
+        [Parameter(ValueFromPipeline = $true)]
+        $InputObject,
+
+        [string[]]$CollectionPropertyNames = @('value')
+    )
+
+    if ($null -eq $InputObject) {
+        return @()
+    }
+
+    $items = @($InputObject)
+
+    # Some cmdlet/API versions return a wrapper object containing value,
+    # Accounts, or Safes. Other versions return the objects directly.
+    if ($items.Count -eq 1 -and $null -ne $items[0]) {
+        $single = $items[0]
+
+        foreach ($propertyName in $CollectionPropertyNames) {
+            $property = $single.PSObject.Properties[$propertyName]
+            if ($property -and $null -ne $property.Value) {
+                return @($property.Value)
+            }
+        }
+    }
+
+    return @($items)
+}
+
+function Get-ObjectPropertyValue {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        $InputObject,
+
+        [Parameter(Mandatory)]
+        [string[]]$PropertyNames
+    )
+
+    foreach ($propertyName in $PropertyNames) {
+        $property = $InputObject.PSObject.Properties[$propertyName]
+        if ($property -and $null -ne $property.Value) {
+            return $property.Value
+        }
+    }
+
+    return $null
+}
+
+function Convert-CyberArkDateTime {
+    [CmdletBinding()]
+    param($Value)
+
+    if ($null -eq $Value) {
+        return $null
+    }
+
+    if ($Value -is [DateTime]) {
+        return ([DateTime]$Value)
+    }
+
+    if ($Value -is [DateTimeOffset]) {
+        return ([DateTimeOffset]$Value).LocalDateTime
+    }
+
+    $text = ([string]$Value).Trim()
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        return $null
+    }
+
+    [long]$numericValue = 0
+    if ([long]::TryParse($text, [ref]$numericValue)) {
+        $epochUtc = [DateTime]::SpecifyKind(
+            [DateTime]::ParseExact('1970-01-01', 'yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture),
+            [DateTimeKind]::Utc
+        )
+
+        # Support either Unix seconds or Unix milliseconds.
+        if ($numericValue -gt 99999999999) {
+            return $epochUtc.AddMilliseconds($numericValue).ToLocalTime()
+        }
+
+        return $epochUtc.AddSeconds($numericValue).ToLocalTime()
+    }
+
+    [DateTime]$parsedDate = [DateTime]::MinValue
+    if ([DateTime]::TryParse($text, [ref]$parsedDate)) {
+        return $parsedDate
+    }
+
+    return $null
+}
 
 # =========================
 # Login helper: CCP -> Identity header -> psPAS
 # =========================
 function Start-PASSessionFromCCP {
+    [CmdletBinding()]
     param(
-        [Parameter(Mandatory)] [string]$ObjectName,
-        [Parameter(Mandatory)] [string]$UPUser
+        [Parameter(Mandatory)]
+        [string]$ObjectName,
+
+        [Parameter(Mandatory)]
+        [string]$UPUser
     )
 
-    $ccpUrl = "$CCPAddress/$location/api/Accounts?AppID=$application&Safe=$safeCCP&Object=$ObjectName"
-    Write-Log "Retrieving CCP credential for '$UPUser' via Object..." 'Cyan'
+    $encodedObject = [Uri]::EscapeDataString($ObjectName)
+    $encodedAppId  = [Uri]::EscapeDataString($Application)
+    $encodedSafe   = [Uri]::EscapeDataString($SafeCCP)
+    $ccpUrl = "$CCPAddress/$Location/api/Accounts?AppID=$encodedAppId&Safe=$encodedSafe&Object=$encodedObject"
 
-    $resp = Invoke-RestMethod -Uri $ccpUrl -Method GET -Headers $headers -UseDefaultCredentials:$windowsAuth
-    if (-not $resp -or -not $resp.Content -or -not $resp.Username) {
-        throw "CCP response missing Content/Username."
-    }
-    Write-Log "CCP returned username for service principal." 'Green'
+    Write-Log "Retrieving CCP credential for '$UPUser' through Object='$ObjectName'." 'Cyan'
 
-    $secPass = ConvertTo-SecureString -String $resp.Content -AsPlainText -Force
-    $upCred  = [PSCredential]::new($UPUser, $secPass)
+    $response = Invoke-RestMethod `
+        -Uri $ccpUrl `
+        -Method Get `
+        -Headers $Headers `
+        -UseDefaultCredentials:$WindowsAuth `
+        -ErrorAction Stop
 
-    Write-Log "Requesting Identity header for '$IdentityTenantURL' (subdomain '$PCloudSubdomain')." 'Cyan'
-    $hdr = Get-IdentityHeader -IdentityTenantURL $IdentityTenantURL -psPASFormat -PCloudSubdomain $PCloudSubdomain -UPCreds $upCred
-
-    Use-PASSession $hdr
-    if (-not (Get-PASSession)) { throw "psPAS session not established." }
-
-    $resp.Content = $null
-    Write-Log "PAS session established (no prompts)." 'Green'
-}
-
-function Cmd-HasParam {
-    param([string]$CommandName, [string]$ParamName)
-    $c = Get-Command $CommandName -ErrorAction Stop
-    return $c.Parameters.ContainsKey($ParamName)
-}
-
-function Get-AccountsPaged {
-    param(
-        [string]$SavedFilter,
-        [int]$Limit = 200
-    )
-
-    $all = New-Object System.Collections.Generic.List[object]
-    $offset = 0
-
-    $hasSavedFilter = Cmd-HasParam -CommandName "Get-PASAccount" -ParamName "savedFilter"
-    $hasOffset      = Cmd-HasParam -CommandName "Get-PASAccount" -ParamName "offset"
-    $hasLimit       = Cmd-HasParam -CommandName "Get-PASAccount" -ParamName "limit"
-
-    while ($true) {
-        $params = @{}
-        if ($SavedFilter -and $hasSavedFilter) { $params["savedFilter"] = $SavedFilter }
-        if ($hasLimit)  { $params["limit"]  = $Limit }
-        if ($hasOffset) { $params["offset"] = $offset }
-
-        # If module lacks -offset, we can only call once
-        if (-not $hasOffset -and $offset -gt 0) { break }
-
-        $page = @()
-        try {
-            $page = @(Get-PASAccount @params -ErrorAction Stop)
-        } catch {
-            if ($SavedFilter -and -not $hasSavedFilter) {
-                $page = @(Get-PASAccount -ErrorAction Stop)
-            } else {
-                throw
-            }
-        }
-
-        if ($page.Count -eq 0) { break }
-
-        foreach ($a in $page) { $all.Add($a) }
-
-        if (-not $hasOffset) { break }
-        if ($page.Count -lt $Limit) { break }
-        if ($all.Count -ge $MaxAccountsToInspect) { break }
-
-        $offset += $Limit
+    if (-not $response -or
+        [string]::IsNullOrWhiteSpace([string]$response.Content) -or
+        [string]::IsNullOrWhiteSpace([string]$response.Username)) {
+        throw 'CCP response is missing Content or Username.'
     }
 
-    return @($all | Group-Object id | ForEach-Object { $_.Group | Select-Object -First 1 })
-}
+    Write-Log "CCP returned credential material for username '$($response.Username)'." 'Green'
 
-function Get-ActivitiesSafe {
-    param([string]$AccountId)
+    $securePassword = ConvertTo-SecureString -String ([string]$response.Content) -AsPlainText -Force
+    $identityCredential = [System.Management.Automation.PSCredential]::new($UPUser, $securePassword)
 
-    try {
-        return @(Get-PASAccountActivity -AccountID $AccountId -ErrorAction Stop)
-    } catch {
-        return @(Get-PASAccountActivity -AccountID $AccountId -useGen1API -ErrorAction Stop)
-    }
-}
+    Write-Log "Requesting CyberArk Identity header for '$IdentityTenantURL' and Privilege Cloud subdomain '$PCloudSubdomain'." 'Cyan'
 
-# -------- FAST-PATH: check account object fields without activity call --------
-function AccountMatchesFast {
-    param([object]$Acct)
+    $identityHeader = Get-IdentityHeader `
+        -IdentityTenantURL $IdentityTenantURL `
+        -psPASFormat `
+        -PCloudSubdomain $PCloudSubdomain `
+        -UPCreds $identityCredential `
+        -ErrorAction Stop
 
-    # Pull only likely fields (cheap). Different tenants may shape these differently.
-    $parts = New-Object System.Collections.Generic.List[string]
+    Use-PASSession $identityHeader
 
-    try { if ($Acct.secretManagement) { $parts.Add(($Acct.secretManagement | Out-String)) } } catch {}
-    try { if ($Acct.secretManagement.lastTask) { $parts.Add(($Acct.secretManagement.lastTask | Out-String)) } } catch {}
-    try { if ($Acct.secretManagement.lastFailedTask) { $parts.Add(($Acct.secretManagement.lastFailedTask | Out-String)) } } catch {}
-    try { if ($Acct.secretManagement.status) { $parts.Add([string]$Acct.secretManagement.status) } } catch {}
-    try { if ($Acct.secretManagement.lastTask.status) { $parts.Add([string]$Acct.secretManagement.lastTask.status) } } catch {}
-    try { if ($Acct.secretManagement.lastTask.reason) { $parts.Add([string]$Acct.secretManagement.lastTask.reason) } } catch {}
-    try { if ($Acct.secretManagement.lastTask.details) { $parts.Add([string]$Acct.secretManagement.lastTask.details) } } catch {}
-    try { if ($Acct.secretManagement.lastTask.error) { $parts.Add([string]$Acct.secretManagement.lastTask.error) } } catch {}
-    try { if ($Acct.secretManagement.lastTask.moreInfo) { $parts.Add([string]$Acct.secretManagement.lastTask.moreInfo) } } catch {}
-
-    if ($parts.Count -eq 0) { return $false }
-
-    $hay = ($parts -join " | ")
-    return ($hay -match $NeedleRegex)
-}
-
-# -------- Narrow which accounts deserve slow-path activity calls --------
-function ShouldScanActivities {
-    param([object]$Acct)
-
-    # If the account doesn't show any hint of failure in secretManagement, skip activity scan.
-    # (This is the biggest performance lever.)
-    try {
-        if ($Acct.secretManagement -and $Acct.secretManagement.status) {
-            return ([string]$Acct.secretManagement.status -match '(?i)fail|error')
-        }
-        if ($Acct.secretManagement -and $Acct.secretManagement.lastTask -and $Acct.secretManagement.lastTask.status) {
-            return ([string]$Acct.secretManagement.lastTask.status -match '(?i)fail|error')
-        }
-    } catch { }
-
-    return $false
-}
-
-# -------- Faster activity match (no ConvertTo-Json) --------
-function ActivityMatchesFast {
-    param($Activity)
-
-    $fields = @()
-    foreach ($n in @("Reason","MoreInfo","Message","Details","Action","Error","Status","Description")) {
-        try {
-            $v = $Activity.$n
-            if ($v) { $fields += [string]$v }
-        } catch {}
+    if (-not (Get-PASSession)) {
+        throw 'psPAS session was not established.'
     }
 
-    if ($fields.Count -eq 0) { return $false }
+    # Remove the clear-text CCP secret from the response object as soon as login completes.
+    try { $response.Content = $null } catch { }
+    $identityCredential = $null
+    $securePassword = $null
 
-    $hay = ($fields -join " | ")
-    return ($hay -match $NeedleRegex)
+    Write-Log 'PAS session established successfully without an interactive prompt.' 'Green'
 }
 
 # =========================
-# MAIN
+# Safe retrieval
+# =========================
+function Get-AllVisibleSafes {
+    [CmdletBinding()]
+    param()
+
+    $parameters = @{}
+
+    # Avoid returning account arrays inside every Safe because the account
+    # inventory is retrieved separately and counted once.
+    if (Test-CommandParameter -CommandName 'Get-PASSafe' -ParameterName 'includeAccounts') {
+        $parameters['includeAccounts'] = $false
+    }
+
+    if (Test-CommandParameter -CommandName 'Get-PASSafe' -ParameterName 'extendedDetails') {
+        $parameters['extendedDetails'] = $true
+    }
+
+    Write-Log 'Calling Get-PASSafe once to retrieve all Safes visible to the session.' 'DarkCyan'
+
+    $rawSafes = Get-PASSafe @parameters -ErrorAction Stop
+    $safeObjects = @(ConvertTo-FlatCollection -InputObject $rawSafes -CollectionPropertyNames @('value', 'Safes'))
+
+    $allSafes = New-Object System.Collections.ArrayList
+    $seenSafeNames = @{}
+
+    foreach ($safe in $safeObjects) {
+        if ($null -eq $safe) { continue }
+
+        $safeName = [string](Get-ObjectPropertyValue -InputObject $safe -PropertyNames @('SafeName', 'safeName', 'Name'))
+        $safeName = $safeName.Trim()
+
+        if ([string]::IsNullOrWhiteSpace($safeName)) {
+            Write-Log 'Skipped a Safe response object because it did not contain SafeName.' 'DarkYellow'
+            continue
+        }
+
+        if (-not $seenSafeNames.ContainsKey($safeName)) {
+            $seenSafeNames[$safeName] = $true
+            [void]$allSafes.Add($safe)
+        }
+    }
+
+    return @($allSafes)
+}
+
+# =========================
+# Account inventory retrieval and Safe counting
+# =========================
+function Get-VisibleAccountSafeCounts {
+    [CmdletBinding()]
+    param(
+        [ValidateRange(1, 1000)]
+        [int]$Limit = 500,
+
+        [ValidateRange(1, 500000)]
+        [int]$MaximumAccounts = 200000
+    )
+
+    $allAccounts = New-Object System.Collections.ArrayList
+    $hasOffset = Test-CommandParameter -CommandName 'Get-PASAccount' -ParameterName 'offset'
+    $hasLimit  = Test-CommandParameter -CommandName 'Get-PASAccount' -ParameterName 'limit'
+    $pagingMode = 'SingleCallUnknown'
+
+    if ($hasLimit -and -not $hasOffset) {
+        # Current psPAS behavior: -limit controls the per-request page size,
+        # and the cmdlet follows the API nextLink until all results are returned.
+        $pagingMode = 'AutomaticNextLink'
+        Write-Log "Calling Get-PASAccount -limit $Limit. psPAS will retrieve all result pages." 'DarkCyan'
+
+        $rawAccounts = Get-PASAccount -limit $Limit -ErrorAction Stop
+        $accountObjects = @(ConvertTo-FlatCollection -InputObject $rawAccounts -CollectionPropertyNames @('value', 'Accounts'))
+
+        foreach ($account in $accountObjects) {
+            [void]$allAccounts.Add($account)
+        }
+    }
+    elseif ($hasLimit -and $hasOffset) {
+        # Compatibility path for older psPAS builds that expose explicit offset.
+        $pagingMode = 'ManualOffset'
+        $offset = 0
+
+        do {
+            Write-Log "Retrieving account inventory page at offset=$offset, limit=$Limit." 'DarkCyan'
+
+            $rawPage = Get-PASAccount -limit $Limit -offset $offset -ErrorAction Stop
+            $page = @(ConvertTo-FlatCollection -InputObject $rawPage -CollectionPropertyNames @('value', 'Accounts'))
+
+            if ($page.Count -eq 0) {
+                break
+            }
+
+            foreach ($account in $page) {
+                [void]$allAccounts.Add($account)
+            }
+
+            Write-Log "Account page returned $($page.Count) object(s); raw account objects collected=$($allAccounts.Count)." 'DarkGray'
+
+            if ($allAccounts.Count -gt $MaximumAccounts) {
+                throw "Raw account inventory exceeded MaxAccountsToInspect=$MaximumAccounts. Increase -MaxAccountsToInspect and run again."
+            }
+
+            if ($page.Count -lt $Limit) {
+                break
+            }
+
+            $offset += $Limit
+        }
+        while ($true)
+    }
+    else {
+        Write-Log 'Get-PASAccount does not expose -limit. Calling it once using the module default behavior.' 'DarkYellow'
+
+        $rawAccounts = Get-PASAccount -ErrorAction Stop
+        $accountObjects = @(ConvertTo-FlatCollection -InputObject $rawAccounts -CollectionPropertyNames @('value', 'Accounts'))
+
+        foreach ($account in $accountObjects) {
+            [void]$allAccounts.Add($account)
+        }
+    }
+
+    Write-Log "Raw account objects returned by Get-PASAccount: $($allAccounts.Count)." 'DarkGray'
+
+    $safeCounts = @{}
+    $seenAccountIds = @{}
+    $totalUniqueAccounts = 0
+    $missingSafeNameCount = 0
+
+    foreach ($account in $allAccounts) {
+        if ($null -eq $account) { continue }
+
+        $accountId = [string](Get-ObjectPropertyValue -InputObject $account -PropertyNames @('id', 'ID', 'AccountID'))
+        $safeName  = [string](Get-ObjectPropertyValue -InputObject $account -PropertyNames @('safeName', 'SafeName'))
+
+        $accountId = $accountId.Trim()
+        $safeName  = $safeName.Trim()
+
+        # Use AccountID when present to guard against duplicate objects.
+        # If no AccountID is returned, build a stable fallback key for this run.
+        if ([string]::IsNullOrWhiteSpace($accountId)) {
+            $accountName = [string](Get-ObjectPropertyValue -InputObject $account -PropertyNames @('name', 'Name'))
+            $userName    = [string](Get-ObjectPropertyValue -InputObject $account -PropertyNames @('userName', 'UserName', 'username'))
+            $address     = [string](Get-ObjectPropertyValue -InputObject $account -PropertyNames @('address', 'Address'))
+            $accountId   = "NOID|$safeName|$accountName|$userName|$address"
+        }
+
+        if ($seenAccountIds.ContainsKey($accountId)) {
+            continue
+        }
+
+        $seenAccountIds[$accountId] = $true
+        $totalUniqueAccounts++
+
+        if ($totalUniqueAccounts -gt $MaximumAccounts) {
+            throw "Account inventory exceeded MaxAccountsToInspect=$MaximumAccounts. Increase -MaxAccountsToInspect and run again. No empty-Safe report was produced because an incomplete account inventory could create false results."
+        }
+
+        if ([string]::IsNullOrWhiteSpace($safeName)) {
+            $missingSafeNameCount++
+            continue
+        }
+
+        if ($safeCounts.ContainsKey($safeName)) {
+            $safeCounts[$safeName] = [int]$safeCounts[$safeName] + 1
+        }
+        else {
+            $safeCounts[$safeName] = 1
+        }
+    }
+
+    return [PSCustomObject]@{
+        SafeCounts           = $safeCounts
+        TotalUniqueAccounts  = $totalUniqueAccounts
+        MissingSafeNameCount = $missingSafeNameCount
+        PagingMode           = $pagingMode
+    }
+}
+
+# =========================
+# Build report row
+# =========================
+function New-EmptySafeReportRow {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        $Safe
+    )
+
+    $safeName = [string](Get-ObjectPropertyValue -InputObject $Safe -PropertyNames @('SafeName', 'safeName', 'Name'))
+    $creationRaw = Get-ObjectPropertyValue -InputObject $Safe -PropertyNames @('CreationTime', 'creationTime', 'CreatedTime')
+    $modifiedRaw = Get-ObjectPropertyValue -InputObject $Safe -PropertyNames @('LastModificationTime', 'lastModificationTime', 'LastModifiedTime')
+
+    $createdOn = Convert-CyberArkDateTime -Value $creationRaw
+    $lastModifiedOn = Convert-CyberArkDateTime -Value $modifiedRaw
+
+    $daysSinceLastModified = $null
+    if ($null -ne $lastModifiedOn) {
+        $daysSinceLastModified = [math]::Floor(((Get-Date) - $lastModifiedOn).TotalDays)
+        if ($daysSinceLastModified -lt 0) {
+            $daysSinceLastModified = 0
+        }
+    }
+
+    return [PSCustomObject][ordered]@{
+        SafeName                  = $safeName.Trim()
+        VisibleAccountCount       = 0
+        Status                    = 'EMPTY - No visible accounts assigned'
+        Description               = Get-ObjectPropertyValue -InputObject $Safe -PropertyNames @('Description', 'description')
+        ManagingCPM               = Get-ObjectPropertyValue -InputObject $Safe -PropertyNames @('ManagingCPM', 'managingCPM')
+        Location                  = Get-ObjectPropertyValue -InputObject $Safe -PropertyNames @('Location', 'location')
+        CreatedOn                 = if ($null -ne $createdOn) { $createdOn.ToString('yyyy-MM-dd HH:mm:ss') } else { $null }
+        LastModifiedOn            = if ($null -ne $lastModifiedOn) { $lastModifiedOn.ToString('yyyy-MM-dd HH:mm:ss') } else { $null }
+        DaysSinceLastModified     = $daysSinceLastModified
+        NumberOfDaysRetention     = Get-ObjectPropertyValue -InputObject $Safe -PropertyNames @('NumberOfDaysRetention', 'numberOfDaysRetention')
+        NumberOfVersionsRetention = Get-ObjectPropertyValue -InputObject $Safe -PropertyNames @('NumberOfVersionsRetention', 'numberOfVersionsRetention')
+        AutoPurgeEnabled          = Get-ObjectPropertyValue -InputObject $Safe -PropertyNames @('AutoPurgeEnabled', 'autoPurgeEnabled')
+        OLACEnabled               = Get-ObjectPropertyValue -InputObject $Safe -PropertyNames @('OLACEnabled', 'olacEnabled')
+        ExpiredMembership         = Get-ObjectPropertyValue -InputObject $Safe -PropertyNames @('isExpiredMember', 'IsExpiredMember')
+    }
+}
+
+# =========================
+# Main
 # =========================
 try {
-    Start-PASSessionFromCCP -ObjectName "cna.com-CA_PAMDiscovery_SVC" -UPUser "CA_PAMDiscovery_SVC"
+    Write-Log '============================================================' 'Cyan'
+    Write-Log 'Dormant/empty CyberArk Safe report starting.' 'Cyan'
+    Write-Log "Safe name filter       : $SafeNameLike" 'White'
+    Write-Log "Excluded name regex    : $(if ([string]::IsNullOrWhiteSpace($ExcludeSafeNameRegex)) { '<none>' } else { $ExcludeSafeNameRegex })" 'White'
+    Write-Log "Page size              : $PageSize" 'White'
+    Write-Log "Maximum account count  : $MaxAccountsToInspect" 'White'
+    Write-Log "CSV output             : $CsvFile" 'White'
+    Write-Log "Log output             : $LogFile" 'White'
 
-    Write-Log "Searching for ALL accounts with disabled-login error (winRc=1331)..." 'Yellow'
-    Write-Log "NeedleRegex: $NeedleRegex" 'DarkYellow'
+    Start-PASSessionFromCCP -ObjectName $CCPObjectName -UPUser $IdentityUser
 
-    # 1) Pull candidates from saved filters (fast)
-    $filtersToTry = @("FailedVerify","FailedChange","FailedReconcile")
+    Write-Log 'Retrieving all visible Safes.' 'Yellow'
+    $allSafes = @(Get-AllVisibleSafes)
 
-    $candidatesList = New-Object System.Collections.Generic.List[object]
-    foreach ($sf in $filtersToTry) {
-        Write-Log "Pulling candidates via savedFilter='$sf' (PageSize=$PageSize)..." 'Cyan'
-        $page = Get-AccountsPaged -SavedFilter $sf -Limit $PageSize
-        Write-Log "savedFilter '$sf' returned $($page.Count) account(s)." 'Green'
-        foreach ($a in $page) { $candidatesList.Add($a) }
+    if ($allSafes.Count -eq 0) {
+        throw 'No Safes were returned. Confirm the API identity has permission to list Safes.'
     }
 
-    $candidates = @($candidatesList | Group-Object id | ForEach-Object { $_.Group | Select-Object -First 1 })
+    Write-Log "Visible unique Safes retrieved: $($allSafes.Count)." 'Green'
 
-    # 2) Optional inventory fallback (slow for huge tenants)
-    if ($candidates.Count -eq 0 -and -not $SkipInventoryFallback) {
-        Write-Log "SavedFilters returned 0. Falling back to inventory paging..." 'Yellow'
-        $candidates = @(Get-AccountsPaged -SavedFilter $null -Limit $PageSize)
-        Write-Log "Inventory paging returned $($candidates.Count) account(s) (cap=$MaxAccountsToInspect)." 'Green'
-    } elseif ($candidates.Count -eq 0) {
-        Write-Log "SavedFilters returned 0 and -SkipInventoryFallback set. Exiting." 'Yellow'
-        exit 0
-    } else {
-        Write-Log "Total unique candidates from saved filters: $($candidates.Count)" 'Yellow'
+    Write-Log 'Retrieving the visible account inventory once and counting accounts by Safe.' 'Yellow'
+    $accountInventory = Get-VisibleAccountSafeCounts -Limit $PageSize -MaximumAccounts $MaxAccountsToInspect
+
+    Write-Log "Visible unique accounts retrieved: $($accountInventory.TotalUniqueAccounts)." 'Green'
+    Write-Log "Safes represented in account inventory: $($accountInventory.SafeCounts.Count)." 'Green'
+
+    if ($accountInventory.MissingSafeNameCount -gt 0) {
+        Write-Log "$($accountInventory.MissingSafeNameCount) account object(s) did not contain SafeName and could not be mapped." 'DarkYellow'
     }
 
-    $results = New-Object System.Collections.Generic.List[object]
-    $toActivityScan = New-Object System.Collections.Generic.List[object]
+    Write-Log "Account retrieval mode: $($accountInventory.PagingMode)." 'DarkGray'
 
-    $inspected = 0
-    $fastHits  = 0
-    $queuedForActivity = 0
+    if ($accountInventory.PagingMode -eq 'SingleCallUnknown') {
+        Write-Log 'WARNING: Get-PASAccount did not expose -limit or -offset. Confirm the installed psPAS version returns the complete inventory in one call.' 'Yellow'
+    }
 
-    # 3) First pass: FAST PATH (no activity calls)
-    foreach ($acct in $candidates) {
-        $inspected++
-        if ($inspected -gt $MaxAccountsToInspect) {
-            Write-Log "Safety stop: inspected $MaxAccountsToInspect accounts." 'Yellow'
-            break
-        }
+    $results = New-Object System.Collections.ArrayList
+    $filteredSafeCount = 0
 
-        if ($inspected % 500 -eq 0) {
-            Write-Log "Progress (pass1): inspected $inspected / $($candidates.Count). FastHits=$fastHits, QueuedForActivity=$queuedForActivity" 'DarkGray'
-        }
+    foreach ($safe in $allSafes) {
+        $safeName = [string](Get-ObjectPropertyValue -InputObject $safe -PropertyNames @('SafeName', 'safeName', 'Name'))
+        $safeName = $safeName.Trim()
 
-        if (AccountMatchesFast -Acct $acct) {
-            $fastHits++
-
-            $row = [PSCustomObject]@{
-                AccountID  = $acct.id
-                SafeName   = $acct.safeName
-                Name       = $acct.name
-                UserName   = $acct.userName
-                Address    = $acct.address
-                PlatformId = $acct.platformId
-            }
-
-            $results.Add($row) | Out-Null
-            Write-Log ("✅ FAST MATCH: AccountID={0} Safe={1} User={2} Address={3} Platform={4}" -f `
-                $row.AccountID, $row.SafeName, $row.UserName, $row.Address, $row.PlatformId) 'Green'
+        if ([string]::IsNullOrWhiteSpace($safeName)) {
             continue
         }
 
-        if (ShouldScanActivities -Acct $acct) {
-            $queuedForActivity++
-            $toActivityScan.Add($acct) | Out-Null
-        }
-    }
-
-    Write-Log "Pass1 complete. FastHits=$fastHits. ActivityScanQueue=$($toActivityScan.Count)." 'Yellow'
-
-    # 4) Second pass: SLOW PATH (activity calls ONLY for failure-like accounts)
-    $scanned = 0
-    foreach ($acct in $toActivityScan) {
-        $scanned++
-
-        if ($scanned % 250 -eq 0) {
-            Write-Log "Progress (pass2): scanned $scanned / $($toActivityScan.Count) activity-eligible accounts. TotalMatches=$($results.Count)" 'DarkGray'
-        }
-
-        # Avoid re-checking accounts already in results (in case of duplicates)
-        if ($results.Where({ $_.AccountID -eq $acct.id }).Count -gt 0) { continue }
-
-        $acts = @()
-        try { $acts = Get-ActivitiesSafe -AccountId $acct.id }
-        catch {
-            Write-Log ("⚠️ Could not read activities for AccountID={0}: {1}" -f $acct.id, $_.Exception.Message) 'DarkYellow'
+        if ($safeName -notlike $SafeNameLike) {
             continue
         }
 
-        $matched = $false
-        foreach ($act in ($acts | Select-Object -First $MaxActivitiesToInspect)) {
-            if (ActivityMatchesFast -Activity $act) { $matched = $true; break }
+        if (-not [string]::IsNullOrWhiteSpace($ExcludeSafeNameRegex) -and $safeName -match $ExcludeSafeNameRegex) {
+            continue
         }
 
-        if (-not $matched) { continue }
+        $filteredSafeCount++
 
-        $row = [PSCustomObject]@{
-            AccountID  = $acct.id
-            SafeName   = $acct.safeName
-            Name       = $acct.name
-            UserName   = $acct.userName
-            Address    = $acct.address
-            PlatformId = $acct.platformId
+        if ($accountInventory.SafeCounts.ContainsKey($safeName)) {
+            continue
         }
 
-        $results.Add($row) | Out-Null
-        Write-Log ("✅ ACTIVITY MATCH: AccountID={0} Safe={1} User={2} Address={3} Platform={4}" -f `
-            $row.AccountID, $row.SafeName, $row.UserName, $row.Address, $row.PlatformId) 'Green'
+        $row = New-EmptySafeReportRow -Safe $safe
+        [void]$results.Add($row)
+        Write-Log "EMPTY SAFE: $safeName" 'Green'
     }
 
-    # 5) Export
+    Write-Log "Safes evaluated after name filters: $filteredSafeCount." 'Yellow'
+    Write-Log "Safes with zero visible accounts: $($results.Count)." 'Yellow'
+
+    $columnNames = @(
+        'SafeName',
+        'VisibleAccountCount',
+        'Status',
+        'Description',
+        'ManagingCPM',
+        'Location',
+        'CreatedOn',
+        'LastModifiedOn',
+        'DaysSinceLastModified',
+        'NumberOfDaysRetention',
+        'NumberOfVersionsRetention',
+        'AutoPurgeEnabled',
+        'OLACEnabled',
+        'ExpiredMembership'
+    )
+
     if ($results.Count -gt 0) {
         $results |
-            Sort-Object SafeName, Address, UserName |
-            Export-Csv -Path $CsvFile -NoTypeInformation -Encoding UTF8
-        Write-Log "✅ Exported $($results.Count) matching account(s) to: $CsvFile" 'Green'
-    } else {
-        Write-Log "No matching accounts found." 'Yellow'
-        @([PSCustomObject]@{AccountID="";SafeName="";Name="";UserName="";Address="";PlatformId=""}) |
-            Export-Csv -Path $CsvFile -NoTypeInformation -Encoding UTF8
+            Sort-Object SafeName |
+            Select-Object $columnNames |
+            Export-Csv -LiteralPath $CsvFile -NoTypeInformation -Encoding UTF8
+
+        Write-Log "Exported $($results.Count) empty Safe(s) to: $CsvFile" 'Green'
+    }
+    else {
+        # Create a header-only CSV when no empty Safes are found.
+        Set-Content -LiteralPath $CsvFile -Value ($columnNames -join ',') -Encoding UTF8
+        Write-Log "No empty Safes were found. A header-only CSV was created at: $CsvFile" 'Green'
     }
 
-} finally {
-    try { Close-PASSession | Out-Null } catch {}
-    Write-Log "Done." 'Green'
+    Write-Log 'Important: "empty" means no account was visible to this API identity for the Safe.' 'DarkYellow'
+}
+catch {
+    Write-Log "FATAL: $($_.Exception.Message)" 'Red'
+    throw
+}
+finally {
+    try {
+        if (Get-PASSession -ErrorAction SilentlyContinue) {
+            Close-PASSession | Out-Null
+            Write-Log 'Logged off from Privilege Cloud.' 'Green'
+        }
+    }
+    catch {
+        Write-Log "Logoff warning: $($_.Exception.Message)" 'DarkYellow'
+    }
+
+    Write-Log 'Dormant/empty CyberArk Safe report finished.' 'Cyan'
+    Write-Log '============================================================' 'Cyan'
 }
