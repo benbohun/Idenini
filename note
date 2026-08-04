@@ -1,9 +1,3 @@
-As part of the remediation to birth discovered service account to their matching safes, we have an attribute called mtbAppCode.
-The identified APPcode should be fielded in this attribute
-example is account is SVCWPA when birthing the account, populate the mtbAppCode attribute with WPA
-
-Update the script below to reflect that
-
 <#
 .SYNOPSIS
     Remediates CyberArk discovered SVC service accounts into app-code mapped AMNG Safes.
@@ -38,7 +32,7 @@ Update the script below to reflect that
       - Reads accounts from the discovery Safe only.
       - Processes accounts where username matches SVC + 3-letter app code.
       - If target account already exists in the mapped Safe, deletes the discovery copy.
-      - If target account does not exist, creates it in the mapped Safe on the STATIC platform, then deletes discovery copy.
+      - If target account does not exist, creates it in the mapped Safe on the DISC platform, then deletes discovery copy.
       - If the source secret is not retrievable, still creates the target account using a generated placeholder secret.
       - Maintains the DISC platform on the newly created target account by default.
       - Target Automatic Password Management is disabled by default to prevent immediate CPM action.
@@ -72,6 +66,13 @@ param(
     [string]$TargetSafeFormat = 'AP-{0}-NP-C1-AMNG',
 
     [string]$ServiceAccountRegex = '^SVC(?<AppCode>[A-Za-z]{3})',
+
+    # Platform account property populated during target-account birth.
+    # Example: SVCWPA -> mtbAppCode=WPA.
+    [string]$AppCodePlatformPropertyName = 'mtbAppCode',
+
+    # Set to false only if you need to temporarily disable mtbAppCode population.
+    [bool]$PopulateAppCodePlatformProperty = $true,
 
     [ValidateSet('UsernameAndAddress','UsernameOnly')]
     [string]$ExistingMatchMode = 'UsernameAndAddress',
@@ -693,9 +694,14 @@ function Remove-CpmTaskProperties {
 }
 
 function New-TargetAccountBody {
-    param([object]$SourceAccount, [string]$TargetSafe, [string]$Secret)
+    param([object]$SourceAccount, [string]$TargetSafe, [string]$Secret, [string]$AppCode)
     $props = ConvertTo-HashtableFromObject -Object $SourceAccount.platformAccountProperties
     Remove-CpmTaskProperties -Properties $props
+
+    if ($PopulateAppCodePlatformProperty -and -not (Test-BlankValue $AppCodePlatformPropertyName) -and -not (Test-BlankValue $AppCode)) {
+        $props[$AppCodePlatformPropertyName] = $AppCode.ToUpperInvariant()
+    }
+
     $name = Get-AccountField -Account $SourceAccount -Names @('name','Name')
     $address = Get-AccountField -Account $SourceAccount -Names @('address','Address')
     $userName = Get-AccountField -Account $SourceAccount -Names @('userName','username','UserName')
@@ -720,10 +726,10 @@ function New-TargetAccountBody {
 }
 
 function New-TargetAccount {
-    param([object]$SourceAccount, [string]$TargetSafe, [string]$Token)
+    param([object]$SourceAccount, [string]$TargetSafe, [string]$Token, [string]$AppCode)
     $secretChoice = Get-AccountSecretForCreate -SourceAccount $SourceAccount -Token $Token
     if (Test-BlankValue $secretChoice.Secret) { throw 'Selected create secret is blank. Target account was not created.' }
-    $body = New-TargetAccountBody -SourceAccount $SourceAccount -TargetSafe $TargetSafe -Secret $secretChoice.Secret
+    $body = New-TargetAccountBody -SourceAccount $SourceAccount -TargetSafe $TargetSafe -Secret $secretChoice.Secret -AppCode $AppCode
     $created = Invoke-CyberArkRest -Method POST -Path 'Accounts?AllowAccountDuplications=false' -Token $Token -Body $body
     return [pscustomobject]@{ Account = $created; SecretSource = $secretChoice.SecretSource; SecretNote = $secretChoice.SecretNote }
 }
@@ -748,7 +754,7 @@ function Invoke-OneAccountRemediation {
     param([object]$CandidateAccount, [int]$RowNumber, [string]$Token)
     $sourceId = Get-AccountField -Account $CandidateAccount -Names @('id','ID','accountId','AccountID')
     $result = [ordered]@{
-        Row = $RowNumber; SourceAccountID = $sourceId; SourceSafe = $SourceSafe; SourcePlatform = ''; SourceName = ''; UserName = ''; Address = ''; AppCode = ''; TargetSafe = ''; TargetPlatform = $TargetPlatformId; ExistingTargetCount = 0; ExistingTargetAccountIDs = ''; NewAccountID = ''; SecretSource = ''; SecretNote = ''; DiscoveryDeleted = 'No'; Action = ''; Result = ''; Message = ''
+        Row = $RowNumber; SourceAccountID = $sourceId; SourceSafe = $SourceSafe; SourcePlatform = ''; SourceName = ''; UserName = ''; Address = ''; AppCode = ''; AppCodePropertyName = $AppCodePlatformPropertyName; AppCodePropertyValue = ''; TargetSafe = ''; TargetPlatform = $TargetPlatformId; ExistingTargetCount = 0; ExistingTargetAccountIDs = ''; NewAccountID = ''; SecretSource = ''; SecretNote = ''; DiscoveryDeleted = 'No'; Action = ''; Result = ''; Message = ''
     }
     try {
         if (Test-BlankValue $sourceId) { throw 'Account list item did not include Account ID.' }
@@ -765,6 +771,9 @@ function Invoke-OneAccountRemediation {
             $result.Action = 'Skip'; $result.Result = 'SKIPPED_NOT_SVC_APPCODE'; $result.Message = "Username '$($result.UserName)' does not match pattern '$ServiceAccountRegex'."; return [pscustomobject]$result
         }
         $result.AppCode = $appCode
+        if ($PopulateAppCodePlatformProperty -and -not (Test-BlankValue $AppCodePlatformPropertyName)) {
+            $result.AppCodePropertyValue = $appCode
+        }
         $targetSafe = Get-TargetSafeName -AppCode $appCode
         $result.TargetSafe = $targetSafe
         if (-not (Test-SafeExists -SafeName $targetSafe -Token $Token)) {
@@ -777,12 +786,12 @@ function Invoke-OneAccountRemediation {
             Remove-AccountById -AccountId $sourceId -Token $Token
             $result.Action = 'DeleteDiscoveryExistingTarget'; $result.Result = 'EXISTING_TARGET_DELETED_DISCOVERY'; $result.DiscoveryDeleted = 'Yes'; $result.Message = "Matching target account already exists in '$targetSafe'. Deleted discovery copy."; return [pscustomobject]$result
         }
-        $newAccountResult = New-TargetAccount -SourceAccount $source -TargetSafe $targetSafe -Token $Token
+        $newAccountResult = New-TargetAccount -SourceAccount $source -TargetSafe $targetSafe -Token $Token -AppCode $appCode
         $newAccount = $newAccountResult.Account
         $newAccountId = Get-AccountField -Account $newAccount -Names @('id','ID','accountId','AccountID')
         if (Test-BlankValue $newAccountId -and $null -ne $newAccount.id) { $newAccountId = [string]$newAccount.id }
         Remove-AccountById -AccountId $sourceId -Token $Token
-        $result.Action = 'CreateTargetDeleteDiscovery'; $result.Result = 'CREATED_AND_DELETED_DISCOVERY'; $result.NewAccountID = $newAccountId; $result.SecretSource = $newAccountResult.SecretSource; $result.SecretNote = $newAccountResult.SecretNote; $result.DiscoveryDeleted = 'Yes'; $result.Message = "Created target account in '$targetSafe' on '$TargetPlatformId', then deleted discovery copy. TargetAutomaticManagementEnabled=$TargetAutomaticManagementEnabled SecretSource=$($newAccountResult.SecretSource). $($newAccountResult.SecretNote)"; return [pscustomobject]$result
+        $result.Action = 'CreateTargetDeleteDiscovery'; $result.Result = 'CREATED_AND_DELETED_DISCOVERY'; $result.NewAccountID = $newAccountId; $result.SecretSource = $newAccountResult.SecretSource; $result.SecretNote = $newAccountResult.SecretNote; $result.DiscoveryDeleted = 'Yes'; $result.Message = "Created target account in '$targetSafe' on '$TargetPlatformId', then deleted discovery copy. TargetAutomaticManagementEnabled=$TargetAutomaticManagementEnabled $AppCodePlatformPropertyName=$appCode SecretSource=$($newAccountResult.SecretSource). $($newAccountResult.SecretNote)"; return [pscustomobject]$result
     }
     catch {
         $result.Action = 'Error'; $result.Result = 'FAILED'; $result.Message = $_.Exception.Message; return [pscustomobject]$result
@@ -794,7 +803,7 @@ function Start-DiscoverySvcRemediation {
     Import-RunConfig
     if ($ConfirmRun -ne 'YES') { throw "This script has no preview mode. Re-run with -ConfirmRun YES after confirming SourceSafe='$SourceSafe', SourcePlatform='$SourcePlatformId', TargetPlatform='$TargetPlatformId', TargetSafeFormat='$TargetSafeFormat'." }
     Write-RunLog 'Start-DiscoverySvcRemediation' 'LIVE MODE ENABLED. No preview and no per-account prompt will be used.' 'WARN'
-    Write-RunLog 'Start-DiscoverySvcRemediation' "SourceSafe=$SourceSafe SourcePlatform=$SourcePlatformId TargetPlatform=$TargetPlatformId TargetSafeFormat=$TargetSafeFormat ExistingMatchMode=$ExistingMatchMode TargetAutomaticManagementEnabled=$TargetAutomaticManagementEnabled UseGeneratedPlaceholderSecretWhenSourceSecretMissing=$UseGeneratedPlaceholderSecretWhenSourceSecretMissing" 'INFO'
+    Write-RunLog 'Start-DiscoverySvcRemediation' "SourceSafe=$SourceSafe SourcePlatform=$SourcePlatformId TargetPlatform=$TargetPlatformId TargetSafeFormat=$TargetSafeFormat ExistingMatchMode=$ExistingMatchMode TargetAutomaticManagementEnabled=$TargetAutomaticManagementEnabled UseGeneratedPlaceholderSecretWhenSourceSecretMissing=$UseGeneratedPlaceholderSecretWhenSourceSecretMissing PopulateAppCodePlatformProperty=$PopulateAppCodePlatformProperty AppCodePlatformPropertyName=$AppCodePlatformPropertyName" 'INFO'
     $token = Get-IdentityBearerToken
     if (-not (Test-SafeExists -SafeName $SourceSafe -Token $token)) { throw "Source discovery Safe '$SourceSafe' was not found or API user cannot access it." }
     Write-RunLog 'Start-DiscoverySvcRemediation' "Loading source candidates from discovery Safe '$SourceSafe' using search text 'SVC'." 'INFO'
