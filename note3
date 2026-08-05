@@ -22,6 +22,10 @@
 
     Default behavior is REPORT ONLY. Use -Execute to send the PUT request.
 
+    When no SWS token or token-helper parameters are supplied, the script prompts
+    immediately for an authentication method. The regular Identity user login is
+    not reused because the SWS public API requires an SWS service account.
+
 .EXAMPLE
     .\Test-Clone-SwsApplicationConfiguration.ps1 `
         -TargetApplicationName 'svc-gcp-app-001' `
@@ -53,6 +57,10 @@
 param(
     [string]$SourceIdentityAppKey = '3c696971-5812-430a-88b1-417c6be2628f',
 
+    # Same Identity tenant used by the original provisioning script.
+    # This value is logged for traceability; SWS API authentication is separate.
+    [string]$IdentityApiTenantURL = 'https://aat4012.id.cyberark.cloud',
+
     [string]$TargetIdentityAppKey = '',
     [string]$TargetApplicationName = '',
 
@@ -60,7 +68,7 @@ param(
     # ApplicationName, TargetApplicationName, Name, or AppName.
     # Optional target-key columns:
     # IdentityAppKey, TargetIdentityAppKey, or AppKey.
-    [string]$CsvPath = '',
+    [string]$CsvPath = 'E:\Installation Media\Script\OnboardScript\SWS_Application_Script\data\SWS_Target_Applications_Sample.csv',
     [switch]$CreateSampleCsv,
     [switch]$StopOnFirstFailure,
 
@@ -299,6 +307,116 @@ function Convert-SecureStringToPlainText {
     }
 }
 
+function Select-InputFile {
+    param(
+        [Parameter(Mandatory)][string]$Title,
+        [Parameter(Mandatory)][string]$Filter,
+        [string]$InitialDirectory = ''
+    )
+
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        $dialog = New-Object System.Windows.Forms.OpenFileDialog
+        $dialog.Title = $Title
+        $dialog.Filter = $Filter
+        $dialog.Multiselect = $false
+        $dialog.CheckFileExists = $true
+        if (-not [string]::IsNullOrWhiteSpace($InitialDirectory) -and (Test-Path -LiteralPath $InitialDirectory)) {
+            $dialog.InitialDirectory = $InitialDirectory
+        }
+
+        $result = $dialog.ShowDialog()
+        if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
+            return $dialog.FileName
+        }
+    }
+    catch {
+        Write-Log ("File-selection dialog was unavailable: {0}" -f $_.Exception.Message) 'WARN'
+    }
+
+    return (Read-Host $Title)
+}
+
+function Resolve-TargetCsvPath {
+    if (-not [string]::IsNullOrWhiteSpace($CsvPath) -and (Test-Path -LiteralPath $CsvPath)) {
+        return
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($CsvPath)) {
+        Write-Log ("Configured CSV file was not found: {0}" -f $CsvPath) 'WARN'
+    }
+
+    $initialDirectory = 'E:\Installation Media\Script\OnboardScript\SWS_Application_Script\data'
+    $selected = Select-InputFile `
+        -Title 'Select the CSV containing the already provisioned Identity applications' `
+        -Filter 'CSV files (*.csv)|*.csv|All files (*.*)|*.*' `
+        -InitialDirectory $initialDirectory
+
+    if ([string]::IsNullOrWhiteSpace($selected) -or -not (Test-Path -LiteralPath $selected)) {
+        throw 'A valid target application CSV file is required.'
+    }
+
+    $script:CsvPath = $selected
+}
+
+function Initialize-SwsAuthenticationPrompt {
+    if (-not [string]::IsNullOrWhiteSpace($SwsAccessToken)) {
+        return
+    }
+
+    $helperReady = -not [string]::IsNullOrWhiteSpace($SwsTenantId) -and
+                   -not [string]::IsNullOrWhiteSpace($TokenHelperJarPath) -and
+                   -not [string]::IsNullOrWhiteSpace($SwsServiceAccountSecretPath)
+    if ($helperReady) {
+        return
+    }
+
+    Write-Host ''
+    Write-Host 'SWS API authentication' -ForegroundColor Cyan
+    Write-Host 'The regular Identity username/password login used by the provisioning script cannot authenticate the SWS public API.' -ForegroundColor Yellow
+    Write-Host 'Choose how this test should authenticate to SWS:' -ForegroundColor White
+    Write-Host '  [1] Paste a current SWS service-account access token' -ForegroundColor White
+    Write-Host '  [2] Generate a token with the CyberArk public API token-helper JAR' -ForegroundColor White
+
+    $choice = Read-Host 'Selection [1]'
+    if ([string]::IsNullOrWhiteSpace($choice)) { $choice = '1' }
+
+    switch ($choice.Trim()) {
+        '2' {
+            if ([string]::IsNullOrWhiteSpace($SwsTenantId)) {
+                $script:SwsTenantId = Read-Host 'Enter the SWS tenant ID (the hexadecimal tenant ID, not aat4012.id.cyberark.cloud)'
+            }
+            if ([string]::IsNullOrWhiteSpace($SwsTenantId)) {
+                throw 'SwsTenantId is required when using the CyberArk token helper.'
+            }
+
+            if ([string]::IsNullOrWhiteSpace($TokenHelperJarPath) -or -not (Test-Path -LiteralPath $TokenHelperJarPath)) {
+                $selectedJar = Select-InputFile `
+                    -Title 'Select public-api-auth-helper-0.0.1-SNAPSHOT-application.jar' `
+                    -Filter 'Java archive (*.jar)|*.jar|All files (*.*)|*.*'
+                if ([string]::IsNullOrWhiteSpace($selectedJar) -or -not (Test-Path -LiteralPath $selectedJar)) {
+                    throw 'A valid CyberArk public API token-helper JAR is required.'
+                }
+                $script:TokenHelperJarPath = $selectedJar
+            }
+
+            if ([string]::IsNullOrWhiteSpace($SwsServiceAccountSecretPath) -or -not (Test-Path -LiteralPath $SwsServiceAccountSecretPath)) {
+                $selectedSecret = Select-InputFile `
+                    -Title 'Select the SWS service-account JSON secret file' `
+                    -Filter 'JSON files (*.json)|*.json|All files (*.*)|*.*'
+                if ([string]::IsNullOrWhiteSpace($selectedSecret) -or -not (Test-Path -LiteralPath $selectedSecret)) {
+                    throw 'A valid SWS service-account JSON secret file is required.'
+                }
+                $script:SwsServiceAccountSecretPath = $selectedSecret
+            }
+        }
+        '1' { }
+        default {
+            throw ("Unsupported authentication selection '{0}'. Choose 1 or 2." -f $choice)
+        }
+    }
+}
+
 function ConvertTo-JsonDeep {
     param([Parameter()][object]$InputObject)
     if ($null -eq $InputObject) { return 'null' }
@@ -502,6 +620,7 @@ function Get-SwsTokenValue {
 
     Write-Host ''
     Write-Host 'Paste a current SWS service-account access token.' -ForegroundColor Yellow
+    Write-Host 'The token is read securely and is never written to the log or report.' -ForegroundColor Gray
     $secureToken = Read-Host 'SWS access token' -AsSecureString
     $plainToken = Convert-SecureStringToPlainText -SecureString $secureToken
 
@@ -1552,6 +1671,7 @@ try {
     Write-Log 'CyberArk SWS application-configuration clone test starting.' 'INFO'
     Write-Log ("Execution mode       : {0}" -f $(if ($Execute) { 'EXECUTE' } else { 'REPORT ONLY' })) 'INFO'
     Write-Log ("Source Identity key  : {0}" -f $SourceIdentityAppKey) 'INFO'
+    Write-Log ("Identity tenant URL   : {0}" -f $IdentityApiTenantURL) 'INFO'
     Write-Log ("CSV path             : {0}" -f $(if ([string]::IsNullOrWhiteSpace($CsvPath)) { '<not supplied>' } else { $CsvPath })) 'INFO'
     Write-Log ("Single target key    : {0}" -f $(if ([string]::IsNullOrWhiteSpace($TargetIdentityAppKey)) { '<not supplied>' } else { $TargetIdentityAppKey })) 'INFO'
     Write-Log ("Single target name   : {0}" -f $(if ([string]::IsNullOrWhiteSpace($TargetApplicationName)) { '<not supplied>' } else { $TargetApplicationName })) 'INFO'
@@ -1572,6 +1692,7 @@ try {
         return
     }
 
+    Resolve-TargetCsvPath
     $targetRows = @(Get-TargetRows)
     Write-Log ("Resolved {0} target application row(s)." -f $targetRows.Count) 'SUCCESS'
     Add-SummaryRow -Step 'Resolve Targets' -Status 'SUCCESS' -Detail ("TargetCount={0}; CsvPath={1}" -f $targetRows.Count, $CsvPath)
@@ -1580,6 +1701,10 @@ try {
         $SwsApiRoot = Get-DataCenterApiRoot -Code $DataCenter
     }
     Write-Log ("SWS API root         : {0}" -f $SwsApiRoot) 'INFO'
+
+    Initialize-SwsAuthenticationPrompt
+    $script:SwsToken = Get-SwsTokenValue
+    Add-SummaryRow -Step 'SWS Authentication' -Status 'SUCCESS' -Detail 'Access token initialized. Token value was not logged.'
 
     $postmanJsonPath = Get-OfficialPostmanCollectionJsonPath -RequestedPath $PostmanCollectionPath
     Write-Log ("Using Postman JSON   : {0}" -f $postmanJsonPath) 'SUCCESS'
@@ -1597,9 +1722,6 @@ try {
     $script:PostmanRequests = @(Get-PostmanRequestRows -Items @($collectionItems))
     Select-SwsPostmanRequests -Requests $script:PostmanRequests
     Add-SummaryRow -Step 'Postman Collection' -Status 'SUCCESS' -Detail ("List={0}; Detail={1}; PutConfig={2}" -f $script:ListPoliciesRequest.Name, $script:GetPolicyRequest.Name, $script:PutApplicationConfigurationRequest.Name)
-
-    $script:SwsToken = Get-SwsTokenValue
-    Add-SummaryRow -Step 'SWS Authentication' -Status 'SUCCESS' -Detail 'Access token initialized. Token value was not logged.'
 
     Write-Log 'Retrieving SWS policies and locating source policy.' 'INFO'
     $initialList = Get-PolicyListResponse
