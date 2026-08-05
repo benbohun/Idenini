@@ -1,227 +1,189 @@
-
 <#
-CNA_Create_And_Update_Identity_WebApp_Reauth_CsvBatch.ps1
+.SYNOPSIS
+    Copies Secure Web Sessions (SWS) application detection and URL/domain
+    inclusion/exclusion settings from an existing SWS policy to another policy.
 
-Purpose
-- Prompt for regular CyberArk Identity credential once
-- Read applications to create from a CSV file
-- Create each app from GenericBrowserExtensionScript
-- Dynamically set app Description to:
-  This GCP Application is managed by Service Account ("ApplicationName")
-- Wait 15 seconds by default after each app create before the update phase
-- Re-establish CyberArk Identity session for each app update phase
-- Update the newly created app using the returned _RowKey
-- Apply non-script settings and the Browser Extension (advanced) login workflow
-- Finish create + wait + reauth + update for the current app before starting the next app
-- No PAS validation
-- No psPAS dependency
+.DESCRIPTION
+    PowerShell 5.1-compatible test utility.
 
-CSV format
-- Required column: ApplicationName
-- Also accepted for the name column: Name or AppName
-- Optional columns: DisplayName, Description
-- If DisplayName is blank, it defaults to ApplicationName
-- If Description is blank, it defaults to:
-  This GCP Application is managed by Service Account ("ApplicationName")
+    This script does NOT change the CyberArk Identity application definition.
+    It works only with the SWS public API and intentionally copies only the
+    application-detection and URL/domain matching or exclusion configuration.
 
-Sample CSV
-ApplicationName
-svc-gcp-app-001
-svc-gcp-app-002
+    The source policy is located by Identity application key. The target policy
+    can be located by its Identity application key or application/policy name.
+
+    To reduce dependency on hard-coded Edge API paths and request-body fields,
+    the script downloads or reads CyberArk's official SWS Postman collection and
+    discovers the following requests from the collection:
+      - GET SWS policies
+      - GET policy by ID
+      - PUT policy application configuration
+
+    Default behavior is REPORT ONLY. Use -Execute to send the PUT request.
+
+.EXAMPLE
+    .\Test-Clone-SwsApplicationConfiguration.ps1 `
+        -TargetApplicationName 'svc-gcp-app-001' `
+        -SwsTenantId '<SWS tenant ID>' `
+        -TokenHelperJarPath 'C:\Tools\public-api-auth-helper-0.0.1-SNAPSHOT-application.jar' `
+        -SwsServiceAccountSecretPath 'C:\Secure\sws-service-account.json'
+
+    Builds and exports the proposed payload but does not update SWS.
+
+.EXAMPLE
+    .\Test-Clone-SwsApplicationConfiguration.ps1 `
+        -TargetApplicationName 'svc-gcp-app-001' `
+        -SwsTenantId '<SWS tenant ID>' `
+        -TokenHelperJarPath 'C:\Tools\public-api-auth-helper-0.0.1-SNAPSHOT-application.jar' `
+        -SwsServiceAccountSecretPath 'C:\Secure\sws-service-account.json' `
+        -Execute
+
+    Copies the SWS detection and URL exemption settings and then verifies them.
+
+.NOTES
+    Source Identity app key default:
+    3c696971-5812-430a-88b1-417c6be2628f
+
+    The SWS v2-edge API is subject to change. This script therefore derives the
+    request URLs and payload shape from the current official Postman collection.
 #>
 
 [CmdletBinding()]
 param(
-    [string]$IdentityApiTenantURL      = 'https://aat4012.id.cyberark.cloud',
+    [string]$SourceIdentityAppKey = '3c696971-5812-430a-88b1-417c6be2628f',
 
-    [string]$RegularUserName           = '',
-    [string]$RegularUserPassword       = '',
+    [string]$TargetIdentityAppKey = '',
+    [string]$TargetApplicationName = '',
 
-    # CSV input
-    [string]$CsvPath                   = 'E:\Installation Media\Script\OnboardScript\data\GCPAccountSample.csv',
+    # Optional batch input. Accepted target-name columns:
+    # ApplicationName, TargetApplicationName, Name, or AppName.
+    # Optional target-key columns:
+    # IdentityAppKey, TargetIdentityAppKey, or AppKey.
+    [string]$CsvPath = '',
     [switch]$CreateSampleCsv,
     [switch]$StopOnFirstFailure,
 
-    # Create
-    [string]$TemplateId                = 'GenericBrowserExtensionScript',
+    [ValidateSet('US','EU','CA','AU','UK','IN','SG','AE','IL','IT','ID','JP')]
+    [string]$DataCenter = 'US',
 
-    # App settings
-    [string]$Name                      = 'g-test-pam1',
-    [string]$DisplayName               = 'GCP - Okta Prod',
-    [string]$Category                  = '_I18N_AppCategory_Other',
-    [string]$DefaultAuthProfile        = 'AlwaysAllowed',
-    [string]$DefaultAuthProfileUuid    = 'AlwaysAllowed',
-    [bool]$OnPrem                      = $true,
-    [bool]$IsSwsEnabled                = $true,
-    [bool]$ShowRegistration            = $false,
-    [string]$AdminTag                  = '_I18N_AppCategory_Other',
-    [string]$UserNameStrategy          = 'SetByUser',
-    [bool]$FormFillingEnabled          = $true,
-    [bool]$Generic                     = $true,
-    [string]$AppType                   = 'Web',
-    [string]$Description               = '_I18N_AppDesc_Generic_BE_Script',
-    [string]$IconUri                   = '/vfslow/lib/application/icons/GenericBrowserExtension.svg',
-    [string]$WebAppType                = 'UsernamePassword',
-    [string]$TemplateName              = 'GenericBrowserExtensionScript',
-    [string]$Notes                     = '',
-    [bool]$LocalizationEnabled         = $false,
-    [string]$WebUPAppType              = 'BrowserExtensionScript',
-    [bool]$NotSelfService              = $true,
+    # Optional override. Examples:
+    # US: https://api.alero.io
+    # EU: https://api.alero.eu
+    [string]$SwsApiRoot = '',
 
-    # Advanced Browser Extension workflow
-    [string]$AdvancedScript            = @'
-loginData.applicationUrl = "https://cna.okta.com/login/default";
-loginData.addField("username", "input#input44", LoginUsername + "@cna.com");
-loginData.addField("password", "input#input77", LoginPassword);
-loginData.formPattern = "form";
-loginData.globalSelectorTimeout = 10000;
-loginData.order = [
-  ["fill", "username"],
-  ["click", "input[type='submit'][value='Next']"],
-  ["waitForNewPage"],
-  ["sleep", 1000],
-  ["fill", "password"],
-  ["click", "input[type='submit'][value='Verify']"]
-];
-'@,
+    # Authentication option 1: supply an access token directly.
+    [string]$SwsAccessToken = '',
 
-    # Timing / retries
-    [int]$PreUpdateDelaySeconds        = 15,
-    [int]$UpdateRetryWindowSeconds     = 300,
-    [int]$RetryIntervalSeconds         = 20,
-    [int]$MaxUpdateReauthAttempts      = 2,
+    # Authentication option 2: run CyberArk's public API token helper.
+    [string]$SwsTenantId = '',
+    [string]$TokenHelperJarPath = '',
+    [string]$SwsServiceAccountSecretPath = '',
+    [string]$JavaPath = 'java.exe',
 
-    # Logging
-    [string]$LogPath                   = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_And_Update_Reauth.log',
-    [string]$ReportCsvPath             = 'E:\Installation Media\Script\OnboardScript\data\Identity_Create_And_Update_Reauth_Report.csv'
+    # CyberArk official SWS Postman collection. May be .json or .zip.
+    # When blank, the current official collection is downloaded automatically.
+    [string]$PostmanCollectionPath = '',
+    [string]$PostmanCollectionDownloadUrl = 'https://docs.cyberark.com/find-sws-docs/latest/en/content/resources/downloads/secure_web_session.postman_collection.zip',
+
+    [int]$TargetPolicyWaitSeconds = 900,
+    [int]$PollIntervalSeconds = 30,
+    [int]$MaximumPoliciesToInspect = 500,
+
+    [switch]$Execute,
+
+    [string]$OutputFolder = '',
+    [string]$LogPath = '',
+
+    [string]$Proxy = '',
+    [System.Management.Automation.PSCredential]$ProxyCredential
 )
 
-$script:IdentityAuthToken         = $null
-$script:IdentityUser              = $null
-$script:IdentityWebSession        = $null
-$script:RegularCredential         = $null
-$script:RegularUserPlainPassword  = $null
-$script:ReportRows                = @()
-$script:CurrentCsvRowNumber       = $null
-$script:CurrentAppName            = $null
-$script:CurrentDisplayName        = $null
-$script:CurrentAppRowKey          = $null
-$script:HadApplicationFailures    = $false
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'Stop'
+
+if ([string]::IsNullOrWhiteSpace($OutputFolder)) {
+    $baseFolder = if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) { $PSScriptRoot } else { (Get-Location).Path }
+    $OutputFolder = Join-Path $baseFolder ('SWS_Clone_Test_{0}' -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+}
+
+if (-not (Test-Path -LiteralPath $OutputFolder)) {
+    New-Item -Path $OutputFolder -ItemType Directory -Force | Out-Null
+}
+
+if ([string]::IsNullOrWhiteSpace($LogPath)) {
+    $LogPath = Join-Path $OutputFolder 'SWS_Clone_Test.log'
+}
+
+$script:SwsToken = $null
+$script:CollectionVariables = @{}
+$script:PostmanRequests = @()
+$script:ListPoliciesRequest = $null
+$script:GetPolicyRequest = $null
+$script:PutApplicationConfigurationRequest = $null
+$script:PolicyDetailCache = @{}
+$script:SummaryRows = @()
+$script:BatchRootOutputFolder = $OutputFolder
+$script:CurrentTargetRowNumber = $null
+$script:CurrentTargetApplicationName = $null
+$script:CurrentTargetIdentityAppKey = $null
+$script:HadTargetFailures = $false
 
 function Write-Log {
     param(
         [Parameter(Mandatory)][string]$Message,
-        [ValidateSet('White','Gray','Green','Yellow','Red','Cyan')][string]$Color = 'White'
+        [ValidateSet('INFO','SUCCESS','WARN','ERROR','DEBUG')][string]$Level = 'INFO'
     )
 
-    $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    $line = "$ts - $Message"
+    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $line = '{0} | {1,-7} | {2}' -f $timestamp, $Level, $Message
 
-    try { Write-Host $line -ForegroundColor $Color } catch { Write-Host $line }
+    $color = switch ($Level) {
+        'SUCCESS' { 'Green' }
+        'WARN'    { 'Yellow' }
+        'ERROR'   { 'Red' }
+        'DEBUG'   { 'Gray' }
+        default   { 'Cyan' }
+    }
 
-    try {
-        $parent = Split-Path -Path $LogPath -Parent
-        if ($parent -and -not (Test-Path $parent)) {
-            New-Item -Path $parent -ItemType Directory -Force | Out-Null
-        }
-        Add-Content -Path $LogPath -Value $line
-    } catch {}
+    try { Write-Host $line -ForegroundColor $color } catch { Write-Host $line }
+    try { Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8 } catch {}
 }
 
-function Add-ReportRow {
+function Add-SummaryRow {
     param(
         [string]$Step,
         [string]$Status,
         [string]$Detail,
         [Nullable[int]]$RowNumber = $null,
-        [string]$AppName = $null,
-        [string]$RowKey = $null
+        [string]$TargetApplicationName = $null,
+        [string]$TargetIdentityAppKey = $null
     )
 
-    if ($null -eq $RowNumber -and $null -ne $script:CurrentCsvRowNumber) {
-        $RowNumber = [int]$script:CurrentCsvRowNumber
+    if ($null -eq $RowNumber -and $null -ne $script:CurrentTargetRowNumber) {
+        $RowNumber = [int]$script:CurrentTargetRowNumber
     }
-    if ([string]::IsNullOrWhiteSpace($AppName) -and -not [string]::IsNullOrWhiteSpace($script:CurrentAppName)) {
-        $AppName = $script:CurrentAppName
+    if ([string]::IsNullOrWhiteSpace($TargetApplicationName) -and -not [string]::IsNullOrWhiteSpace($script:CurrentTargetApplicationName)) {
+        $TargetApplicationName = $script:CurrentTargetApplicationName
     }
-    if ([string]::IsNullOrWhiteSpace($RowKey) -and -not [string]::IsNullOrWhiteSpace($script:CurrentAppRowKey)) {
-        $RowKey = $script:CurrentAppRowKey
+    if ([string]::IsNullOrWhiteSpace($TargetIdentityAppKey) -and -not [string]::IsNullOrWhiteSpace($script:CurrentTargetIdentityAppKey)) {
+        $TargetIdentityAppKey = $script:CurrentTargetIdentityAppKey
     }
 
-    $script:ReportRows += [pscustomobject]@{
-        Timestamp = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
-        RowNumber = $RowNumber
-        AppName   = $AppName
-        RowKey    = $RowKey
-        Step      = $Step
-        Status    = $Status
-        Detail    = $Detail
+    $script:SummaryRows += [pscustomobject]@{
+        Timestamp             = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+        RowNumber             = $RowNumber
+        TargetApplicationName = $TargetApplicationName
+        TargetIdentityAppKey  = $TargetIdentityAppKey
+        Step                  = $Step
+        Status                = $Status
+        Detail                = $Detail
     }
 }
 
-function ConvertTo-JsonSafe {
-    param([Parameter()][object]$Object)
-    if ($null -eq $Object) { return $null }
-    return ($Object | ConvertTo-Json -Depth 100)
-}
-
-function Get-DirectField {
+function Get-CsvValue {
     param(
-        [Parameter(Mandatory)]$Object,
-        [Parameter(Mandatory)][string]$FieldName
-    )
-
-    if ($null -eq $Object) { return $null }
-
-    if ($Object -is [System.Collections.IDictionary]) {
-        if ($Object.Contains($FieldName)) { return $Object[$FieldName] }
-        return $null
-    }
-
-    if ($Object.PSObject -and $Object.PSObject.Properties.Name -contains $FieldName) {
-        return $Object.$FieldName
-    }
-
-    return $null
-}
-
-function Convert-SecureStringToPlainText {
-    param([Parameter(Mandatory)][SecureString]$SecureString)
-
-    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureString)
-    try {
-        return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
-    } finally {
-        if ($bstr -ne [IntPtr]::Zero) {
-            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
-        }
-    }
-}
-
-function Get-RegularCredential {
-    if ([string]::IsNullOrWhiteSpace($RegularUserName)) {
-        $script:RegularCredential = Get-Credential -Message 'Enter REGULAR user credential for CyberArk Identity'
-        if ($null -eq $script:RegularCredential) {
-            throw 'Credential prompt was cancelled.'
-        }
-        $script:RegularUserPlainPassword = Convert-SecureStringToPlainText -SecureString $script:RegularCredential.Password
-        return
-    }
-
-    if ([string]::IsNullOrWhiteSpace($RegularUserPassword)) {
-        $secure = Read-Host "Enter password for $RegularUserName" -AsSecureString
-        $script:RegularUserPlainPassword = Convert-SecureStringToPlainText -SecureString $secure
-    } else {
-        $secure = ConvertTo-SecureString $RegularUserPassword -AsPlainText -Force
-        $script:RegularUserPlainPassword = $RegularUserPassword
-    }
-
-    $script:RegularCredential = [pscredential]::new($RegularUserName, $secure)
-}
-
-function Get-PreferredCsvValue {
-    param(
-        [Parameter(Mandatory)]$Row,
+        [Parameter(Mandatory)][object]$Row,
         [Parameter(Mandatory)][string[]]$ColumnNames
     )
 
@@ -237,146 +199,163 @@ function Get-PreferredCsvValue {
     return $null
 }
 
-function New-SampleApplicationCsv {
+function New-SampleTargetCsv {
     param([Parameter(Mandatory)][string]$Path)
 
     $parent = Split-Path -Path $Path -Parent
-    if ($parent -and -not (Test-Path $parent)) {
+    if ($parent -and -not (Test-Path -LiteralPath $parent)) {
         New-Item -Path $parent -ItemType Directory -Force | Out-Null
     }
 
     @(
-        [pscustomobject]@{ ApplicationName = 'svc-gcp-app-001'; DisplayName = 'svc-gcp-app-001'; Description = '' }
-        [pscustomobject]@{ ApplicationName = 'svc-gcp-app-002'; DisplayName = 'svc-gcp-app-002'; Description = '' }
-    ) | Export-Csv -Path $Path -NoTypeInformation -Force
+        [pscustomobject]@{ ApplicationName = 'svc-gcp-app-001'; IdentityAppKey = '' }
+        [pscustomobject]@{ ApplicationName = 'svc-gcp-app-002'; IdentityAppKey = '' }
+    ) | Export-Csv -LiteralPath $Path -NoTypeInformation -Force
 
-    Write-Log ("Sample application CSV created: {0}" -f $Path) 'Green'
+    Write-Log ("Sample target CSV created: {0}" -f $Path) 'SUCCESS'
 }
 
-function Import-AppCreationCsv {
+function Import-TargetApplicationCsv {
     param([Parameter(Mandatory)][string]$Path)
 
-    if ([string]::IsNullOrWhiteSpace($Path)) {
-        throw 'CsvPath cannot be empty. Provide a CSV file with an ApplicationName column.'
+    if (-not (Test-Path -LiteralPath $Path)) {
+        throw ("Target CSV was not found: {0}" -f $Path)
     }
 
-    if (-not (Test-Path -Path $Path)) {
-        throw ("CSV file was not found: {0}" -f $Path)
+    $rows = @(Import-Csv -LiteralPath $Path)
+    if ($rows.Count -eq 0) {
+        throw ("Target CSV contains no rows: {0}" -f $Path)
     }
 
-    $rows = @(Import-Csv -Path $Path)
-    if ($rows.Count -lt 1) {
-        throw ("CSV file contains no rows: {0}" -f $Path)
-    }
-
-    $resolvedRows = @()
+    $targets = @()
     $rowNumber = 1
 
     foreach ($row in $rows) {
-        $appName = Get-PreferredCsvValue -Row $row -ColumnNames @('ApplicationName','Name','AppName')
+        $targetName = Get-CsvValue -Row $row -ColumnNames @('ApplicationName','TargetApplicationName','Name','AppName')
+        $targetKey = Get-CsvValue -Row $row -ColumnNames @('IdentityAppKey','TargetIdentityAppKey','AppKey')
 
-        if ([string]::IsNullOrWhiteSpace($appName)) {
-            Write-Log ("CSV row {0} skipped because ApplicationName/Name/AppName is blank." -f $rowNumber) 'Yellow'
-            Add-ReportRow -Step 'Import CSV Row' -Status 'SKIPPED' -Detail 'Missing ApplicationName/Name/AppName value.' -RowNumber $rowNumber
+        if ([string]::IsNullOrWhiteSpace($targetName) -and [string]::IsNullOrWhiteSpace($targetKey)) {
+            Write-Log ("CSV row {0} skipped because neither an application name nor Identity app key was supplied." -f $rowNumber) 'WARN'
+            Add-SummaryRow -Step 'Import CSV Row' -Status 'SKIPPED' -Detail 'Missing target application name and Identity app key.' -RowNumber $rowNumber
             $rowNumber++
             continue
         }
 
-        $displayName = Get-PreferredCsvValue -Row $row -ColumnNames @('DisplayName')
-        if ([string]::IsNullOrWhiteSpace($displayName)) {
-            $displayName = $appName
+        $targets += [pscustomobject]@{
+            RowNumber             = $rowNumber
+            TargetApplicationName = $targetName
+            TargetIdentityAppKey  = $targetKey
         }
-
-        $descriptionValue = Get-PreferredCsvValue -Row $row -ColumnNames @('Description')
-        if ([string]::IsNullOrWhiteSpace($descriptionValue)) {
-            $descriptionValue = 'This GCP Application is managed by Service Account ("{0}")' -f $appName
-        }
-
-        $resolvedRows += [pscustomobject]@{
-            RowNumber   = $rowNumber
-            AppName     = $appName
-            DisplayName = $displayName
-            Description = $descriptionValue
-        }
-
         $rowNumber++
     }
 
-    if ($resolvedRows.Count -lt 1) {
-        throw 'No valid application rows were found in the CSV.'
+    if ($targets.Count -eq 0) {
+        throw 'No valid target applications were found in the CSV.'
     }
 
-    Write-Log ("Imported {0} valid application row(s) from CSV: {1}" -f $resolvedRows.Count, $Path) 'Green'
-    Add-ReportRow -Step 'Import CSV' -Status 'SUCCESS' -Detail ("ValidRows={0}; CsvPath={1}" -f $resolvedRows.Count, $Path)
-
-    return $resolvedRows
+    return $targets
 }
 
-function Set-CurrentAppContext {
-    param([Parameter(Mandatory)]$AppRow)
-
-    $script:CurrentCsvRowNumber = [int]$AppRow.RowNumber
-    $script:CurrentAppName      = [string]$AppRow.AppName
-    $script:CurrentDisplayName  = [string]$AppRow.DisplayName
-    $script:CurrentAppRowKey    = $null
-
-    $script:Name        = [string]$AppRow.AppName
-    $script:DisplayName = [string]$AppRow.DisplayName
-    $script:Description = [string]$AppRow.Description
-
-    Write-Log ("Resolved CSV row {0}: Name='{1}', DisplayName='{2}'." -f $script:CurrentCsvRowNumber, $script:Name, $script:DisplayName) 'Cyan'
-    Write-Log ("Resolved app Description: '{0}'." -f $script:Description) 'Cyan'
-
-    Add-ReportRow -Step 'Resolved App Name' -Status 'INFO' -Detail ("Name={0}; DisplayName={1}" -f $script:Name, $script:DisplayName)
-    Add-ReportRow -Step 'Resolved App Description' -Status 'INFO' -Detail ("Description={0}" -f $script:Description)
-}
-
-function Reset-IdentitySessionState {
-    $script:IdentityAuthToken  = $null
-    $script:IdentityUser       = $null
-    $script:IdentityWebSession = $null
-}
-
-function Get-AuthPayload {
-    param([Parameter(Mandatory)]$Response)
-
-    if ($Response.PSObject -and $Response.PSObject.Properties.Name -contains 'Result' -and $null -ne $Response.Result) {
-        return $Response.Result
+function Get-TargetRows {
+    if (-not [string]::IsNullOrWhiteSpace($CsvPath)) {
+        if (-not [string]::IsNullOrWhiteSpace($TargetApplicationName) -or -not [string]::IsNullOrWhiteSpace($TargetIdentityAppKey)) {
+            Write-Log 'CsvPath was supplied. The single-target parameters will be ignored.' 'WARN'
+        }
+        return @(Import-TargetApplicationCsv -Path $CsvPath)
     }
 
-    return $Response
+    if ([string]::IsNullOrWhiteSpace($TargetApplicationName) -and [string]::IsNullOrWhiteSpace($TargetIdentityAppKey)) {
+        throw 'Provide -CsvPath, -TargetApplicationName, or -TargetIdentityAppKey.'
+    }
+
+    return @([pscustomobject]@{
+        RowNumber             = 1
+        TargetApplicationName = $TargetApplicationName
+        TargetIdentityAppKey  = $TargetIdentityAppKey
+    })
 }
 
-function Get-AuthSummaryValue {
-    param([Parameter(Mandatory)]$Payload)
-    return [string](Get-DirectField -Object $Payload -FieldName 'Summary')
+function Get-SafeFolderName {
+    param([Parameter(Mandatory)][string]$Value)
+
+    $safe = [regex]::Replace($Value.Trim(), '[^A-Za-z0-9._-]+', '_')
+    $safe = $safe.Trim('_','.')
+    if ([string]::IsNullOrWhiteSpace($safe)) { return 'Target' }
+    if ($safe.Length -gt 80) { return $safe.Substring(0, 80) }
+    return $safe
 }
 
-function Get-AuthSessionId {
-    param([Parameter(Mandatory)]$Payload)
-    return [string](Get-DirectField -Object $Payload -FieldName 'SessionId')
+function Convert-SecureStringToPlainText {
+    param([Parameter(Mandatory)][SecureString]$SecureString)
+
+    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureString)
+    try {
+        return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+    }
+    finally {
+        if ($bstr -ne [IntPtr]::Zero) {
+            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+        }
+    }
 }
 
-function Get-AuthTokenValue {
-    param([Parameter(Mandatory)]$Payload)
-    return [string](Get-DirectField -Object $Payload -FieldName 'Auth')
+function ConvertTo-JsonDeep {
+    param([Parameter()][object]$InputObject)
+    if ($null -eq $InputObject) { return 'null' }
+    return ($InputObject | ConvertTo-Json -Depth 100)
 }
 
-function Get-AuthUserValue {
-    param([Parameter(Mandatory)]$Payload)
-    return [string](Get-DirectField -Object $Payload -FieldName 'User')
+function Copy-DeepObject {
+    param([Parameter()][object]$InputObject)
+    if ($null -eq $InputObject) { return $null }
+    return ((ConvertTo-JsonDeep -InputObject $InputObject) | ConvertFrom-Json)
 }
 
-function Get-FirstMechanism {
-    param([Parameter(Mandatory)]$Payload)
+function Save-JsonArtifact {
+    param(
+        [Parameter(Mandatory)][string]$FileName,
+        [Parameter()][object]$Object
+    )
 
-    $challenges = @(Get-DirectField -Object $Payload -FieldName 'Challenges')
-    foreach ($challenge in $challenges) {
-        $mechs = @(Get-DirectField -Object $challenge -FieldName 'Mechanisms')
-        foreach ($mech in $mechs) {
-            $mechId = [string](Get-DirectField -Object $mech -FieldName 'MechanismId')
-            if (-not [string]::IsNullOrWhiteSpace($mechId)) {
-                return $mech
+    $path = Join-Path $OutputFolder $FileName
+    ConvertTo-JsonDeep -InputObject $Object | Set-Content -LiteralPath $path -Encoding UTF8
+    Write-Log ("Saved artifact: {0}" -f $path) 'DEBUG'
+    return $path
+}
+
+function Get-DataCenterApiRoot {
+    param([Parameter(Mandatory)][string]$Code)
+
+    $map = @{
+        US = 'https://api.alero.io'
+        EU = 'https://api.alero.eu'
+        CA = 'https://api.ca.alero.io'
+        AU = 'https://api.au.alero.io'
+        UK = 'https://api.uk.alero.io'
+        IN = 'https://api.in.alero.io'
+        SG = 'https://api.sg.alero.io'
+        AE = 'https://api.ae.alero.io'
+        IL = 'https://api.il.alero.io'
+        IT = 'https://api.it.alero.io'
+        ID = 'https://api.id.alero.io'
+        JP = 'https://api.jp.alero.io'
+    }
+
+    return $map[$Code]
+}
+
+function Get-DirectProperty {
+    param(
+        [Parameter()][object]$Object,
+        [Parameter(Mandatory)][string[]]$Names
+    )
+
+    if ($null -eq $Object) { return $null }
+
+    foreach ($property in @($Object.PSObject.Properties)) {
+        foreach ($name in $Names) {
+            if ($property.Name -ieq $name) {
+                return $property.Value
             }
         }
     }
@@ -384,500 +363,1305 @@ function Get-FirstMechanism {
     return $null
 }
 
-function Get-MechanismPrompt {
-    param([Parameter(Mandatory)]$Mechanism)
-
-    $name   = [string](Get-DirectField -Object $Mechanism -FieldName 'Name')
-    $prompt = [string](Get-DirectField -Object $Mechanism -FieldName 'PromptSelectMech')
-    $type   = [string](Get-DirectField -Object $Mechanism -FieldName 'AnswerType')
-
-    if ($name -eq 'UP' -or $prompt -match 'Password') {
-        return @{
-            Action = 'Answer'
-            Answer = $script:RegularUserPlainPassword
-        }
-    }
-
-    $display = if (-not [string]::IsNullOrWhiteSpace($prompt)) { $prompt } else { $name }
-    $answer = Read-Host ("Enter response for challenge [{0}] {1}" -f $type, $display)
-
-    return @{
-        Action = 'Answer'
-        Answer = $answer
-    }
-}
-
-function Start-IdentityRegularUserSession {
-    if ($null -eq $script:RegularCredential) {
-        throw 'Regular user credential is not initialized.'
-    }
-
-    $tenantUrl = $IdentityApiTenantURL
-    $userName  = $script:RegularCredential.UserName
-
-    $baseHeaders = @{
-        'X-IDAP-NATIVE-CLIENT' = 'true'
-        'Content-Type'         = 'application/json'
-        'Accept'               = 'application/json'
-    }
-
-    $startUri = ($tenantUrl.TrimEnd('/') + '/Security/StartAuthentication')
-    $advUri   = ($tenantUrl.TrimEnd('/') + '/Security/AdvanceAuthentication')
-
-    $script:IdentityWebSession = New-Object Microsoft.PowerShell.Commands.WebRequestSession
-
-    Write-Log ("Starting interactive CyberArk Identity authentication for regular user '{0}'..." -f $userName) 'Cyan'
-
-    $startBody = @{
-        User    = $userName
-        Version = '1.0'
-    }
-
-    $startResp = Invoke-RestMethod -Method POST -Uri $startUri -Headers $baseHeaders -WebSession $script:IdentityWebSession -ContentType 'application/json' -Body (ConvertTo-JsonSafe $startBody) -ErrorAction Stop
-    $payload = Get-AuthPayload -Response $startResp
-
-    for ($i = 0; $i -lt 10; $i++) {
-        $summary = Get-AuthSummaryValue -Payload $payload
-        $authVal = Get-AuthTokenValue -Payload $payload
-
-        if ($summary -eq 'LoginSuccess' -or -not [string]::IsNullOrWhiteSpace($authVal)) {
-            $script:IdentityAuthToken = $authVal
-            $script:IdentityUser      = Get-AuthUserValue -Payload $payload
-
-            $cookieCount = 0
-            try { $cookieCount = $script:IdentityWebSession.Cookies.GetCookies($tenantUrl).Count } catch {}
-
-            Write-Log ("Identity API authentication succeeded as '{0}'. CookieCount={1}" -f $script:IdentityUser, $cookieCount) 'Green'
-            Add-ReportRow -Step 'Identity Login' -Status 'SUCCESS' -Detail ("Authenticated as {0}; CookieCount={1}" -f $script:IdentityUser, $cookieCount)
-            return
-        }
-
-        $sessionId = Get-AuthSessionId -Payload $payload
-        if ([string]::IsNullOrWhiteSpace($sessionId)) {
-            throw 'Authentication package did not include SessionId.'
-        }
-
-        $mechanism = Get-FirstMechanism -Payload $payload
-        if ($null -eq $mechanism) {
-            throw 'No supported authentication mechanism was returned.'
-        }
-
-        $mechId = [string](Get-DirectField -Object $mechanism -FieldName 'MechanismId')
-        $name   = [string](Get-DirectField -Object $mechanism -FieldName 'Name')
-        $prompt = [string](Get-DirectField -Object $mechanism -FieldName 'PromptSelectMech')
-
-        Write-Log ("Responding to Identity challenge. Mechanism='{0}' Prompt='{1}'." -f $name, $prompt) 'Gray'
-
-        $response = Get-MechanismPrompt -Mechanism $mechanism
-
-        $advBody = @{
-            SessionId   = $sessionId
-            MechanismId = $mechId
-            Action      = $response.Action
-            Answer      = $response.Answer
-        }
-
-        $advResp = Invoke-RestMethod -Method POST -Uri $advUri -Headers $baseHeaders -WebSession $script:IdentityWebSession -ContentType 'application/json' -Body (ConvertTo-JsonSafe $advBody) -ErrorAction Stop
-        $payload = Get-AuthPayload -Response $advResp
-    }
-
-    throw 'Interactive Identity authentication did not complete after multiple challenge rounds.'
-}
-
-function Invoke-IdentityRequestRaw {
+function Get-DirectPropertyName {
     param(
-        [Parameter(Mandatory)][string]$AbsoluteUri,
-        [Parameter()][object]$Body,
-        [ValidateSet('BearerCookie','CookieOnly','BearerOnly')][string]$AuthMode = 'BearerCookie'
+        [Parameter()][object]$Object,
+        [Parameter(Mandatory)][string[]]$Names
     )
 
-    $headers = @{
-        'X-IDAP-NATIVE-CLIENT' = 'true'
-        'Accept'               = 'application/json'
-        'Content-Type'         = 'application/json'
-    }
+    if ($null -eq $Object) { return $null }
 
-    if ($AuthMode -eq 'BearerCookie' -or $AuthMode -eq 'BearerOnly') {
-        if ([string]::IsNullOrWhiteSpace($script:IdentityAuthToken)) {
-            throw 'Identity auth token is not initialized.'
-        }
-        $headers['Authorization'] = ("Bearer {0}" -f $script:IdentityAuthToken)
-    }
-
-    $invokeParams = @{
-        Method      = 'POST'
-        Uri         = $AbsoluteUri
-        Headers     = $headers
-        ContentType = 'application/json'
-        ErrorAction = 'Stop'
-    }
-
-    $json = ConvertTo-JsonSafe -Object $Body
-    if ($null -ne $json) { $invokeParams['Body'] = $json }
-
-    if (($AuthMode -eq 'BearerCookie' -or $AuthMode -eq 'CookieOnly') -and $null -ne $script:IdentityWebSession) {
-        $invokeParams['WebSession'] = $script:IdentityWebSession
-    }
-
-    return Invoke-RestMethod @invokeParams
-}
-
-function Invoke-IdentityRequestWithRetry {
-    param(
-        [Parameter(Mandatory)][string[]]$AbsoluteUris,
-        [Parameter()][object]$Body,
-        [string]$LogicalName = 'Identity API call'
-    )
-
-    $authModes = @('BearerCookie','CookieOnly','BearerOnly')
-    $errors = @()
-
-    foreach ($uri in $AbsoluteUris) {
-        foreach ($mode in $authModes) {
-            try {
-                Write-Log ("Trying {0} via URI '{1}' using auth mode '{2}'..." -f $LogicalName, $uri, $mode) 'Gray'
-                $resp = Invoke-IdentityRequestRaw -AbsoluteUri $uri -Body $Body -AuthMode $mode
-                Write-Log ("Succeeded: {0} via URI '{1}' using auth mode '{2}'." -f $LogicalName, $uri, $mode) 'Gray'
-                return $resp
-            } catch {
-                $status = $null
-                try { $status = [int]$_.Exception.Response.StatusCode.value__ } catch {}
-                $msg = $_.Exception.Message
-                $errors += ("URI={0}; Mode={1}; Status={2}; Error={3}" -f $uri, $mode, $status, $msg)
-
-                if ($status -eq 401) {
-                    Write-Log ("401 on {0} via URI '{1}' using auth mode '{2}'. Retrying..." -f $LogicalName, $uri, $mode) 'Yellow'
-                    continue
-                }
-
-                throw
+    foreach ($property in @($Object.PSObject.Properties)) {
+        foreach ($name in $Names) {
+            if ($property.Name -ieq $name) {
+                return $property.Name
             }
         }
     }
 
-    throw ("Unauthorized persisted for {0}. Details: {1}" -f $LogicalName, ($errors -join ' || '))
+    return $null
 }
 
-function Import-AppFromTemplate {
-    param([Parameter(Mandatory)][string]$ResolvedTemplateId)
+function Test-IsComplexObject {
+    param([Parameter()][object]$Object)
 
-    $uri = $IdentityApiTenantURL.TrimEnd('/') + '/SaasManage/ImportAppFromTemplate'
-    $body = @{ ID = @($ResolvedTemplateId) }
-
-    $resp = Invoke-IdentityRequestWithRetry -AbsoluteUris @($uri) -Body $body -LogicalName 'ImportAppFromTemplate'
-    if (-not $resp.success) {
-        throw ('ImportAppFromTemplate returned success=false: ' + ($resp.Message | Out-String))
-    }
-
-    $resultItems = @($resp.Result)
-    if ($resultItems.Count -lt 1) {
-        throw 'ImportAppFromTemplate returned no result items.'
-    }
-
-    $first = $resultItems[0]
-    $created = Get-DirectField -Object $first -FieldName 'success'
-    if ($created -ne $true) {
-        $idVal = [string](Get-DirectField -Object $first -FieldName 'ID')
-        $msg = [string](Get-DirectField -Object $first -FieldName 'Message')
-        throw ("ImportAppFromTemplate result item failed. ID={0}; Message={1}" -f $idVal, $msg)
-    }
-
-    $rowKey = [string](Get-DirectField -Object $first -FieldName '_RowKey')
-    if ([string]::IsNullOrWhiteSpace($rowKey)) {
-        $rowKey = [string](Get-DirectField -Object $first -FieldName '_Rowkey')
-    }
-
-    if ([string]::IsNullOrWhiteSpace($rowKey)) {
-        throw 'ImportAppFromTemplate did not return _RowKey.'
-    }
-
-    Write-Log ("Imported new application from template '{0}'. New _RowKey='{1}'." -f $ResolvedTemplateId, $rowKey) 'Green'
-    Add-ReportRow -Step 'Create Application' -Status 'SUCCESS' -Detail ("TemplateID={0}; RowKey={1}" -f $ResolvedTemplateId, $rowKey)
-    return $rowKey
+    if ($null -eq $Object) { return $false }
+    if ($Object -is [string]) { return $false }
+    if ($Object.GetType().IsValueType) { return $false }
+    return $true
 }
 
-function New-BaseNonScriptFields {
-    param([Parameter(Mandatory)][string]$ResolvedRowKey)
-
-    $authRules = @{
-        _UniqueKey = 'Condition'
-        _Value     = @()
-        Enabled    = $true
-        _Type      = 'RowSet'
-    }
-
-    $defaultAuthProfileInfo = @{
-        Uuid = $DefaultAuthProfileUuid
-    }
-
-    return [ordered]@{
-        _Rowkey                = $ResolvedRowKey
-        Name                   = $Name
-        DisplayName            = $DisplayName
-        Category               = $Category
-        DefaultAuthProfileInfo = $defaultAuthProfileInfo
-        OnPrem                 = $OnPrem
-        IsSwsEnabled           = $IsSwsEnabled
-        ShowRegistration       = $ShowRegistration
-        AdminTag               = $AdminTag
-        UserNameStrategy       = $UserNameStrategy
-        Description            = $Description
-        FormFillingEnabled     = $FormFillingEnabled
-        Generic                = $Generic
-        AppType                = $AppType
-        DefaultAuthProfile     = $DefaultAuthProfile
-        IconUri                = $IconUri
-        AuthRules              = $authRules
-        WebAppType             = $WebAppType
-        TemplateName           = $TemplateName
-        Notes                  = $Notes
-        LocalizationEnabled    = $LocalizationEnabled
-        WebUPAppType           = $WebUPAppType
-        NotSelfService         = $NotSelfService
-    }
-}
-
-function New-AdvancedScriptPayloadVariants {
-    param([Parameter(Mandatory)][string]$ResolvedRowKey)
-
-    $base = New-BaseNonScriptFields -ResolvedRowKey $ResolvedRowKey
-    $variants = @()
-
-    $v1 = [ordered]@{}
-    foreach ($k in $base.Keys) { $v1[$k] = $base[$k] }
-    $v1['Script'] = $AdvancedScript
-    $variants += ,$v1
-
-    $v2 = [ordered]@{}
-    foreach ($k in $v1.Keys) {
-        if ($k -eq '_Rowkey') { $v2['_RowKey'] = $v1[$k] } else { $v2[$k] = $v1[$k] }
-    }
-    $variants += ,$v2
-
-    $v3 = [ordered]@{
-        _Rowkey             = $ResolvedRowKey
-        Name                = $Name
-        DisplayName         = $DisplayName
-        Description         = $Description
-        IconUri             = $IconUri
-        IsSwsEnabled        = $IsSwsEnabled
-        UserNameStrategy    = $UserNameStrategy
-        FormFillingEnabled  = $FormFillingEnabled
-        AppType             = $AppType
-        WebAppType          = $WebAppType
-        WebUPAppType        = $WebUPAppType
-        TemplateName        = $TemplateName
-        DefaultAuthProfile  = $DefaultAuthProfile
-        Script              = $AdvancedScript
-    }
-    $variants += ,$v3
-
-    $v4 = [ordered]@{}
-    foreach ($k in $v3.Keys) {
-        if ($k -eq '_Rowkey') { $v4['_RowKey'] = $v3[$k] } else { $v4[$k] = $v3[$k] }
-    }
-    $variants += ,$v4
-
-    $v5 = [ordered]@{}
-    foreach ($k in $base.Keys) { $v5[$k] = $base[$k] }
-    $v5['CBEScript'] = $AdvancedScript
-    $variants += ,$v5
-
-    $v6 = [ordered]@{}
-    foreach ($k in $v5.Keys) {
-        if ($k -eq '_Rowkey') { $v6['_RowKey'] = $v5[$k] } else { $v6[$k] = $v5[$k] }
-    }
-    $variants += ,$v6
-
-    $v7 = [ordered]@{
-        _Rowkey     = $ResolvedRowKey
-        Name        = $Name
-        Description = $Description
-        Script      = $AdvancedScript
-    }
-    $variants += ,$v7
-
-    $v8 = [ordered]@{
-        _Rowkey     = $ResolvedRowKey
-        Name        = $Name
-        Description = $Description
-        CBEScript   = $AdvancedScript
-    }
-    $variants += ,$v8
-
-    return $variants
-}
-
-function Update-CurrentApplicationWithAdvancedScript {
-    param([Parameter(Mandatory)][string]$ResolvedRowKey)
-
-    $uri = $IdentityApiTenantURL.TrimEnd('/') + '/SaasManage/UpdateApplicationDE'
-    $variants = New-AdvancedScriptPayloadVariants -ResolvedRowKey $ResolvedRowKey
-
-    $variantNumber = 0
-    foreach ($payload in $variants) {
-        $variantNumber++
-        try {
-            Write-Log ("Trying UpdateApplicationDE advanced-script payload variant #{0}..." -f $variantNumber) 'Gray'
-            $resp = Invoke-IdentityRequestWithRetry -AbsoluteUris @($uri) -Body $payload -LogicalName 'UpdateApplicationDE'
-
-            $success = Get-DirectField -Object $resp -FieldName 'success'
-            if ($success -ne $true) {
-                $msg = [string](Get-DirectField -Object $resp -FieldName 'Message')
-                throw ("UpdateApplicationDE returned success=false. Message={0}" -f $msg)
-            }
-
-            Write-Log ("UpdateApplicationDE succeeded on advanced-script payload variant #{0}." -f $variantNumber) 'Green'
-            Add-ReportRow -Step 'Update Application' -Status 'SUCCESS' -Detail ("RowKey={0}; Variant={1}" -f $ResolvedRowKey, $variantNumber)
-            return
-        } catch {
-            Write-Log ("Advanced-script payload variant #{0} failed: {1}" -f $variantNumber, $_.Exception.Message) 'Yellow'
-        }
-    }
-
-    throw 'All UpdateApplicationDE advanced-script payload variants failed.'
-}
-
-function Invoke-EventuallyConsistentStep {
+function Get-ObjectNodes {
     param(
-        [Parameter(Mandatory)][scriptblock]$Operation,
-        [Parameter(Mandatory)][string]$OperationName,
-        [Parameter(Mandatory)][int]$MaxWaitSeconds,
-        [int]$IntervalSeconds = 15
+        [Parameter()][object]$Object,
+        [string]$Path = '$'
     )
 
-    $deadline = (Get-Date).AddSeconds($MaxWaitSeconds)
-    $attempt = 0
-    $lastMessage = $null
+    $results = New-Object System.Collections.ArrayList
 
-    while ((Get-Date) -lt $deadline) {
-        $attempt++
-        try {
-            Write-Log ("{0} attempt #{1}..." -f $OperationName, $attempt) 'Gray'
-            & $Operation
-            Write-Log ("{0} succeeded on attempt #{1}." -f $OperationName, $attempt) 'Green'
-            return
-        } catch {
-            $lastMessage = $_.Exception.Message
-            Write-Log ("{0} not ready yet on attempt #{1}. Retrying in {2}s. Remaining window: {3}s. Last error: {4}" -f $OperationName, $attempt, $IntervalSeconds, [int][Math]::Max(0, ($deadline - (Get-Date)).TotalSeconds), $lastMessage) 'Yellow'
-            Start-Sleep -Seconds $IntervalSeconds
-        }
-    }
+    function Visit-Node {
+        param([object]$Node, [string]$CurrentPath)
 
-    throw ("{0} did not succeed within {1} seconds. Last error: {2}" -f $OperationName, $MaxWaitSeconds, $lastMessage)
-}
+        if ($null -eq $Node) { return }
+        if ($Node -is [string] -or $Node.GetType().IsValueType) { return }
 
-function Invoke-PostCreateUpdatePhase {
-    param([Parameter(Mandatory)][string]$CreatedRowKey)
+        [void]$results.Add([pscustomobject]@{
+            Path   = $CurrentPath
+            Object = $Node
+        })
 
-    $attempt = 0
-    while ($attempt -lt $MaxUpdateReauthAttempts) {
-        $attempt++
-        try {
-            Write-Log ("Starting post-create update phase with fresh Identity session (attempt {0}/{1})..." -f $attempt, $MaxUpdateReauthAttempts) 'Cyan'
-            Reset-IdentitySessionState
-            Start-IdentityRegularUserSession
-
-            Invoke-EventuallyConsistentStep `
-                -Operation {
-                    Update-CurrentApplicationWithAdvancedScript -ResolvedRowKey $CreatedRowKey
-                } `
-                -OperationName 'Post-Create UpdateApplicationDE' `
-                -MaxWaitSeconds $UpdateRetryWindowSeconds `
-                -IntervalSeconds $RetryIntervalSeconds
-
-            return
-        } catch {
-            $msg = $_.Exception.Message
-            Write-Log ("Post-create update phase attempt {0} failed: {1}" -f $attempt, $msg) 'Yellow'
-
-            if ($attempt -ge $MaxUpdateReauthAttempts) {
-                throw
+        if ($Node -is [System.Collections.IEnumerable] -and -not ($Node -is [System.Collections.IDictionary]) -and -not ($Node -is [pscustomobject])) {
+            $index = 0
+            foreach ($item in $Node) {
+                Visit-Node -Node $item -CurrentPath ("{0}[{1}]" -f $CurrentPath, $index)
+                $index++
             }
+            return
+        }
 
-            Write-Log "Re-establishing Identity session and retrying update phase..." 'Yellow'
-            Start-Sleep -Seconds $RetryIntervalSeconds
+        foreach ($property in @($Node.PSObject.Properties)) {
+            $value = $property.Value
+            if (Test-IsComplexObject -Object $value) {
+                Visit-Node -Node $value -CurrentPath ("{0}.{1}" -f $CurrentPath, $property.Name)
+            }
         }
     }
+
+    Visit-Node -Node $Object -CurrentPath $Path
+    return @($results)
 }
 
-try {
-    if ([string]::IsNullOrWhiteSpace($TemplateId)) {
-        throw 'TemplateId cannot be empty.'
+function Get-FirstRecursivePropertyValue {
+    param(
+        [Parameter()][object]$Object,
+        [Parameter(Mandatory)][string]$PropertyName
+    )
+
+    foreach ($node in @(Get-ObjectNodes -Object $Object)) {
+        foreach ($property in @($node.Object.PSObject.Properties)) {
+            if ($property.Name -ieq $PropertyName) {
+                return $property.Value
+            }
+        }
     }
 
-    if ($CreateSampleCsv) {
-        New-SampleApplicationCsv -Path $CsvPath
-        Add-ReportRow -Step 'Create Sample CSV' -Status 'SUCCESS' -Detail ("SampleCsvPath={0}" -f $CsvPath)
+    return $null
+}
+
+function Set-DirectPropertyValue {
+    param(
+        [Parameter(Mandatory)][object]$Object,
+        [Parameter(Mandatory)][string]$PropertyName,
+        [Parameter()][object]$Value
+    )
+
+    $actualName = Get-DirectPropertyName -Object $Object -Names @($PropertyName)
+    if (-not [string]::IsNullOrWhiteSpace($actualName)) {
+        $Object.$actualName = $Value
         return
     }
 
-    Get-RegularCredential
+    $Object | Add-Member -MemberType NoteProperty -Name $PropertyName -Value $Value -Force
+}
 
-    Write-Log ("Using regular user credential '{0}' for CSV create + reauth + update flow." -f $script:RegularCredential.UserName) 'Cyan'
-    Add-ReportRow -Step 'Credential Mode' -Status 'INFO' -Detail ("Regular user login as {0}" -f $script:RegularCredential.UserName)
+function Get-SwsTokenValue {
+    if (-not [string]::IsNullOrWhiteSpace($SwsAccessToken)) {
+        Write-Log 'Using SWS access token supplied through -SwsAccessToken.' 'INFO'
+        return $SwsAccessToken.Trim()
+    }
 
-    $appRows = @(Import-AppCreationCsv -Path $CsvPath)
+    $canUseHelper = -not [string]::IsNullOrWhiteSpace($SwsTenantId) -and
+                    -not [string]::IsNullOrWhiteSpace($TokenHelperJarPath) -and
+                    -not [string]::IsNullOrWhiteSpace($SwsServiceAccountSecretPath)
 
-    foreach ($appRow in $appRows) {
-        Set-CurrentAppContext -AppRow $appRow
-        Add-ReportRow -Step 'Application Start' -Status 'INFO' -Detail ("Starting create + wait + reauth + update sequence for CSV row {0}." -f $script:CurrentCsvRowNumber)
+    if ($canUseHelper) {
+        if (-not (Test-Path -LiteralPath $TokenHelperJarPath)) {
+            throw "Token helper JAR was not found: $TokenHelperJarPath"
+        }
+        if (-not (Test-Path -LiteralPath $SwsServiceAccountSecretPath)) {
+            throw "SWS service-account secret file was not found: $SwsServiceAccountSecretPath"
+        }
 
+        $javaCommand = Get-Command $JavaPath -ErrorAction Stop
+        Write-Log 'Generating SWS API access token with CyberArk public API token helper.' 'INFO'
+
+        $helperOutput = & $javaCommand.Source -jar $TokenHelperJarPath -t $SwsTenantId -p $SwsServiceAccountSecretPath 2>&1 | Out-String
+        if ($LASTEXITCODE -ne 0) {
+            throw ("CyberArk token helper failed. Output: {0}" -f $helperOutput.Trim())
+        }
+
+        $tokenMatches = [regex]::Matches($helperOutput, 'eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+')
+        if ($tokenMatches.Count -lt 1) {
+            throw 'The token helper completed, but a JWT access token could not be parsed from its output.'
+        }
+
+        $token = @($tokenMatches | ForEach-Object { $_.Value } | Sort-Object Length -Descending)[0]
+        Write-Log 'SWS access token generated successfully.' 'SUCCESS'
+        return $token
+    }
+
+    Write-Host ''
+    Write-Host 'Paste a current SWS service-account access token.' -ForegroundColor Yellow
+    $secureToken = Read-Host 'SWS access token' -AsSecureString
+    $plainToken = Convert-SecureStringToPlainText -SecureString $secureToken
+
+    if ([string]::IsNullOrWhiteSpace($plainToken)) {
+        throw 'An SWS access token is required.'
+    }
+
+    return $plainToken.Trim()
+}
+
+function Get-WebRequestCommonParameters {
+    $parameters = @{
+        UseBasicParsing = $true
+        ErrorAction     = 'Stop'
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($Proxy)) {
+        $parameters['Proxy'] = $Proxy
+    }
+    if ($null -ne $ProxyCredential) {
+        $parameters['ProxyCredential'] = $ProxyCredential
+    }
+
+    return $parameters
+}
+
+function Get-OfficialPostmanCollectionJsonPath {
+    param([string]$RequestedPath)
+
+    $workingPath = $RequestedPath
+
+    if ([string]::IsNullOrWhiteSpace($workingPath)) {
+        $zipPath = Join-Path $OutputFolder 'secure_web_session.postman_collection.zip'
+        Write-Log 'Downloading CyberArk official SWS Postman collection.' 'INFO'
+
+        $downloadParameters = Get-WebRequestCommonParameters
+        $downloadParameters['Uri'] = $PostmanCollectionDownloadUrl
+        $downloadParameters['OutFile'] = $zipPath
+        Invoke-WebRequest @downloadParameters | Out-Null
+
+        $workingPath = $zipPath
+        Write-Log ("Downloaded Postman collection: {0}" -f $zipPath) 'SUCCESS'
+    }
+
+    if (-not (Test-Path -LiteralPath $workingPath)) {
+        throw "Postman collection file was not found: $workingPath"
+    }
+
+    $extension = [IO.Path]::GetExtension($workingPath)
+    if ($extension -ieq '.json') {
+        return (Resolve-Path -LiteralPath $workingPath).Path
+    }
+
+    if ($extension -notin @('.zip','.ZIP')) {
+        throw 'PostmanCollectionPath must reference a .json or .zip file.'
+    }
+
+    $extractFolder = Join-Path $OutputFolder 'PostmanCollection'
+    if (Test-Path -LiteralPath $extractFolder) {
+        Remove-Item -LiteralPath $extractFolder -Recurse -Force
+    }
+    New-Item -Path $extractFolder -ItemType Directory -Force | Out-Null
+
+    try {
+        Expand-Archive -LiteralPath $workingPath -DestinationPath $extractFolder -Force
+    }
+    catch {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        [System.IO.Compression.ZipFile]::ExtractToDirectory($workingPath, $extractFolder)
+    }
+
+    $jsonFiles = @(Get-ChildItem -LiteralPath $extractFolder -Filter '*.json' -File -Recurse)
+    if ($jsonFiles.Count -lt 1) {
+        throw 'No JSON file was found inside the SWS Postman collection archive.'
+    }
+
+    foreach ($file in $jsonFiles) {
+        $text = Get-Content -LiteralPath $file.FullName -Raw
+        if ($text -match '(?i)SWS policies' -and $text -match '(?i)application configuration') {
+            return $file.FullName
+        }
+    }
+
+    return ($jsonFiles | Sort-Object Length -Descending | Select-Object -First 1).FullName
+}
+
+function Get-PostmanRequestRows {
+    param([Parameter()][object[]]$Items)
+
+    $results = New-Object System.Collections.ArrayList
+
+    function Visit-PostmanItems {
+        param([object[]]$CurrentItems, [string]$FolderPath)
+
+        foreach ($item in @($CurrentItems)) {
+            $itemName = [string](Get-DirectProperty -Object $item -Names @('name'))
+            $currentName = if ([string]::IsNullOrWhiteSpace($FolderPath)) { $itemName } else { "$FolderPath / $itemName" }
+            $request = Get-DirectProperty -Object $item -Names @('request')
+
+            if ($null -ne $request) {
+                $method = [string](Get-DirectProperty -Object $request -Names @('method'))
+                $urlObject = Get-DirectProperty -Object $request -Names @('url')
+                $rawUrl = ''
+
+                if ($urlObject -is [string]) {
+                    $rawUrl = [string]$urlObject
+                }
+                elseif ($null -ne $urlObject) {
+                    $rawUrl = [string](Get-DirectProperty -Object $urlObject -Names @('raw'))
+                    if ([string]::IsNullOrWhiteSpace($rawUrl)) {
+                        $host = @((Get-DirectProperty -Object $urlObject -Names @('host'))) -join '.'
+                        $path = @((Get-DirectProperty -Object $urlObject -Names @('path'))) -join '/'
+                        $rawUrl = ('https://{0}/{1}' -f $host, $path)
+                    }
+                }
+
+                $body = Get-DirectProperty -Object $request -Names @('body')
+                $bodyRaw = if ($null -ne $body) { [string](Get-DirectProperty -Object $body -Names @('raw')) } else { '' }
+
+                [void]$results.Add([pscustomobject]@{
+                    Name    = $currentName
+                    Method  = $method.ToUpperInvariant()
+                    RawUrl  = $rawUrl
+                    BodyRaw = $bodyRaw
+                    Request = $request
+                })
+            }
+
+            $children = Get-DirectProperty -Object $item -Names @('item')
+            if ($null -ne $children) {
+                Visit-PostmanItems -CurrentItems @($children) -FolderPath $currentName
+            }
+        }
+    }
+
+    Visit-PostmanItems -CurrentItems @($Items) -FolderPath ''
+    return @($results)
+}
+
+function Expand-CollectionVariables {
+    param([Parameter(Mandatory)][string]$Text)
+
+    $expanded = $Text
+    for ($round = 0; $round -lt 10; $round++) {
+        $changed = $false
+        foreach ($key in @($script:CollectionVariables.Keys)) {
+            $token = '{{' + $key + '}}'
+            if ($expanded.IndexOf($token, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                $expanded = [regex]::Replace(
+                    $expanded,
+                    [regex]::Escape($token),
+                    [System.Text.RegularExpressions.MatchEvaluator]{ param($m) [string]$script:CollectionVariables[$key] },
+                    [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+                )
+                $changed = $true
+            }
+        }
+        if (-not $changed) { break }
+    }
+    return $expanded
+}
+
+function Select-SwsPostmanRequests {
+    param([Parameter(Mandatory)][object[]]$Requests)
+
+    $listScored = foreach ($request in $Requests) {
+        if ($request.Method -ne 'GET') { continue }
+        $text = "{0} {1}" -f $request.Name, $request.RawUrl
+        if ($text -notmatch '(?i)polic') { continue }
+        if ($text -match '(?i)member|user|recording|session|activit|security.layer|default') { continue }
+
+        $score = 0
+        if ($request.Name -match '(?i)GET SWS policies') { $score += 30 }
+        if ($request.Name -match '(?i)policies') { $score += 10 }
+        if ($request.RawUrl -match '(?i)/policies') { $score += 10 }
+        if ($request.RawUrl -notmatch '(?i)(policy.?id|\{.*id.*\}|\{\{.*id.*\}\}|:.*id)') { $score += 15 }
+        [pscustomobject]@{ Request = $request; Score = $score }
+    }
+
+    $detailScored = foreach ($request in $Requests) {
+        if ($request.Method -ne 'GET') { continue }
+        $text = "{0} {1}" -f $request.Name, $request.RawUrl
+        if ($text -notmatch '(?i)polic') { continue }
+        if ($text -match '(?i)member|user|recording|session|activit|security.layer|default') { continue }
+
+        $score = 0
+        if ($request.Name -match '(?i)policy ID|policy by ID|policies \(policy ID\)') { $score += 30 }
+        if ($request.RawUrl -match '(?i)(policy.?id|\{.*id.*\}|\{\{.*id.*\}\}|:.*id)') { $score += 25 }
+        if ($request.RawUrl -match '(?i)/policies') { $score += 10 }
+        [pscustomobject]@{ Request = $request; Score = $score }
+    }
+
+    $putScored = foreach ($request in $Requests) {
+        if ($request.Method -ne 'PUT') { continue }
+        $text = "{0} {1}" -f $request.Name, $request.RawUrl
+        if ($text -notmatch '(?i)polic') { continue }
+
+        $score = 0
+        if ($request.Name -match '(?i)Policy application configuration') { $score += 50 }
+        if ($text -match '(?i)application.*config|config.*application') { $score += 30 }
+        if ($request.RawUrl -match '(?i)/policies') { $score += 10 }
+        if ($text -match '(?i)member|security.layer|default|status') { $score -= 30 }
+        [pscustomobject]@{ Request = $request; Score = $score }
+    }
+
+    $script:ListPoliciesRequest = ($listScored | Sort-Object Score -Descending | Select-Object -First 1).Request
+    $script:GetPolicyRequest = ($detailScored | Sort-Object Score -Descending | Select-Object -First 1).Request
+    $script:PutApplicationConfigurationRequest = ($putScored | Sort-Object Score -Descending | Select-Object -First 1).Request
+
+    if ($null -eq $script:ListPoliciesRequest) {
+        throw 'Could not identify the GET SWS policies request in the CyberArk Postman collection.'
+    }
+    if ($null -eq $script:GetPolicyRequest) {
+        throw 'Could not identify the GET policy-by-ID request in the CyberArk Postman collection.'
+    }
+    if ($null -eq $script:PutApplicationConfigurationRequest) {
+        throw 'Could not identify the PUT Policy application configuration request in the CyberArk Postman collection.'
+    }
+
+    Write-Log ("Postman GET list request : {0} -> {1}" -f $script:ListPoliciesRequest.Name, $script:ListPoliciesRequest.RawUrl) 'DEBUG'
+    Write-Log ("Postman GET detail request: {0} -> {1}" -f $script:GetPolicyRequest.Name, $script:GetPolicyRequest.RawUrl) 'DEBUG'
+    Write-Log ("Postman PUT config request: {0} -> {1}" -f $script:PutApplicationConfigurationRequest.Name, $script:PutApplicationConfigurationRequest.RawUrl) 'DEBUG'
+}
+
+function Remove-UnresolvedQueryParameters {
+    param([Parameter(Mandatory)][string]$Url)
+
+    $questionIndex = $Url.IndexOf('?')
+    if ($questionIndex -lt 0) { return $Url }
+
+    $base = $Url.Substring(0, $questionIndex)
+    $query = $Url.Substring($questionIndex + 1)
+    $kept = @()
+
+    foreach ($part in @($query -split '&')) {
+        if ($part -notmatch '\{\{' -and $part -notmatch '\{[^}]+\}' -and $part -notmatch ':[A-Za-z][A-Za-z0-9_]*') {
+            $kept += $part
+        }
+    }
+
+    if ($kept.Count -eq 0) { return $base }
+    return $base + '?' + ($kept -join '&')
+}
+
+function Resolve-SwsRequestUrl {
+    param(
+        [Parameter(Mandatory)][string]$RawUrl,
+        [string]$PolicyId = ''
+    )
+
+    $url = Expand-CollectionVariables -Text $RawUrl
+
+    if (-not [string]::IsNullOrWhiteSpace($PolicyId)) {
+        $escapedId = [uri]::EscapeDataString($PolicyId)
+        $patterns = @(
+            '\{\{policyId\}\}', '\{\{policyID\}\}', '\{\{id\}\}',
+            '\{policyId\}', '\{policyID\}', '\{id\}',
+            ':policyId', ':policyID', ':id'
+        )
+        foreach ($pattern in $patterns) {
+            $url = [regex]::Replace($url, $pattern, $escapedId, [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+        }
+    }
+
+    $url = Remove-UnresolvedQueryParameters -Url $url
+
+    $apiRootResolved = $SwsApiRoot.TrimEnd('/')
+    if ([string]::IsNullOrWhiteSpace($apiRootResolved)) {
+        $apiRootResolved = (Get-DataCenterApiRoot -Code $DataCenter).TrimEnd('/')
+    }
+
+    $versionPathMatch = [regex]::Match($url, '(?i)/(v[0-9]+(?:-edge)?)/')
+    if ($versionPathMatch.Success) {
+        $pathStart = $versionPathMatch.Index
+        return $apiRootResolved + $url.Substring($pathStart)
+    }
+
+    if ($url -match '^https?://') {
+        $uri = [uri]$url
+        $pathAndQuery = $uri.PathAndQuery
+        if ($pathAndQuery -notmatch '(?i)^/v[0-9]+(?:-edge)?/') {
+            $normalizedPathAndQuery = if ($pathAndQuery.StartsWith('/')) { $pathAndQuery } else { '/' + $pathAndQuery }
+            $pathAndQuery = '/v2-edge' + $normalizedPathAndQuery
+        }
+        return $apiRootResolved + $pathAndQuery
+    }
+
+    $relative = $url
+    $relative = [regex]::Replace($relative, '^\{\{[^}]+\}\}', '')
+    if (-not $relative.StartsWith('/')) { $relative = '/' + $relative }
+    if ($relative -notmatch '(?i)^/v[0-9]+(?:-edge)?/') {
+        $relative = '/v2-edge' + $relative
+    }
+
+    if ($relative -match '\{\{' -or $relative -match '\{[^}]+\}') {
+        throw "The Postman request URL still contains an unresolved path variable: $relative"
+    }
+
+    return $apiRootResolved + $relative
+}
+
+function Get-HttpErrorDetail {
+    param([Parameter(Mandatory)]$ErrorRecord)
+
+    $status = $null
+    $body = $null
+
+    try { $status = [int]$ErrorRecord.Exception.Response.StatusCode.value__ } catch {}
+    try {
+        $stream = $ErrorRecord.Exception.Response.GetResponseStream()
+        if ($null -ne $stream) {
+            $reader = New-Object IO.StreamReader($stream)
+            $body = $reader.ReadToEnd()
+            $reader.Dispose()
+        }
+    } catch {}
+
+    return [pscustomobject]@{
+        StatusCode = $status
+        Body       = $body
+        Message    = $ErrorRecord.Exception.Message
+    }
+}
+
+function Invoke-SwsApi {
+    param(
+        [Parameter(Mandatory)][ValidateSet('GET','PUT','POST','DELETE','OPTIONS')][string]$Method,
+        [Parameter(Mandatory)][string]$Uri,
+        [Parameter()][object]$Body
+    )
+
+    $headers = @{
+        Authorization = 'Bearer ' + $script:SwsToken
+        Accept        = 'application/json'
+    }
+
+    $parameters = @{
+        Method      = $Method
+        Uri         = $Uri
+        Headers     = $headers
+        ErrorAction = 'Stop'
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($Proxy)) {
+        $parameters['Proxy'] = $Proxy
+    }
+    if ($null -ne $ProxyCredential) {
+        $parameters['ProxyCredential'] = $ProxyCredential
+    }
+
+    if ($null -ne $Body) {
+        $parameters['ContentType'] = 'application/json'
+        $parameters['Body'] = ConvertTo-JsonDeep -InputObject $Body
+    }
+
+    Write-Log ("SWS API {0} {1}" -f $Method, $Uri) 'DEBUG'
+
+    try {
+        return Invoke-RestMethod @parameters
+    }
+    catch {
+        $detail = Get-HttpErrorDetail -ErrorRecord $_
+        throw ("SWS API call failed. Method={0}; URI={1}; Status={2}; Error={3}; Response={4}" -f $Method, $Uri, $detail.StatusCode, $detail.Message, $detail.Body)
+    }
+}
+
+function Get-PolicyIdentifier {
+    param([Parameter()][object]$Object)
+
+    $value = Get-DirectProperty -Object $Object -Names @('policyId','policyID','PolicyId','id','Id','uuid','Uuid')
+    if ($null -eq $value) { return $null }
+
+    $text = [string]$value
+    if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+    return $text.Trim()
+}
+
+function Get-PolicyDisplayValue {
+    param([Parameter()][object]$Object)
+
+    $value = Get-DirectProperty -Object $Object -Names @('policyName','applicationName','displayName','name','Name','title')
+    if ($null -eq $value) { return '' }
+    return [string]$value
+}
+
+function Get-PolicyCandidates {
+    param([Parameter(Mandatory)][object]$ListResponse)
+
+    $groups = @()
+
+    foreach ($node in @(Get-ObjectNodes -Object $ListResponse)) {
+        $value = $node.Object
+        $isEnumerable = $value -is [System.Collections.IEnumerable] -and
+                        -not ($value -is [string]) -and
+                        -not ($value -is [System.Collections.IDictionary]) -and
+                        -not ($value -is [pscustomobject])
+
+        if (-not $isEnumerable) { continue }
+
+        $items = @($value)
+        if ($items.Count -eq 0) { continue }
+
+        $recognizedItems = @()
+        $groupScore = 0
+
+        if ($node.Path -match '(?i)(^|\.)(policies|applicationPolicies|items|content|results?)$') {
+            $groupScore += 30
+        }
+
+        foreach ($item in $items) {
+            if (-not (Test-IsComplexObject -Object $item)) { continue }
+
+            $id = Get-PolicyIdentifier -Object $item
+            if ([string]::IsNullOrWhiteSpace($id)) { continue }
+
+            $propertyNames = @(Get-DirectPropertyNames -Object $item)
+            $itemScore = 2
+
+            foreach ($propertyName in $propertyNames) {
+                if ($propertyName -match '(?i)policy') { $itemScore += 8 }
+                if ($propertyName -match '(?i)application|appKey|identityApp') { $itemScore += 7 }
+                if ($propertyName -match '(?i)securityLayer|defaultLayer') { $itemScore += 4 }
+                if ($propertyName -match '(?i)status|active') { $itemScore += 1 }
+            }
+
+            $display = Get-PolicyDisplayValue -Object $item
+            if (-not [string]::IsNullOrWhiteSpace($display)) { $itemScore += 2 }
+
+            $recognizedItems += [pscustomobject]@{
+                PolicyId = $id
+                Name     = $display
+                Object   = $item
+                Path     = $node.Path
+                ItemScore = $itemScore
+            }
+            $groupScore += $itemScore
+        }
+
+        if ($recognizedItems.Count -gt 0) {
+            $groups += [pscustomobject]@{
+                Path       = $node.Path
+                Score      = $groupScore
+                Candidates = $recognizedItems
+            }
+        }
+    }
+
+    if ($groups.Count -eq 0) {
+        # Fallback for an unusual response that contains policy objects but no array.
+        $fallback = @{}
+        foreach ($node in @(Get-ObjectNodes -Object $ListResponse)) {
+            $id = Get-PolicyIdentifier -Object $node.Object
+            if ([string]::IsNullOrWhiteSpace($id)) { continue }
+
+            $propertyNames = @(Get-DirectPropertyNames -Object $node.Object)
+            $hasPolicySignal = @($propertyNames | Where-Object { $_ -match '(?i)policy|application|appKey|identityApp' }).Count -gt 0
+            if (-not $hasPolicySignal) { continue }
+
+            if (-not $fallback.ContainsKey($id)) {
+                $fallback[$id] = [pscustomobject]@{
+                    PolicyId = $id
+                    Name     = Get-PolicyDisplayValue -Object $node.Object
+                    Object   = $node.Object
+                    Path     = $node.Path
+                }
+            }
+        }
+        return @($fallback.Values)
+    }
+
+    $winningGroup = $groups | Sort-Object Score -Descending | Select-Object -First 1
+    Write-Log ("Selected policy collection at path '{0}' with {1} candidate(s)." -f $winningGroup.Path, $winningGroup.Candidates.Count) 'DEBUG'
+
+    $deduplicated = @{}
+    foreach ($candidate in @($winningGroup.Candidates)) {
+        if (-not $deduplicated.ContainsKey($candidate.PolicyId)) {
+            $deduplicated[$candidate.PolicyId] = [pscustomobject]@{
+                PolicyId = $candidate.PolicyId
+                Name     = $candidate.Name
+                Object   = $candidate.Object
+                Path     = $candidate.Path
+            }
+        }
+    }
+
+    return @($deduplicated.Values)
+}
+
+function Set-PolicyListQueryForLargePage {
+    param([Parameter(Mandatory)][string]$Url)
+
+    $questionIndex = $Url.IndexOf('?')
+    if ($questionIndex -lt 0) { return $Url }
+
+    $base = $Url.Substring(0, $questionIndex)
+    $query = $Url.Substring($questionIndex + 1)
+    $updated = @()
+
+    foreach ($part in @($query -split '&')) {
+        if ([string]::IsNullOrWhiteSpace($part)) { continue }
+        $pair = $part -split '=', 2
+        $name = $pair[0]
+        $value = if ($pair.Count -gt 1) { $pair[1] } else { '' }
+        $decodedName = [uri]::UnescapeDataString($name)
+
+        if ($decodedName -match '(?i)^(limit|size|pageSize|take|top|maxResults)$') {
+            $value = '1000'
+        }
+        elseif ($decodedName -match '(?i)^(offset|skip|page|pageNumber)$') {
+            $value = '0'
+        }
+
+        $updated += ($name + '=' + $value)
+    }
+
+    if ($updated.Count -eq 0) { return $base }
+    return $base + '?' + ($updated -join '&')
+}
+
+function Get-PolicyListResponse {
+    $url = Resolve-SwsRequestUrl -RawUrl $script:ListPoliciesRequest.RawUrl
+    $url = Set-PolicyListQueryForLargePage -Url $url
+    return Invoke-SwsApi -Method GET -Uri $url
+}
+
+function Get-PolicyDetailResponse {
+    param([Parameter(Mandatory)][string]$PolicyId, [switch]$Refresh)
+
+    if (-not $Refresh -and $script:PolicyDetailCache.ContainsKey($PolicyId)) {
+        return $script:PolicyDetailCache[$PolicyId]
+    }
+
+    $url = Resolve-SwsRequestUrl -RawUrl $script:GetPolicyRequest.RawUrl -PolicyId $PolicyId
+    $detail = Invoke-SwsApi -Method GET -Uri $url
+    $script:PolicyDetailCache[$PolicyId] = $detail
+    return $detail
+}
+
+function Get-PolicyMatchScore {
+    param(
+        [Parameter(Mandatory)][object]$CandidateObject,
+        [Parameter(Mandatory)][string]$Selector
+    )
+
+    $score = 0
+    $json = ConvertTo-JsonDeep -InputObject $CandidateObject
+    if ($json.IndexOf($Selector, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $score += 20 }
+
+    foreach ($propertyName in @('identityAppKey','applicationKey','appKey','policyName','applicationName','displayName','name')) {
+        $value = Get-DirectProperty -Object $CandidateObject -Names @($propertyName)
+        if ($null -eq $value) { continue }
+
+        if ($value -is [System.Collections.IEnumerable] -and -not ($value -is [string])) {
+            foreach ($item in $value) {
+                if ([string]$item -ieq $Selector) { $score += 50 }
+            }
+        }
+        elseif ([string]$value -ieq $Selector) {
+            $score += 50
+        }
+        elseif ([string]$value -like "*$Selector*") {
+            $score += 15
+        }
+    }
+
+    return $score
+}
+
+function Find-SwsPolicy {
+    param(
+        [Parameter(Mandatory)][string]$Selector,
+        [Parameter(Mandatory)][string]$SelectorDescription,
+        [Parameter(Mandatory)][object]$ListResponse
+    )
+
+    $candidates = @(Get-PolicyCandidates -ListResponse $ListResponse)
+    if ($candidates.Count -eq 0) {
+        throw 'The GET SWS policies response did not contain recognizable policy IDs.'
+    }
+
+    if ($candidates.Count -gt $MaximumPoliciesToInspect) {
+        throw ("The policy list contained {0} candidates, exceeding MaximumPoliciesToInspect={1}. Increase the limit if appropriate." -f $candidates.Count, $MaximumPoliciesToInspect)
+    }
+
+    $matches = @()
+    foreach ($candidate in $candidates) {
+        $listScore = Get-PolicyMatchScore -CandidateObject $candidate.Object -Selector $Selector
+        if ($listScore -gt 0) {
+            $matches += [pscustomobject]@{
+                Candidate = $candidate
+                Score     = $listScore
+                Detail    = $null
+            }
+        }
+    }
+
+    if ($matches.Count -eq 1 -and $matches[0].Score -ge 50) {
+        $detail = Get-PolicyDetailResponse -PolicyId $matches[0].Candidate.PolicyId
+        return [pscustomobject]@{
+            PolicyId = $matches[0].Candidate.PolicyId
+            Name     = $matches[0].Candidate.Name
+            Detail   = $detail
+        }
+    }
+
+    $detailMatches = @()
+    foreach ($candidate in $candidates) {
         try {
-            # Phase 1: create for the current app only
-            Reset-IdentitySessionState
-            Start-IdentityRegularUserSession
-            $createdAppRowKey = Import-AppFromTemplate -ResolvedTemplateId $TemplateId
-            $script:CurrentAppRowKey = $createdAppRowKey
-
-            Write-Log ("Waiting {0} second(s) before starting fresh-session update phase for app '{1}'..." -f $PreUpdateDelaySeconds, $script:Name) 'Yellow'
-            Start-Sleep -Seconds $PreUpdateDelaySeconds
-
-            # Phase 2: fresh session update for the current app only
-            Invoke-PostCreateUpdatePhase -CreatedRowKey $createdAppRowKey
-
-            Write-Log ("Create + update completed successfully for app '{0}'. Created app row key is '{1}'." -f $script:Name, $createdAppRowKey) 'Green'
-            Add-ReportRow -Step 'Overall' -Status 'SUCCESS' -Detail ("CreatedRowKey={0}; FinalName={1}; DisplayName={2}; Description={3}" -f $createdAppRowKey, $script:Name, $script:DisplayName, $script:Description) -RowKey $createdAppRowKey
+            $detail = Get-PolicyDetailResponse -PolicyId $candidate.PolicyId
         }
         catch {
-            $script:HadApplicationFailures = $true
-            $msg = $_.Exception.Message
-            Write-Log ("FAILED for CSV row {0}, app '{1}': {2}" -f $script:CurrentCsvRowNumber, $script:Name, $msg) 'Red'
-            Add-ReportRow -Step 'Overall' -Status 'FAILED' -Detail $msg
+            Write-Log ("Skipping candidate PolicyId={0} because policy detail retrieval failed: {1}" -f $candidate.PolicyId, $_.Exception.Message) 'WARN'
+            continue
+        }
+
+        $score = Get-PolicyMatchScore -CandidateObject $detail -Selector $Selector
+        if ($score -gt 0) {
+            $detailMatches += [pscustomobject]@{
+                PolicyId = $candidate.PolicyId
+                Name     = if (-not [string]::IsNullOrWhiteSpace($candidate.Name)) { $candidate.Name } else { Get-PolicyDisplayValue -Object $detail }
+                Score    = $score
+                Detail   = $detail
+            }
+        }
+    }
+
+    if ($detailMatches.Count -eq 0) {
+        return $null
+    }
+
+    $ordered = @($detailMatches | Sort-Object Score -Descending)
+    if ($ordered.Count -gt 1 -and $ordered[0].Score -eq $ordered[1].Score) {
+        $text = ($ordered | ForEach-Object { "PolicyId=$($_.PolicyId); Name=$($_.Name); Score=$($_.Score)" }) -join ' || '
+        throw ("Multiple SWS policies matched {0} '{1}'. Matches: {2}" -f $SelectorDescription, $Selector, $text)
+    }
+
+    return $ordered[0]
+}
+
+function Wait-ForTargetPolicy {
+    param(
+        [Parameter(Mandatory)][string]$Selector,
+        [Parameter(Mandatory)][string]$SelectorDescription
+    )
+
+    $deadline = (Get-Date).AddSeconds($TargetPolicyWaitSeconds)
+    $attempt = 0
+
+    do {
+        $attempt++
+        $script:PolicyDetailCache = @{}
+        Write-Log ("Searching for target SWS policy by {0} '{1}' (attempt {2})." -f $SelectorDescription, $Selector, $attempt) 'INFO'
+
+        $list = Get-PolicyListResponse
+        $match = Find-SwsPolicy -Selector $Selector -SelectorDescription $SelectorDescription -ListResponse $list
+        if ($null -ne $match) {
+            Write-Log ("Target SWS policy found. PolicyId={0}; Name='{1}'." -f $match.PolicyId, $match.Name) 'SUCCESS'
+            return $match
+        }
+
+        if ((Get-Date) -ge $deadline) { break }
+        Write-Log ("Target policy is not available yet. Retrying in {0} second(s)." -f $PollIntervalSeconds) 'WARN'
+        Start-Sleep -Seconds $PollIntervalSeconds
+    }
+    while ((Get-Date) -lt $deadline)
+
+    throw ("Target SWS policy was not found within {0} seconds using {1} '{2}'." -f $TargetPolicyWaitSeconds, $SelectorDescription, $Selector)
+}
+
+function Get-SwsConfigurationNode {
+    param([Parameter(Mandatory)][object]$PolicyDetail)
+
+    $scoredNodes = @()
+    foreach ($node in @(Get-ObjectNodes -Object $PolicyDetail)) {
+        $score = 0
+        if ($node.Path -match '(?i)application.*config|config.*application|general.*setting|policy.*setting') { $score += 30 }
+
+        foreach ($property in @($node.Object.PSObject.Properties)) {
+            $name = $property.Name
+            if ($name -match '(?i)detect') { $score += 20 }
+            if ($name -match '(?i)exclud') { $score += 20 }
+            if ($name -match '(?i)includ') { $score += 8 }
+            if ($name -match '(?i)domain') { $score += 8 }
+            if ($name -match '(?i)url') { $score += 8 }
+            if ($name -match '(?i)automatic|manual') { $score += 8 }
+            if ($name -match '(?i)app.*key|identity.*key') { $score += 2 }
+        }
+
+        if ($score -gt 0) {
+            $jsonLength = (ConvertTo-JsonDeep -InputObject $node.Object).Length
+            $scoredNodes += [pscustomobject]@{
+                Node       = $node
+                Score      = $score
+                JsonLength = $jsonLength
+            }
+        }
+    }
+
+    if ($scoredNodes.Count -eq 0) {
+        throw 'Could not locate an SWS application-configuration object in the policy detail response.'
+    }
+
+    $winner = $scoredNodes | Sort-Object @{Expression='Score';Descending=$true}, @{Expression='JsonLength';Descending=$false} | Select-Object -First 1
+    Write-Log ("Selected SWS configuration node at path '{0}' with score {1}." -f $winner.Node.Path, $winner.Score) 'DEBUG'
+    return $winner.Node.Object
+}
+
+function Test-IsCopyFieldName {
+    param([Parameter(Mandatory)][string]$Name)
+
+    if ($Name -match '(?i)(^|_)(id|uuid|key|name)$|policy.?id|identity.*key|app.*key|application.*id|tenant|member|security.layer|status') {
+        return $false
+    }
+
+    return ($Name -match '(?i)detect|exclud|includ|domain|url|pattern|automatic|manual|monitor|match')
+}
+
+function Merge-SwsDetectionConfiguration {
+    param(
+        [Parameter(Mandatory)][object]$Source,
+        [Parameter(Mandatory)][object]$Target
+    )
+
+    $copiedPaths = New-Object System.Collections.ArrayList
+
+    function Merge-Node {
+        param([object]$SourceNode, [object]$TargetNode, [string]$CurrentPath)
+
+        if ($null -eq $SourceNode -or $null -eq $TargetNode) { return }
+
+        foreach ($sourceProperty in @($SourceNode.PSObject.Properties)) {
+            $name = $sourceProperty.Name
+            $sourceValue = $sourceProperty.Value
+            $targetPropertyName = Get-DirectPropertyName -Object $TargetNode -Names @($name)
+
+            if (Test-IsCopyFieldName -Name $name) {
+                Set-DirectPropertyValue -Object $TargetNode -PropertyName $name -Value (Copy-DeepObject -InputObject $sourceValue)
+                [void]$copiedPaths.Add(("{0}.{1}" -f $CurrentPath, $name))
+                continue
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace($targetPropertyName)) {
+                $targetValue = $TargetNode.$targetPropertyName
+                if (Test-IsComplexObject -Object $sourceValue -and Test-IsComplexObject -Object $targetValue) {
+                    Merge-Node -SourceNode $sourceValue -TargetNode $targetValue -CurrentPath ("{0}.{1}" -f $CurrentPath, $name)
+                }
+            }
+        }
+    }
+
+    $merged = Copy-DeepObject -InputObject $Target
+    Merge-Node -SourceNode $Source -TargetNode $merged -CurrentPath '$'
+
+    if ($copiedPaths.Count -eq 0) {
+        throw 'No SWS detection, URL, domain, include, or exclusion fields were recognized for copying. No update was attempted.'
+    }
+
+    return [pscustomobject]@{
+        Configuration = $merged
+        CopiedPaths   = @($copiedPaths | Sort-Object -Unique)
+    }
+}
+
+function ConvertFrom-PostmanBodyJson {
+    param([string]$BodyRaw)
+
+    if ([string]::IsNullOrWhiteSpace($BodyRaw)) { return $null }
+
+    $expanded = Expand-CollectionVariables -Text $BodyRaw
+    $expanded = [regex]::Replace($expanded, '"\{\{[^}]+\}\}"', '"POSTMAN_VARIABLE"')
+    $expanded = [regex]::Replace($expanded, '\{\{[^}]+\}\}', 'null')
+
+    try {
+        return ($expanded | ConvertFrom-Json)
+    }
+    catch {
+        Write-Log ("Could not parse the Postman PUT request body as JSON: {0}" -f $_.Exception.Message) 'WARN'
+        return $null
+    }
+}
+
+function Get-DirectPropertyNames {
+    param([Parameter()][object]$Object)
+    if ($null -eq $Object) { return @() }
+    return @($Object.PSObject.Properties | ForEach-Object { $_.Name })
+}
+
+function Get-NameOverlapCount {
+    param([Parameter()][object]$First, [Parameter()][object]$Second)
+
+    $firstNames = @(Get-DirectPropertyNames -Object $First)
+    $secondNames = @(Get-DirectPropertyNames -Object $Second)
+    $count = 0
+
+    foreach ($name in $firstNames) {
+        if ($secondNames -icontains $name) { $count++ }
+    }
+    return $count
+}
+
+function Project-ConfigurationToTemplate {
+    param(
+        [Parameter(Mandatory)][object]$Template,
+        [Parameter(Mandatory)][object]$MergedConfiguration,
+        [Parameter(Mandatory)][object]$TargetPolicyDetail
+    )
+
+    function Project-Node {
+        param([object]$TemplateNode, [object]$PreferredNode, [object]$FallbackRoot)
+
+        if ($null -eq $TemplateNode) { return $null }
+        if ($TemplateNode -is [string] -or $TemplateNode.GetType().IsValueType) { return $TemplateNode }
+
+        if ($TemplateNode -is [System.Collections.IEnumerable] -and -not ($TemplateNode -is [pscustomobject])) {
+            return Copy-DeepObject -InputObject $TemplateNode
+        }
+
+        $output = [ordered]@{}
+        foreach ($property in @($TemplateNode.PSObject.Properties)) {
+            $name = $property.Name
+            $templateValue = $property.Value
+
+            $preferredValue = Get-DirectProperty -Object $PreferredNode -Names @($name)
+            if ($null -eq $preferredValue) {
+                $preferredValue = Get-FirstRecursivePropertyValue -Object $FallbackRoot -PropertyName $name
+            }
+
+            if ($null -ne $preferredValue) {
+                $output[$name] = Copy-DeepObject -InputObject $preferredValue
+                continue
+            }
+
+            if (Test-IsComplexObject -Object $templateValue) {
+                $output[$name] = Project-Node -TemplateNode $templateValue -PreferredNode $PreferredNode -FallbackRoot $FallbackRoot
+            }
+            else {
+                $output[$name] = $templateValue
+            }
+        }
+
+        return [pscustomobject]$output
+    }
+
+    $topNames = @(Get-DirectPropertyNames -Object $Template)
+    if ($topNames.Count -eq 1) {
+        $wrapperName = $topNames[0]
+        $wrapperValue = Get-DirectProperty -Object $Template -Names @($wrapperName)
+        if (Test-IsComplexObject -Object $wrapperValue) {
+            $overlap = Get-NameOverlapCount -First $wrapperValue -Second $MergedConfiguration
+            if ($overlap -gt 0 -or $wrapperName -match '(?i)config|policy|application') {
+                $inner = Project-Node -TemplateNode $wrapperValue -PreferredNode $MergedConfiguration -FallbackRoot $TargetPolicyDetail
+                $wrapped = [ordered]@{}
+                $wrapped[$wrapperName] = $inner
+                return [pscustomobject]$wrapped
+            }
+        }
+    }
+
+    return Project-Node -TemplateNode $Template -PreferredNode $MergedConfiguration -FallbackRoot $TargetPolicyDetail
+}
+
+function New-SwsPutPayload {
+    param(
+        [Parameter(Mandatory)][object]$MergedConfiguration,
+        [Parameter(Mandatory)][object]$TargetPolicyDetail
+    )
+
+    $template = ConvertFrom-PostmanBodyJson -BodyRaw $script:PutApplicationConfigurationRequest.BodyRaw
+    if ($null -eq $template) {
+        Write-Log 'The Postman request did not provide a usable JSON body. Using the target configuration object as the PUT body.' 'WARN'
+        return Copy-DeepObject -InputObject $MergedConfiguration
+    }
+
+    Save-JsonArtifact -FileName '00_Postman_Put_Body_Template.json' -Object $template | Out-Null
+    return Project-ConfigurationToTemplate -Template $template -MergedConfiguration $MergedConfiguration -TargetPolicyDetail $TargetPolicyDetail
+}
+
+function Test-PayloadForUnresolvedValues {
+    param([Parameter(Mandatory)][object]$Payload)
+
+    $json = ConvertTo-JsonDeep -InputObject $Payload
+    $issues = @()
+
+    if ($json -match '\{\{[^}]+\}\}') { $issues += 'unresolved Postman variable' }
+    if ($json -match '"POSTMAN_VARIABLE"') { $issues += 'unresolved Postman variable placeholder' }
+
+    return @($issues | Sort-Object -Unique)
+}
+
+function Get-ValueBySimplePath {
+    param([Parameter()][object]$Root, [Parameter(Mandatory)][string]$Path)
+
+    $segments = @($Path.TrimStart('$').TrimStart('.') -split '\.')
+    $current = $Root
+
+    foreach ($segment in $segments) {
+        if ([string]::IsNullOrWhiteSpace($segment)) { continue }
+        if ($null -eq $current) { return $null }
+        $current = Get-DirectProperty -Object $current -Names @($segment)
+    }
+
+    return $current
+}
+
+function Compare-CopiedConfiguration {
+    param(
+        [Parameter(Mandatory)][object]$ExpectedConfiguration,
+        [Parameter(Mandatory)][object]$ActualConfiguration,
+        [Parameter(Mandatory)][string[]]$CopiedPaths
+    )
+
+    $results = @()
+    foreach ($path in $CopiedPaths) {
+        $expected = Get-ValueBySimplePath -Root $ExpectedConfiguration -Path $path
+        $actual = Get-ValueBySimplePath -Root $ActualConfiguration -Path $path
+        $expectedJson = ConvertTo-JsonDeep -InputObject $expected
+        $actualJson = ConvertTo-JsonDeep -InputObject $actual
+
+        $results += [pscustomobject]@{
+            Path         = $path
+            Match        = ($expectedJson -ceq $actualJson)
+            ExpectedJson = $expectedJson
+            ActualJson   = $actualJson
+        }
+    }
+
+    return $results
+}
+
+
+function Invoke-SwsCloneForTarget {
+    param(
+        [Parameter(Mandatory)][object]$TargetRow,
+        [Parameter(Mandatory)][object]$SourcePolicy,
+        [Parameter(Mandatory)][object]$SourceConfiguration
+    )
+
+    $script:CurrentTargetRowNumber = [int]$TargetRow.RowNumber
+    $script:CurrentTargetApplicationName = [string]$TargetRow.TargetApplicationName
+    $script:CurrentTargetIdentityAppKey = [string]$TargetRow.TargetIdentityAppKey
+
+    $targetLabel = if (-not [string]::IsNullOrWhiteSpace($script:CurrentTargetApplicationName)) {
+        $script:CurrentTargetApplicationName
+    }
+    else {
+        $script:CurrentTargetIdentityAppKey
+    }
+
+    $folderName = 'Row_{0:D4}_{1}' -f $script:CurrentTargetRowNumber, (Get-SafeFolderName -Value $targetLabel)
+    $targetOutputFolder = Join-Path $script:BatchRootOutputFolder $folderName
+    $script:OutputFolder = $targetOutputFolder
+    if (-not (Test-Path -LiteralPath $targetOutputFolder)) {
+        New-Item -Path $targetOutputFolder -ItemType Directory -Force | Out-Null
+    }
+
+    Write-Log '------------------------------------------------------------' 'INFO'
+    Write-Log ("Processing CSV row {0}. TargetApplicationName='{1}'; TargetIdentityAppKey='{2}'." -f $script:CurrentTargetRowNumber, $script:CurrentTargetApplicationName, $script:CurrentTargetIdentityAppKey) 'INFO'
+    Write-Log ("Target artifact folder: {0}" -f $targetOutputFolder) 'INFO'
+    Add-SummaryRow -Step 'Target Start' -Status 'INFO' -Detail ("ArtifactFolder={0}" -f $targetOutputFolder)
+
+    Save-JsonArtifact -FileName '02_Source_Policy_Detail.json' -Object $SourcePolicy.Detail | Out-Null
+    Save-JsonArtifact -FileName '04_Source_Application_Configuration.json' -Object $SourceConfiguration | Out-Null
+
+    $targetSelector = if (-not [string]::IsNullOrWhiteSpace($script:CurrentTargetIdentityAppKey)) {
+        $script:CurrentTargetIdentityAppKey
+    }
+    else {
+        $script:CurrentTargetApplicationName
+    }
+    $targetDescription = if (-not [string]::IsNullOrWhiteSpace($script:CurrentTargetIdentityAppKey)) {
+        'target Identity app key'
+    }
+    else {
+        'target application name'
+    }
+
+    $targetPolicy = Wait-ForTargetPolicy -Selector $targetSelector -SelectorDescription $targetDescription
+    Add-SummaryRow -Step 'Find Target Policy' -Status 'SUCCESS' -Detail ("PolicyId={0}; Name={1}" -f $targetPolicy.PolicyId, $targetPolicy.Name)
+    Save-JsonArtifact -FileName '03_Target_Policy_Detail_Before.json' -Object $targetPolicy.Detail | Out-Null
+
+    if ($SourcePolicy.PolicyId -ieq $targetPolicy.PolicyId) {
+        Write-Log 'Source and target resolve to the same SWS policy. SWS has already consolidated the applications; no PUT is required.' 'SUCCESS'
+        Add-SummaryRow -Step 'Clone Configuration' -Status 'NO_ACTION' -Detail 'Source and target are the same SWS policy.'
+        return
+    }
+
+    $targetConfiguration = Get-SwsConfigurationNode -PolicyDetail $targetPolicy.Detail
+    Save-JsonArtifact -FileName '05_Target_Application_Configuration_Before.json' -Object $targetConfiguration | Out-Null
+
+    $mergeResult = Merge-SwsDetectionConfiguration -Source $SourceConfiguration -Target $targetConfiguration
+    $mergedConfiguration = $mergeResult.Configuration
+    $copiedPaths = @($mergeResult.CopiedPaths)
+
+    Save-JsonArtifact -FileName '06_Target_Application_Configuration_Proposed.json' -Object $mergedConfiguration | Out-Null
+    $copiedPaths | Set-Content -LiteralPath (Join-Path $targetOutputFolder '07_Copied_Configuration_Paths.txt') -Encoding UTF8
+
+    Write-Log ("Prepared SWS detection/URL clone. Copied field paths: {0}" -f ($copiedPaths -join ', ')) 'SUCCESS'
+    Add-SummaryRow -Step 'Build Configuration' -Status 'SUCCESS' -Detail ("CopiedPaths={0}" -f ($copiedPaths -join ';'))
+
+    $putPayload = New-SwsPutPayload -MergedConfiguration $mergedConfiguration -TargetPolicyDetail $targetPolicy.Detail
+    $payloadPath = Save-JsonArtifact -FileName '08_Proposed_Put_Payload.json' -Object $putPayload
+
+    $payloadIssues = @(Test-PayloadForUnresolvedValues -Payload $putPayload)
+    if ($payloadIssues.Count -gt 0) {
+        throw ("The proposed PUT payload contains unsafe unresolved values: {0}. Review {1}." -f ($payloadIssues -join ', '), $payloadPath)
+    }
+
+    $putUrl = Resolve-SwsRequestUrl -RawUrl $script:PutApplicationConfigurationRequest.RawUrl -PolicyId $targetPolicy.PolicyId
+    Write-Log ("Resolved PUT endpoint: {0}" -f $putUrl) 'INFO'
+    Add-SummaryRow -Step 'Resolve PUT Endpoint' -Status 'SUCCESS' -Detail $putUrl
+
+    if (-not $Execute) {
+        Write-Log 'REPORT ONLY completed for this target. No SWS configuration was changed.' 'WARN'
+        Write-Log ("Review the proposed payload: {0}" -f $payloadPath) 'WARN'
+        Add-SummaryRow -Step 'Clone Configuration' -Status 'REPORT_ONLY' -Detail ("ProposedPayload={0}" -f $payloadPath)
+        return
+    }
+
+    Write-Log 'Sending SWS application-configuration PUT request.' 'INFO'
+    $putResponse = Invoke-SwsApi -Method PUT -Uri $putUrl -Body $putPayload
+    Save-JsonArtifact -FileName '09_Put_Response.json' -Object $putResponse | Out-Null
+    Write-Log 'SWS application-configuration PUT request completed.' 'SUCCESS'
+    Add-SummaryRow -Step 'Clone Configuration' -Status 'SUCCESS' -Detail ("TargetPolicyId={0}" -f $targetPolicy.PolicyId)
+
+    Start-Sleep -Seconds 5
+    $targetAfter = Get-PolicyDetailResponse -PolicyId $targetPolicy.PolicyId -Refresh
+    Save-JsonArtifact -FileName '10_Target_Policy_Detail_After.json' -Object $targetAfter | Out-Null
+
+    $actualConfiguration = Get-SwsConfigurationNode -PolicyDetail $targetAfter
+    Save-JsonArtifact -FileName '11_Target_Application_Configuration_After.json' -Object $actualConfiguration | Out-Null
+
+    $verification = @(Compare-CopiedConfiguration -ExpectedConfiguration $mergedConfiguration -ActualConfiguration $actualConfiguration -CopiedPaths $copiedPaths)
+    $verificationPath = Join-Path $targetOutputFolder '12_Verification.csv'
+    $verification | Export-Csv -LiteralPath $verificationPath -NoTypeInformation -Force
+
+    $failures = @($verification | Where-Object { -not $_.Match })
+    if ($failures.Count -gt 0) {
+        throw ("The PUT completed, but {0} copied configuration path(s) did not verify. Review {1}." -f $failures.Count, $verificationPath)
+    }
+
+    Write-Log ("Verification succeeded for all {0} copied configuration path(s)." -f $verification.Count) 'SUCCESS'
+    Add-SummaryRow -Step 'Verification' -Status 'SUCCESS' -Detail ("VerifiedPaths={0}; Report={1}" -f $verification.Count, $verificationPath)
+}
+
+
+try {
+    Write-Log '============================================================' 'INFO'
+    Write-Log 'CyberArk SWS application-configuration clone test starting.' 'INFO'
+    Write-Log ("Execution mode       : {0}" -f $(if ($Execute) { 'EXECUTE' } else { 'REPORT ONLY' })) 'INFO'
+    Write-Log ("Source Identity key  : {0}" -f $SourceIdentityAppKey) 'INFO'
+    Write-Log ("CSV path             : {0}" -f $(if ([string]::IsNullOrWhiteSpace($CsvPath)) { '<not supplied>' } else { $CsvPath })) 'INFO'
+    Write-Log ("Single target key    : {0}" -f $(if ([string]::IsNullOrWhiteSpace($TargetIdentityAppKey)) { '<not supplied>' } else { $TargetIdentityAppKey })) 'INFO'
+    Write-Log ("Single target name   : {0}" -f $(if ([string]::IsNullOrWhiteSpace($TargetApplicationName)) { '<not supplied>' } else { $TargetApplicationName })) 'INFO'
+    Write-Log ("Output folder        : {0}" -f $script:BatchRootOutputFolder) 'INFO'
+
+    if ([string]::IsNullOrWhiteSpace($SourceIdentityAppKey)) {
+        throw 'SourceIdentityAppKey cannot be blank.'
+    }
+    if ($TargetPolicyWaitSeconds -lt 0) { throw 'TargetPolicyWaitSeconds cannot be negative.' }
+    if ($PollIntervalSeconds -lt 1) { throw 'PollIntervalSeconds must be at least 1.' }
+
+    if ($CreateSampleCsv) {
+        if ([string]::IsNullOrWhiteSpace($CsvPath)) {
+            $CsvPath = Join-Path $script:BatchRootOutputFolder 'SWS_Target_Applications_Sample.csv'
+        }
+        New-SampleTargetCsv -Path $CsvPath
+        Add-SummaryRow -Step 'Create Sample CSV' -Status 'SUCCESS' -Detail ("CsvPath={0}" -f $CsvPath)
+        return
+    }
+
+    $targetRows = @(Get-TargetRows)
+    Write-Log ("Resolved {0} target application row(s)." -f $targetRows.Count) 'SUCCESS'
+    Add-SummaryRow -Step 'Resolve Targets' -Status 'SUCCESS' -Detail ("TargetCount={0}; CsvPath={1}" -f $targetRows.Count, $CsvPath)
+
+    if ([string]::IsNullOrWhiteSpace($SwsApiRoot)) {
+        $SwsApiRoot = Get-DataCenterApiRoot -Code $DataCenter
+    }
+    Write-Log ("SWS API root         : {0}" -f $SwsApiRoot) 'INFO'
+
+    $postmanJsonPath = Get-OfficialPostmanCollectionJsonPath -RequestedPath $PostmanCollectionPath
+    Write-Log ("Using Postman JSON   : {0}" -f $postmanJsonPath) 'SUCCESS'
+
+    $collection = Get-Content -LiteralPath $postmanJsonPath -Raw | ConvertFrom-Json
+    foreach ($variable in @((Get-DirectProperty -Object $collection -Names @('variable')))) {
+        $key = [string](Get-DirectProperty -Object $variable -Names @('key','name'))
+        $value = Get-DirectProperty -Object $variable -Names @('value','current','initial')
+        if (-not [string]::IsNullOrWhiteSpace($key) -and $null -ne $value) {
+            $script:CollectionVariables[$key] = [string]$value
+        }
+    }
+
+    $collectionItems = Get-DirectProperty -Object $collection -Names @('item')
+    $script:PostmanRequests = @(Get-PostmanRequestRows -Items @($collectionItems))
+    Select-SwsPostmanRequests -Requests $script:PostmanRequests
+    Add-SummaryRow -Step 'Postman Collection' -Status 'SUCCESS' -Detail ("List={0}; Detail={1}; PutConfig={2}" -f $script:ListPoliciesRequest.Name, $script:GetPolicyRequest.Name, $script:PutApplicationConfigurationRequest.Name)
+
+    $script:SwsToken = Get-SwsTokenValue
+    Add-SummaryRow -Step 'SWS Authentication' -Status 'SUCCESS' -Detail 'Access token initialized. Token value was not logged.'
+
+    Write-Log 'Retrieving SWS policies and locating source policy.' 'INFO'
+    $initialList = Get-PolicyListResponse
+    Save-JsonArtifact -FileName '01_Sws_Policy_List.json' -Object $initialList | Out-Null
+
+    $sourcePolicy = Find-SwsPolicy -Selector $SourceIdentityAppKey -SelectorDescription 'source Identity app key' -ListResponse $initialList
+    if ($null -eq $sourcePolicy) {
+        throw ("No SWS policy was found for source Identity app key '{0}'." -f $SourceIdentityAppKey)
+    }
+
+    Write-Log ("Source SWS policy found. PolicyId={0}; Name='{1}'." -f $sourcePolicy.PolicyId, $sourcePolicy.Name) 'SUCCESS'
+    Add-SummaryRow -Step 'Find Source Policy' -Status 'SUCCESS' -Detail ("PolicyId={0}; Name={1}" -f $sourcePolicy.PolicyId, $sourcePolicy.Name)
+    Save-JsonArtifact -FileName '02_Source_Policy_Detail.json' -Object $sourcePolicy.Detail | Out-Null
+
+    $sourceConfiguration = Get-SwsConfigurationNode -PolicyDetail $sourcePolicy.Detail
+    Save-JsonArtifact -FileName '04_Source_Application_Configuration.json' -Object $sourceConfiguration | Out-Null
+
+    foreach ($targetRow in $targetRows) {
+        try {
+            Invoke-SwsCloneForTarget -TargetRow $targetRow -SourcePolicy $sourcePolicy -SourceConfiguration $sourceConfiguration
+            Add-SummaryRow -Step 'Target Overall' -Status 'SUCCESS' -Detail 'Target processing completed.' -RowNumber $targetRow.RowNumber -TargetApplicationName $targetRow.TargetApplicationName -TargetIdentityAppKey $targetRow.TargetIdentityAppKey
+        }
+        catch {
+            $script:HadTargetFailures = $true
+            Write-Log ("FAILED target row {0}, application '{1}', key '{2}': {3}" -f $targetRow.RowNumber, $targetRow.TargetApplicationName, $targetRow.TargetIdentityAppKey, $_.Exception.Message) 'ERROR'
+            Add-SummaryRow -Step 'Target Overall' -Status 'FAILED' -Detail $_.Exception.Message -RowNumber $targetRow.RowNumber -TargetApplicationName $targetRow.TargetApplicationName -TargetIdentityAppKey $targetRow.TargetIdentityAppKey
 
             if ($StopOnFirstFailure) {
                 throw
             }
-
-            Write-Log "Continuing to the next CSV application row after failure." 'Yellow'
         }
         finally {
-            Reset-IdentitySessionState
+            $script:CurrentTargetRowNumber = $null
+            $script:CurrentTargetApplicationName = $null
+            $script:CurrentTargetIdentityAppKey = $null
+            $script:OutputFolder = $script:BatchRootOutputFolder
         }
     }
 
-    if ($script:HadApplicationFailures) {
-        Write-Log 'CSV batch completed with one or more application failures. Review the report CSV for details.' 'Yellow'
-    } else {
-        Write-Log 'CSV batch completed successfully for all applications.' 'Green'
+    if ($script:HadTargetFailures) {
+        throw 'CSV batch completed with one or more target failures. Review SWS_Clone_Test_Summary.csv and the per-target folders.'
     }
+
+    Write-Log ("Completed successfully for all {0} target application(s)." -f $targetRows.Count) 'SUCCESS'
+    Add-SummaryRow -Step 'Overall Batch' -Status 'SUCCESS' -Detail ("TargetCount={0}" -f $targetRows.Count)
 }
 catch {
-    Write-Log ("FAILED: {0}" -f $_.Exception.Message) 'Red'
-    Add-ReportRow -Step 'Overall Batch' -Status 'FAILED' -Detail $_.Exception.Message
+    Write-Log ("FAILED: {0}" -f $_.Exception.Message) 'ERROR'
+    Add-SummaryRow -Step 'Overall Batch' -Status 'FAILED' -Detail $_.Exception.Message
+    throw
 }
 finally {
     try {
-        $csvDir = Split-Path -Path $ReportCsvPath -Parent
-        if ($csvDir -and -not (Test-Path $csvDir)) {
-            New-Item -Path $csvDir -ItemType Directory -Force | Out-Null
+        if ($script:SummaryRows.Count -gt 0) {
+            $summaryPath = Join-Path $script:BatchRootOutputFolder 'SWS_Clone_Test_Summary.csv'
+            $script:SummaryRows | Export-Csv -LiteralPath $summaryPath -NoTypeInformation -Force
+            Write-Log ("Summary report exported: {0}" -f $summaryPath) 'INFO'
         }
-
-        if ($script:ReportRows.Count -gt 0) {
-            $script:ReportRows | Export-Csv -Path $ReportCsvPath -NoTypeInformation -Force
-            Write-Log ("Report exported: {0}" -f $ReportCsvPath) 'Green'
-        }
-    } catch {
-        Write-Log ("Could not export report CSV: {0}" -f $_.Exception.Message) 'Yellow'
     }
+    catch {
+        Write-Host ("Could not export summary report: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
+    }
+
+    $script:SwsToken = $null
 }
