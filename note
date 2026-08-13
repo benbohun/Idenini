@@ -1,11 +1,3 @@
-For this script, 
-i use to run .\Update-VaultedAccounts.ps1 -CsvFile .\samples\account-update-template.csv -Environment prod
-
-now i need to be able to run 
-.\Update-VaultedAccounts.ps1 -CsvFile .\samples\account-update-template.csv -Environment prod -TargetAutomaticManagementEnabled $true
-
-Update
-
 <#
 .SYNOPSIS
     Updates or recreates CyberArk vaulted accounts from a CSV file.
@@ -29,8 +21,16 @@ Update
         -DisableSourceAfterMigration
 
 .EXAMPLE
+    .\Update-VaultedAccounts.ps1 -CsvFile .\samples\account-update-template.csv -Environment prod `
+        -TargetAutomaticManagementEnabled $true
+
+.EXAMPLE
     .\Update-VaultedAccounts.ps1 -CsvFile .\input\device-migration.csv -Environment prod `
-        -DisableSourceAfterMigration `
+        -DisableSourceAfterMigration
+
+.EXAMPLE
+    .\Update-VaultedAccounts.ps1 -CsvFile .\samples\account-update-template.csv -Environment prod `
+        -TargetAutomaticManagementEnabled $true `
         -DeleteSourceAfterMigration `
         -ConfirmDeleteSourceAfterMigration YES
 #>
@@ -79,6 +79,11 @@ param(
 
     # Manual management reason placed on duplicated/recreated target accounts when CPM is disabled on create.
     [string]$NewAccountManualManagementReason = 'Duplicated/recreated account created with Automatic Password Management disabled to prevent immediate CPM action.',
+
+    # Default Automatic Password Management state for duplicated/recreated target accounts.
+    # Use -TargetAutomaticManagementEnabled $true to create new target accounts with CPM management enabled.
+    # Per-row CSV columns AutomaticManagementEnabled or DisableAutomaticManagement still override this default.
+    [bool]$TargetAutomaticManagementEnabled = $false,
 
     # Allows CSV Prop:<name> values that are not advertised in the platform definition.
     [switch]$AllowUnknownPlatformProperties,
@@ -1545,9 +1550,20 @@ function Invoke-SafeMoveCreate {
     if (Test-BlankValue $secret) {
         throw 'Retrieved secret was empty. New account was not created.'
     }
-    # Safe behavior: create the duplicated/recreated target account with Automatic Password Management disabled.
-    # This prevents CPM from immediately consuming copied task flags or platform scheduling after account creation.
+    # The Automatic Password Management state for the new target account is controlled by:
+    #   1. The row-level CSV AutomaticManagementEnabled / DisableAutomaticManagement columns, when supplied.
+    #   2. Otherwise the command-line -TargetAutomaticManagementEnabled parameter.
     # The script still does not call Accounts/{id}/Change or Accounts/{id}/Reconcile.
+    $effectiveAutoManagement = if ($null -ne $AutomaticManagement) { [bool]$AutomaticManagement } else { [bool]$TargetAutomaticManagementEnabled }
+    $effectiveManualReason = $ManualManagementReason
+
+    if ($effectiveAutoManagement -eq $false -and (Test-BlankValue $effectiveManualReason)) {
+        $effectiveManualReason = $NewAccountManualManagementReason
+    }
+
+    if ($effectiveAutoManagement -eq $true) {
+        $effectiveManualReason = $null
+    }
 
     $body = New-AccountCreateBody -CurrentAccount $CurrentAccount `
         -TargetSafe $TargetSafe `
@@ -1556,8 +1572,8 @@ function Invoke-SafeMoveCreate {
         -TargetUserName $TargetUserName `
         -TargetPlatformId $TargetPlatformId `
         -Secret $secret `
-        -AutomaticManagement $false `
-        -ManualManagementReason $NewAccountManualManagementReason `
+        -AutomaticManagement $effectiveAutoManagement `
+        -ManualManagementReason $effectiveManualReason `
         -PlatformProperties $PlatformProperties
 
     return Invoke-CyberArkRest -Method POST -Path 'Accounts?AllowAccountDuplications=false' -Token $Token -Body $body
@@ -1606,9 +1622,20 @@ function Invoke-DeviceTypeMigrationCreate {
     if (Test-BlankValue $secret) {
         throw 'Retrieved secret was empty. New account was not created.'
     }
-    # Safe behavior: create the duplicated/recreated target account with Automatic Password Management disabled.
-    # This prevents CPM from immediately consuming copied task flags or platform scheduling after account creation.
+    # The Automatic Password Management state for the new target account is controlled by:
+    #   1. The row-level CSV AutomaticManagementEnabled / DisableAutomaticManagement columns, when supplied.
+    #   2. Otherwise the command-line -TargetAutomaticManagementEnabled parameter.
     # The script still does not call Accounts/{id}/Change or Accounts/{id}/Reconcile.
+    $effectiveAutoManagement = if ($null -ne $AutomaticManagement) { [bool]$AutomaticManagement } else { [bool]$TargetAutomaticManagementEnabled }
+    $effectiveManualReason = $ManualManagementReason
+
+    if ($effectiveAutoManagement -eq $false -and (Test-BlankValue $effectiveManualReason)) {
+        $effectiveManualReason = $NewAccountManualManagementReason
+    }
+
+    if ($effectiveAutoManagement -eq $true) {
+        $effectiveManualReason = $null
+    }
 
     $body = New-AccountCreateBody -CurrentAccount $CurrentAccount `
         -TargetSafe $TargetSafe `
@@ -1617,8 +1644,8 @@ function Invoke-DeviceTypeMigrationCreate {
         -TargetUserName $TargetUserName `
         -TargetPlatformId $TargetPlatformId `
         -Secret $secret `
-        -AutomaticManagement $false `
-        -ManualManagementReason $NewAccountManualManagementReason `
+        -AutomaticManagement $effectiveAutoManagement `
+        -ManualManagementReason $effectiveManualReason `
         -PlatformProperties $PlatformProperties `
         -UseProvidedPlatformPropertiesOnly
 
@@ -1848,7 +1875,7 @@ function Invoke-RowUpdate {
                 TargetPlatform = $targetPlatformId
                 SourceDeviceType = $currentDeviceType
                 TargetDeviceType = $targetDeviceType
-                NewAccountAutomaticManagement = 'DisabledOnCreate_NoImmediateCpmAction'
+                NewAccountAutomaticManagement = if ([bool]$automaticManagement) { 'EnabledOnCreate' } else { 'DisabledOnCreate_NoImmediateCpmAction' }
                 CreatedTime = (Get-Date -Format s)
             })
 
@@ -1907,7 +1934,7 @@ function Invoke-RowUpdate {
             Write-RunLog 'Invoke-RowUpdate' "SOURCE review. SourceAccountID=$($current.id) NewAccountID=$($newAccount.id) Status=$deleteStatus Note=$sourceNote" 'WARN'
 
             $result.Result = 'SUCCESS'
-            $newAccountCpmNote = 'New account created with Automatic Password Management disabled; no manual Change/Reconcile action invoked by script.'
+            $newAccountCpmNote = if ([bool]$automaticManagement) { 'New account created with Automatic Password Management enabled; no manual Change/Reconcile action invoked by script.' } else { 'New account created with Automatic Password Management disabled; no manual Change/Reconcile action invoked by script.' }
             $result.Message = "Device-type migration created new account. NewAccountID=$($newAccount.id). $newAccountCpmNote $sourceNote"
 
             return [pscustomobject]$result
@@ -1963,14 +1990,14 @@ function Invoke-RowUpdate {
                 TargetPlatform = $targetPlatformId
                 SourceDeviceType = $currentDeviceType
                 TargetDeviceType = $targetDeviceType
-                NewAccountAutomaticManagement = 'DisabledOnCreate_NoImmediateCpmAction'
+                NewAccountAutomaticManagement = if ([bool]$automaticManagement) { 'EnabledOnCreate' } else { 'DisabledOnCreate_NoImmediateCpmAction' }
                 CreatedTime = (Get-Date -Format s)
             })
 
             try {
                 $deleteNote = Remove-SourceAccountAfterMove -AccountId $current.id -Token $Token
                 $result.Result = 'SUCCESS'
-                $newAccountCpmNote = 'New account created with Automatic Password Management disabled; no manual Change/Reconcile action invoked by script.'
+                $newAccountCpmNote = if ([bool]$automaticManagement) { 'New account created with Automatic Password Management enabled; no manual Change/Reconcile action invoked by script.' } else { 'New account created with Automatic Password Management disabled; no manual Change/Reconcile action invoked by script.' }
                 $result.Message = "Created target Safe account. NewAccountID=$($newAccount.id). $newAccountCpmNote $deleteNote"
 
                 Add-DeleteCandidateRow -Row ([pscustomobject]@{
@@ -2052,7 +2079,7 @@ function Start-AccountUpdateRun {
     }
 
     Write-RunLog 'Start-AccountUpdateRun' 'Device-type migration auto-detection is enabled. Source accounts are kept unless delete confirmation is explicitly supplied.' 'INFO'
-    Write-RunLog 'Start-AccountUpdateRun' 'Duplicated/recreated target accounts will be created with Automatic Password Management disabled. No manual Change/Reconcile action is invoked by this script after create.' 'WARN'
+    Write-RunLog 'Start-AccountUpdateRun' "Duplicated/recreated target account default TargetAutomaticManagementEnabled=$TargetAutomaticManagementEnabled. CSV AutomaticManagementEnabled/DisableAutomaticManagement can override per row. No manual Change/Reconcile action is invoked by this script after create." 'WARN'
 
     Write-RunLog 'Start-AccountUpdateRun' "Using CSV file: $CsvFile" 'INFO'
 
