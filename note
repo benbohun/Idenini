@@ -1,18 +1,1259 @@
-I have a list of account with username and domain below
-prod.mtb.com
-cert.mtb.com
-dev.mtb.com
-atmprod.mtb.com
-atmcert.mtb.com-AMNG
-mgmt.local
+<#
+.SYNOPSIS
+    Searches CyberArk for OMNG/AMNG account pairs by domain and validates delete candidates.
 
-We just moved and duplicated them to their AMNG pair e.g from AP-(Appcode)-C1-OMNG to AP-(Appcode)-C1-AMNG
+.DESCRIPTION
+    Searches CyberArk directly for accounts containing the target domains, then identifies
+    OMNG and AMNG Safe pairs even when OMNG/AMNG appears in the middle of the Safe name.
 
-Need script to validate their previous and pair with same username. List the once that have existing OMNG safe pair 
+    Corrected default domains:
+        prod.mtb.com
+        cert.mtb.com
+        dev.mtb.com
+        atmprod.mtb.com
+        atmcert.mtb.com
+        mgmt.local
 
-Same script should contain delete action as the idea is to delete the OMNG pair.
+    Pairing example:
+        Safe AP-WBK-P-C1-OMNG      pairs with AP-WBK-P-C1-AMNG
+        Safe AP-WBK-OMNG-P-C1-X    pairs with AP-WBK-AMNG-P-C1-X
 
-Use same script login we have been using based on history
+    Matching default:
+        Same Safe pair base + same username + same matched domain.
 
+    Optional delete:
+        Deletes only OMNG accounts that have an AMNG pair, and only when:
+            -DeleteOmng -ConfirmDelete YES
+        are supplied together.
 
+.NOTES
+    Designed for Windows PowerShell 5.1.
+    Does not retrieve passwords/secrets.
+    Does not log bearer tokens.
+    Exports a multi-sheet XLSX workbook without requiring Excel or ImportExcel.
+#>
 
+#requires -Version 5.1
+[CmdletBinding()]
+param(
+    [ValidateSet('dev','prod')]
+    [string]$Environment = 'prod',
+
+    [string]$TenantId = '',
+
+    [string]$PVWA = '',
+
+    [string]$EnvFolder = (Join-Path $PSScriptRoot 'env'),
+
+    [string[]]$Domains = @(
+        'prod.mtb.com',
+        'cert.mtb.com',
+        'dev.mtb.com',
+        'atmprod.mtb.com',
+        'atmcert.mtb.com',
+        'mgmt.local'
+    ),
+
+    [ValidateSet('Contains','Exact')]
+    [string]$DomainMatchMode = 'Contains',
+
+    [ValidateSet('UsernameAndDomain','UsernameAndAddress')]
+    [string]$PairMatchMode = 'UsernameAndDomain',
+
+    # Token means OMNG/AMNG must be delimited by start/end, dash, or underscore.
+    # Contains allows any occurrence of OMNG/AMNG anywhere in the Safe name.
+    [ValidateSet('Token','Contains')]
+    [string]$SafeMarkerMatchMode = 'Token',
+
+    [int]$PageLimit = 1000,
+
+    [int]$MaxResultsPerDomain = 0,
+
+    [switch]$DeleteOmng,
+
+    [ValidateSet('NO','YES')]
+    [string]$ConfirmDelete = 'NO',
+
+    [switch]$ProxyUseDefaultCredentials,
+
+    [string]$ReportFolder = (Join-Path $PSScriptRoot 'reports'),
+
+    [string]$LogFolder = (Join-Path $PSScriptRoot 'logs'),
+
+    [string]$LogId = ''
+)
+
+$ErrorActionPreference = 'Stop'
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+$script:LogFile = $null
+$script:XlsxReportFile = $null
+$script:CsvPairFile = $null
+$script:CsvDeleteCandidateFile = $null
+$script:Config = $null
+
+function Test-BlankValue {
+    param([object]$Value)
+
+    if ($null -eq $Value) { return $true }
+
+    $text = $Value.ToString().Trim()
+
+    if ($text.Length -eq 0) { return $true }
+    if ($text -match '^(Placehold|Placeholder|YOUR-|<.*>|CHANGEME)$') { return $true }
+
+    return $false
+}
+
+function Get-EnvironmentDefault {
+    param(
+        [ValidateSet('TenantId','PVWA')]
+        [string]$Name
+    )
+
+    if ($Environment -eq 'dev') {
+        if ($Name -eq 'TenantId') { return 'abq4291' }
+        if ($Name -eq 'PVWA') { return 'https://mtbanktest.privilegecloud.cyberark.cloud' }
+    }
+
+    if ($Environment -eq 'prod') {
+        if ($Name -eq 'TenantId') { return 'abq4289' }
+        if ($Name -eq 'PVWA') { return 'https://mtbank.privilegecloud.cyberark.cloud' }
+    }
+
+    return $null
+}
+
+function New-RunLog {
+    if (-not (Test-Path $LogFolder)) {
+        New-Item -Path $LogFolder -ItemType Directory -Force | Out-Null
+    }
+
+    if (-not (Test-Path $ReportFolder)) {
+        New-Item -Path $ReportFolder -ItemType Directory -Force | Out-Null
+    }
+
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $suffix = if (Test-BlankValue $LogId) { '' } else { "_$LogId" }
+
+    $script:LogFile = Join-Path $LogFolder "Validate-OMNG-AMNG-Pairs_$stamp$suffix.log"
+    $script:XlsxReportFile = Join-Path $ReportFolder "OMNG_AMNG_PairValidation_$stamp$suffix.xlsx"
+    $script:CsvPairFile = Join-Path $ReportFolder "OMNG_AMNG_DuplicatePairs_$stamp$suffix.csv"
+    $script:CsvDeleteCandidateFile = Join-Path $ReportFolder "OMNG_DeleteCandidates_$stamp$suffix.csv"
+
+    Set-Content -Path $script:LogFile -Value "$(Get-Date -Format s) source=New-RunLog [INFO] Starting OMNG/AMNG pair validation"
+}
+
+function Write-RunLog {
+    param(
+        [string]$Source,
+        [string]$Message,
+        [ValidateSet('DEBUG','INFO','WARN','ERROR','SUCCESS')]
+        [string]$Level = 'INFO'
+    )
+
+    $line = "$(Get-Date -Format s) source=$Source [$Level] $Message"
+    Add-Content -Path $script:LogFile -Value $line
+
+    if ($Level -eq 'ERROR') { Write-Host $line -ForegroundColor Red }
+    elseif ($Level -eq 'WARN') { Write-Host $line -ForegroundColor Yellow }
+    elseif ($Level -eq 'SUCCESS') { Write-Host $line -ForegroundColor Green }
+    else { Write-Host $line }
+}
+
+function Read-DotEnvFile {
+    param([string]$Path)
+
+    $result = @{}
+
+    if (-not (Test-Path $Path)) {
+        return $result
+    }
+
+    foreach ($line in (Get-Content -Path $Path -ErrorAction Stop)) {
+        $trimmed = $line.Trim()
+
+        if ($trimmed.Length -eq 0) { continue }
+        if ($trimmed.StartsWith('#')) { continue }
+        if ($trimmed -notmatch '=') { continue }
+
+        $parts = $trimmed.Split('=', 2)
+        $key = $parts[0].Trim()
+        $value = $parts[1].Trim()
+
+        if ($value.Length -ge 2) {
+            if (
+                ($value.StartsWith('"') -and $value.EndsWith('"')) -or
+                ($value.StartsWith("'") -and $value.EndsWith("'"))
+            ) {
+                $value = $value.Substring(1, $value.Length - 2)
+            }
+        }
+
+        if (-not (Test-BlankValue $key)) {
+            $result[$key] = $value
+        }
+    }
+
+    return $result
+}
+
+function Join-EnvValues {
+    param([hashtable[]]$Maps)
+
+    $merged = @{}
+
+    foreach ($map in $Maps) {
+        foreach ($key in $map.Keys) {
+            $merged[$key] = $map[$key]
+        }
+    }
+
+    return $merged
+}
+
+function Normalize-PvwaApiBase {
+    param([string]$PvwaValue)
+
+    $base = $PvwaValue.Trim().TrimEnd('/')
+
+    $base = $base -replace '/PrivilegeCloud$', ''
+    $base = $base -replace '/PasswordVault/API/Accounts/?$', '/PasswordVault/API'
+    $base = $base -replace '/PasswordVault/API/.+$', '/PasswordVault/API'
+
+    if ($base -match '/PasswordVault/API$') {
+        return $base
+    }
+
+    if ($base -match '/PasswordVault$') {
+        return "$base/API"
+    }
+
+    return "$base/PasswordVault/API"
+}
+
+function Resolve-IdentityBase {
+    param([string]$TenantValue)
+
+    $tenant = $TenantValue
+
+    if (Test-BlankValue $tenant) {
+        throw "TENANT_ID could not be resolved. Provide -TenantId, set TENANT_ID in .env/env file, or use -Environment dev/prod defaults."
+    }
+
+    $tenant = $tenant.Trim().TrimEnd('/')
+
+    if ($tenant -match '^https?://') {
+        return $tenant
+    }
+
+    if ($tenant -match '\.id\.cyberark\.cloud$') {
+        return "https://$tenant"
+    }
+
+    if ($tenant -match '\.') {
+        return "https://$tenant"
+    }
+
+    return "https://$tenant.id.cyberark.cloud"
+}
+
+function Get-ProxyFromSettings {
+    param([hashtable]$Settings)
+
+    $proxy = $Settings['PROXY']
+
+    if (-not (Test-BlankValue $proxy)) {
+        return $proxy.Trim()
+    }
+
+    $proxyAddress = $Settings['PROXY_ADDRESS']
+
+    if (Test-BlankValue $proxyAddress) {
+        $proxyAddress = $Settings['ROXY_ADDRESS']
+    }
+
+    $proxyPort = $Settings['PROXY_PORT']
+
+    if ((Test-BlankValue $proxyAddress) -or (Test-BlankValue $proxyPort)) {
+        return $null
+    }
+
+    $proxyAddress = $proxyAddress.Trim().TrimEnd('/')
+
+    if ($proxyAddress -notmatch '^https?://') {
+        $proxyAddress = "http://$proxyAddress"
+    }
+
+    return "$proxyAddress`:$($proxyPort.Trim())"
+}
+
+function Import-RunConfig {
+    $baseFile = Join-Path $PSScriptRoot '.env'
+    $envFile1 = Join-Path $EnvFolder "$Environment.env"
+    $envFile2 = Join-Path $PSScriptRoot "$Environment.env"
+
+    $base = Read-DotEnvFile -Path $baseFile
+    $envSpecific = @{}
+
+    if (Test-Path $envFile1) {
+        $envSpecific = Read-DotEnvFile -Path $envFile1
+    }
+    elseif (Test-Path $envFile2) {
+        $envSpecific = Read-DotEnvFile -Path $envFile2
+    }
+    else {
+        Write-RunLog 'Import-RunConfig' "No environment file found for '$Environment'. Checked '$envFile1' and '$envFile2'. Built-in defaults will be used unless direct parameters are supplied." 'WARN'
+    }
+
+    $settings = Join-EnvValues -Maps @($base, $envSpecific)
+
+    if (-not (Test-BlankValue $TenantId)) {
+        $settings['TENANT_ID'] = $TenantId
+    }
+
+    if (-not (Test-BlankValue $PVWA)) {
+        $settings['PVWA'] = $PVWA
+    }
+
+    if (Test-BlankValue $settings['TENANT_ID']) {
+        $settings['TENANT_ID'] = Get-EnvironmentDefault -Name TenantId
+        Write-RunLog 'Import-RunConfig' "TENANT_ID was not found in env files. Using built-in $Environment default." 'WARN'
+    }
+
+    if (Test-BlankValue $settings['PVWA']) {
+        if (-not (Test-BlankValue $settings['SUB_DOMAIN'])) {
+            $settings['PVWA'] = "https://$($settings['SUB_DOMAIN']).privilegecloud.cyberark.cloud"
+        }
+        else {
+            $settings['PVWA'] = Get-EnvironmentDefault -Name PVWA
+            Write-RunLog 'Import-RunConfig' "PVWA was not found in env files. Using built-in $Environment default." 'WARN'
+        }
+    }
+
+    $identityBase = Resolve-IdentityBase -TenantValue $settings['TENANT_ID']
+    $apiBase = Normalize-PvwaApiBase -PvwaValue $settings['PVWA']
+    $proxyFromEnv = Get-ProxyFromSettings -Settings $settings
+
+    if (-not (Test-BlankValue $proxyFromEnv)) {
+        $webProxy = New-Object System.Net.WebProxy($proxyFromEnv, $true)
+
+        if ($ProxyUseDefaultCredentials) {
+            $webProxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials
+        }
+
+        [System.Net.WebRequest]::DefaultWebProxy = $webProxy
+    }
+
+    $script:Config = [pscustomobject]@{
+        Environment = $Environment
+        IdentityBase = $identityBase
+        TokenUrl = "$identityBase/oauth2/platformtoken"
+        ApiBase = $apiBase
+        Proxy = $proxyFromEnv
+    }
+
+    Write-RunLog 'Import-RunConfig' "Environment=$Environment IdentityBase=$identityBase ApiBase=$apiBase ProxyConfigured=$([bool]$proxyFromEnv)" 'INFO'
+}
+
+function ConvertTo-FormBody {
+    param([hashtable]$Body)
+
+    $pairs = @()
+
+    foreach ($key in $Body.Keys) {
+        $k = [System.Uri]::EscapeDataString([string]$key)
+        $v = [System.Uri]::EscapeDataString([string]$Body[$key])
+        $pairs += "$k=$v"
+    }
+
+    return ($pairs -join '&')
+}
+
+function Get-Sha256Fingerprint {
+    param([string]$Text)
+
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
+        $hash = $sha.ComputeHash($bytes)
+
+        return (($hash | ForEach-Object { $_.ToString('x2') }) -join '')
+    }
+    finally {
+        $sha.Dispose()
+    }
+}
+
+function Get-WebErrorText {
+    param([System.Management.Automation.ErrorRecord]$ErrorRecord)
+
+    $parts = New-Object System.Collections.Generic.List[string]
+
+    if ($null -ne $ErrorRecord.Exception -and -not (Test-BlankValue $ErrorRecord.Exception.Message)) {
+        [void]$parts.Add($ErrorRecord.Exception.Message)
+    }
+
+    $response = $ErrorRecord.Exception.Response
+
+    if ($null -ne $response) {
+        try {
+            [void]$parts.Add("HTTPStatus=$([int]$response.StatusCode) $($response.StatusDescription)")
+        }
+        catch {}
+    }
+
+    $body = $null
+
+    if ($null -ne $ErrorRecord.ErrorDetails -and -not (Test-BlankValue $ErrorRecord.ErrorDetails.Message)) {
+        $body = [string]$ErrorRecord.ErrorDetails.Message
+    }
+
+    if ((Test-BlankValue $body) -and $null -ne $response) {
+        try {
+            $stream = $response.GetResponseStream()
+
+            if ($null -ne $stream) {
+                $reader = New-Object System.IO.StreamReader($stream)
+
+                try {
+                    $body = $reader.ReadToEnd()
+                }
+                finally {
+                    $reader.Dispose()
+                }
+            }
+        }
+        catch {}
+    }
+
+    if (-not (Test-BlankValue $body)) {
+        [void]$parts.Add("Response=$body")
+    }
+
+    if ($parts.Count -eq 0) {
+        return 'Unknown web request error.'
+    }
+
+    return ($parts -join ' | ')
+}
+
+function Get-IdentityBearerToken {
+    Write-RunLog 'Get-IdentityBearerToken' 'Prompting for CyberArk Identity service-user credentials' 'INFO'
+
+    $credential = Get-Credential -Message 'Enter CyberArk Identity service-user credentials'
+
+    $body = ConvertTo-FormBody -Body @{
+        grant_type = 'client_credentials'
+        client_id = $credential.UserName
+        client_secret = $credential.GetNetworkCredential().Password
+    }
+
+    $params = @{
+        Method = 'Post'
+        Uri = $script:Config.TokenUrl
+        Body = $body
+        ContentType = 'application/x-www-form-urlencoded'
+        Headers = @{ Accept = 'application/json' }
+        ErrorAction = 'Stop'
+    }
+
+    if (-not (Test-BlankValue $script:Config.Proxy)) {
+        $params['Proxy'] = $script:Config.Proxy
+    }
+
+    if ($ProxyUseDefaultCredentials) {
+        $params['ProxyUseDefaultCredentials'] = $true
+    }
+
+    try {
+        $response = Invoke-RestMethod @params
+    }
+    catch {
+        throw "Identity token request failed. $(Get-WebErrorText -ErrorRecord $_)"
+    }
+
+    if ($null -eq $response.access_token) {
+        throw 'Identity token response did not include access_token.'
+    }
+
+    $token = [string]$response.access_token
+    $fingerprint = Get-Sha256Fingerprint -Text $token
+
+    Write-RunLog 'Get-IdentityBearerToken' "Token acquired. SHA256 fingerprint=$($fingerprint.Substring(0,16))... ExpiresIn=$($response.expires_in)" 'INFO'
+
+    return $token
+}
+
+function Invoke-CyberArkRest {
+    param(
+        [ValidateSet('GET','DELETE')]
+        [string]$Method,
+
+        [string]$Path,
+
+        [string]$Token
+    )
+
+    if ($Path -match '^https?://') {
+        $uri = $Path
+    }
+    else {
+        $uri = "$($script:Config.ApiBase)/$($Path.TrimStart('/'))"
+    }
+
+    $params = @{
+        Method = $Method
+        Uri = $uri
+        Headers = @{ Authorization = "Bearer $Token" }
+        ErrorAction = 'Stop'
+    }
+
+    if (-not (Test-BlankValue $script:Config.Proxy)) {
+        $params['Proxy'] = $script:Config.Proxy
+    }
+
+    if ($ProxyUseDefaultCredentials) {
+        $params['ProxyUseDefaultCredentials'] = $true
+    }
+
+    try {
+        return Invoke-RestMethod @params
+    }
+    catch {
+        throw "REST call failed. Method=$Method Uri=$uri $(Get-WebErrorText -ErrorRecord $_)"
+    }
+}
+
+function ConvertTo-AccountList {
+    param([object]$Response)
+
+    if ($null -eq $Response) { return @() }
+
+    if ($Response -is [System.Array]) {
+        return @($Response)
+    }
+
+    foreach ($name in @('value','accounts','Accounts')) {
+        $p = $Response.PSObject.Properties[$name]
+
+        if ($null -ne $p) {
+            return @($p.Value)
+        }
+    }
+
+    return @($Response)
+}
+
+function Get-AccountField {
+    param(
+        [object]$Account,
+        [string[]]$Names
+    )
+
+    if ($null -eq $Account) { return '' }
+
+    foreach ($name in $Names) {
+        $p = $Account.PSObject.Properties[$name]
+
+        if ($null -ne $p -and -not (Test-BlankValue $p.Value)) {
+            return $p.Value.ToString()
+        }
+    }
+
+    return ''
+}
+
+function Add-UniqueAccount {
+    param(
+        [hashtable]$Table,
+        [object]$Account,
+        [string]$MatchedDomain
+    )
+
+    $id = Get-AccountField -Account $Account -Names @('id','ID','accountId','AccountID')
+
+    if (Test-BlankValue $id) { return }
+
+    if (-not $Table.ContainsKey($id)) {
+        $Table[$id] = [pscustomobject]@{
+            Account = $Account
+            MatchedDomains = New-Object System.Collections.Generic.List[string]
+        }
+    }
+
+    if (-not (Test-BlankValue $MatchedDomain) -and -not $Table[$id].MatchedDomains.Contains($MatchedDomain)) {
+        [void]$Table[$id].MatchedDomains.Add($MatchedDomain)
+    }
+}
+
+function Get-AccountsByDomainSearch {
+    param(
+        [string]$Domain,
+        [string]$Token
+    )
+
+    $found = @{}
+    $offset = 0
+    $limit = [Math]::Min([Math]::Max($PageLimit, 1), 1000)
+    $countForDomain = 0
+
+    do {
+        $path = "Accounts?offset=$offset&limit=$limit&search=$([System.Uri]::EscapeDataString($Domain))&searchType=contains"
+
+        $response = Invoke-CyberArkRest -Method GET -Path $path -Token $Token
+        $items = @(ConvertTo-AccountList -Response $response)
+
+        foreach ($item in $items) {
+            $address = Get-AccountField -Account $item -Names @('address','Address')
+
+            if (-not (Test-DomainMatch -Address $address -Domain $Domain)) {
+                continue
+            }
+
+            Add-UniqueAccount -Table $found -Account $item -MatchedDomain $Domain
+            $countForDomain++
+
+            if ($MaxResultsPerDomain -gt 0 -and $countForDomain -ge $MaxResultsPerDomain) {
+                break
+            }
+        }
+
+        if ($MaxResultsPerDomain -gt 0 -and $countForDomain -ge $MaxResultsPerDomain) {
+            break
+        }
+
+        $offset += $limit
+    } while ($items.Count -eq $limit)
+
+    return @($found.Values)
+}
+
+function Test-DomainMatch {
+    param(
+        [string]$Address,
+        [string]$Domain
+    )
+
+    if (Test-BlankValue $Address -or Test-BlankValue $Domain) {
+        return $false
+    }
+
+    $a = $Address.Trim().ToLowerInvariant()
+    $d = $Domain.Trim().ToLowerInvariant()
+
+    if ($DomainMatchMode -eq 'Exact') {
+        return ($a -eq $d)
+    }
+
+    return ($a -like "*$d*")
+}
+
+function Get-MatchedDomainForAddress {
+    param([string]$Address)
+
+    foreach ($domain in $Domains) {
+        if (Test-DomainMatch -Address $Address -Domain $domain) {
+            return $domain.ToLowerInvariant()
+        }
+    }
+
+    return ''
+}
+
+function Get-SafePairInfo {
+    param([string]$SafeName)
+
+    if (Test-BlankValue $SafeName) {
+        return $null
+    }
+
+    $match = $null
+
+    if ($SafeMarkerMatchMode -eq 'Contains') {
+        $match = [regex]::Match($SafeName, '(?i)(OMNG|AMNG)')
+    }
+    else {
+        $match = [regex]::Match($SafeName, '(?i)(^|[-_])(?<Kind>OMNG|AMNG)(?=$|[-_])')
+    }
+
+    if (-not $match.Success) {
+        return $null
+    }
+
+    $kindGroup = $match.Groups['Kind']
+
+    if ($SafeMarkerMatchMode -eq 'Contains') {
+        $kindText = $match.Groups[1].Value
+        $kindIndex = $match.Groups[1].Index
+        $kindLength = $match.Groups[1].Length
+    }
+    else {
+        $kindText = $kindGroup.Value
+        $kindIndex = $kindGroup.Index
+        $kindLength = $kindGroup.Length
+    }
+
+    $kind = $kindText.ToUpperInvariant()
+    $pairKind = if ($kind -eq 'OMNG') { 'AMNG' } else { 'OMNG' }
+
+    $pairSafeName = $SafeName.Remove($kindIndex, $kindLength).Insert($kindIndex, $pairKind)
+    $pairKey = $SafeName.Remove($kindIndex, $kindLength).Insert($kindIndex, '{PAIR}')
+
+    return [pscustomobject]@{
+        Kind = $kind
+        PairKind = $pairKind
+        PairSafeName = $pairSafeName
+        PairKey = $pairKey.ToUpperInvariant()
+    }
+}
+
+function Get-PairMatchKey {
+    param(
+        [pscustomobject]$Row
+    )
+
+    $user = if (Test-BlankValue $Row.UserName) { '' } else { $Row.UserName.Trim().ToUpperInvariant() }
+
+    if ($PairMatchMode -eq 'UsernameAndAddress') {
+        $address = if (Test-BlankValue $Row.Address) { '' } else { $Row.Address.Trim().ToUpperInvariant() }
+        return "$($Row.SafePairKey)|$user|$address"
+    }
+
+    $domain = if (Test-BlankValue $Row.MatchedDomain) { '' } else { $Row.MatchedDomain.Trim().ToUpperInvariant() }
+
+    return "$($Row.SafePairKey)|$user|$domain"
+}
+
+function Convert-AccountToPairRow {
+    param(
+        [object]$Account,
+        [string[]]$MatchedDomains
+    )
+
+    $safeName = Get-AccountField -Account $Account -Names @('safeName','SafeName','safe','Safe')
+    $info = Get-SafePairInfo -SafeName $safeName
+
+    $address = Get-AccountField -Account $Account -Names @('address','Address')
+    $matchedDomain = ''
+
+    if ($null -ne $MatchedDomains -and $MatchedDomains.Count -gt 0) {
+        $matchedDomain = ($MatchedDomains | Select-Object -First 1)
+    }
+    else {
+        $matchedDomain = Get-MatchedDomainForAddress -Address $address
+    }
+
+    $kind = ''
+    $pairKind = ''
+    $pairSafeName = ''
+    $pairKey = ''
+    $classification = 'Ignored_Not_OMNG_AMNG'
+
+    if ($null -ne $info) {
+        $kind = $info.Kind
+        $pairKind = $info.PairKind
+        $pairSafeName = $info.PairSafeName
+        $pairKey = $info.PairKey
+        $classification = $kind
+    }
+
+    return [pscustomobject]@{
+        AccountID = Get-AccountField -Account $Account -Names @('id','ID','accountId','AccountID')
+        Name = Get-AccountField -Account $Account -Names @('name','Name')
+        UserName = Get-AccountField -Account $Account -Names @('userName','username','UserName')
+        Address = $address
+        MatchedDomain = $matchedDomain
+        SafeName = $safeName
+        PlatformId = Get-AccountField -Account $Account -Names @('platformId','platformID')
+        SafeKind = $kind
+        ExpectedPairKind = $pairKind
+        ExpectedPairSafeName = $pairSafeName
+        SafePairKey = $pairKey
+        PairMatchKey = ''
+        Classification = $classification
+    }
+}
+
+function Remove-AccountById {
+    param(
+        [string]$AccountId,
+        [string]$Token
+    )
+
+    $id = [System.Uri]::EscapeDataString($AccountId)
+
+    Invoke-CyberArkRest -Method DELETE -Path "Accounts/$id/" -Token $Token | Out-Null
+}
+
+function Export-CsvSafe {
+    param(
+        [object[]]$Rows,
+        [string]$Path
+    )
+
+    if ($Rows.Count -eq 0) {
+        [pscustomobject]@{ Note = 'No rows' } | Export-Csv -Path $Path -NoTypeInformation
+        return
+    }
+
+    $Rows | Export-Csv -Path $Path -NoTypeInformation
+}
+
+function ConvertTo-ExcelColumnName {
+    param([int]$Index)
+
+    $name = ''
+    $n = $Index
+
+    while ($n -gt 0) {
+        $n--
+        $name = [char](65 + ($n % 26)) + $name
+        $n = [Math]::Floor($n / 26)
+    }
+
+    return $name
+}
+
+function Escape-XmlText {
+    param([object]$Value)
+
+    if ($null -eq $Value) {
+        return ''
+    }
+
+    $text = [string]$Value
+    $text = $text -replace '&', '&amp;'
+    $text = $text -replace '<', '&lt;'
+    $text = $text -replace '>', '&gt;'
+    $text = $text -replace '"', '&quot;'
+    $text = $text -replace "'", '&apos;'
+    return $text
+}
+
+function Get-ObjectPropertyNames {
+    param([object[]]$Rows)
+
+    $names = New-Object System.Collections.Generic.List[string]
+
+    foreach ($row in $Rows) {
+        if ($null -eq $row) { continue }
+
+        foreach ($p in $row.PSObject.Properties) {
+            if (-not $names.Contains($p.Name)) {
+                [void]$names.Add($p.Name)
+            }
+        }
+    }
+
+    if ($names.Count -eq 0) {
+        [void]$names.Add('Note')
+    }
+
+    return @($names)
+}
+
+function New-WorksheetXml {
+    param(
+        [object[]]$Rows
+    )
+
+    $dataRows = @($Rows)
+
+    if ($dataRows.Count -eq 0) {
+        $dataRows = @([pscustomobject]@{ Note = 'No rows' })
+    }
+
+    $columns = Get-ObjectPropertyNames -Rows $dataRows
+    $sb = New-Object System.Text.StringBuilder
+
+    [void]$sb.Append('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>')
+    [void]$sb.Append('<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">')
+    [void]$sb.Append('<sheetData>')
+
+    [void]$sb.Append('<row r="1">')
+    for ($i = 0; $i -lt $columns.Count; $i++) {
+        $cellRef = "$(ConvertTo-ExcelColumnName -Index ($i + 1))1"
+        [void]$sb.Append("<c r=""$cellRef"" t=""inlineStr""><is><t>")
+        [void]$sb.Append((Escape-XmlText $columns[$i]))
+        [void]$sb.Append('</t></is></c>')
+    }
+    [void]$sb.Append('</row>')
+
+    $rowIndex = 2
+
+    foreach ($row in $dataRows) {
+        [void]$sb.Append("<row r=""$rowIndex"">")
+
+        for ($i = 0; $i -lt $columns.Count; $i++) {
+            $name = $columns[$i]
+            $value = ''
+            $p = $row.PSObject.Properties[$name]
+
+            if ($null -ne $p -and $null -ne $p.Value) {
+                $value = [string]$p.Value
+            }
+
+            $cellRef = "$(ConvertTo-ExcelColumnName -Index ($i + 1))$rowIndex"
+            [void]$sb.Append("<c r=""$cellRef"" t=""inlineStr""><is><t>")
+            [void]$sb.Append((Escape-XmlText $value))
+            [void]$sb.Append('</t></is></c>')
+        }
+
+        [void]$sb.Append('</row>')
+        $rowIndex++
+    }
+
+    [void]$sb.Append('</sheetData>')
+    [void]$sb.Append('</worksheet>')
+
+    return $sb.ToString()
+}
+
+function Add-ZipEntryText {
+    param(
+        [System.IO.Compression.ZipArchive]$Zip,
+        [string]$EntryName,
+        [string]$Text
+    )
+
+    $entry = $Zip.CreateEntry($EntryName)
+    $stream = $entry.Open()
+    $writer = New-Object System.IO.StreamWriter($stream, (New-Object System.Text.UTF8Encoding($false)))
+
+    try {
+        $writer.Write($Text)
+    }
+    finally {
+        $writer.Dispose()
+        $stream.Dispose()
+    }
+}
+
+function Export-XlsxWorkbook {
+    param(
+        [hashtable]$Sheets,
+        [string]$Path
+    )
+
+    Add-Type -AssemblyName System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+    if (Test-Path $Path) {
+        Remove-Item -Path $Path -Force
+    }
+
+    $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::CreateNew)
+    $zip = New-Object System.IO.Compression.ZipArchive($fs, [System.IO.Compression.ZipArchiveMode]::Create)
+
+    try {
+        $sheetNames = @($Sheets.Keys | Sort-Object)
+
+        $contentTypes = New-Object System.Text.StringBuilder
+        [void]$contentTypes.Append('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>')
+        [void]$contentTypes.Append('<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">')
+        [void]$contentTypes.Append('<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>')
+        [void]$contentTypes.Append('<Default Extension="xml" ContentType="application/xml"/>')
+        [void]$contentTypes.Append('<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>')
+        [void]$contentTypes.Append('<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>')
+
+        for ($i = 1; $i -le $sheetNames.Count; $i++) {
+            [void]$contentTypes.Append("<Override PartName=""/xl/worksheets/sheet$i.xml"" ContentType=""application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml""/>")
+        }
+
+        [void]$contentTypes.Append('</Types>')
+        Add-ZipEntryText -Zip $zip -EntryName '[Content_Types].xml' -Text $contentTypes.ToString()
+
+        Add-ZipEntryText -Zip $zip -EntryName '_rels/.rels' -Text '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>'
+
+        $workbook = New-Object System.Text.StringBuilder
+        [void]$workbook.Append('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>')
+        [void]$workbook.Append('<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>')
+
+        $rels = New-Object System.Text.StringBuilder
+        [void]$rels.Append('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>')
+        [void]$rels.Append('<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">')
+
+        for ($i = 1; $i -le $sheetNames.Count; $i++) {
+            $safeName = $sheetNames[$i - 1]
+            if ($safeName.Length -gt 31) {
+                $safeName = $safeName.Substring(0, 31)
+            }
+
+            [void]$workbook.Append("<sheet name=""$(Escape-XmlText $safeName)"" sheetId=""$i"" r:id=""rId$i""/>")
+            [void]$rels.Append("<Relationship Id=""rId$i"" Type=""http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet"" Target=""worksheets/sheet$i.xml""/>")
+            Add-ZipEntryText -Zip $zip -EntryName "xl/worksheets/sheet$i.xml" -Text (New-WorksheetXml -Rows @($Sheets[$sheetNames[$i - 1]]))
+        }
+
+        [void]$workbook.Append('</sheets></workbook>')
+        [void]$rels.Append('</Relationships>')
+
+        Add-ZipEntryText -Zip $zip -EntryName 'xl/workbook.xml' -Text $workbook.ToString()
+        Add-ZipEntryText -Zip $zip -EntryName 'xl/_rels/workbook.xml.rels' -Text $rels.ToString()
+        Add-ZipEntryText -Zip $zip -EntryName 'xl/styles.xml' -Text '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts><fills count="1"><fill><patternFill patternType="none"/></fill></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/></cellXfs></styleSheet>'
+    }
+    finally {
+        $zip.Dispose()
+        $fs.Dispose()
+    }
+}
+
+function Start-PairValidation {
+    New-RunLog
+    Import-RunConfig
+
+    if ($DeleteOmng -and $ConfirmDelete -ne 'YES') {
+        Write-RunLog 'Start-PairValidation' 'DeleteOmng supplied without ConfirmDelete YES. No deletion will be performed.' 'WARN'
+    }
+
+    Write-RunLog 'Start-PairValidation' "Domains=$($Domains -join ', ') DomainMatchMode=$DomainMatchMode PairMatchMode=$PairMatchMode SafeMarkerMatchMode=$SafeMarkerMatchMode" 'INFO'
+    Write-RunLog 'Start-PairValidation' "DeleteOmng=$DeleteOmng ConfirmDelete=$ConfirmDelete" 'WARN'
+
+    $token = Get-IdentityBearerToken
+
+    $accountMap = @{}
+
+    foreach ($domain in $Domains) {
+        $cleanDomain = $domain.Trim()
+
+        if (Test-BlankValue $cleanDomain) {
+            continue
+        }
+
+        Write-RunLog 'Start-PairValidation' "Searching CyberArk for domain '$cleanDomain'." 'INFO'
+
+        $items = @(Get-AccountsByDomainSearch -Domain $cleanDomain -Token $token)
+
+        foreach ($entry in $items) {
+            $acct = $entry.Account
+            $id = Get-AccountField -Account $acct -Names @('id','ID','accountId','AccountID')
+
+            if (Test-BlankValue $id) {
+                continue
+            }
+
+            if (-not $accountMap.ContainsKey($id)) {
+                $accountMap[$id] = $entry
+            }
+            else {
+                foreach ($d in $entry.MatchedDomains) {
+                    if (-not $accountMap[$id].MatchedDomains.Contains($d)) {
+                        [void]$accountMap[$id].MatchedDomains.Add($d)
+                    }
+                }
+            }
+        }
+
+        Write-RunLog 'Start-PairValidation' "Domain '$cleanDomain' returned $($items.Count) filtered account(s)." 'INFO'
+    }
+
+    $allRows = @()
+
+    foreach ($key in $accountMap.Keys) {
+        $entry = $accountMap[$key]
+        $row = Convert-AccountToPairRow -Account $entry.Account -MatchedDomains @($entry.MatchedDomains)
+        $row.PairMatchKey = Get-PairMatchKey -Row $row
+        $allRows += $row
+    }
+
+    $omngRows = @($allRows | Where-Object { $_.SafeKind -eq 'OMNG' })
+    $amngRows = @($allRows | Where-Object { $_.SafeKind -eq 'AMNG' })
+    $ignoredRows = @($allRows | Where-Object { $_.SafeKind -ne 'OMNG' -and $_.SafeKind -ne 'AMNG' })
+
+    $amngByKey = @{}
+    foreach ($row in $amngRows) {
+        if (-not $amngByKey.ContainsKey($row.PairMatchKey)) {
+            $amngByKey[$row.PairMatchKey] = New-Object System.Collections.Generic.List[object]
+        }
+
+        [void]$amngByKey[$row.PairMatchKey].Add($row)
+    }
+
+    $omngByKey = @{}
+    foreach ($row in $omngRows) {
+        if (-not $omngByKey.ContainsKey($row.PairMatchKey)) {
+            $omngByKey[$row.PairMatchKey] = New-Object System.Collections.Generic.List[object]
+        }
+
+        [void]$omngByKey[$row.PairMatchKey].Add($row)
+    }
+
+    $pairs = @()
+    $deleteCandidates = @()
+    $missingAmng = @()
+
+    foreach ($omng in $omngRows) {
+        $matches = @()
+
+        if ($amngByKey.ContainsKey($omng.PairMatchKey)) {
+            $matches = @($amngByKey[$omng.PairMatchKey] | Where-Object { $_.SafeName -ieq $omng.ExpectedPairSafeName })
+        }
+
+        if ($matches.Count -eq 0) {
+            $missingAmng += [pscustomobject]@{
+                OMNG_AccountID = $omng.AccountID
+                OMNG_Name = $omng.Name
+                UserName = $omng.UserName
+                Address = $omng.Address
+                MatchedDomain = $omng.MatchedDomain
+                OMNG_Safe = $omng.SafeName
+                Expected_AMNG_Safe = $omng.ExpectedPairSafeName
+                PlatformId = $omng.PlatformId
+                Action = 'KEEP_OMNG_NO_AMNG_PAIR_FOUND'
+            }
+            continue
+        }
+
+        foreach ($amng in $matches) {
+            $pair = [pscustomobject]@{
+                PairStatus = 'OMNG_HAS_AMNG_PAIR'
+                MatchMode = $PairMatchMode
+                UserName = $omng.UserName
+                MatchedDomain = $omng.MatchedDomain
+                Address = $omng.Address
+                OMNG_AccountID = $omng.AccountID
+                OMNG_Name = $omng.Name
+                OMNG_Safe = $omng.SafeName
+                OMNG_PlatformId = $omng.PlatformId
+                AMNG_AccountID = $amng.AccountID
+                AMNG_Name = $amng.Name
+                AMNG_Safe = $amng.SafeName
+                AMNG_PlatformId = $amng.PlatformId
+                SafePairKey = $omng.SafePairKey
+                DeleteEligible = 'Yes'
+                DeleteResult = ''
+                DeleteMessage = ''
+            }
+
+            $pairs += $pair
+            $deleteCandidates += $pair
+        }
+    }
+
+    $amngOnly = @()
+    foreach ($amng in $amngRows) {
+        $hasOmng = $false
+
+        if ($omngByKey.ContainsKey($amng.PairMatchKey)) {
+            $possible = @($omngByKey[$amng.PairMatchKey] | Where-Object { $_.SafeName -ieq $amng.ExpectedPairSafeName })
+            if ($possible.Count -gt 0) {
+                $hasOmng = $true
+            }
+        }
+
+        if (-not $hasOmng) {
+            $amngOnly += [pscustomobject]@{
+                AMNG_AccountID = $amng.AccountID
+                AMNG_Name = $amng.Name
+                UserName = $amng.UserName
+                Address = $amng.Address
+                MatchedDomain = $amng.MatchedDomain
+                AMNG_Safe = $amng.SafeName
+                Expected_OMNG_Safe = $amng.ExpectedPairSafeName
+                PlatformId = $amng.PlatformId
+                Note = 'AMNG account found without matching OMNG account in searched domains.'
+            }
+        }
+    }
+
+    $deleteResults = @()
+
+    if ($DeleteOmng -and $ConfirmDelete -eq 'YES') {
+        $deleted = @{}
+
+        foreach ($candidate in $deleteCandidates) {
+            if ($deleted.ContainsKey($candidate.OMNG_AccountID)) {
+                continue
+            }
+
+            try {
+                Write-RunLog 'Start-PairValidation' "Deleting OMNG AccountID=$($candidate.OMNG_AccountID) Safe=$($candidate.OMNG_Safe) User=$($candidate.UserName)" 'WARN'
+                Remove-AccountById -AccountId $candidate.OMNG_AccountID -Token $token
+                $deleted[$candidate.OMNG_AccountID] = $true
+
+                $candidate.DeleteResult = 'DELETED'
+                $candidate.DeleteMessage = 'OMNG account deleted because AMNG pair exists.'
+
+                $deleteResults += [pscustomobject]@{
+                    OMNG_AccountID = $candidate.OMNG_AccountID
+                    UserName = $candidate.UserName
+                    Address = $candidate.Address
+                    MatchedDomain = $candidate.MatchedDomain
+                    OMNG_Safe = $candidate.OMNG_Safe
+                    AMNG_AccountID = $candidate.AMNG_AccountID
+                    AMNG_Safe = $candidate.AMNG_Safe
+                    DeleteResult = 'DELETED'
+                    Message = 'OMNG account deleted because AMNG pair exists.'
+                }
+            }
+            catch {
+                $candidate.DeleteResult = 'FAILED'
+                $candidate.DeleteMessage = $_.Exception.Message
+
+                $deleteResults += [pscustomobject]@{
+                    OMNG_AccountID = $candidate.OMNG_AccountID
+                    UserName = $candidate.UserName
+                    Address = $candidate.Address
+                    MatchedDomain = $candidate.MatchedDomain
+                    OMNG_Safe = $candidate.OMNG_Safe
+                    AMNG_AccountID = $candidate.AMNG_AccountID
+                    AMNG_Safe = $candidate.AMNG_Safe
+                    DeleteResult = 'FAILED'
+                    Message = $_.Exception.Message
+                }
+
+                Write-RunLog 'Start-PairValidation' "Delete failed for OMNG AccountID=$($candidate.OMNG_AccountID). $($_.Exception.Message)" 'ERROR'
+            }
+        }
+    }
+    else {
+        foreach ($candidate in $deleteCandidates) {
+            $candidate.DeleteResult = 'NOT_RUN'
+            $candidate.DeleteMessage = 'Run without -DeleteOmng -ConfirmDelete YES.'
+        }
+    }
+
+    $summary = @(
+        [pscustomobject]@{ Metric = 'Environment'; Value = $Environment },
+        [pscustomobject]@{ Metric = 'Domains'; Value = ($Domains -join ', ') },
+        [pscustomobject]@{ Metric = 'DomainMatchMode'; Value = $DomainMatchMode },
+        [pscustomobject]@{ Metric = 'SafeMarkerMatchMode'; Value = $SafeMarkerMatchMode },
+        [pscustomobject]@{ Metric = 'PairMatchMode'; Value = $PairMatchMode },
+        [pscustomobject]@{ Metric = 'TotalAccountsFound'; Value = $allRows.Count },
+        [pscustomobject]@{ Metric = 'OMNGAccountsFound'; Value = $omngRows.Count },
+        [pscustomobject]@{ Metric = 'AMNGAccountsFound'; Value = $amngRows.Count },
+        [pscustomobject]@{ Metric = 'IgnoredNotOmngAmng'; Value = $ignoredRows.Count },
+        [pscustomobject]@{ Metric = 'DuplicatePairsFound'; Value = $pairs.Count },
+        [pscustomobject]@{ Metric = 'OMNGDeleteCandidates'; Value = $deleteCandidates.Count },
+        [pscustomobject]@{ Metric = 'MissingAMNGKeepOMNG'; Value = $missingAmng.Count },
+        [pscustomobject]@{ Metric = 'AMNGOnlyClean'; Value = $amngOnly.Count },
+        [pscustomobject]@{ Metric = 'DeleteMode'; Value = [string]($DeleteOmng -and $ConfirmDelete -eq 'YES') },
+        [pscustomobject]@{ Metric = 'DeletedCount'; Value = (@($deleteResults | Where-Object { $_.DeleteResult -eq 'DELETED' })).Count },
+        [pscustomobject]@{ Metric = 'FailedDeleteCount'; Value = (@($deleteResults | Where-Object { $_.DeleteResult -eq 'FAILED' })).Count }
+    )
+
+    Export-CsvSafe -Rows @($pairs) -Path $script:CsvPairFile
+    Export-CsvSafe -Rows @($deleteCandidates) -Path $script:CsvDeleteCandidateFile
+
+    $sheets = [ordered]@{
+        '00_Summary' = @($summary)
+        '01_DuplicatePairs' = @($pairs)
+        '02_OMNG_DeleteCandidates' = @($deleteCandidates)
+        '03_All_OMNG_Found' = @($omngRows)
+        '04_All_AMNG_Found' = @($amngRows)
+        '05_Missing_AMNG_Keep_OMNG' = @($missingAmng)
+        '06_AMNG_Only_Clean' = @($amngOnly)
+        '07_Ignored_Not_OMNG_AMNG' = @($ignoredRows)
+        '08_DeleteResults' = @($deleteResults)
+    }
+
+    Export-XlsxWorkbook -Sheets $sheets -Path $script:XlsxReportFile
+
+    Write-RunLog 'Start-PairValidation' "Run completed. Workbook=$script:XlsxReportFile" 'SUCCESS'
+    Write-RunLog 'Start-PairValidation' "DuplicatePairsCsv=$script:CsvPairFile" 'INFO'
+    Write-RunLog 'Start-PairValidation' "DeleteCandidatesCsv=$script:CsvDeleteCandidateFile" 'INFO'
+    Write-RunLog 'Start-PairValidation' "Log=$script:LogFile" 'INFO'
+}
+
+Start-PairValidation
