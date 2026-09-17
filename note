@@ -1,164 +1,1456 @@
-"Salesforce will operate as the SAML Service Provider (SP), while Idira/CyberArk Identity will operate as the SAML Identity Provider (IdP), authenticate the user using a phishing-resistant passkey, and issue the SAML response to Salesforce."
+<#
+.SYNOPSIS
+    CNA Privilege Cloud database account report with extended properties.
 
-they normally do not each require a different SP Entity ID merely because they're different Salesforce accounts.
+.DESCRIPTION
+    - Authenticates to CNA Privilege Cloud using CCP + psPAS Identity Header.
+    - Retrieves the regular account-platform inventory.
+    - Identifies database platforms by platform metadata and optional explicit overrides.
+    - Retrieves all visible accounts and keeps accounts assigned to database platforms.
+    - Optionally retrieves the full details of every matching account.
+    - Exports common database fields such as Port, DatabaseName, InstanceName,
+      ServiceName, SID, Schema, DSN, and ConnectionString.
+    - Dynamically creates one CSV column for every populated platform account property.
+    - Exports a second CSV listing the database platforms used for the report.
 
-One SAML SP configuration can authenticate multiple Salesforce users since its still under 1 SF Org
+.NOTES
+    This script is report-only.
+    It never retrieves account passwords, keys, or secret values.
+    It does not add, update, verify, reconcile, change, rotate, move, or delete accounts.
 
+    PowerShell compatibility: Windows PowerShell 5.1+
+#>
 
+[CmdletBinding()]
+param(
+    # ===== CNA Identity / Privilege Cloud =====
+    [string]$IdentityTenantURL = 'https://aat4012.id.cyberark.cloud',
+    [string]$PCloudSubdomain   = 'cna-prod',
+    [string]$PrivilegeCloudURL = 'https://cna-prod.privilegecloud.cyberark.cloud',
 
-User clicks Salesforce CLMAdmin tile
-              ↓
-CyberArk application authentication policy evaluates
-              ↓
-Passkey required
-              ↓
-Windows Hello / supported platform authenticator
-              ↓
-CyberArk validates FIDO2 authentication
-              ↓
-CyberArk issues SAMLResponse
-              ↓
-Salesforce
+    # ===== CCP settings CNA =====
+    [string]$CCPAddress        = 'https://vskau1p1231.cna.com',
+    [string]$CCPLocation       = 'AIMWebService',
+    [string]$CCPAppID          = 'PAMDiscovery',
+    [string]$CCPSafe           = 'CA_PCloud_Admins',
+    [string]$CCPObject         = 'cna-prod.cyberark.cloud-cnarestbot',
+    [bool]$CCPWindowsAuth      = $false,
 
+    # ===== Output paths =====
+    [string]$OutputFolder           = 'E:\Installation Media\Script\OnboardScript\data',
+    [string]$AccountCsvName         = 'DatabaseAccountReport_ExtendedProperties.csv',
+    [string]$PlatformCsvName        = 'DatabasePlatformInventory.csv',
+    [string]$LogFileName            = 'DatabaseAccountReport.log',
 
+    # ===== Retrieval settings =====
+    [ValidateRange(1, 1000)]
+    [int]$PageLimit = 1000,
 
-Question to CyberArk
-When a user authenticates to an Idira Web-SAML application using a CyberArk FIDO2/passkey authentication profile, can Idira dynamically emit a Salesforce-recognized phishing-resistant AMR or ACR value in that application's SAMLResponse—such as fido2, passkey, phr, or another Salesforce-supported phishing-resistant value—and is that assertion tied to the authentication method actually used for that transaction?
+    [bool]$RetrieveFullAccountDetails = $true,
 
-1. User authenticates to the Idira User Portal.
+    [ValidateRange(1, 10)]
+    [int]$ApiRetryCount = 3,
 
-2. User sees only Salesforce tiles permitted by assigned Identity Role.
+    [ValidateRange(0, 60)]
+    [int]$ApiRetryDelaySeconds = 2,
 
-3. User clicks:
-   "Salesforce - CLMAdmin Test"
+    [ValidateRange(0, 60000)]
+    [int]$AccountDetailDelayMilliseconds = 0,
 
-4. Application authentication policy evaluates the transaction.
+    # ===== Database platform detection =====
+    # The pattern is checked against platform SystemType, PlatformID, Name,
+    # PlatformBaseID, and Description. Customize it for your tenant if needed.
+    [string]$DatabasePlatformPattern = '(?i)(database|oracle|sql\s*server|sqlserver|mssql|db2|sybase|adaptive\s*server|mysql|mariadb|postgres|postgresql|informix|mongodb|mongo|cassandra|teradata|snowflake|redshift|vertica|hana|sap\s*hana|cosmos\s*db|dynamodb|redis|couchbase|neo4j)',
 
-5. Policy requires Passkey / FIDO2.
+    # Explicitly include custom database platforms that do not match the pattern.
+    [string[]]$IncludePlatformID = @(),
 
-6. User uses Windows Hello / approved platform passkey.
+    # Explicitly exclude platforms that match the pattern but are not databases.
+    [string[]]$ExcludePlatformID = @()
+)
 
-7. Idira verifies the phishing-resistant authentication.
+# ============================================
+# Runtime Settings
+# ============================================
 
-8. Idira constructs signed SAMLResponse.
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$ErrorActionPreference = 'Stop'
+$ProgressPreference    = 'SilentlyContinue'
 
-9. SAMLResponse includes:
-      Issuer      = Idira IdP
-      Audience    = Salesforce SP Entity ID
-      Recipient   = Salesforce ACS
-      NameID      = Salesforce-mapped identity
-      ACR/AMR     = recognized phishing-resistant indication
+# ============================================
+# Paths
+# ============================================
 
-10. Browser POSTs SAMLResponse to Salesforce ACS.
+if (-not (Test-Path -LiteralPath $OutputFolder)) {
+    New-Item -ItemType Directory -Path $OutputFolder -Force | Out-Null
+}
 
-11. Salesforce:
-      validates signing certificate
-      validates issuer
-      validates audience
-      validates recipient
-      identifies Salesforce user
-      evaluates ACR/AMR
+$LogFile         = Join-Path $OutputFolder $LogFileName
+$AccountCsvPath  = Join-Path $OutputFolder $AccountCsvName
+$PlatformCsvPath = Join-Path $OutputFolder $PlatformCsvName
 
-12. Salesforce determines:
-      SSO authentication = phishing resistant
+New-Item -ItemType File -Force -Path $LogFile | Out-Null
 
-13. User enters Salesforce.
+# Remove previous CSV outputs so an empty current run cannot leave stale data behind.
+foreach ($existingCsv in @($AccountCsvPath, $PlatformCsvPath)) {
+    if (Test-Path -LiteralPath $existingCsv) {
+        Remove-Item -LiteralPath $existingCsv -Force
+    }
+}
 
-14. No additional Salesforce passkey enrollment prompt occurs.
+# ============================================
+# Logger
+# ============================================
 
+function Write-Log {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Message,
 
+        [ConsoleColor]$Color = 'White'
+    )
 
-Hi CyberArk Team,
+    $ts   = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $line = "$ts - $Message"
 
-Thank you again for the working session yesterday and for walking us through the proposed Salesforce SAML and Passkey use case. Based on the configuration demonstrated during the session, the approach looks promising, and we would like to take the testing one step further to validate how Salesforce handles the phishing-resistant authentication assertion for a privileged user.
+    Write-Host $line -ForegroundColor $Color
+    Add-Content -Path $LogFile -Value $line
+}
 
-For the next phase of the POC, could we please make the following adjustment on the Salesforce side:
+# ============================================
+# Generic Helpers
+# ============================================
 
-1. Elevate the Jaime Salesforce test user
+function Get-NormalizedIdentityTenant {
+    param(
+        [Parameter(Mandatory)]
+        [string]$TenantUrl
+    )
 
-Can the existing Jaime Salesforce test account be temporarily elevated to a more privileged/administrative role, ideally one that falls within Salesforce's privileged-user MFA enforcement scope?
+    $normalized = $TenantUrl.Trim()
 
-The objective is to validate the behavior when Salesforce expects phishing-resistant MFA rather than testing only with a standard/non-privileged user.
+    if ($normalized -notmatch '^https?://') {
+        $normalized = "https://$normalized"
+    }
 
-Once elevated, we would like to repeat the Idira/CyberArk Passkey authentication flow and confirm whether the resulting SAML assertion contains sufficient authentication-strength information for Salesforce to recognize that phishing-resistant authentication was successfully performed by CyberArk.
+    return $normalized.TrimEnd('/')
+}
 
-In particular, we would like to validate whether CyberArk dynamically provides a Salesforce-supported AMR or ACR value when the user successfully authenticates with Passkey/FIDO2.
+function Get-ObjectPropertyValue {
+    param(
+        [object]$InputObject,
 
-Examples we would like to inspect include values such as:
+        [Parameter(Mandatory)]
+        [string[]]$PropertyNames
+    )
 
-fido2
-passkey
-phr
-or another Salesforce-recognized phishing-resistant authentication context
+    if ($null -eq $InputObject) {
+        return $null
+    }
 
-Ideally, during the test we would like to capture the actual SAMLResponse/XML assertion and review the AuthnContext and/or AMR attributes being sent to Salesforce.
+    if ($InputObject -is [System.Collections.IDictionary]) {
+        foreach ($propName in $PropertyNames) {
+            if ($InputObject.Contains($propName)) {
+                return $InputObject[$propName]
+            }
+        }
+    }
 
-Expected workflow if the design works as intended
+    foreach ($propName in $PropertyNames) {
+        $property = $InputObject.PSObject.Properties[$propName]
 
-Our understanding of the proposed architecture is:
+        if ($null -ne $property) {
+            return $property.Value
+        }
+    }
 
-The user is provisioned in CyberArk Identity/Idira and assigned to an appropriate Identity Role.
-The Identity Role is granted access to the applicable Salesforce Web-SAML application in CyberArk.
-A dedicated CyberArk authentication policy for the Salesforce application requires an approved phishing-resistant authentication method, specifically Passkey/FIDO2.
-The user selects the Salesforce application from the CyberArk Access/User Portal.
-CyberArk evaluates the application authentication policy and prompts the user for Passkey authentication where required.
-The user authenticates using the registered Passkey, for example Windows Hello or another approved FIDO2 authenticator.
-Once CyberArk successfully validates the Passkey authentication, CyberArk generates a signed SAMLResponse for Salesforce.
-The SAML assertion contains the Salesforce user identifier/Federation ID together with the required SAML parameters such as Issuer, Audience, Recipient/ACS, and authentication context.
-Most importantly, the assertion should provide Salesforce with an AMR or ACR indication that the authentication performed was phishing-resistant.
-Salesforce validates the SAML assertion, maps the incoming identity to the existing Salesforce local user, recognizes that phishing-resistant MFA has already been satisfied by CyberArk, and establishes the Salesforce session without requiring a second Salesforce-native Passkey enrollment/authentication.
+    return $null
+}
 
-We would like to confirm that this is the expected CyberArk architecture and, specifically, that the phishing-resistant authentication context is dynamically associated with the actual Passkey authentication event rather than being statically defined in the SAML application configuration.
+function Get-NestedPropertyValue {
+    param(
+        [object]$InputObject,
 
-Clarification regarding Salesforce SP configuration
+        [Parameter(Mandatory)]
+        [string[]]$ParentProperties,
 
-We would also appreciate confirmation on one point from our discussion around the individual CLMAdmin applications.
+        [Parameter(Mandatory)]
+        [string[]]$ChildProperties
+    )
 
-Our current understanding is that the Salesforce SAML Service Provider configuration is associated with the Salesforce organization/My Domain rather than an individual Salesforce user.
+    if ($null -eq $InputObject) {
+        return $null
+    }
 
-For example, if:
+    $parent = Get-ObjectPropertyValue -InputObject $InputObject -PropertyNames $ParentProperties
 
-CLMAdmin01
-CLMAdmin02
-CLMAdmin03
+    if ($null -eq $parent) {
+        return $null
+    }
 
-are all local users within the same Salesforce organization, such as:
+    return Get-ObjectPropertyValue -InputObject $parent -PropertyNames $ChildProperties
+}
 
-company.my.salesforce.com
+function Convert-ToReportValue {
+    param(
+        [object]$Value
+    )
 
-then we would normally expect one Salesforce SAML SP configuration / Entity ID to be capable of authenticating all of those users.
+    if ($null -eq $Value) {
+        return ''
+    }
 
-CyberArk would send a different NameID/Federation ID for each user, while the Salesforce SP Entity ID, ACS endpoint, signing relationship, and overall SAML trust remain associated with the same Salesforce organization.
+    if ($Value -is [string] -or
+        $Value -is [bool] -or
+        $Value -is [byte] -or
+        $Value -is [int16] -or
+        $Value -is [int32] -or
+        $Value -is [int64] -or
+        $Value -is [single] -or
+        $Value -is [double] -or
+        $Value -is [decimal]) {
+        return $Value
+    }
 
-Conceptually:
+    try {
+        return ($Value | ConvertTo-Json -Compress -Depth 20)
+    } catch {
+        return [string]$Value
+    }
+}
 
-CyberArk Identity / Idira
-→ One Salesforce Web-SAML application
-→ Salesforce Organization / SP
-→ Federation ID determines CLMAdmin01, CLMAdmin02, CLMAdmin03, etc.
+function Convert-CyberArkTime {
+    param(
+        [object]$Value
+    )
 
-If, however, the CLMAdmin accounts belong to separate Salesforce organizations/My Domains, then we understand why separate CyberArk SAML applications and separate Salesforce SP Entity IDs would be required.
+    if ($null -eq $Value -or [string]::IsNullOrWhiteSpace([string]$Value)) {
+        return ''
+    }
 
-Could you please confirm whether this interpretation is correct and whether there is any CyberArk-specific requirement that would require us to create an individual Web-SAML application for every CLMAdmin user even when all of the accounts reside within the same Salesforce organization?
+    # Preserve values already returned as DateTime objects.
+    if ($Value -is [DateTime]) {
+        return $Value.ToString('yyyy-MM-dd HH:mm:ss')
+    }
 
-Key items we would like to validate during the next session
+    # Preserve ISO-style timestamps returned by some API versions.
+    $parsedDate = [DateTime]::MinValue
+    if ([DateTime]::TryParse([string]$Value, [ref]$parsedDate)) {
+        return $parsedDate.ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss')
+    }
 
-Our primary objectives would therefore be to:
+    try {
+        $raw = [Int64]$Value
 
-Elevate the Jaime test account to an administrative/privileged Salesforce role.
-Authenticate Jaime through the CyberArk Passkey policy.
-Capture and review the generated SAML assertion.
-Confirm the exact AMR/ACR authentication-strength value being presented to Salesforce.
-Validate that Salesforce recognizes the assertion as phishing-resistant MFA.
-Confirm that Salesforce does not subsequently require its own Passkey challenge.
-Confirm whether one Salesforce SP/Web-SAML configuration can support multiple Salesforce users within the same Salesforce organization.
-Validate how CyberArk maps each individual CyberArk identity to the appropriate Salesforce Federation ID/NameID.
+        if ($raw -le 0) {
+            return ''
+        }
 
-This test should give us a much stronger validation of the proposed architecture and confirm whether the CyberArk Passkey authentication can satisfy Salesforce's privileged-user phishing-resistant MFA requirement end-to-end.
+        # CyberArk fields can be Unix seconds or milliseconds.
+        if ($raw -gt 999999999999) {
+            $dt = [DateTimeOffset]::FromUnixTimeMilliseconds($raw).LocalDateTime
+        } else {
+            $dt = [DateTimeOffset]::FromUnixTimeSeconds($raw).LocalDateTime
+        }
 
-Thank you again for the support and for the valuable discussion yesterday. We look forward to validating these remaining items in the next working session.
+        return $dt.ToString('yyyy-MM-dd HH:mm:ss')
+    } catch {
+        return [string]$Value
+    }
+}
 
-Best regards,
+function ConvertTo-PropertyMap {
+    param(
+        [object]$InputObject
+    )
 
-Ben
+    # PowerShell hashtables are case-insensitive by default.
+    $map = @{}
 
+    if ($null -eq $InputObject) {
+        return $map
+    }
+
+    if ($InputObject -is [System.Collections.IDictionary]) {
+        foreach ($key in $InputObject.Keys) {
+            if ($null -ne $key) {
+                $map[[string]$key] = $InputObject[$key]
+            }
+        }
+
+        return $map
+    }
+
+    foreach ($property in $InputObject.PSObject.Properties) {
+        $map[$property.Name] = $property.Value
+    }
+
+    return $map
+}
+
+function Get-MapValueByAlias {
+    param(
+        [hashtable]$Map,
+
+        [Parameter(Mandatory)]
+        [string[]]$Aliases
+    )
+
+    if ($null -eq $Map) {
+        return ''
+    }
+
+    foreach ($alias in $Aliases) {
+        if ($Map.ContainsKey($alias)) {
+            return Convert-ToReportValue $Map[$alias]
+        }
+    }
+
+    return ''
+}
+
+function ConvertTo-SafeColumnName {
+    param(
+        [Parameter(Mandatory)]
+        [string]$PropertyName
+    )
+
+    $safeName = $PropertyName.Trim()
+    $safeName = $safeName -replace '[^a-zA-Z0-9_]', '_'
+    $safeName = $safeName -replace '_+', '_'
+    $safeName = $safeName.Trim('_')
+
+    if ([string]::IsNullOrWhiteSpace($safeName)) {
+        $safeName = 'UnnamedProperty'
+    }
+
+    return "Property_$safeName"
+}
+
+function Join-PropertyDefinitionNames {
+    param(
+        [object]$DefinitionCollection
+    )
+
+    if ($null -eq $DefinitionCollection) {
+        return ''
+    }
+
+    $names = New-Object System.Collections.Generic.List[string]
+
+    foreach ($definition in @($DefinitionCollection)) {
+        if ($definition -is [string]) {
+            $name = [string]$definition
+        } else {
+            $name = Get-ObjectPropertyValue -InputObject $definition -PropertyNames @('name', 'Name')
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace([string]$name)) {
+            $names.Add([string]$name)
+        }
+    }
+
+    return (($names | Sort-Object -Unique) -join ';')
+}
+
+function Test-StringInList {
+    param(
+        [string]$Value,
+        [string[]]$List
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value) -or $null -eq $List) {
+        return $false
+    }
+
+    foreach ($item in $List) {
+        if (-not [string]::IsNullOrWhiteSpace($item) -and
+            [string]::Equals($Value, $item.Trim(), [StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+# ============================================
+# Import psPAS
+# ============================================
+
+try {
+    Import-Module psPAS -Force -ErrorAction Stop
+    $psPASModule = Get-Module psPAS
+
+    if ($psPASModule) {
+        Write-Log ("psPAS module loaded. Version: {0}" -f $psPASModule.Version) 'Green'
+    } else {
+        Write-Log 'psPAS module loaded.' 'Green'
+    }
+} catch {
+    Write-Log ("ERROR: Failed to import psPAS module. {0}" -f $_.Exception.Message) 'Red'
+    throw
+}
+
+# ============================================
+# Validate IdentityCommand / Get-IdentityHeader
+# ============================================
+
+if (-not (Get-Command Get-IdentityHeader -ErrorAction SilentlyContinue)) {
+    Write-Log 'ERROR: Get-IdentityHeader cmdlet was not found. Confirm IdentityCommand module is installed and available.' 'Red'
+    throw 'Get-IdentityHeader cmdlet not found.'
+}
+
+# ============================================
+# Login Method: CCP + psPAS Identity Header
+# ============================================
+
+function Start-PASSessionFromCCP {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ObjectName
+    )
+
+    $headers = @{
+        'Content-Type' = 'application/json'
+    }
+
+    $ccpUrl = "$CCPAddress/$CCPLocation/api/Accounts?AppID=$CCPAppID&Safe=$CCPSafe&Object=$ObjectName"
+
+    Write-Log ("Retrieving CyberArk API credentials from CCP using Object='{0}'..." -f $ObjectName) 'Cyan'
+    Write-Log ("CCP URL: {0}" -f $ccpUrl) 'Gray'
+
+    $resp       = $null
+    $securePass = $null
+
+    try {
+        $resp = Invoke-RestMethod `
+            -Uri $ccpUrl `
+            -Method GET `
+            -Headers $headers `
+            -UseDefaultCredentials:$CCPWindowsAuth `
+            -ErrorAction Stop
+
+        if (-not $resp -or -not $resp.Content) {
+            throw 'Empty CCP response or missing Content field.'
+        }
+    } catch {
+        Write-Log ("ERROR: CCP credential fetch failed. {0}" -f $_.Exception.Message) 'Red'
+        throw
+    }
+
+    $resolvedUser = Get-ObjectPropertyValue -InputObject $resp -PropertyNames @('Username', 'UserName')
+
+    if ([string]::IsNullOrWhiteSpace([string]$resolvedUser)) {
+        throw 'CCP returned password but no Username/UserName field.'
+    }
+
+    Write-Log ("Successfully retrieved CCP credential for user: {0}" -f $resolvedUser) 'Green'
+
+    try {
+        $normalizedTenant = Get-NormalizedIdentityTenant -TenantUrl $IdentityTenantURL
+
+        $securePass = ConvertTo-SecureString $resp.Content -AsPlainText -Force
+        $credential = New-Object System.Management.Automation.PSCredential($resolvedUser, $securePass)
+
+        Write-Log ("Requesting CyberArk PAS authentication using psPAS Identity header as {0}..." -f $resolvedUser) 'Cyan'
+        Write-Log ("IdentityTenantURL passed to Get-IdentityHeader: {0}" -f $normalizedTenant) 'Gray'
+        Write-Log ("Privilege Cloud Subdomain: {0}" -f $PCloudSubdomain) 'Gray'
+
+        $header = Get-IdentityHeader `
+            -IdentityTenantURL $normalizedTenant `
+            -psPASFormat `
+            -PCloudSubdomain $PCloudSubdomain `
+            -UPCreds $credential
+
+        Use-PASSession $header | Out-Null
+
+        if (-not (Get-PASSession)) {
+            throw 'psPAS session not established.'
+        }
+
+        Write-Log ("Authentication successful. PAS session established as {0}." -f $resolvedUser) 'Green'
+    } catch {
+        Write-Log ("ERROR: Failed to authenticate via psPAS Identity header. {0}" -f $_.Exception.Message) 'Red'
+        throw
+    } finally {
+        if ($null -ne $resp -and $null -ne $resp.PSObject.Properties['Content']) {
+            $resp.Content = $null
+        }
+
+        if ($null -ne $securePass) {
+            $securePass.Dispose()
+        }
+    }
+
+    return [string]$resolvedUser
+}
+
+# ============================================
+# PAS API Helpers
+# ============================================
+
+function Invoke-PASGetWithRetry {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Uri,
+
+        [string]$OperationName = 'PAS API GET'
+    )
+
+    if (-not (Get-Command Invoke-PASRestMethod -ErrorAction SilentlyContinue)) {
+        throw 'Invoke-PASRestMethod cmdlet was not found in the installed psPAS module.'
+    }
+
+    $lastError = $null
+
+    for ($attempt = 1; $attempt -le $ApiRetryCount; $attempt++) {
+        try {
+            return Invoke-PASRestMethod -Uri $Uri -Method GET -ErrorAction Stop
+        } catch {
+            $lastError = $_
+
+            if ($attempt -lt $ApiRetryCount) {
+                Write-Log ("WARNING: {0} failed on attempt {1}/{2}. Retrying in {3} second(s). Error: {4}" -f `
+                    $OperationName, $attempt, $ApiRetryCount, $ApiRetryDelaySeconds, $_.Exception.Message) 'Yellow'
+
+                if ($ApiRetryDelaySeconds -gt 0) {
+                    Start-Sleep -Seconds $ApiRetryDelaySeconds
+                }
+            }
+        }
+    }
+
+    if ($null -ne $lastError -and $null -ne $lastError.Exception) {
+        throw $lastError.Exception
+    }
+
+    throw ("{0} failed after {1} attempt(s)." -f $OperationName, $ApiRetryCount)
+}
+
+function Get-AllPASAccounts {
+    param(
+        [int]$Limit = 1000
+    )
+
+    $allAccounts = New-Object System.Collections.Generic.List[object]
+
+    if (Get-Command Invoke-PASRestMethod -ErrorAction SilentlyContinue) {
+        Write-Log 'Using Invoke-PASRestMethod with paginated /Accounts API retrieval...' 'Cyan'
+
+        $offset     = 0
+        $pageNumber = 0
+
+        while ($true) {
+            $pageNumber++
+            $relativeUri = "Accounts?limit=$Limit&offset=$offset"
+
+            Write-Log ("Retrieving account page {0}. Offset={1}, Limit={2}" -f $pageNumber, $offset, $Limit) 'Gray'
+
+            try {
+                $response = Invoke-PASGetWithRetry `
+                    -Uri $relativeUri `
+                    -OperationName ("Account page {0}" -f $pageNumber)
+            } catch {
+                Write-Log ("WARNING: Invoke-PASRestMethod account retrieval failed. Falling back to Get-PASAccount. Error: {0}" -f $_.Exception.Message) 'Yellow'
+                $allAccounts.Clear()
+                break
+            }
+
+            $batch = @()
+
+            if ($null -ne $response) {
+                $value = Get-ObjectPropertyValue -InputObject $response -PropertyNames @('value', 'Value', 'accounts', 'Accounts')
+
+                if ($null -ne $value) {
+                    $batch = @($value)
+                } elseif ($response -is [array]) {
+                    $batch = @($response)
+                } else {
+                    $batch = @($response)
+                }
+            }
+
+            foreach ($account in @($batch)) {
+                if ($null -ne $account) {
+                    $allAccounts.Add($account)
+                }
+            }
+
+            Write-Log ("Retrieved {0} account(s) from page {1}." -f @($batch).Count, $pageNumber) 'Green'
+
+            if (@($batch).Count -lt $Limit) {
+                break
+            }
+
+            $offset += $Limit
+        }
+
+        if ($allAccounts.Count -gt 0) {
+            return @($allAccounts)
+        }
+    }
+
+    Write-Log 'Using Get-PASAccount fallback method...' 'Cyan'
+
+    try {
+        $accounts = Get-PASAccount -ErrorAction Stop
+
+        if ($null -eq $accounts) {
+            return @()
+        }
+
+        return @($accounts)
+    } catch {
+        Write-Log ("ERROR: Get-PASAccount fallback failed. {0}" -f $_.Exception.Message) 'Red'
+        throw
+    }
+}
+
+function Get-AllPASPlatforms {
+    $platforms = @()
+
+    if (Get-Command Invoke-PASRestMethod -ErrorAction SilentlyContinue) {
+        Write-Log 'Retrieving regular account platforms from /Platforms API...' 'Cyan'
+
+        try {
+            $response = Invoke-PASGetWithRetry `
+                -Uri 'Platforms?PlatformType=Regular' `
+                -OperationName 'Platform inventory retrieval'
+
+            $platformValue = Get-ObjectPropertyValue -InputObject $response -PropertyNames @('Platforms', 'platforms', 'value', 'Value')
+
+            if ($null -ne $platformValue) {
+                $platforms = @($platformValue)
+            } elseif ($response -is [array]) {
+                $platforms = @($response)
+            } elseif ($null -ne $response) {
+                $platforms = @($response)
+            }
+        } catch {
+            Write-Log ("WARNING: /Platforms API retrieval failed. Error: {0}" -f $_.Exception.Message) 'Yellow'
+            $platforms = @()
+        }
+    }
+
+    if ($platforms.Count -eq 0 -and (Get-Command Get-PASPlatform -ErrorAction SilentlyContinue)) {
+        Write-Log 'Attempting Get-PASPlatform fallback...' 'Cyan'
+
+        try {
+            $platforms = @(Get-PASPlatform -PlatformType Regular -ErrorAction Stop)
+        } catch {
+            Write-Log ("WARNING: Get-PASPlatform fallback failed. Error: {0}" -f $_.Exception.Message) 'Yellow'
+            $platforms = @()
+        }
+    }
+
+    return @($platforms)
+}
+
+function Get-PASAccountDetailRecord {
+    param(
+        [Parameter(Mandatory)]
+        [string]$AccountID
+    )
+
+    if (Get-Command Invoke-PASRestMethod -ErrorAction SilentlyContinue) {
+        $escapedID = [Uri]::EscapeDataString($AccountID)
+
+        return Invoke-PASGetWithRetry `
+            -Uri ("Accounts/{0}/" -f $escapedID) `
+            -OperationName ("Account detail retrieval for {0}" -f $AccountID)
+    }
+
+    # Fallback for environments where Invoke-PASRestMethod is unavailable.
+    if (Get-Command Get-PASAccount -ErrorAction SilentlyContinue) {
+        return Get-PASAccount -id $AccountID -ErrorAction Stop
+    }
+
+    throw 'Neither Invoke-PASRestMethod nor Get-PASAccount is available for account detail retrieval.'
+}
+
+# ============================================
+# Platform Normalization and Classification
+# ============================================
+
+function ConvertTo-NormalizedPlatform {
+    param(
+        [Parameter(Mandatory)]
+        [object]$Platform
+    )
+
+    $general = Get-ObjectPropertyValue -InputObject $Platform -PropertyNames @('general', 'General')
+
+    if ($null -eq $general) {
+        $details = Get-ObjectPropertyValue -InputObject $Platform -PropertyNames @('details', 'Details')
+        if ($null -ne $details) {
+            $general = Get-ObjectPropertyValue -InputObject $details -PropertyNames @('general', 'General')
+        }
+    }
+
+    if ($null -eq $general) {
+        $general = $Platform
+    }
+
+    $properties = Get-ObjectPropertyValue -InputObject $Platform -PropertyNames @('properties', 'Properties')
+
+    if ($null -eq $properties) {
+        $details = Get-ObjectPropertyValue -InputObject $Platform -PropertyNames @('details', 'Details')
+        if ($null -ne $details) {
+            $properties = Get-ObjectPropertyValue -InputObject $details -PropertyNames @('properties', 'Properties')
+        }
+    }
+
+    $requiredDefinitions = Get-ObjectPropertyValue -InputObject $properties -PropertyNames @('required', 'Required')
+    $optionalDefinitions = Get-ObjectPropertyValue -InputObject $properties -PropertyNames @('optional', 'Optional')
+
+    $platformID = Get-ObjectPropertyValue -InputObject $general -PropertyNames @(
+        'id', 'Id', 'ID', 'platformId', 'PlatformId', 'PlatformID'
+    )
+
+    if ([string]::IsNullOrWhiteSpace([string]$platformID)) {
+        $platformID = Get-ObjectPropertyValue -InputObject $Platform -PropertyNames @(
+            'id', 'Id', 'ID', 'platformId', 'PlatformId', 'PlatformID'
+        )
+    }
+
+    $name = Get-ObjectPropertyValue -InputObject $general -PropertyNames @('name', 'Name', 'platformName', 'PlatformName')
+    if ([string]::IsNullOrWhiteSpace([string]$name)) {
+        $name = Get-ObjectPropertyValue -InputObject $Platform -PropertyNames @('name', 'Name', 'platformName', 'PlatformName')
+    }
+
+    $systemType = Get-ObjectPropertyValue -InputObject $general -PropertyNames @('systemType', 'SystemType')
+    if ([string]::IsNullOrWhiteSpace([string]$systemType)) {
+        $systemType = Get-ObjectPropertyValue -InputObject $Platform -PropertyNames @('systemType', 'SystemType')
+    }
+
+    $active = Get-ObjectPropertyValue -InputObject $general -PropertyNames @('active', 'Active')
+    if ($null -eq $active) {
+        $active = Get-ObjectPropertyValue -InputObject $Platform -PropertyNames @('active', 'Active')
+    }
+
+    $description = Get-ObjectPropertyValue -InputObject $general -PropertyNames @('description', 'Description')
+    if ($null -eq $description) {
+        $description = Get-ObjectPropertyValue -InputObject $Platform -PropertyNames @('description', 'Description')
+    }
+
+    $platformBaseID = Get-ObjectPropertyValue -InputObject $general -PropertyNames @('platformBaseID', 'PlatformBaseID', 'basePlatformID', 'BasePlatformID')
+    if ($null -eq $platformBaseID) {
+        $platformBaseID = Get-ObjectPropertyValue -InputObject $Platform -PropertyNames @('platformBaseID', 'PlatformBaseID', 'basePlatformID', 'BasePlatformID')
+    }
+
+    $platformType = Get-ObjectPropertyValue -InputObject $general -PropertyNames @('platformType', 'PlatformType')
+    if ($null -eq $platformType) {
+        $platformType = Get-ObjectPropertyValue -InputObject $Platform -PropertyNames @('platformType', 'PlatformType')
+    }
+
+    return [PSCustomObject]@{
+        PlatformID          = Convert-ToReportValue $platformID
+        PlatformName        = Convert-ToReportValue $name
+        SystemType          = Convert-ToReportValue $systemType
+        Active              = Convert-ToReportValue $active
+        Description         = Convert-ToReportValue $description
+        PlatformBaseID      = Convert-ToReportValue $platformBaseID
+        PlatformType        = Convert-ToReportValue $platformType
+        RequiredProperties  = Join-PropertyDefinitionNames $requiredDefinitions
+        OptionalProperties  = Join-PropertyDefinitionNames $optionalDefinitions
+        RawPlatformObject   = $Platform
+    }
+}
+
+function Get-DatabasePlatformDetection {
+    param(
+        [Parameter(Mandatory)]
+        [object]$Platform
+    )
+
+    $platformID = [string]$Platform.PlatformID
+
+    if (Test-StringInList -Value $platformID -List $ExcludePlatformID) {
+        return [PSCustomObject]@{
+            IsDatabase = $false
+            Reason     = 'Explicitly excluded by ExcludePlatformID'
+        }
+    }
+
+    if (Test-StringInList -Value $platformID -List $IncludePlatformID) {
+        return [PSCustomObject]@{
+            IsDatabase = $true
+            Reason     = 'Explicitly included by IncludePlatformID'
+        }
+    }
+
+    $fieldsToCheck = [ordered]@{
+        SystemType     = [string]$Platform.SystemType
+        PlatformID     = [string]$Platform.PlatformID
+        PlatformName   = [string]$Platform.PlatformName
+        PlatformBaseID = [string]$Platform.PlatformBaseID
+        Description    = [string]$Platform.Description
+    }
+
+    foreach ($fieldName in $fieldsToCheck.Keys) {
+        $fieldValue = $fieldsToCheck[$fieldName]
+
+        if (-not [string]::IsNullOrWhiteSpace($fieldValue) -and
+            $fieldValue -match $DatabasePlatformPattern) {
+            return [PSCustomObject]@{
+                IsDatabase = $true
+                Reason     = ("{0} matched database pattern: {1}" -f $fieldName, $fieldValue)
+            }
+        }
+    }
+
+    return [PSCustomObject]@{
+        IsDatabase = $false
+        Reason     = 'No database metadata match'
+    }
+}
+
+function Test-AccountPlatformMatch {
+    param(
+        [Parameter(Mandatory)]
+        [string]$PlatformID,
+
+        [hashtable]$DatabasePlatformLookup
+    )
+
+    if (Test-StringInList -Value $PlatformID -List $ExcludePlatformID) {
+        return $false
+    }
+
+    if (Test-StringInList -Value $PlatformID -List $IncludePlatformID) {
+        return $true
+    }
+
+    if ($null -ne $DatabasePlatformLookup -and $DatabasePlatformLookup.ContainsKey($PlatformID)) {
+        return $true
+    }
+
+    # Fallback classification when platform inventory is unavailable or incomplete.
+    if (-not [string]::IsNullOrWhiteSpace($PlatformID) -and
+        $PlatformID -match $DatabasePlatformPattern) {
+        return $true
+    }
+
+    return $false
+}
+
+# ============================================
+# Start Script
+# ============================================
+
+Write-Log '============================================================' 'Gray'
+Write-Log 'CNA Database Account Report with Extended Properties started.' 'Cyan'
+Write-Log ("Identity Tenant URL        : {0}" -f $IdentityTenantURL) 'Gray'
+Write-Log ("Privilege Cloud URL        : {0}" -f $PrivilegeCloudURL) 'Gray'
+Write-Log ("PCloud Subdomain           : {0}" -f $PCloudSubdomain) 'Gray'
+Write-Log ("CCP Address                : {0}" -f $CCPAddress) 'Gray'
+Write-Log ("CCP AppID                  : {0}" -f $CCPAppID) 'Gray'
+Write-Log ("CCP Safe                   : {0}" -f $CCPSafe) 'Gray'
+Write-Log ("CCP Object                 : {0}" -f $CCPObject) 'Gray'
+Write-Log ("Retrieve Full Details      : {0}" -f $RetrieveFullAccountDetails) 'Gray'
+Write-Log ("Database Platform Pattern  : {0}" -f $DatabasePlatformPattern) 'Gray'
+Write-Log ("Explicit Include Platforms : {0}" -f (($IncludePlatformID | Where-Object { $_ }) -join ';')) 'Gray'
+Write-Log ("Explicit Exclude Platforms : {0}" -f (($ExcludePlatformID | Where-Object { $_ }) -join ';')) 'Gray'
+Write-Log ("Account CSV                : {0}" -f $AccountCsvPath) 'Gray'
+Write-Log ("Platform CSV               : {0}" -f $PlatformCsvPath) 'Gray'
+Write-Log '============================================================' 'Gray'
+
+$AuthenticatedUser = $null
+$SessionEstablished = $false
+
+try {
+    # ============================================
+    # Authenticate
+    # ============================================
+
+    $AuthenticatedUser = Start-PASSessionFromCCP -ObjectName $CCPObject
+    $SessionEstablished = $true
+
+    # ============================================
+    # Retrieve and Classify Platforms
+    # ============================================
+
+    Write-Log 'Retrieving platform inventory...' 'Yellow'
+    $rawPlatforms = @(Get-AllPASPlatforms)
+    Write-Log ("Retrieved {0} platform record(s)." -f $rawPlatforms.Count) 'Green'
+
+    $normalizedPlatforms = New-Object System.Collections.Generic.List[object]
+    $databasePlatforms   = New-Object System.Collections.Generic.List[object]
+    $platformLookup      = @{}
+    $databasePlatformLookup = @{}
+
+    foreach ($rawPlatform in $rawPlatforms) {
+        if ($null -eq $rawPlatform) {
+            continue
+        }
+
+        $normalized = ConvertTo-NormalizedPlatform -Platform $rawPlatform
+
+        if ([string]::IsNullOrWhiteSpace([string]$normalized.PlatformID)) {
+            Write-Log 'WARNING: Skipping a platform record because no PlatformID could be resolved.' 'Yellow'
+            continue
+        }
+
+        $detection = Get-DatabasePlatformDetection -Platform $normalized
+
+        $platformRecord = [PSCustomObject]@{
+            PlatformID         = $normalized.PlatformID
+            PlatformName       = $normalized.PlatformName
+            SystemType         = $normalized.SystemType
+            PlatformBaseID     = $normalized.PlatformBaseID
+            PlatformType       = $normalized.PlatformType
+            Active             = $normalized.Active
+            Description        = $normalized.Description
+            RequiredProperties = $normalized.RequiredProperties
+            OptionalProperties = $normalized.OptionalProperties
+            IsDatabasePlatform = $detection.IsDatabase
+            DetectionReason    = $detection.Reason
+        }
+
+        $normalizedPlatforms.Add($platformRecord)
+        $platformLookup[[string]$normalized.PlatformID] = $platformRecord
+
+        if ($detection.IsDatabase) {
+            $databasePlatforms.Add($platformRecord)
+            $databasePlatformLookup[[string]$normalized.PlatformID] = $platformRecord
+        }
+    }
+
+    # Add explicitly included platform IDs that were not returned by the platform API.
+    foreach ($explicitPlatformID in @($IncludePlatformID)) {
+        if ([string]::IsNullOrWhiteSpace($explicitPlatformID)) {
+            continue
+        }
+
+        $explicitPlatformID = $explicitPlatformID.Trim()
+
+        if (-not $databasePlatformLookup.ContainsKey($explicitPlatformID) -and
+            -not (Test-StringInList -Value $explicitPlatformID -List $ExcludePlatformID)) {
+
+            $explicitRecord = [PSCustomObject]@{
+                PlatformID         = $explicitPlatformID
+                PlatformName       = ''
+                SystemType         = ''
+                PlatformBaseID     = ''
+                PlatformType       = 'Regular'
+                Active             = ''
+                Description        = ''
+                RequiredProperties = ''
+                OptionalProperties = ''
+                IsDatabasePlatform = $true
+                DetectionReason    = 'Explicitly included; platform metadata was not returned'
+            }
+
+            $databasePlatforms.Add($explicitRecord)
+            $databasePlatformLookup[$explicitPlatformID] = $explicitRecord
+            $platformLookup[$explicitPlatformID] = $explicitRecord
+        }
+    }
+
+    Write-Log ("Identified {0} database platform(s)." -f $databasePlatforms.Count) 'Green'
+
+    foreach ($databasePlatform in ($databasePlatforms | Sort-Object PlatformID)) {
+        Write-Log ("Database platform: ID='{0}', Name='{1}', SystemType='{2}', Reason='{3}'" -f `
+            $databasePlatform.PlatformID,
+            $databasePlatform.PlatformName,
+            $databasePlatform.SystemType,
+            $databasePlatform.DetectionReason) 'Gray'
+    }
+
+    try {
+        if ($databasePlatforms.Count -gt 0) {
+            $databasePlatforms |
+                Sort-Object PlatformID |
+                Export-Csv -Path $PlatformCsvPath -NoTypeInformation -Encoding UTF8
+        } else {
+            $emptyPlatformHeader = [PSCustomObject][ordered]@{
+                PlatformID         = ''
+                PlatformName       = ''
+                SystemType         = ''
+                PlatformBaseID     = ''
+                PlatformType       = ''
+                Active             = ''
+                Description        = ''
+                RequiredProperties = ''
+                OptionalProperties = ''
+                IsDatabasePlatform = ''
+                DetectionReason    = ''
+            }
+
+            $emptyPlatformHeader | Export-Csv -Path $PlatformCsvPath -NoTypeInformation -Encoding UTF8
+            $platformHeaderLine = Get-Content -Path $PlatformCsvPath -TotalCount 1
+            Set-Content -Path $PlatformCsvPath -Value $platformHeaderLine -Encoding UTF8
+        }
+
+        Write-Log ("Database platform inventory exported to: {0}" -f $PlatformCsvPath) 'Green'
+    } catch {
+        Write-Log ("ERROR: Failed to export database platform inventory. {0}" -f $_.Exception.Message) 'Red'
+        throw
+    }
+
+    # ============================================
+    # Retrieve Accounts
+    # ============================================
+
+    Write-Log 'Retrieving all visible accounts...' 'Yellow'
+    $accounts = @(Get-AllPASAccounts -Limit $PageLimit)
+    Write-Log ("Retrieved {0} account(s)." -f $accounts.Count) 'Green'
+
+    # ============================================
+    # Filter Database Accounts
+    # ============================================
+
+    $databaseAccountSummaries = New-Object System.Collections.Generic.List[object]
+
+    foreach ($account in $accounts) {
+        $platformID = Get-ObjectPropertyValue -InputObject $account -PropertyNames @(
+            'platformId', 'PlatformId', 'platformID', 'PlatformID'
+        )
+
+        if ([string]::IsNullOrWhiteSpace([string]$platformID)) {
+            continue
+        }
+
+        if (Test-AccountPlatformMatch -PlatformID ([string]$platformID) -DatabasePlatformLookup $databasePlatformLookup) {
+            $databaseAccountSummaries.Add($account)
+        }
+    }
+
+    Write-Log ("Found {0} account(s) assigned to database platforms." -f $databaseAccountSummaries.Count) 'Green'
+
+    # ============================================
+    # Retrieve Full Account Details and Discover
+    # Dynamic Extended Property Names
+    # ============================================
+
+    $accountWorkItems = New-Object System.Collections.Generic.List[object]
+    $allExtendedPropertyNames = @{}
+
+    # Seed dynamic columns from the database platform definitions. This preserves
+    # columns for optional properties even when no current account has a value.
+    $coreAccountPropertyNames = @(
+        'Address', 'Username', 'UserName', 'Name', 'AccountName', 'Safe', 'SafeName',
+        'PlatformID', 'PlatformId', 'Secret', 'Password'
+    )
+
+    foreach ($databasePlatform in $databasePlatforms) {
+        $definedPropertyText = @(
+            [string]$databasePlatform.RequiredProperties,
+            [string]$databasePlatform.OptionalProperties
+        ) -join ';'
+
+        foreach ($definedPropertyName in ($definedPropertyText -split ';')) {
+            $definedPropertyName = $definedPropertyName.Trim()
+
+            if ([string]::IsNullOrWhiteSpace($definedPropertyName)) {
+                continue
+            }
+
+            if (Test-StringInList -Value $definedPropertyName -List $coreAccountPropertyNames) {
+                continue
+            }
+
+            if (-not $allExtendedPropertyNames.ContainsKey($definedPropertyName)) {
+                $allExtendedPropertyNames[$definedPropertyName] = $definedPropertyName
+            }
+        }
+    }
+
+    Write-Log ("Seeded {0} extended-property column name(s) from database platform definitions." -f $allExtendedPropertyNames.Count) 'Gray'
+
+    $currentIndex = 0
+    $totalDatabaseAccounts = $databaseAccountSummaries.Count
+
+    foreach ($summaryAccount in $databaseAccountSummaries) {
+        $currentIndex++
+
+        $accountID = Get-ObjectPropertyValue -InputObject $summaryAccount -PropertyNames @(
+            'id', 'Id', 'accountId', 'AccountId', 'AccountID'
+        )
+
+        $accountData  = $summaryAccount
+        $detailSource = 'AccountList'
+        $detailError  = ''
+
+        if ($RetrieveFullAccountDetails -and -not [string]::IsNullOrWhiteSpace([string]$accountID)) {
+            try {
+                $detail = Get-PASAccountDetailRecord -AccountID ([string]$accountID)
+
+                if ($detail -is [array]) {
+                    $detail = @($detail)[0]
+                }
+
+                if ($null -ne $detail) {
+                    $accountData  = $detail
+                    $detailSource = 'AccountDetailAPI'
+                }
+            } catch {
+                $detailError = $_.Exception.Message
+                Write-Log ("WARNING: Full details could not be retrieved for AccountID='{0}'. Using account-list data. Error: {1}" -f `
+                    $accountID, $detailError) 'Yellow'
+            }
+
+            if ($AccountDetailDelayMilliseconds -gt 0) {
+                Start-Sleep -Milliseconds $AccountDetailDelayMilliseconds
+            }
+        }
+
+        $platformPropertiesObject = Get-ObjectPropertyValue -InputObject $accountData -PropertyNames @(
+            'platformAccountProperties', 'PlatformAccountProperties'
+        )
+
+        # Some psPAS outputs may wrap the API result in a value/details property.
+        if ($null -eq $platformPropertiesObject) {
+            $wrappedAccount = Get-ObjectPropertyValue -InputObject $accountData -PropertyNames @('value', 'Value', 'details', 'Details')
+
+            if ($null -ne $wrappedAccount) {
+                $possibleWrappedAccount = if ($wrappedAccount -is [array]) { @($wrappedAccount)[0] } else { $wrappedAccount }
+
+                $wrappedProperties = Get-ObjectPropertyValue -InputObject $possibleWrappedAccount -PropertyNames @(
+                    'platformAccountProperties', 'PlatformAccountProperties'
+                )
+
+                if ($null -ne $wrappedProperties) {
+                    $accountData = $possibleWrappedAccount
+                    $platformPropertiesObject = $wrappedProperties
+                }
+            }
+        }
+
+        $propertyMap = ConvertTo-PropertyMap -InputObject $platformPropertiesObject
+
+        foreach ($propertyName in $propertyMap.Keys) {
+            if (-not $allExtendedPropertyNames.ContainsKey([string]$propertyName)) {
+                $allExtendedPropertyNames[[string]$propertyName] = [string]$propertyName
+            }
+        }
+
+        $accountWorkItems.Add([PSCustomObject]@{
+            SummaryAccount = $summaryAccount
+            AccountData    = $accountData
+            PropertyMap    = $propertyMap
+            DetailSource   = $detailSource
+            DetailError    = $detailError
+        })
+
+        if (($currentIndex % 100) -eq 0 -or $currentIndex -eq $totalDatabaseAccounts) {
+            Write-Log ("Prepared {0}/{1} database account(s). Discovered {2} unique extended property name(s)." -f `
+                $currentIndex, $totalDatabaseAccounts, $allExtendedPropertyNames.Count) 'Gray'
+        }
+    }
+
+    # ============================================
+    # Create Stable, Unique CSV Column Names for
+    # Every Extended Property
+    # ============================================
+
+    $propertyColumnMap = [ordered]@{}
+    $usedColumnNames   = @{}
+
+    foreach ($originalPropertyName in ($allExtendedPropertyNames.Values | Sort-Object)) {
+        $baseColumnName = ConvertTo-SafeColumnName -PropertyName $originalPropertyName
+        $columnName     = $baseColumnName
+        $suffix         = 2
+
+        while ($usedColumnNames.ContainsKey($columnName)) {
+            $columnName = "${baseColumnName}_$suffix"
+            $suffix++
+        }
+
+        $usedColumnNames[$columnName] = $true
+        $propertyColumnMap[$originalPropertyName] = $columnName
+    }
+
+    Write-Log ("Created {0} dynamic extended-property CSV column(s)." -f $propertyColumnMap.Count) 'Green'
+
+    # ============================================
+    # Build Database Account Report
+    # ============================================
+
+    $databaseAccountReport = New-Object System.Collections.Generic.List[object]
+    $currentIndex = 0
+
+    foreach ($workItem in $accountWorkItems) {
+        $currentIndex++
+
+        $account = $workItem.AccountData
+        $summary = $workItem.SummaryAccount
+        $propertyMap = $workItem.PropertyMap
+
+        $accountID = Get-ObjectPropertyValue -InputObject $account -PropertyNames @(
+            'id', 'Id', 'accountId', 'AccountId', 'AccountID'
+        )
+        if ([string]::IsNullOrWhiteSpace([string]$accountID)) {
+            $accountID = Get-ObjectPropertyValue -InputObject $summary -PropertyNames @(
+                'id', 'Id', 'accountId', 'AccountId', 'AccountID'
+            )
+        }
+
+        $accountName = Get-ObjectPropertyValue -InputObject $account -PropertyNames @(
+            'name', 'Name', 'accountName', 'AccountName'
+        )
+        if ([string]::IsNullOrWhiteSpace([string]$accountName)) {
+            $accountName = Get-ObjectPropertyValue -InputObject $summary -PropertyNames @(
+                'name', 'Name', 'accountName', 'AccountName'
+            )
+        }
+
+        $safeName = Get-ObjectPropertyValue -InputObject $account -PropertyNames @(
+            'safeName', 'SafeName', 'safe', 'Safe'
+        )
+        if ([string]::IsNullOrWhiteSpace([string]$safeName)) {
+            $safeName = Get-ObjectPropertyValue -InputObject $summary -PropertyNames @(
+                'safeName', 'SafeName', 'safe', 'Safe'
+            )
+        }
+
+        $userName = Get-ObjectPropertyValue -InputObject $account -PropertyNames @(
+            'userName', 'UserName', 'username', 'Username'
+        )
+        if ([string]::IsNullOrWhiteSpace([string]$userName)) {
+            $userName = Get-ObjectPropertyValue -InputObject $summary -PropertyNames @(
+                'userName', 'UserName', 'username', 'Username'
+            )
+        }
+
+        $address = Get-ObjectPropertyValue -InputObject $account -PropertyNames @('address', 'Address')
+        if ([string]::IsNullOrWhiteSpace([string]$address)) {
+            $address = Get-ObjectPropertyValue -InputObject $summary -PropertyNames @('address', 'Address')
+        }
+
+        $platformID = Get-ObjectPropertyValue -InputObject $account -PropertyNames @(
+            'platformId', 'PlatformId', 'platformID', 'PlatformID'
+        )
+        if ([string]::IsNullOrWhiteSpace([string]$platformID)) {
+            $platformID = Get-ObjectPropertyValue -InputObject $summary -PropertyNames @(
+                'platformId', 'PlatformId', 'platformID', 'PlatformID'
+            )
+        }
+
+        $secretType = Get-ObjectPropertyValue -InputObject $account -PropertyNames @('secretType', 'SecretType')
+        if ([string]::IsNullOrWhiteSpace([string]$secretType)) {
+            $secretType = Get-ObjectPropertyValue -InputObject $summary -PropertyNames @('secretType', 'SecretType')
+        }
+
+        $createdTime = Get-ObjectPropertyValue -InputObject $account -PropertyNames @(
+            'createdTime', 'CreatedTime', 'creationTime', 'CreationTime'
+        )
+
+        $categoryModificationTime = Get-ObjectPropertyValue -InputObject $account -PropertyNames @(
+            'CategoryModificationTime', 'categoryModificationTime', 'modifiedTime', 'ModifiedTime'
+        )
+
+        $automaticManagementEnabled = Get-NestedPropertyValue `
+            -InputObject $account `
+            -ParentProperties @('secretManagement', 'SecretManagement') `
+            -ChildProperties @('automaticManagementEnabled', 'AutomaticManagementEnabled')
+
+        $manualManagementReason = Get-NestedPropertyValue `
+            -InputObject $account `
+            -ParentProperties @('secretManagement', 'SecretManagement') `
+            -ChildProperties @('manualManagementReason', 'ManualManagementReason')
+
+        $cpmStatus = Get-NestedPropertyValue `
+            -InputObject $account `
+            -ParentProperties @('secretManagement', 'SecretManagement') `
+            -ChildProperties @('status', 'Status', 'cpmStatus', 'CPMStatus')
+
+        $cpmLastModifiedTime = Get-NestedPropertyValue `
+            -InputObject $account `
+            -ParentProperties @('secretManagement', 'SecretManagement') `
+            -ChildProperties @('lastModifiedTime', 'LastModifiedTime')
+
+        $lastReconciledTime = Get-NestedPropertyValue `
+            -InputObject $account `
+            -ParentProperties @('secretManagement', 'SecretManagement') `
+            -ChildProperties @('lastReconciledTime', 'LastReconciledTime', 'lastSuccessfulReconcile', 'LastSuccessfulReconcile')
+
+        $lastVerifiedTime = Get-NestedPropertyValue `
+            -InputObject $account `
+            -ParentProperties @('secretManagement', 'SecretManagement') `
+            -ChildProperties @('lastVerifiedTime', 'LastVerifiedTime', 'lastSuccessfulVerification', 'LastSuccessfulVerification')
+
+        $lastSuccessfulChange = Get-NestedPropertyValue `
+            -InputObject $account `
+            -ParentProperties @('secretManagement', 'SecretManagement') `
+            -ChildProperties @('lastSuccessfulChange', 'LastSuccessfulChange')
+
+        $remoteMachines = Get-NestedPropertyValue `
+            -InputObject $account `
+            -ParentProperties @('remoteMachinesAccess', 'RemoteMachinesAccess') `
+            -ChildProperties @('remoteMachines', 'RemoteMachines')
+
+        $accessRestrictedToRemoteMachines = Get-NestedPropertyValue `
+            -InputObject $account `
+            -ParentProperties @('remoteMachinesAccess', 'RemoteMachinesAccess') `
+            -ChildProperties @('accessRestrictedToRemoteMachines', 'AccessRestrictedToRemoteMachines')
+
+        $platformMetadata = $null
+        if (-not [string]::IsNullOrWhiteSpace([string]$platformID) -and $platformLookup.ContainsKey([string]$platformID)) {
+            $platformMetadata = $platformLookup[[string]$platformID]
+        }
+
+        $extendedPropertiesJson = ''
+        if ($propertyMap.Count -gt 0) {
+            try {
+                $extendedPropertiesJson = ($propertyMap | ConvertTo-Json -Compress -Depth 20)
+            } catch {
+                $extendedPropertiesJson = [string]$propertyMap
+            }
+        }
+
+        $row = [ordered]@{
+            AccountID                       = Convert-ToReportValue $accountID
+            SafeName                        = Convert-ToReportValue $safeName
+            AccountName                     = Convert-ToReportValue $accountName
+            UserName                        = Convert-ToReportValue $userName
+            Address                         = Convert-ToReportValue $address
+            PlatformID                      = Convert-ToReportValue $platformID
+            PlatformName                    = if ($null -ne $platformMetadata) { $platformMetadata.PlatformName } else { '' }
+            PlatformSystemType              = if ($null -ne $platformMetadata) { $platformMetadata.SystemType } else { '' }
+            PlatformBaseID                  = if ($null -ne $platformMetadata) { $platformMetadata.PlatformBaseID } else { '' }
+            PlatformActive                  = if ($null -ne $platformMetadata) { $platformMetadata.Active } else { '' }
+            PlatformDetectionReason         = if ($null -ne $platformMetadata) { $platformMetadata.DetectionReason } else { 'PlatformID matched fallback database pattern' }
+            PlatformRequiredProperties      = if ($null -ne $platformMetadata) { $platformMetadata.RequiredProperties } else { '' }
+            PlatformOptionalProperties      = if ($null -ne $platformMetadata) { $platformMetadata.OptionalProperties } else { '' }
+            SecretType                      = Convert-ToReportValue $secretType
+
+            # Common database fields resolved from multiple likely property names.
+            Port                            = Get-MapValueByAlias -Map $propertyMap -Aliases @('Port', 'Database Port', 'DatabasePort', 'DB Port', 'DBPort', 'TCP Port', 'TCPPort', 'OraclePort', 'MSSQLPort')
+            DatabaseName                    = Get-MapValueByAlias -Map $propertyMap -Aliases @('Database Name', 'DatabaseName', 'Database', 'DB Name', 'DBName', 'Initial Catalog', 'InitialCatalog', 'Catalog', 'SQLDatabase', 'OracleDatabase')
+            InstanceName                    = Get-MapValueByAlias -Map $propertyMap -Aliases @('Instance Name', 'InstanceName', 'Instance', 'SQL Instance', 'SQLInstance', 'DB Instance', 'DBInstance', 'ServerInstance')
+            ServiceName                     = Get-MapValueByAlias -Map $propertyMap -Aliases @('Service Name', 'ServiceName', 'Oracle Service Name', 'OracleServiceName', 'DB Service Name', 'DBServiceName')
+            SID                             = Get-MapValueByAlias -Map $propertyMap -Aliases @('SID', 'Oracle SID', 'OracleSID')
+            TNSAlias                        = Get-MapValueByAlias -Map $propertyMap -Aliases @('TNS Alias', 'TNSAlias', 'TNS Name', 'TNSName', 'OracleTNSAlias')
+            Schema                          = Get-MapValueByAlias -Map $propertyMap -Aliases @('Schema', 'Schema Name', 'SchemaName', 'Database Schema', 'DatabaseSchema')
+            DSN                             = Get-MapValueByAlias -Map $propertyMap -Aliases @('DSN', 'Data Source Name', 'DataSourceName')
+            ConnectionString                = Get-MapValueByAlias -Map $propertyMap -Aliases @('Connection String', 'ConnectionString', 'DB Connection String', 'DBConnectionString', 'Database Connection String', 'DatabaseConnectionString')
+            DatabaseRole                    = Get-MapValueByAlias -Map $propertyMap -Aliases @('Role', 'Database Role', 'DatabaseRole', 'DB Role', 'DBRole')
+
+            CPMStatus                       = Convert-ToReportValue $cpmStatus
+            AutomaticManagementEnabled      = Convert-ToReportValue $automaticManagementEnabled
+            ManualManagementReason          = Convert-ToReportValue $manualManagementReason
+            CreatedTime                     = Convert-CyberArkTime $createdTime
+            CategoryModificationTime        = Convert-CyberArkTime $categoryModificationTime
+            CPMLastModifiedTime             = Convert-CyberArkTime $cpmLastModifiedTime
+            LastSuccessfulChange            = Convert-CyberArkTime $lastSuccessfulChange
+            LastReconciledTime              = Convert-CyberArkTime $lastReconciledTime
+            LastVerifiedTime                = Convert-CyberArkTime $lastVerifiedTime
+            RemoteMachines                  = Convert-ToReportValue $remoteMachines
+            AccessRestrictedToRemoteMachines = Convert-ToReportValue $accessRestrictedToRemoteMachines
+            ExtendedPropertyCount           = $propertyMap.Count
+            ExtendedPropertiesJson          = $extendedPropertiesJson
+            DetailSource                    = $workItem.DetailSource
+            DetailRetrievalError            = $workItem.DetailError
+        }
+
+        # Add every extended property as an individual CSV column.
+        foreach ($originalPropertyName in $propertyColumnMap.Keys) {
+            $columnName = $propertyColumnMap[$originalPropertyName]
+
+            if ($propertyMap.ContainsKey($originalPropertyName)) {
+                $row[$columnName] = Convert-ToReportValue $propertyMap[$originalPropertyName]
+            } else {
+                $row[$columnName] = ''
+            }
+        }
+
+        $databaseAccountReport.Add([PSCustomObject]$row)
+
+        if (($currentIndex % 250) -eq 0 -or $currentIndex -eq $accountWorkItems.Count) {
+            Write-Log ("Built {0}/{1} database account report row(s)." -f $currentIndex, $accountWorkItems.Count) 'Gray'
+        }
+    }
+
+    # ============================================
+    # Export Database Account Report
+    # ============================================
+
+    Write-Log 'Exporting database account report with extended properties...' 'Yellow'
+
+    if ($databaseAccountReport.Count -gt 0) {
+        $databaseAccountReport |
+            Sort-Object PlatformID, SafeName, Address, UserName, AccountName |
+            Export-Csv -Path $AccountCsvPath -NoTypeInformation -Encoding UTF8
+    } else {
+        # Export a header-only CSV so the output location is still predictable.
+        $emptyHeader = [PSCustomObject][ordered]@{
+            AccountID = ''
+            SafeName = ''
+            AccountName = ''
+            UserName = ''
+            Address = ''
+            PlatformID = ''
+            PlatformName = ''
+            PlatformSystemType = ''
+            PlatformBaseID = ''
+            PlatformActive = ''
+            PlatformDetectionReason = ''
+            PlatformRequiredProperties = ''
+            PlatformOptionalProperties = ''
+            SecretType = ''
+            Port = ''
+            DatabaseName = ''
+            InstanceName = ''
+            ServiceName = ''
+            SID = ''
+            TNSAlias = ''
+            Schema = ''
+            DSN = ''
+            ConnectionString = ''
+            DatabaseRole = ''
+            CPMStatus = ''
+            AutomaticManagementEnabled = ''
+            ManualManagementReason = ''
+            CreatedTime = ''
+            CategoryModificationTime = ''
+            CPMLastModifiedTime = ''
+            LastSuccessfulChange = ''
+            LastReconciledTime = ''
+            LastVerifiedTime = ''
+            RemoteMachines = ''
+            AccessRestrictedToRemoteMachines = ''
+            ExtendedPropertyCount = ''
+            ExtendedPropertiesJson = ''
+            DetailSource = ''
+            DetailRetrievalError = ''
+        }
+
+        $emptyHeader | Export-Csv -Path $AccountCsvPath -NoTypeInformation -Encoding UTF8
+
+        # Remove the empty data row but preserve the header.
+        $headerLine = Get-Content -Path $AccountCsvPath -TotalCount 1
+        Set-Content -Path $AccountCsvPath -Value $headerLine -Encoding UTF8
+    }
+
+    Write-Log ("Database account report exported to: {0}" -f $AccountCsvPath) 'Green'
+
+    # ============================================
+    # Completion
+    # ============================================
+
+    Write-Log '============================================================' 'Gray'
+    Write-Log 'CNA Database Account Report with Extended Properties completed.' 'Green'
+    Write-Log ("Authenticated User             : {0}" -f $AuthenticatedUser) 'Gray'
+    Write-Log ("Total Platforms Retrieved      : {0}" -f $rawPlatforms.Count) 'Gray'
+    Write-Log ("Database Platforms Identified  : {0}" -f $databasePlatforms.Count) 'Green'
+    Write-Log ("Total Accounts Retrieved       : {0}" -f $accounts.Count) 'Gray'
+    Write-Log ("Database Accounts Exported     : {0}" -f $databaseAccountReport.Count) 'Green'
+    Write-Log ("Dynamic Property Columns       : {0}" -f $propertyColumnMap.Count) 'Green'
+    Write-Log ("Account Report                 : {0}" -f $AccountCsvPath) 'Gray'
+    Write-Log ("Platform Inventory             : {0}" -f $PlatformCsvPath) 'Gray'
+    Write-Log '============================================================' 'Gray'
+} catch {
+    Write-Log ("FATAL: Database account report failed. {0}" -f $_.Exception.Message) 'Red'
+    Write-Log ("FATAL DETAILS: {0}" -f ($_ | Out-String).Trim()) 'Red'
+    exit 1
+} finally {
+    if ($SessionEstablished) {
+        try {
+            Close-PASSession | Out-Null
+            Write-Log 'PAS session closed.' 'Gray'
+        } catch {
+            Write-Log ("WARNING: Could not close PAS session cleanly. {0}" -f $_.Exception.Message) 'Yellow'
+        }
+    }
+}
