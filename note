@@ -33,6 +33,8 @@ $Host.UI.RawUI.WindowTitle = "Privilege Cloud CreateCredFile-Helper"
 $Script:LOG_FILE_PATH = "$PSScriptRoot\_CreateCredFile-Helper.log"
 $global:CPMnewSyncToolFolder = "$PSScriptRoot\CreateCredFile-HelperDependencies"
 $ScriptVersion = "5.1"
+$Script:HardenedBuild = "2026-09-18-null-safety"
+# NOTE: This derived build contains local hardening changes. Automatic upstream self-update is disabled below so these changes are not overwritten.
 
 #region Writer Functions
 $InDebug = $PSBoundParameters.Debug.IsPresent
@@ -228,6 +230,174 @@ Function Collect-ExceptionMessage {
 
 #endregion
 
+#region Hardening Helpers
+# Local hardening helpers added to prevent null-array/index failures and to produce actionable errors.
+Function Get-FirstNonEmptyValue
+{
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$false)]
+        $InputObject,
+        [Parameter(Mandatory=$false)]
+        [string]$Description = "value",
+        [Parameter(Mandatory=$false)]
+        [switch]$Required
+    )
+
+    foreach($item in @($InputObject))
+    {
+        if($null -ne $item -and -not [string]::IsNullOrWhiteSpace([string]$item))
+        {
+            return $item
+        }
+    }
+
+    if($Required)
+    {
+        throw "Required $Description was not found."
+    }
+
+    return $null
+}
+
+Function Get-KeyValueAfterDelimiter
+{
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$false)]
+        [AllowNull()]
+        [string]$Line,
+        [Parameter(Mandatory=$false)]
+        [string]$Delimiter = "="
+    )
+
+    if([string]::IsNullOrWhiteSpace($Line))
+    {
+        return $null
+    }
+
+    $parts = @($Line -split [regex]::Escape($Delimiter), 2)
+    if($parts.Count -lt 2)
+    {
+        return $null
+    }
+
+    $value = ([string]$parts[1]).Trim()
+    if([string]::IsNullOrWhiteSpace($value))
+    {
+        return $null
+    }
+
+    return $value
+}
+
+Function Get-ComponentCredentialFiles
+{
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        [ValidateNotNull()]
+        [PSObject]$Component
+    )
+
+    $files = @()
+    foreach($candidate in @($Component.ComponentUser))
+    {
+        if($null -ne $candidate -and -not [string]::IsNullOrWhiteSpace([string]$candidate) -and (Test-Path -LiteralPath $candidate))
+        {
+            $files += [string]$candidate
+        }
+    }
+
+    if($files.Count -eq 0 -and -not [string]::IsNullOrWhiteSpace([string]$Component.Path))
+    {
+        $expectedFiles = @()
+        switch($Component.Name)
+        {
+            "CPM" { $expectedFiles = @(Join-Path -Path $Component.Path -ChildPath "Vault\user.ini") }
+            "PSM" { $expectedFiles = @(
+                        (Join-Path -Path $Component.Path -ChildPath "Vault\psmapp.cred"),
+                        (Join-Path -Path $Component.Path -ChildPath "Vault\psmgw.cred")
+                    ) }
+            "AIM" { $expectedFiles = @(Join-Path -Path $Component.Path -ChildPath "Vault\AppProviderUser.cred") }
+        }
+
+        foreach($expectedFile in $expectedFiles)
+        {
+            if(Test-Path -LiteralPath $expectedFile)
+            {
+                Write-LogMessage -Type Warning -MSG "ComponentUser was empty. Recovered credential file from expected path '$expectedFile'."
+                $files += $expectedFile
+            }
+        }
+    }
+
+    if($files.Count -eq 0)
+    {
+        throw "No local credential file could be resolved for component '$($Component.Name)' under '$($Component.Path)'. Verify the component Vault folder, credential-file path, and local permissions."
+    }
+
+    return $files
+}
+
+Function Get-CPMScannerServiceName
+{
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        [ValidateNotNull()]
+        [PSObject]$Component
+    )
+
+    $scannerService = $Component.ServiceName | Where-Object { $_ -eq "CyberArk Central Policy Manager Scanner" } | Select-Object -First 1
+    if([string]::IsNullOrWhiteSpace([string]$scannerService))
+    {
+        $existingScanner = Get-Service -Name "CyberArk Central Policy Manager Scanner" -ErrorAction SilentlyContinue
+        if($null -ne $existingScanner)
+        {
+            $scannerService = $existingScanner.Name
+        }
+    }
+
+    return $scannerService
+}
+
+Function Get-FirstExistingLogPath
+{
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$false)]
+        $LogPaths
+    )
+
+    foreach($logPath in @($LogPaths))
+    {
+        if($null -ne $logPath -and -not [string]::IsNullOrWhiteSpace([string]$logPath) -and (Test-Path -LiteralPath $logPath))
+        {
+            return [string]$logPath
+        }
+    }
+
+    return $null
+}
+
+Function ConvertTo-PSMGatewayComponentUser
+{
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$SourceUser
+    )
+
+    if($SourceUser -match '^[^_]+_(.+)$')
+    {
+        return "PSMGw_$($Matches[1])"
+    }
+
+    throw "Unable to derive the PSM Gateway component user from '$SourceUser' because the expected '<prefix>_<suffix>' format was not found."
+}
+#endregion
 
 #region Check latest version
 $Script:GitHubAPIURL = "https://api.github.com/repos"
@@ -256,22 +426,18 @@ Function Test-ScriptLatestVersion
                 $outGitHubVersion.Value = $gitHubScriptVersion
             }
             Write-LogMessage -type Verbose -msg "Current Version: $currentVersion; GitHub Version: $gitHubScriptVersion"
-            $gitHubMajorMinor = [double]($gitHubScriptVersion.Split(".")[0..1] -join '.')
-            $currentMajorMinor = [double]($currentVersion.Split(".")[0..1] -join '.')
-            $gitHubPatch = 0
-            $currentPatch = 0
-            if(($gitHubScriptVersion.Split(".").Count -gt 2) -or ($currentVersion.Split(".").Count -gt 2))
+            try
             {
-                $gitHubPatch = [int]($gitHubScriptVersion.Split(".")[2])
-                $currentPatch = [int]($currentVersion.Split(".")[2])
+                $gitHubVersionObject = [version]$gitHubScriptVersion
+                $currentVersionObject = [version]$currentVersion
+                if($gitHubVersionObject -gt $currentVersionObject)
+                {
+                    $isLatestVersion = $true
+                }
             }
-            if($gitHubMajorMinor -gt $currentMajorMinor)
+            catch
             {
-                $isLatestVersion = $true
-            }
-            elseif($gitHubMajorMinor -eq $currentMajorMinor -and $gitHubPatch -gt $currentPatch)
-            {
-                $isLatestVersion = $true
+                Write-LogMessage -type Warning -MSG "Unable to compare script versions '$currentVersion' and '$gitHubScriptVersion'. Skipping automatic version comparison."
             }
         }
         else
@@ -582,7 +748,7 @@ function Get-ServiceInstallPath {
             }
         } else {
             # If the path isn't quoted, assume the executable path is the first token.
-            return $imagePath.Split(" ")[0]
+            return ($imagePath.Split(" ") | Select-Object -First 1)
         }
     }
     catch {
@@ -694,10 +860,22 @@ Function Find-Components
                             $ServiceLogsMain = @((Join-Path -Path $cpmPath -ChildPath "Logs\PMTrace.log"),(Join-Path -Path $cpmPath -ChildPath "Logs\CACPMScanner.log"))
                             $serviceLogs = $ServiceLogsMain + $serviceLogsOldTrace + $serviceLogsOldConsole
                             $userType = "CPM"
-                            #Create New Fresh Cred File, it will not overwrite an existing one, this is just incase there was no cred to begin with.
-                            New-Item (Join-Path -Path $cpmPath -ChildPath "Vault\user.ini") -ErrorAction SilentlyContinue | Get-Acl | Set-Acl (Join-Path -Path $cpmPath -ChildPath "Vault\Vault.ini")
+                            # Ensure a local cred-file path is available. If a new file must be created, copy Vault.ini ACL TO the new file (not the reverse).
+                            $ComponentUser = @()
                             $appFilePath = (Join-Path -Path $cpmPath -ChildPath "Vault\user.ini")
-                            if (Test-Path $appFilePath){
+                            $vaultIniPath = (Join-Path -Path $cpmPath -ChildPath "Vault\Vault.ini")
+                            if(-not (Test-Path -LiteralPath $appFilePath)){
+                                try{
+                                    New-Item -ItemType File -Path $appFilePath -ErrorAction Stop | Out-Null
+                                    if(Test-Path -LiteralPath $vaultIniPath){
+                                        $vaultAcl = Get-Acl -LiteralPath $vaultIniPath -ErrorAction Stop
+                                        Set-Acl -LiteralPath $appFilePath -AclObject $vaultAcl -ErrorAction Stop
+                                    }
+                                } catch {
+                                    Write-LogMessage -Type Warning -MSG "Unable to create or set ACL on CPM credential file '$appFilePath': $($_.Exception.Message)"
+                                }
+                            }
+                            if (Test-Path -LiteralPath $appFilePath){
                                 $ComponentUser = @($appFilePath)
                             }
 							$myObject = New-Object PSObject -Property @{Name="CPM";DisplayName="CyberArk Password Manager (CPM) $fileVersion";
@@ -764,15 +942,27 @@ Function Find-Components
                             $ServiceLogs = $ServiceLogsMain + $serviceLogsOldTrace + $serviceLogsOldConsole
                             $ComponentUser = @()
                             $UserType = "PSM"
-                            #Create New Fresh Cred File, it will not overwrite an existing one, this is just incase there was no cred to begin with.
+                            # Ensure local cred-file paths are available. If creating a file, copy Vault.ini ACL TO the new file.
+                            $psmVaultIniPath = (Join-Path -Path $PSMPath -ChildPath "Vault\Vault.ini")
                             foreach($cleanCredFile in @("psmapp.cred","psmgw.cred"))
                             {
-                            New-Item (Join-Path -Path $PSMPath -ChildPath "Vault\$cleanCredFile") -ErrorAction SilentlyContinue | Get-Acl | Set-Acl (Join-Path -Path $PSMPath -ChildPath "Vault\Vault.ini")
+                                $cleanCredPath = (Join-Path -Path $PSMPath -ChildPath "Vault\$cleanCredFile")
+                                if(-not (Test-Path -LiteralPath $cleanCredPath)){
+                                    try{
+                                        New-Item -ItemType File -Path $cleanCredPath -ErrorAction Stop | Out-Null
+                                        if(Test-Path -LiteralPath $psmVaultIniPath){
+                                            $vaultAcl = Get-Acl -LiteralPath $psmVaultIniPath -ErrorAction Stop
+                                            Set-Acl -LiteralPath $cleanCredPath -AclObject $vaultAcl -ErrorAction Stop
+                                        }
+                                    } catch {
+                                        Write-LogMessage -Type Warning -MSG "Unable to create or set ACL on PSM credential file '$cleanCredPath': $($_.Exception.Message)"
+                                    }
+                                }
                             }
                             foreach($fileName in @("psmapp.cred","psmgw.cred"))
                             {
                                 $appFilePath = (Join-Path -Path $PSMPath -ChildPath "Vault\$fileName")
-                                if (Test-Path $appFilePath){
+                                if (Test-Path -LiteralPath $appFilePath){
                                     $ComponentUser += $appFilePath
                                 }
                             }
@@ -803,10 +993,22 @@ Function Find-Components
                             $ServiceLogsMain = @(Join-Path -Path $AIMPath -ChildPath "Logs\APPTrace.log")
                             $ServiceLogs = $ServiceLogsMain + $serviceLogsOldTrace + $serviceLogsOldConsole
                             $UserType = "AppProvider"
-                            #Create New Fresh Cred File, it will not overwrite an existing one, this is just incase there was no cred to begin with.
-                            New-Item (Join-Path -Path $AIMPath -ChildPath "Vault\AppProviderUser.cred") -ErrorAction SilentlyContinue | Get-Acl | Set-Acl (Join-Path -Path $AIMPath -ChildPath "Vault\Vault.ini")
+                            # Ensure a local cred-file path is available. If a new file must be created, copy Vault.ini ACL TO the new file.
+                            $ComponentUser = @()
                             $appFilePath = (Join-Path -Path $AIMPath -ChildPath "Vault\AppProviderUser.cred")
-                            if (Test-Path $appFilePath){
+                            $vaultIniPath = (Join-Path -Path $AIMPath -ChildPath "Vault\Vault.ini")
+                            if(-not (Test-Path -LiteralPath $appFilePath)){
+                                try{
+                                    New-Item -ItemType File -Path $appFilePath -ErrorAction Stop | Out-Null
+                                    if(Test-Path -LiteralPath $vaultIniPath){
+                                        $vaultAcl = Get-Acl -LiteralPath $vaultIniPath -ErrorAction Stop
+                                        Set-Acl -LiteralPath $appFilePath -AclObject $vaultAcl -ErrorAction Stop
+                                    }
+                                } catch {
+                                    Write-LogMessage -Type Warning -MSG "Unable to create or set ACL on AIM credential file '$appFilePath': $($_.Exception.Message)"
+                                }
+                            }
+                            if (Test-Path -LiteralPath $appFilePath){
                                 $ComponentUser = @($appFilePath)
                             }
                             $myObject = New-Object PSObject -Property @{Name="AIM";DisplayName="CyberArk Application Password Provider (AIM) $fileVersion";
@@ -882,8 +1084,8 @@ Function Set-PVWAURL{
             if ($ComponentID -eq "PSM"){
                 [xml]$GetPVWAStringURL = Get-Content $ConfigPath
                 if(![string]::IsNullOrEmpty($GetPVWAStringURL) -and $GetPVWAStringURL.PasswordVaultConfiguration.General.ApplicationRoot){ 
-                    # In case there is more than one address, get the first one
-                    $PVWAurl = ($GetPVWAStringURL.PasswordVaultConfiguration.General.ApplicationRoot).Split(",")[0]
+                    # In case there is more than one address, get the first one without direct array indexing.
+                    $PVWAurl = (($GetPVWAStringURL.PasswordVaultConfiguration.General.ApplicationRoot).Split(",") | Select-Object -First 1)
                     # Check that the PVWAUrl contains a URL and not IP
                     # if false, URL contains IP and we need to prompt for user input.
                     $foundConfig = ($PVWAurl -NotMatch "\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}")
@@ -894,8 +1096,10 @@ Function Set-PVWAURL{
             }
             if ($ComponentID -eq "CPM"){
                 try{
-                    # In case there is more than one address, get the first one
-                    $GetPVWAStringURL = ((Get-Content $ConfigPath | Where-Object {$_ -match "Addresses" }).Split("=")[1]).Split(",")[0]
+                    # In case there is more than one address, get the first one using guarded parsing.
+                    $addressLine = Get-Content -Path $ConfigPath -ErrorAction Stop | Where-Object {$_ -match "^\s*Addresses\s*=" } | Select-Object -First 1
+                    $addressValue = Get-KeyValueAfterDelimiter -Line $addressLine
+                    $GetPVWAStringURL = Get-FirstNonEmptyValue -InputObject ($addressValue -split ",") -Description "CPM Vault address"
                 } catch {
                     Write-LogMessage -type Error -MSG "There was an error finding PVWA Address from vault.ini configuration file"
                     $GetPVWAStringURL = $null
@@ -907,8 +1111,10 @@ Function Set-PVWAURL{
             }
             if ($ComponentID -eq "AIM"){
                 try{
-                    # In case there is more than one address, get the first one
-                    $GetPVWAStringURL = ((Get-Content $ConfigPath | Where-Object {$_ -match "Address" }).Split("=")[1]).Split(",")[0]
+                    # In case there is more than one address, get the first one using guarded parsing.
+                    $addressLine = Get-Content -Path $ConfigPath -ErrorAction Stop | Where-Object {$_ -match "^\s*Address\s*=" } | Select-Object -First 1
+                    $addressValue = Get-KeyValueAfterDelimiter -Line $addressLine
+                    $GetPVWAStringURL = Get-FirstNonEmptyValue -InputObject ($addressValue -split ",") -Description "AIM Vault address"
                     # if false, URL contains IP and we need to prompt for user input.
                     $foundConfig = ($GetPVWAStringURL -NotMatch "\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}")
                     # In case of AIM there is no PVWA record anywhere, but we can determine if vault address is DNS type and has pcloud pattern and convert it to PVWA from it.
@@ -916,7 +1122,7 @@ Function Set-PVWAURL{
                         # URL exists and is DNS type, let's check if its pcloud pattern
                         if (($GetPVWAStringURL -like "vault-*.cyberark.com") -or ($GetPVWAStringURL -like "*vault-*.cyberark.cloud")){
                             # grab first subdomain and trim vault- from it.
-                            $portalSubDomainURL = $GetPVWAStringURL.Split(".")[0] -replace '^vault-', ''
+                            $portalSubDomainURL = ($GetPVWAStringURL.Split(".") | Select-Object -First 1) -replace '^vault-', ''
                         }
                         Else{
                             # set $foundConfig to false in case this is non pcloud tenant so it prompts user to enter PVWA again
@@ -1302,17 +1508,22 @@ Function Stop-CYBRService
         $CAStopping = "StopPending"
         $CAStop = "Stop"
         Write-LogMessage -type Info -Msg "Stopping '$ServiceName' Service..."
-        #get process ID
-        $Service = (Get-WmiObject win32_service | where {$_.name -eq $ServiceName} -ErrorAction SilentlyContinue).ProcessID
-        if($Service -eq 0){
+        # Get service/process safely. A missing service must not be treated as an indexable/usable object.
+        $serviceWmi = Get-WmiObject win32_service -Filter "Name='$ServiceName'" -ErrorAction SilentlyContinue | Select-Object -First 1
+        if($null -eq $serviceWmi){
+            Write-LogMessage -type Warning -MSG "Service '$ServiceName' was not found. Skipping stop operation."
+            return
+        }
+        $serviceProcessId = [int]$serviceWmi.ProcessID
+        if($serviceProcessId -le 0){
             Write-LogMessage -type Info -MSG "Service is already stopped, skipping..."
         }
         Else{
             #kill the process
-            Stop-Process $Service -Force | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
+            Stop-Process -Id $serviceProcessId -Force -ErrorAction SilentlyContinue | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
             #stop service, this makes sure the next status command receives a proper status as kill command is very abrupt.
-            Get-Service $ServiceName | Stop-Service -Force -ErrorAction SilentlyContinue
-            $ServiceStatus = Get-Service -Name $ServiceName | Select-Object -ExpandProperty status
+            Get-Service -Name $ServiceName -ErrorAction Stop | Stop-Service -Force -ErrorAction SilentlyContinue
+            $ServiceStatus = Get-Service -Name $ServiceName -ErrorAction Stop | Select-Object -ExpandProperty status
             if($ServiceStatus -eq $CAStopped){
                 Write-LogMessage -type success -Msg "Successfully $CAStopped Service: $($ServiceName)."
             }
@@ -1338,7 +1549,8 @@ Function Start-CYBRService
         $CAStarted = "Started"
         $CAStart = "Start"
         $CARunning = "Running"
-        $Service = Get-Service $ServiceName
+        $Service = Get-Service -Name $ServiceName -ErrorAction Stop
+        if($null -eq $Service){ throw "Service '$ServiceName' was not found." }
         $service.Start()
         $Service.WaitForStatus($CARunning,'00:01:59')
         $service.refresh()
@@ -1495,14 +1707,40 @@ Function Get-CredFileUser
     [CmdletBinding()]
     param (
         [Parameter(Mandatory=$true)]
-        [ValidateScript({Test-Path $_})]
+        [ValidateNotNullOrEmpty()]
         [string]$File
     )
     try{
-        $fileUserName = ((Get-Content $File | Select-Object -Index 2).split("=")[1]).Trim()
-        return $fileUserName
+        if(-not (Test-Path -LiteralPath $File)){
+            Write-LogMessage -type Warning -MSG "Credential file '$File' does not exist."
+            return $null
+        }
+
+        $content = @(Get-Content -LiteralPath $File -ErrorAction Stop)
+        if($content.Count -eq 0){
+            Write-LogMessage -type Warning -MSG "Credential file '$File' is empty. Component user will be resolved from System Health/logs or requested interactively."
+            return $null
+        }
+
+        # Preserve the original expectation (third line), but validate it before use.
+        $candidateLines = @()
+        if($content.Count -ge 3){
+            $candidateLines += $content[2]
+        }
+        # Fallback for variants where the username line is not line 3.
+        $candidateLines += @($content | Where-Object { $_ -match '^\s*(?:UserName|Username|User)\s*=' })
+
+        foreach($candidateLine in $candidateLines){
+            $fileUserName = Get-KeyValueAfterDelimiter -Line ([string]$candidateLine)
+            if(-not [string]::IsNullOrWhiteSpace($fileUserName)){
+                return $fileUserName
+            }
+        }
+
+        Write-LogMessage -type Warning -MSG "Could not parse a component user from credential file '$File'."
+        return $null
     } catch {
-        Write-LogMessage -type Error -MSG "Could not find CredFile user name from file '$file'"
+        Write-LogMessage -type Error -MSG "Could not find CredFile user name from file '$File'. Error: $($_.Exception.Message)"
         return $null
     }
 }
@@ -1548,8 +1786,9 @@ Function Find-UserInSystemLogs
     {
         If(Test-Path -Path $log)
         {
-            If(Get-Content -Path $log | where {$_ -Match $User}){
-                $retUser = $Matches[0]
+            $matchedLine = Select-String -Path $log -Pattern ([regex]::Escape($User)) -ErrorAction SilentlyContinue | Select-Object -First 1
+            If($null -ne $matchedLine){
+                $retUser = $User
                 break
             }
         }
@@ -1629,7 +1868,7 @@ Function Get-Account{
     }
     Catch
     {
-        Write-LogMessage -Type Error -Msg "Error: $(Collect-ExceptionMessage $_.exception.message $($_.ErrorDetails.Message) $($_.exception.status) $($_.exception.Response.ResponseUri.AbsoluteUri) $pvwaERR)"
+        Write-LogMessage -Type Error -Msg "Error: $(Collect-ExceptionMessage -e $_.Exception)"
     }
 }
 
@@ -1660,7 +1899,7 @@ Function Get-AccountPassword{
         return $GetAccountPassword
     }
     Catch{
-        Write-LogMessage -Type Error -Msg "Error: $(Collect-ExceptionMessage $_.exception.message $($_.ErrorDetails.Message) $($_.exception.status) $($_.exception.Response.ResponseUri.AbsoluteUri) $pvwaERR)"
+        Write-LogMessage -Type Error -Msg "Error: $(Collect-ExceptionMessage -e $_.Exception)"
     }
 }
 
@@ -1905,8 +2144,10 @@ Function Invoke-ResetCredFile
             ComponentPath = $Component.Path;        
             NewPassword = $generatedPassword
         }
-        #Run through each existing cred File (For CPM: User.ini, for PSM: psmapp.cred, psmgw.cred) and generate cred using $ComponentUser
-        Foreach($credFile in $Component.ComponentUser)
+        # Run through each existing cred file (For CPM: User.ini, for PSM: psmapp.cred, psmgw.cred).
+        # Resolve and validate the collection first so a null ComponentUser property can never be indexed later.
+        $resolvedCredFiles = @(Get-ComponentCredentialFiles -Component $Component)
+        Foreach($credFile in $resolvedCredFiles)
         {
             #Pull the User from the cred file
             $ComponentUser = $(Get-CredFileUser -File $credFile)
@@ -1925,7 +2166,7 @@ Function Invoke-ResetCredFile
                         $ComponentUser = $foundUser
                         #If the $CredFile is psmgw.cred then we split the SystemHealth PSM App user into 2 strings and replace "PSMApp_blabla" with "PSMgw_blabla" so we also reset the gw cred.
                             If ($credFile -like "*psmgw.cred*"){
-								$ComponentUser = "PSMGw_"+$foundUser.split("_")[1]
+								$ComponentUser = ConvertTo-PSMGatewayComponentUser -SourceUser $foundUser
                             }
                         Break
                     }
@@ -1961,8 +2202,16 @@ Function Invoke-ResetCredFile
             }
         }
         
-        Get-SystemHealth -componentUserDetails $(Get-CredFileUser -File $Component.ComponentUser[0]) -ComponentID $Component.Name
-        #Test-SystemLogs -ComponentID $Component.Name -LogPath $Component.serviceLogs[0] | Out-Null
+        $healthCredFile = Get-FirstNonEmptyValue -InputObject $resolvedCredFiles -Description "$($Component.Name) credential file"
+        if(-not [string]::IsNullOrWhiteSpace([string]$healthCredFile)){
+            $healthComponentUser = Get-CredFileUser -File $healthCredFile
+            if(-not [string]::IsNullOrWhiteSpace([string]$healthComponentUser)){
+                Get-SystemHealth -componentUserDetails $healthComponentUser -ComponentID $Component.Name
+            } else {
+                Write-LogMessage -Type Warning -MSG "Skipping final System Health user check because the component user could not be parsed from '$healthCredFile'."
+            }
+        }
+        # Test-SystemLogs is handled centrally at the end of the selected component flow.
         #Invoke-Logoff
     } catch {
         Throw $(New-Object System.Exception ("Error in the flow of Resetting component $($Component.Name) credentials file.",$_.Exception))
@@ -1979,6 +2228,10 @@ Function Resolve-ComponentUserForCredFile
         [string]$CredFile
     )
 
+    if([string]::IsNullOrWhiteSpace($CredFile) -or -not (Test-Path -LiteralPath $CredFile)){
+        throw "Credential file path '$CredFile' is invalid or does not exist for component '$($Component.Name)'."
+    }
+
     $ComponentUser = $(Get-CredFileUser -File $CredFile)
     if([string]::IsNullOrEmpty($ComponentUser))
     {
@@ -1991,7 +2244,7 @@ Function Resolve-ComponentUserForCredFile
                 Write-LogMessage -Type Success -MSG "Found a match between an offline component user '$foundUser' and local logs, will use it to generate CredFile."
                 $ComponentUser = $foundUser
                 if ($CredFile -like "*psmgw.cred*"){
-                    $ComponentUser = "PSMGw_"+$foundUser.split("_")[1]
+                    $ComponentUser = ConvertTo-PSMGatewayComponentUser -SourceUser $foundUser
                 }
                 Break
             }
@@ -2204,9 +2457,14 @@ function Add-CAUserRight {
             $exportPath = Join-Path -Path $tempPath -ChildPath "export.inf"
             secedit.exe /export /cfg "$exportPath" >$null 2>&1
 
-            $currentRightKeyValue = (Select-String $exportPath -Pattern "$userRight").Line
-            $splitedKeyValue = $currentRightKeyValue.split("=", [System.StringSplitOptions]::RemoveEmptyEntries)
-            $currentSidsValue = $splitedKeyValue[1].Trim()
+            $currentRightMatch = Select-String -Path $exportPath -Pattern ("^\s*" + [regex]::Escape($userRight) + "\s*=") | Select-Object -First 1
+            $currentSidsValue = ""
+            if($null -ne $currentRightMatch){
+                $parsedRights = @($currentRightMatch.Line -split "=", 2)
+                if($parsedRights.Count -ge 2){
+                    $currentSidsValue = ([string]$parsedRights[1]).Trim()
+                }
+            }
 
             if ($currentSidsValue -notlike "*$userSidstr*") {
                 $newSidsValue = if ([string]::IsNullOrEmpty($currentSidsValue)) { "*$userSidstr" } else { "*$userSidstr,$currentSidsValue" }
@@ -2225,8 +2483,8 @@ $userRight = $newSidsValue
                 secedit.exe /configure /db secedit.sdb /cfg "$importPath" /areas USER_RIGHTS >$null 2>&1
             }
 
-            Remove-Item -Path $importPath -Force
-            Remove-Item -Path $exportPath -Force
+            if($importPath -and (Test-Path -LiteralPath $importPath)){ Remove-Item -LiteralPath $importPath -Force -ErrorAction SilentlyContinue }
+            if(Test-Path -LiteralPath $exportPath){ Remove-Item -LiteralPath $exportPath -Force -ErrorAction SilentlyContinue }
         } catch {
             Write-LogMessage -Type "Error" -Msg "Failed to add $userRight user right for user $userName. Error: $_"
         }
@@ -2238,7 +2496,7 @@ Function CheckIfNewDiscoveryEnabled(){
         Write-LogMessage "Retrieving tenant details"
         $GetTenantSettingsInvoke = Invoke-RestMethod -Uri "$URL_PVWAAPI/settings/features" -Method Get -ContentType "application/json" -TimeoutSec 10 -Headers $pvwaLogonHeader -ErrorVariable pvwaERR
     }Catch{
-        Write-LogMessage -Type Error -Msg "Error: $(Collect-ExceptionMessage $_.exception.message $($_.ErrorDetails.Message) $($_.exception.status) $($_.exception.Response.ResponseUri.AbsoluteUri) $pvwaERR)"
+        Write-LogMessage -Type Error -Msg "Error: $(Collect-ExceptionMessage -e $_.Exception)"
     }
     Return $GetTenantSettingsInvoke.DisabledClassicDiscovery
 }
@@ -2336,13 +2594,11 @@ If(! $SkipVersionCheck)
 {
 	try{
         Write-LogMessage -type Info -Msg "Current script version $ScriptVersion"
-        $isLatestVersion = $(Test-GitHubLatestVersion @gitHubLatestVersionParameters)
+        # Hardened builds check upstream only; they do not self-replace because that would overwrite local fixes.
+        $isLatestVersion = $(Test-GitHubLatestVersion @gitHubLatestVersionParameters -TestOnly)
 		If($isLatestVersion -eq $false)
 		{
-			$scriptPathAndArgs = "`& `"$PSScriptRoot\CreateCredFile-Helper.ps1`" -SkipVersionCheck"
-			Write-LogMessage -type Info -Msg "Finished Updating, relaunching the script"
-			Invoke-Expression $scriptPathAndArgs
-			return
+            Write-LogMessage -type Warning -Msg "A newer upstream helper is available. This hardened build will not auto-update itself. Review/merge the newer CyberArk version manually."
 		}
 	} catch {
 		Write-LogMessage -type Error -Msg "Error checking for latest version. Error: $(Join-ExceptionMessage $_.Exception)"
@@ -2364,8 +2620,8 @@ try{
     if(-not($SkipCertVerification)){IgnoreCert}
 
     #Create A Dynamic Menu based on the services found
-    $detectedComponents = $(Find-Components)
-    If(($null -ne $detectedComponents) -and ($detectedComponents.Name.Count -gt 0))
+    $detectedComponents = @(Find-Components)
+    If($detectedComponents.Count -gt 0)
     {
         # Show the menu
         $answer = Show-Menu -Items $detectedComponents.DisplayName
@@ -2378,7 +2634,14 @@ try{
         Else
         {
             $answer = [int]$answer #if answer is not a letter (Q) convert to int so we can use the below command
-            $typeChosen = $detectedComponents[$answer-1]
+            $selectedIndex = $answer - 1
+            if($selectedIndex -lt 0 -or $selectedIndex -ge $detectedComponents.Count){
+                throw "Selected component index '$selectedIndex' is outside the detected component range (0-$($detectedComponents.Count - 1))."
+            }
+            $typeChosen = $detectedComponents[$selectedIndex]
+            if($null -eq $typeChosen){
+                throw "The selected CyberArk component could not be resolved."
+            }
             if ($typeChosen.Name -eq "CPM" -and $typeChosen.Version -ge [version]"14.2")
             {
                 $typeChosen.InitPVWAURL()
@@ -2387,7 +2650,12 @@ try{
                 {
                     Stop-CYBRService -ServiceName $svc
                 }
-                $resolvedComponentUser = Resolve-ComponentUserForCredFile -Component $typeChosen -CredFile $typeChosen.ComponentUser[0]
+                $resolvedCPMCredFiles = @(Get-ComponentCredentialFiles -Component $typeChosen)
+                $primaryCPMCredFile = Get-FirstNonEmptyValue -InputObject $resolvedCPMCredFiles -Description "CPM credential file" -Required
+                $resolvedComponentUser = Resolve-ComponentUserForCredFile -Component $typeChosen -CredFile $primaryCPMCredFile
+                if([string]::IsNullOrWhiteSpace([string]$resolvedComponentUser)){
+                    throw "Unable to resolve the CPM component user from '$primaryCPMCredFile'."
+                }
                 $global:apiKeyUsername = $resolvedComponentUser
                 $global:apiKeyPath = $typeChosen.Path
                 Write-LogMessage -Type Info -MSG "CPM version $($typeChosen.Version) detected, using SyncCompUsers.exe to update CPM credentials instead of the legacy CreateCredFile.exe flow."
@@ -2491,6 +2759,8 @@ try{
                     }Else{
                         Write-LogMessage -type Warning -MSG "Old CPM version detected, can't perform $PluginManagerUser Sync action, do it manually by contacting CyberArk Support if the user is out of sync."
                     }
+                        # Resolve scanner service by name rather than assuming ServiceName[1] exists.
+                        $cpmScannerService = Get-CPMScannerServiceName -Component $typeChosen
                         # Skip CPM Scanner service if new discovery is enabled, False means we need to use old scanner and reset apikey.
                         $discoverySetting = CheckIfNewDiscoveryEnabled
                         if ($discoverySetting -eq $false -or $discoverySetting -eq $null){
@@ -2499,7 +2769,11 @@ try{
                             if ($decisionAPIKey -eq "No") {
                                 Write-LogMessage -Type info -MSG "Selected not to run CPM Scanner APIKey reset."
                                 # Scanner service
-                                Start-CYBRService -ServiceName $typeChosen.ServiceName[1]
+                                if(-not [string]::IsNullOrWhiteSpace([string]$cpmScannerService)){
+                                    Start-CYBRService -ServiceName $cpmScannerService
+                                } else {
+                                    Write-LogMessage -Type Warning -MSG "CPM Scanner service was not found; skipping scanner start."
+                                }
                             } else {
                                 # in 14.2 CPM deprecated apikeymanger tool and we need to use the new tool
                                 if($typeChosen.Version -ge [version]"14.2"){
@@ -2510,11 +2784,19 @@ try{
                                     Invoke-ResetAPIKey -pathApikey $apiKeyPath -apiUser $apiKeyUsername -AdminUser $Credentials.UserName -ComponentType CPM
                                 }
                                 # finally Scanner service
-                                Start-CYBRService -ServiceName $typeChosen.ServiceName[1]
+                                if(-not [string]::IsNullOrWhiteSpace([string]$cpmScannerService)){
+                                    Start-CYBRService -ServiceName $cpmScannerService
+                                } else {
+                                    Write-LogMessage -Type Warning -MSG "CPM Scanner service was not found; skipping scanner start."
+                                }
                                 $Credentials = $null
                             }
                         }Else{
-                            Write-LogMessage -type Success -MSG "Skipping $($typeChosen.ServiceName[1]) since New Discovery service is enabled on tenant."
+                            if(-not [string]::IsNullOrWhiteSpace([string]$cpmScannerService)){
+                                Write-LogMessage -type Success -MSG "Skipping $cpmScannerService since New Discovery service is enabled on tenant."
+                            } else {
+                                Write-LogMessage -type Success -MSG "New Discovery is enabled on tenant; legacy CPM Scanner API key handling is skipped."
+                            }
                         }
                 }
 				"PSM"
@@ -2530,8 +2812,13 @@ try{
                         }
 				}
             }
-			# TODO maybe add logs check here instead?
-			Test-SystemLogs -ComponentID $typeChosen.Name -LogPath $typeChosen.serviceLogs[0] | Out-Null
+			# Validate an existing log path instead of assuming serviceLogs[0] exists.
+            $primaryLogPath = Get-FirstExistingLogPath -LogPaths $typeChosen.ServiceLogs
+            if(-not [string]::IsNullOrWhiteSpace([string]$primaryLogPath)){
+                Test-SystemLogs -ComponentID $typeChosen.Name -LogPath $primaryLogPath | Out-Null
+            } else {
+                Write-LogMessage -Type Warning -MSG "No existing service log was found for '$($typeChosen.Name)'; skipping final log error scan."
+            }
         }
     }
     else {
@@ -2547,278 +2834,3 @@ Finally{
 # Script ended
 Write-LogMessage -type Info -MSG "Create CredFile helper script ended" -Footer
 return
-# SIG # Begin signature block
-# MIIzFwYJKoZIhvcNAQcCoIIzCDCCMwQCAQExDzANBglghkgBZQMEAgEFADB5Bgor
-# BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAdHpBTnpcAMhfA
-# WObbN4HqKBQUqrAQac3l4eziuPDy4qCCGJkwggROMIIDNqADAgECAg0B7l8Wnf+X
-# NStkZdZqMA0GCSqGSIb3DQEBCwUAMFcxCzAJBgNVBAYTAkJFMRkwFwYDVQQKExBH
-# bG9iYWxTaWduIG52LXNhMRAwDgYDVQQLEwdSb290IENBMRswGQYDVQQDExJHbG9i
-# YWxTaWduIFJvb3QgQ0EwHhcNMTgwOTE5MDAwMDAwWhcNMjgwMTI4MTIwMDAwWjBM
-# MSAwHgYDVQQLExdHbG9iYWxTaWduIFJvb3QgQ0EgLSBSMzETMBEGA1UEChMKR2xv
-# YmFsU2lnbjETMBEGA1UEAxMKR2xvYmFsU2lnbjCCASIwDQYJKoZIhvcNAQEBBQAD
-# ggEPADCCAQoCggEBAMwldpB5BngiFvXAg7aEyiie/QV2EcWtiHL8RgJDx7KKnQRf
-# JMsuS+FggkbhUqsMgUdwbN1k0ev1LKMPgj0MK66X17YUhhB5uzsTgHeMCOFJ0mpi
-# Lx9e+pZo34knlTifBtc+ycsmWQ1z3rDI6SYOgxXG71uL0gRgykmmKPZpO/bLyCiR
-# 5Z2KYVc3rHQU3HTgOu5yLy6c+9C7v/U9AOEGM+iCK65TpjoWc4zdQQ4gOsC0p6Hp
-# sk+QLjJg6VfLuQSSaGjlOCZgdbKfd/+RFO+uIEn8rUAVSNECMWEZXriX7613t2Sa
-# er9fwRPvm2L7DWzgVGkWqQPabumDk3F2xmmFghcCAwEAAaOCASIwggEeMA4GA1Ud
-# DwEB/wQEAwIBBjAPBgNVHRMBAf8EBTADAQH/MB0GA1UdDgQWBBSP8Et/qC5FJK5N
-# UPpjmove4t0bvDAfBgNVHSMEGDAWgBRge2YaRQ2XyolQL30EzTSo//z9SzA9Bggr
-# BgEFBQcBAQQxMC8wLQYIKwYBBQUHMAGGIWh0dHA6Ly9vY3NwLmdsb2JhbHNpZ24u
-# Y29tL3Jvb3RyMTAzBgNVHR8ELDAqMCigJqAkhiJodHRwOi8vY3JsLmdsb2JhbHNp
-# Z24uY29tL3Jvb3QuY3JsMEcGA1UdIARAMD4wPAYEVR0gADA0MDIGCCsGAQUFBwIB
-# FiZodHRwczovL3d3dy5nbG9iYWxzaWduLmNvbS9yZXBvc2l0b3J5LzANBgkqhkiG
-# 9w0BAQsFAAOCAQEAI3Dpz+K+9VmulEJvxEMzqs0/OrlkF/JiBktI8UCIBheh/qvR
-# XzzGM/Lzjt0fHT7MGmCZggusx/x+mocqpX0PplfurDtqhdbevUBj+K2myIiwEvz2
-# Qd8PCZceOOpTn74F9D7q059QEna+CYvCC0h9Hi5R9o1T06sfQBuKju19+095VnBf
-# DNOOG7OncA03K5eVq9rgEmscQM7Fx37twmJY7HftcyLCivWGQ4it6hNu/dj+Qi+5
-# fV6tGO+UkMo9J6smlJl1x8vTe/fKTNOvUSGSW4R9K58VP3TLUeiegw4WbxvnRs4j
-# vfnkoovSOWuqeRyRLOJhJC2OKkhwkMQexejgcDCCBaIwggSKoAMCAQICEHgDGEJF
-# cIpBz28BuO60qVQwDQYJKoZIhvcNAQEMBQAwTDEgMB4GA1UECxMXR2xvYmFsU2ln
-# biBSb290IENBIC0gUjMxEzARBgNVBAoTCkdsb2JhbFNpZ24xEzARBgNVBAMTCkds
-# b2JhbFNpZ24wHhcNMjAwNzI4MDAwMDAwWhcNMjkwMzE4MDAwMDAwWjBTMQswCQYD
-# VQQGEwJCRTEZMBcGA1UEChMQR2xvYmFsU2lnbiBudi1zYTEpMCcGA1UEAxMgR2xv
-# YmFsU2lnbiBDb2RlIFNpZ25pbmcgUm9vdCBSNDUwggIiMA0GCSqGSIb3DQEBAQUA
-# A4ICDwAwggIKAoICAQC2LcUw3Xroq5A9A3KwOkuZFmGy5f+lZx03HOV+7JODqoT1
-# o0ObmEWKuGNXXZsAiAQl6fhokkuC2EvJSgPzqH9qj4phJ72hRND99T8iwqNPkY2z
-# BbIogpFd+1mIBQuXBsKY+CynMyTuUDpBzPCgsHsdTdKoWDiW6d/5G5G7ixAs0sdD
-# HaIJdKGAr3vmMwoMWWuOvPSrWpd7f65V+4TwgP6ETNfiur3EdaFvvWEQdESymAfi
-# dKv/aNxsJj7pH+XgBIetMNMMjQN8VbgWcFwkeCAl62dniKu6TjSYa3AR3jjK1L6h
-# wJzh3x4CAdg74WdDhLbP/HS3L4Sjv7oJNz1nbLFFXBlhq0GD9awd63cNRkdzzr+9
-# lZXtnSuIEP76WOinV+Gzz6ha6QclmxLEnoByPZPcjJTfO0TmJoD80sMD8IwM0kXW
-# LuePmJ7mBO5Cbmd+QhZxYucE+WDGZKG2nIEhTivGbWiUhsaZdHNnMXqR8tSMeW58
-# prt+Rm9NxYUSK8+aIkQIqIU3zgdhVwYXEiTAxDFzoZg1V0d+EDpF2S2kUZCYqaAH
-# N8RlGqocaxZ396eX7D8ZMJlvMfvqQLLn0sT6ydDwUHZ0WfqNbRcyvvjpfgP054d1
-# mtRKkSyFAxMCK0KA8olqNs/ITKDOnvjLja0Wp9Pe1ZsYp8aSOvGCY/EuDiRk3wID
-# AQABo4IBdzCCAXMwDgYDVR0PAQH/BAQDAgGGMBMGA1UdJQQMMAoGCCsGAQUFBwMD
-# MA8GA1UdEwEB/wQFMAMBAf8wHQYDVR0OBBYEFB8Av0aACvx4ObeltEPZVlC7zpY7
-# MB8GA1UdIwQYMBaAFI/wS3+oLkUkrk1Q+mOai97i3Ru8MHoGCCsGAQUFBwEBBG4w
-# bDAtBggrBgEFBQcwAYYhaHR0cDovL29jc3AuZ2xvYmFsc2lnbi5jb20vcm9vdHIz
-# MDsGCCsGAQUFBzAChi9odHRwOi8vc2VjdXJlLmdsb2JhbHNpZ24uY29tL2NhY2Vy
-# dC9yb290LXIzLmNydDA2BgNVHR8ELzAtMCugKaAnhiVodHRwOi8vY3JsLmdsb2Jh
-# bHNpZ24uY29tL3Jvb3QtcjMuY3JsMEcGA1UdIARAMD4wPAYEVR0gADA0MDIGCCsG
-# AQUFBwIBFiZodHRwczovL3d3dy5nbG9iYWxzaWduLmNvbS9yZXBvc2l0b3J5LzAN
-# BgkqhkiG9w0BAQwFAAOCAQEArPfMFYsweagdCyiIGQnXHH/+hr17WjNuDWcOe2LZ
-# 4RhcsL0TXR0jrjlQdjeqRP1fASNZhlZMzK28ZBMUMKQgqOA/6Jxy3H7z2Awjuqgt
-# qjz27J+HMQdl9TmnUYJ14fIvl/bR4WWWg2T+oR1R+7Ukm/XSd2m8hSxc+lh30a6n
-# sQvi1ne7qbQ0SqlvPfTzDZVd5vl6RbAlFzEu2/cPaOaDH6n35dSdmIzTYUsvwyh+
-# et6TDrR9oAptksS0Zj99p1jurPfswwgBqzj8ChypxZeyiMgJAhn2XJoa8U1sMNSz
-# BqsAYEgNeKvPF62Sk2Igd3VsvcgytNxN69nfwZCWKb3BfzCCBugwggTQoAMCAQIC
-# EHe9DgW3WQu2HUdhUx4/de0wDQYJKoZIhvcNAQELBQAwUzELMAkGA1UEBhMCQkUx
-# GTAXBgNVBAoTEEdsb2JhbFNpZ24gbnYtc2ExKTAnBgNVBAMTIEdsb2JhbFNpZ24g
-# Q29kZSBTaWduaW5nIFJvb3QgUjQ1MB4XDTIwMDcyODAwMDAwMFoXDTMwMDcyODAw
-# MDAwMFowXDELMAkGA1UEBhMCQkUxGTAXBgNVBAoTEEdsb2JhbFNpZ24gbnYtc2Ex
-# MjAwBgNVBAMTKUdsb2JhbFNpZ24gR0NDIFI0NSBFViBDb2RlU2lnbmluZyBDQSAy
-# MDIwMIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAyyDvlx65ATJDoFup
-# iiP9IF6uOBKLyizU/0HYGlXUGVO3/aMX53o5XMD3zhGj+aXtAfq1upPvr5Pc+OKz
-# GUyDsEpEUAR4hBBqpNaWkI6B+HyrL7WjVzPSWHuUDm0PpZEmKrODT3KxintkktDw
-# tFVflgsR5Zq1LLIRzyUbfVErmB9Jo1/4E541uAMC2qQTL4VK78QvcA7B1MwzEuy9
-# QJXTEcrmzbMFnMhT61LXeExRAZKC3hPzB450uoSAn9KkFQ7or+v3ifbfcfDRvqey
-# QTMgdcyx1e0dBxnE6yZ38qttF5NJqbfmw5CcxrjszMl7ml7FxSSTY29+EIthz5hV
-# oySiiDby+Z++ky6yBp8mwAwBVhLhsoqfDh7cmIsuz9riiTSmHyagqK54beyhiBU8
-# wurut9itYaWvcDaieY7cDXPA8eQsq5TsWAY5NkjWO1roIs50Dq8s8RXa0bSV6KzV
-# SW3lr92ba2MgXY5+O7JD2GI6lOXNtJizNxkkEnJzqwSwCdyF5tQiBO9AKh0ubcdp
-# 0263AWwN4JenFuYmi4j3A0SGX2JnTLWnN6hV3AM2jG7PbTYm8Q6PsD1xwOEyp4Lk
-# tjICMjB8tZPIIf08iOZpY/judcmLwqvvujr96V6/thHxvvA9yjI+bn3eD36blcQS
-# h+cauE7uLMHfoWXoJIPJKsL9uVMCAwEAAaOCAa0wggGpMA4GA1UdDwEB/wQEAwIB
-# hjATBgNVHSUEDDAKBggrBgEFBQcDAzASBgNVHRMBAf8ECDAGAQH/AgEAMB0GA1Ud
-# DgQWBBQlndD8WQmGY8Xs87ETO1ccA5I2ETAfBgNVHSMEGDAWgBQfAL9GgAr8eDm3
-# pbRD2VZQu86WOzCBkwYIKwYBBQUHAQEEgYYwgYMwOQYIKwYBBQUHMAGGLWh0dHA6
-# Ly9vY3NwLmdsb2JhbHNpZ24uY29tL2NvZGVzaWduaW5ncm9vdHI0NTBGBggrBgEF
-# BQcwAoY6aHR0cDovL3NlY3VyZS5nbG9iYWxzaWduLmNvbS9jYWNlcnQvY29kZXNp
-# Z25pbmdyb290cjQ1LmNydDBBBgNVHR8EOjA4MDagNKAyhjBodHRwOi8vY3JsLmds
-# b2JhbHNpZ24uY29tL2NvZGVzaWduaW5ncm9vdHI0NS5jcmwwVQYDVR0gBE4wTDBB
-# BgkrBgEEAaAyAQIwNDAyBggrBgEFBQcCARYmaHR0cHM6Ly93d3cuZ2xvYmFsc2ln
-# bi5jb20vcmVwb3NpdG9yeS8wBwYFZ4EMAQMwDQYJKoZIhvcNAQELBQADggIBACV1
-# oAnJObq3oTmJLxifq9brHUvolHwNB2ibHJ3vcbYXamsCT7M/hkWHzGWbTONYBgIi
-# ZtVhAsVjj9Si8bZeJQt3lunNcUAziCns7vOibbxNtT4GS8lzM8oIFC09TOiwunWm
-# dC2kWDpsE0n4pRUKFJaFsWpoNCVCr5ZW9BD6JH3xK3LBFuFr6+apmMc+WvTQGJ39
-# dJeGd0YqPSN9KHOKru8rG5q/bFOnFJ48h3HAXo7I+9MqkjPqV01eB17KwRisgS0a
-# Ifpuz5dhe99xejrKY/fVMEQ3Mv67Q4XcuvymyjMZK3dt28sF8H5fdS6itr81qjZj
-# yc5k2b38vCzzSVYAyBIrxie7N69X78TPHinE9OItziphz1ft9QpA4vUY1h7pkC/K
-# 04dfk4pIGhEd5TeFny5mYppegU6VrFVXQ9xTiyV+PGEPigu69T+m1473BFZeIbuf
-# 12pxgL+W3nID2NgiK/MnFk846FFADK6S7749ffeAxkw2V4SVp4QVSDAOUicIjY6i
-# vSLHGcmmyg6oejbbarphXxEklaTijmjuGalJmV7QtDS91vlAxxCXMVI5NSkRhyTT
-# xPupY8t3SNX6Yvwk4AR6TtDkbt7OnjhQJvQhcWXXCSXUyQcAerjH83foxdTiVdDT
-# HvZ/UuJJjbkRcgyIRCYzZgFE3+QzDiHeYolIB9r1MIIHsTCCBZmgAwIBAgIMBmw4
-# iuAOfBdrKw0JMA0GCSqGSIb3DQEBCwUAMFwxCzAJBgNVBAYTAkJFMRkwFwYDVQQK
-# ExBHbG9iYWxTaWduIG52LXNhMTIwMAYDVQQDEylHbG9iYWxTaWduIEdDQyBSNDUg
-# RVYgQ29kZVNpZ25pbmcgQ0EgMjAyMDAeFw0yNTAxMjgxMDI4MzNaFw0yODAxMjkx
-# MDI4MzNaMIH3MR0wGwYDVQQPDBRQcml2YXRlIE9yZ2FuaXphdGlvbjESMBAGA1UE
-# BRMJNTEyMjkxNjQyMRMwEQYLKwYBBAGCNzwCAQMTAklMMQswCQYDVQQGEwJJTDEQ
-# MA4GA1UECBMHQ2VudHJhbDEUMBIGA1UEBxMLUGV0YWggVGlrdmExEzARBgNVBAkT
-# CjkgSGFwc2Fnb3QxHzAdBgNVBAoTFkN5YmVyQXJrIFNvZnR3YXJlIEx0ZC4xHzAd
-# BgNVBAMTFkN5YmVyQXJrIFNvZnR3YXJlIEx0ZC4xITAfBgkqhkiG9w0BCQEWEmFk
-# bWluQGN5YmVyYXJrLmNvbTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIB
-# ANZQPlxrcfMjyi+hhEn41HogbUr17cJB+2rbTOBphAPzZEySpd+GObt2pAyYbXTb
-# 1XGHRomYxq/fTVcDWn6ESHKqIpTUnTsai2FakMr4OINfey2c0Lw81SCwedG6ind+
-# QxszJ3c1iAoyuO8fbNAJJQHKTNAdTCADAHrfHvv8fuF8iw8vZCP5E6JFdcvaNUL9
-# 9lecTTlIuXMyfLoO/9Q6geZ30UeSibynHoZbGzzK20pxL9VM5LA9YiGtA+bfdRGe
-# hlqhPD4KgBRkc9bogTxA78QaiBUEnYM1vMmKc86MjXSS6R+z5mFAdhcs5C6cqWdO
-# wo5jVFXpwxQh0jNTalt/kkwTjlIeO3+fdDDYLmbmH3nIsMutaHyXPogVp7upktz9
-# WeS9r0ZpqKw7viVe/CWS9Df8/ceZD9zBkIbTrYGFU02hDaWaN1pFs6V21iaiTaZX
-# pnnpEbtgoy8rptlFFIf0GQBDD0mTBDm7lZ8rDfN7IECcahCN4dMfnFO/QFpxAILa
-# ekomXUmtkH3WBaQl4hraHja+fCi4ZtKhYYTZWdakH6bvdkENywuze/liwv2OVdZ4
-# qddJpbvblqa9jqnV8RhugofYVEBq6yyd6OgJosdFPIZN7upzrCmHJTiTDtBNQJ2z
-# m7LXrryUF9yTyjeUjLbUfTKbpj4UzM3jcKu1J5jDL5zFAgMBAAGjggHVMIIB0TAO
-# BgNVHQ8BAf8EBAMCB4AwgZ8GCCsGAQUFBwEBBIGSMIGPMEwGCCsGAQUFBzAChkBo
-# dHRwOi8vc2VjdXJlLmdsb2JhbHNpZ24uY29tL2NhY2VydC9nc2djY3I0NWV2Y29k
-# ZXNpZ25jYTIwMjAuY3J0MD8GCCsGAQUFBzABhjNodHRwOi8vb2NzcC5nbG9iYWxz
-# aWduLmNvbS9nc2djY3I0NWV2Y29kZXNpZ25jYTIwMjAwVQYDVR0gBE4wTDBBBgkr
-# BgEEAaAyAQIwNDAyBggrBgEFBQcCARYmaHR0cHM6Ly93d3cuZ2xvYmFsc2lnbi5j
-# b20vcmVwb3NpdG9yeS8wBwYFZ4EMAQMwCQYDVR0TBAIwADBHBgNVHR8EQDA+MDyg
-# OqA4hjZodHRwOi8vY3JsLmdsb2JhbHNpZ24uY29tL2dzZ2NjcjQ1ZXZjb2Rlc2ln
-# bmNhMjAyMC5jcmwwHQYDVR0RBBYwFIESYWRtaW5AY3liZXJhcmsuY29tMBMGA1Ud
-# JQQMMAoGCCsGAQUFBwMDMB8GA1UdIwQYMBaAFCWd0PxZCYZjxezzsRM7VxwDkjYR
-# MB0GA1UdDgQWBBQewhxJyrlxdN3533DHK3x6hrz7uzANBgkqhkiG9w0BAQsFAAOC
-# AgEAWgNDad105JaVijYhNrwnSPmm1mIhDpSvPDvIR4pENU9IdPcI8rxXRmJ083JM
-# vIx5p7LvuBOTkyaNgZOjmkypMNM4NtMtHHdXAiWb6T+Udv4w0lcgUBWapeRxO7X5
-# ok+E9lrVeSiiSrM/6TDF3xkAwcR5CzYjEYsgYa0H+hBXl9+oXe2QYFuArlQ0OfTv
-# nXr2iFlvl0AKR7fRY0qBBGoKUATjGiYUFcigc9PyW2vml1BMxXx65jkKdoPIMZSJ
-# Ka7xkExONB+t3uJc8yI+n2x24k1bjl8mJdnEkryUATe58vLxfYa93mLFC7VLCTND
-# cJjFBvdL86F1HyveXhHX5XMlS/HPcnRk6VV8+zkr72fGP18cxl1nOAftgjOxh0mD
-# Y6l9UMkOle1gSlf/S15z6VlRx+TkE/ZeL2n/tw4zHqWaNatHy+Zs2BIzaMdzP/u4
-# tYTOuhQfXYnP5zrGw5ldYkIAQawVZwcODVO+FBb8/F3uTBbiMqCaOxy8RGLTqJlI
-# bk+fBnkgtYyiIglUE10Y/FwI4qMgG2iZh97WsISLblu4Lfz9t7/bo54Y4bGqOdnW
-# rz6e4hDhlkozop7MHG35nqHRN5Qx4iUDxvyDJLpZXG0kes+Cx+zkqhGvz9ST0bB6
-# WH5RcnIk2Rog6Rr/bs0O1ZMS5DZy6vm1RB5fAZfAZ451uRwxghnUMIIZ0AIBATBs
-# MFwxCzAJBgNVBAYTAkJFMRkwFwYDVQQKExBHbG9iYWxTaWduIG52LXNhMTIwMAYD
-# VQQDEylHbG9iYWxTaWduIEdDQyBSNDUgRVYgQ29kZVNpZ25pbmcgQ0EgMjAyMAIM
-# Bmw4iuAOfBdrKw0JMA0GCWCGSAFlAwQCAQUAoHwwEAYKKwYBBAGCNwIBDDECMAAw
-# GQYJKoZIhvcNAQkDMQwGCisGAQQBgjcCAQQwHAYKKwYBBAGCNwIBCzEOMAwGCisG
-# AQQBgjcCARUwLwYJKoZIhvcNAQkEMSIEIKjN6vvIEd9thb5EObdafyccso0ApSVP
-# m1uaMuIXl8aeMA0GCSqGSIb3DQEBAQUABIICAIkDusoPKEWe1kf26s/9lqpvxwJe
-# K0g2GK2DcLHsE08CBF9RTa2YD882N/NICTBsmW8E3zkeXg+U2JMeGzpllH9QSjOk
-# TYLiB3Fd6qGrpVRllVheguBIDDk0MEfkABtRjCJHEqUs9b3yrxqX5ROJBoqZ8N+V
-# zIAhnNtrheEsaVflDqG4U5XjWZS+vpMh5ToYaUTWmkI+Ftll5RujRZDeTsXAqD+9
-# wK0bROf4IfMcF2ksO/1uLESJ7EAx2YQ3bCMSuezbeLxv1bKx1Y7nBjm5dR2x2iWT
-# wD7JOq+Gxvt+a84S3WfCuBSK6dWNBx+a9CerAi53ffHiD+8yQYC/T/8UGdsfNuOH
-# 5rRlo7+The2FPPm6GqbJJdF5vjRYGyzpZ3V5mEb6MKjQEeWeRAgS8x23vq4HNkwT
-# IyAA9EVZkIDBFSnP6+C4aCeSblA1oM2ikjrf4Jm1UaJqzzjglUeVnkFU5xgr6MxK
-# MUkVKTC7rt/8GBuCMlJNwqagW4xpigA75uMnxUXQrng0PXDuMiIrqNfaKu/5vmyI
-# y0xyrI3a57ypIAGdygEyFvmT+ByFYt5GB7QAIcrQ1oN9oyrOwcocRTI7nM8zKAMh
-# V2KIXFDH/NI4+drCcTpx/iI9PEwAuTKtYzdsnbxL6CxoedhHaSin8GRcC9Bevn97
-# 3TdHEHJfcA31yoiWoYIWuzCCFrcGCisGAQQBgjcDAwExghanMIIWowYJKoZIhvcN
-# AQcCoIIWlDCCFpACAQMxDTALBglghkgBZQMEAgEwgd8GCyqGSIb3DQEJEAEEoIHP
-# BIHMMIHJAgEBBgsrBgEEAaAyAgMBAjAxMA0GCWCGSAFlAwQCAQUABCC+lsrZ6i89
-# C9p/68eKmb5f5pVqWJb2iJTOU74SRrWOhQIUYWAeNBJ5PuCl9zmKCqTkK9sHwOAY
-# DzIwMjYwNDEzMTIzODE0WjADAgEBoFikVjBUMQswCQYDVQQGEwJCRTEZMBcGA1UE
-# CgwQR2xvYmFsU2lnbiBudi1zYTEqMCgGA1UEAwwhR2xvYmFsc2lnbiBUU0EgZm9y
-# IENvZGVTaWduMSAtIFI2oIISSzCCBmMwggRLoAMCAQICEAEACyAFs5QHYts+NnmU
-# m6kwDQYJKoZIhvcNAQEMBQAwWzELMAkGA1UEBhMCQkUxGTAXBgNVBAoTEEdsb2Jh
-# bFNpZ24gbnYtc2ExMTAvBgNVBAMTKEdsb2JhbFNpZ24gVGltZXN0YW1waW5nIENB
-# IC0gU0hBMzg0IC0gRzQwHhcNMjUwNDExMTQ0NzM5WhcNMzQxMjEwMDAwMDAwWjBU
-# MQswCQYDVQQGEwJCRTEZMBcGA1UECgwQR2xvYmFsU2lnbiBudi1zYTEqMCgGA1UE
-# AwwhR2xvYmFsc2lnbiBUU0EgZm9yIENvZGVTaWduMSAtIFI2MIIBojANBgkqhkiG
-# 9w0BAQEFAAOCAY8AMIIBigKCAYEAolvEqk1J5SN4PuCF6+aqCj7V8qyop0Rh94rL
-# mY37Cn8er80SkfKzdJHJk3Tqa9QY4UwV6hedXfSb5gk0Xydy3MNEj1qE+ZomPEcj
-# C7uRtGdfB/PtnieWJzjtPVUlmEPrUMsoFU7woJScRV1W6/6efi2BySHXshZ30V1E
-# DZ2lKQ0DK3q3bI4sJE/5n/dQy8iL4hjTaS9v0YQy5RJY+o1NWhxP/HsNum67Or4r
-# FDsGIE85hg5r4g3CXFuiqWvlNmPbCBWgdxp/PCqY0Lie04DuKbDwRd6nrm5AH5oI
-# RJyFUjLvG4HO0L1UXYMuJ6J1JzO438RA0mJRvU2ZwbI6yiFHaS0x3SgFakvhELLn
-# 4tmwngYPj+FDX3LaWHnni/MGJXRxnN0pQdYJqEYhKUlrMH9+2Klndcz/9yXYGEyw
-# Tt88d3y+TUFvZlAA0BMOYMMrYFQEptlRg2DYrx5sWtX1qvCzk6sEBLRVPEbE0i+J
-# 01ILlBzRpcJusZUQyGK2RVSOFfXPAgMBAAGjggGoMIIBpDAOBgNVHQ8BAf8EBAMC
-# B4AwFgYDVR0lAQH/BAwwCgYIKwYBBQUHAwgwHQYDVR0OBBYEFIBDTPy6bR0T0nUS
-# iAl3b9vGT5VUMFYGA1UdIARPME0wCAYGZ4EMAQQCMEEGCSsGAQQBoDIBHjA0MDIG
-# CCsGAQUFBwIBFiZodHRwczovL3d3dy5nbG9iYWxzaWduLmNvbS9yZXBvc2l0b3J5
-# LzAMBgNVHRMBAf8EAjAAMIGQBggrBgEFBQcBAQSBgzCBgDA5BggrBgEFBQcwAYYt
-# aHR0cDovL29jc3AuZ2xvYmFsc2lnbi5jb20vY2EvZ3N0c2FjYXNoYTM4NGc0MEMG
-# CCsGAQUFBzAChjdodHRwOi8vc2VjdXJlLmdsb2JhbHNpZ24uY29tL2NhY2VydC9n
-# c3RzYWNhc2hhMzg0ZzQuY3J0MB8GA1UdIwQYMBaAFOoWxmnn48tXRTkzpPBAvtDD
-# vWWWMEEGA1UdHwQ6MDgwNqA0oDKGMGh0dHA6Ly9jcmwuZ2xvYmFsc2lnbi5jb20v
-# Y2EvZ3N0c2FjYXNoYTM4NGc0LmNybDANBgkqhkiG9w0BAQwFAAOCAgEAt6bHSpl2
-# dP0gYie9iXw3Bz5XzwsvmiYisEjboyRZin+jqH26IFq7fQMIrN5VdX8KGl5pEe21
-# b8skPfUctiroo6QS5oWESl4kzZow2iJ/qJn76TkvL+v2f4mHolGLBwyDm74fXr68
-# W63xuiYSpnbf7NYPyBaHI7zJ/ErST4bA00TC+ftPttS+G/MhNUaKg34yaJ8Z6AEN
-# nPdCB8VIrt/sqd6R1k89Ojx1jL36QBEPUr2dtIIlS3Ki74CU15YTvG+Xxt9cwE+0
-# Gx/qRQv8YbF+UcsdgYU4jNRZB0kTV3Bsd3lyIWmt8DT4RQj9LQ1ILOpqG/Czwd9q
-# 9GJL6jSJeSq1AC4ZocVMuqcYd/D9JpIML9BQ/wk5lgJkgXEc1gRgPsDsU9zz36Jy
-# mN1+Yhvx0Vr67jr0Qfqk3V0z6/xVmEAJKafTeIfD9hQchjiGkyw3EKNiyHyM37rd
-# K/BsTSx0rB3MHdqE9/dHQX5NUOQCWUvhkWy10u71yzGKWnbAWQ6NNuq9ftcwYFTm
-# cyo5YbFwzfkyS+Y78+O9utqgi6VoE2NzVJbucqGLZtJFJzGJD7xe/rqULwYHeQ3H
-# PSnNCagb6jqBeFSnXTx0GbuYuk3jA51dQNtsogVAGXCqHsh62QVAl/gadTfcRaMp
-# IWAc3CPup3x19dDApspmRyOVzXBUtsiCWsIwggZZMIIEQaADAgECAg0B7BySQN79
-# LkBdfEd0MA0GCSqGSIb3DQEBDAUAMEwxIDAeBgNVBAsTF0dsb2JhbFNpZ24gUm9v
-# dCBDQSAtIFI2MRMwEQYDVQQKEwpHbG9iYWxTaWduMRMwEQYDVQQDEwpHbG9iYWxT
-# aWduMB4XDTE4MDYyMDAwMDAwMFoXDTM0MTIxMDAwMDAwMFowWzELMAkGA1UEBhMC
-# QkUxGTAXBgNVBAoTEEdsb2JhbFNpZ24gbnYtc2ExMTAvBgNVBAMTKEdsb2JhbFNp
-# Z24gVGltZXN0YW1waW5nIENBIC0gU0hBMzg0IC0gRzQwggIiMA0GCSqGSIb3DQEB
-# AQUAA4ICDwAwggIKAoICAQDwAuIwI/rgG+GadLOvdYNfqUdSx2E6Y3w5I3ltdPwx
-# 5HQSGZb6zidiW64HiifuV6PENe2zNMeswwzrgGZt0ShKwSy7uXDycq6M95laXXau
-# v0SofEEkjo+6xU//NkGrpy39eE5DiP6TGRfZ7jHPvIo7bmrEiPDul/bc8xigS5kc
-# DoenJuGIyaDlmeKe9JxMP11b7Lbv0mXPRQtUPbFUUweLmW64VJmKqDGSO/J6ffwO
-# WN+BauGwbB5lgirUIceU/kKWO/ELsX9/RpgOhz16ZevRVqkuvftYPbWF+lOZTVt0
-# 7XJLog2CNxkM0KvqWsHvD9WZuT/0TzXxnA/TNxNS2SU07Zbv+GfqCL6PSXr/kLHU
-# 9ykV1/kNXdaHQx50xHAotIB7vSqbu4ThDqxvDbm19m1W/oodCT4kDmcmx/yyDaCU
-# sLKUzHvmZ/6mWLLU2EESwVX9bpHFu7FMCEue1EIGbxsY1TbqZK7O/fUF5uJm0A4F
-# IayxEQYjGeT7BTRE6giunUlnEYuC5a1ahqdm/TMDAd6ZJflxbumcXQJMYDzPAo8B
-# /XLukvGnEt5CEk3sqSbldwKsDlcMCdFhniaI/MiyTdtk8EWfusE/VKPYdgKVbGqN
-# yiJc9gwE4yn6S7Ac0zd0hNkdZqs0c48efXxeltY9GbCX6oxQkW2vV4Z+EDcdaxoU
-# 3wIDAQABo4IBKTCCASUwDgYDVR0PAQH/BAQDAgGGMBIGA1UdEwEB/wQIMAYBAf8C
-# AQAwHQYDVR0OBBYEFOoWxmnn48tXRTkzpPBAvtDDvWWWMB8GA1UdIwQYMBaAFK5s
-# BaOTE+Ki5+LXHNbH8H/IZ1OgMD4GCCsGAQUFBwEBBDIwMDAuBggrBgEFBQcwAYYi
-# aHR0cDovL29jc3AyLmdsb2JhbHNpZ24uY29tL3Jvb3RyNjA2BgNVHR8ELzAtMCug
-# KaAnhiVodHRwOi8vY3JsLmdsb2JhbHNpZ24uY29tL3Jvb3QtcjYuY3JsMEcGA1Ud
-# IARAMD4wPAYEVR0gADA0MDIGCCsGAQUFBwIBFiZodHRwczovL3d3dy5nbG9iYWxz
-# aWduLmNvbS9yZXBvc2l0b3J5LzANBgkqhkiG9w0BAQwFAAOCAgEAf+KI2VdnK0Jf
-# gacJC7rEuygYVtZMv9sbB3DG+wsJrQA6YDMfOcYWaxlASSUIHuSb99akDY8elvKG
-# ohfeQb9P4byrze7AI4zGhf5LFST5GETsH8KkrNCyz+zCVmUdvX/23oLIt59h07VG
-# SJiXAmd6FpVK22LG0LMCzDRIRVXd7OlKn14U7XIQcXZw0g+W8+o3V5SRGK/cjZk4
-# GVjCqaF+om4VJuq0+X8q5+dIZGkv0pqhcvb3JEt0Wn1yhjWzAlcfi5z8u6xM3vre
-# U0yD/RKxtklVT3WdrG9KyC5qucqIwxIwTrIIc59eodaZzul9S5YszBZrGM3kWTeG
-# CSziRdayzW6CdaXajR63Wy+ILj198fKRMAWcznt8oMWsr1EG8BHHHTDFUVZg6HyV
-# PSLj1QokUyeXgPpIiScseeI85Zse46qEgok+wEr1If5iEO0dMPz2zOpIJ3yLdUJ/
-# a8vzpWuVHwRYNAqJ7YJQ5NF7qMnmvkiqK1XZjbclIA4bUaDUY6qD6mxyYUrJ+kPE
-# xlfFnbY8sIuwuRwx773vFNgUQGwgHcIt6AvGjW2MtnHtUiH+PvafnzkarqzSL3og
-# sfSsqh3iLRSd+pZqHcY8yvPZHL9TTaRHWXyVxENB+SXiLBB+gfkNlKd98rUJ9dhg
-# ckBQlSDUQ0S++qCV5yBZtnjGpGqqIpswggWDMIIDa6ADAgECAg5F5rsDgzPDhWVI
-# 5v9FUTANBgkqhkiG9w0BAQwFADBMMSAwHgYDVQQLExdHbG9iYWxTaWduIFJvb3Qg
-# Q0EgLSBSNjETMBEGA1UEChMKR2xvYmFsU2lnbjETMBEGA1UEAxMKR2xvYmFsU2ln
-# bjAeFw0xNDEyMTAwMDAwMDBaFw0zNDEyMTAwMDAwMDBaMEwxIDAeBgNVBAsTF0ds
-# b2JhbFNpZ24gUm9vdCBDQSAtIFI2MRMwEQYDVQQKEwpHbG9iYWxTaWduMRMwEQYD
-# VQQDEwpHbG9iYWxTaWduMIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEA
-# lQfoc8pm+ewUyns89w0I8bRFCyyCtEjG61s8roO4QZIzFKRvf+kqzMawiGvFtonR
-# xrL/FM5RFCHsSt0bWsbWh+5NOhUG7WRmC5KAykTec5RO86eJf094YwjIElBtQmYv
-# Tbl5KE1SGooagLcZgQ5+xIq8ZEwhHENo1z08isWyZtWQmrcxBsW+4m0yBqYe+bnr
-# qqO4v76CY1DQ8BiJ3+QPefXqoh8q0nAue+e8k7ttU+JIfIwQBzj/ZrJ3YX7g6ow8
-# qrSk9vOVShIHbf2MsonP0KBhd8hYdLDUIzr3XTrKotudCd5dRC2Q8YHNV5L6frxQ
-# BGM032uTGL5rNrI55KwkNrfw77YcE1eTtt6y+OKFt3OiuDWqRfLgnTahb1SK8XJW
-# bi6IxVFCRBWU7qPFOJabTk5aC0fzBjZJdzC8cTflpuwhCHX85mEWP3fV2ZGXhAps
-# 1AJNdMAU7f05+4PyXhShBLAL6f7uj+FuC7IIs2FmCWqxBjplllnA8DX9ydoojRoR
-# h3CBCqiadR2eOoYFAJ7bgNYl+dwFnidZTHY5W+r5paHYgw/R/98wEfmFzzNI9cpt
-# ZBQselhP00sIScWVZBpjDnk99bOMylitnEJFeW4OhxlcVLFltr+Mm9wT6Q1vuC7c
-# Z27JixG1hBSKABlwg3mRl5HUGie/Nx4yB9gUYzwoTK8CAwEAAaNjMGEwDgYDVR0P
-# AQH/BAQDAgEGMA8GA1UdEwEB/wQFMAMBAf8wHQYDVR0OBBYEFK5sBaOTE+Ki5+LX
-# HNbH8H/IZ1OgMB8GA1UdIwQYMBaAFK5sBaOTE+Ki5+LXHNbH8H/IZ1OgMA0GCSqG
-# SIb3DQEBDAUAA4ICAQCDJe3o0f2VUs2ewASgkWnmXNCE3tytok/oR3jWZZipW6g8
-# h3wCitFutxZz5l/AVJjVdL7BzeIRka0jGD3d4XJElrSVXsB7jpl4FkMTVlezorM7
-# tXfcQHKso+ubNT6xCCGh58RDN3kyvrXnnCxMvEMpmY4w06wh4OMd+tgHM3ZUACIq
-# uU0gLnBo2uVT/INc053y/0QMRGby0uO9RgAabQK6JV2NoTFR3VRGHE3bmZbvGhwE
-# XKYV73jgef5d2z6qTFX9mhWpb+Gm+99wMOnD7kJG7cKTBYn6fWN7P9BxgXwA6Jiu
-# Dng0wyX7rwqfIGvdOxOPEoziQRpIenOgd2nHtlx/gsge/lgbKCuobK1ebcAF0nu3
-# 64D+JTf+AptorEJdw+71zNzwUHXSNmmc5nsE324GabbeCglIWYfrexRgemSqaUPv
-# kcdM7BjdbO9TLYyZ4V7ycj7PVMi9Z+ykD0xF/9O5MCMHTI8Qv4aW2ZlatJlXHKTM
-# uxWJU7osBQ/kxJ4ZsRg01Uyduu33H68klQR4qAO77oHl2l98i0qhkHQlp7M+S8gs
-# Vr3HyO844lyS8Hn3nIS6dC1hASB+ftHyTwdZX4stQ1LrRgyU4fVmR3l31VRbH60k
-# N8tFWk6gREjI2LCZxRWECfbWSUnAZbjmGnFuoKjxguhFPmzWAtcKZ4MFWsmkEDGC
-# A0kwggNFAgEBMG8wWzELMAkGA1UEBhMCQkUxGTAXBgNVBAoTEEdsb2JhbFNpZ24g
-# bnYtc2ExMTAvBgNVBAMTKEdsb2JhbFNpZ24gVGltZXN0YW1waW5nIENBIC0gU0hB
-# Mzg0IC0gRzQCEAEACyAFs5QHYts+NnmUm6kwCwYJYIZIAWUDBAIBoIIBLTAaBgkq
-# hkiG9w0BCQMxDQYLKoZIhvcNAQkQAQQwKwYJKoZIhvcNAQk0MR4wHDALBglghkgB
-# ZQMEAgGhDQYJKoZIhvcNAQELBQAwLwYJKoZIhvcNAQkEMSIEIKr8PYFiAsWf4SbI
-# fAhmRHdkuYxSf7t7IU+UPKJPg2aZMIGwBgsqhkiG9w0BCRACLzGBoDCBnTCBmjCB
-# lwQgcl7yf0jhbmm5Y9hCaIxbygeojGkXBkLI/1ord69gXP0wczBfpF0wWzELMAkG
-# A1UEBhMCQkUxGTAXBgNVBAoTEEdsb2JhbFNpZ24gbnYtc2ExMTAvBgNVBAMTKEds
-# b2JhbFNpZ24gVGltZXN0YW1waW5nIENBIC0gU0hBMzg0IC0gRzQCEAEACyAFs5QH
-# Yts+NnmUm6kwDQYJKoZIhvcNAQELBQAEggGASd7V4Vm5RdRRp1WlT+AJ+j7o1Jnl
-# 5+mFUGo5SqcyKB/KWL8Tqt92lIwE6VkaxkvxJhGGnlOmGGdB+F18SaIysJOXox1A
-# a3/xGwtlgAqlIfIsdWvbfj83jTH+eS5y7/6xK28KdhynTUaXa4/CgKtfWbu/jbv8
-# x06KoL/7r1fAPARKkhnEb2oks5+obxRubzjN5CDVqicQHNk5T2VSJLmovABOmP++
-# DuXeOvQnFODgY1QCgx8h+ZqvBj+XQ2geyaXi3Es2/Fn+n3Qv62B6+kq169av9ctu
-# h8GK1MGfiiu0MH7v9WQ8JPxDTiDK4zPazJ112UrEfJhLqFKrxStbKLkIuwKkU6Qx
-# uc4RGTV3w3Twla3JcZZlehXzvmQk1vUuvQFWiJ1A9ym4FXnyfcayDJx0v8oPihO8
-# LhnRWL5mjiPpUqsR7mzHRdM/MgxOjuMk3ubPgzdHFWZXeg2kasDze9rMJMh6vBBb
-# Gkop8Kr7TPRTyuPiW/Nm2GM2ykHrMhex4FJ4
-# SIG # End signature block
