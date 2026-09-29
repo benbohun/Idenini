@@ -25,6 +25,10 @@
         -TargetAutomaticManagementEnabled $true
 
 .EXAMPLE
+    .\Update-VaultedAccounts.ps1 -CsvFile .\samples\account-update-template.csv -Environment prod `
+        -Reconcile YES
+
+.EXAMPLE
     .\Update-VaultedAccounts.ps1 -CsvFile .\input\device-migration.csv -Environment prod `
         -DisableSourceAfterMigration
 
@@ -84,6 +88,22 @@ param(
     # Use -TargetAutomaticManagementEnabled $true to create new target accounts with CPM management enabled.
     # Per-row CSV columns AutomaticManagementEnabled or DisableAutomaticManagement still override this default.
     [bool]$TargetAutomaticManagementEnabled = $false,
+
+    # Optional CPM reconcile after successful processing.
+    # Default NO means no reconcile action is sent.
+    # With -Reconcile YES, successful same-account PATCH updates are reconciled by default.
+    [ValidateSet('NO','YES')]
+    [string]$Reconcile = 'NO',
+
+    # UpdatedOnly: reconcile only accounts successfully PATCHed in place.
+    # UpdatedAndCreated: also reconcile newly duplicated/recreated target accounts.
+    [ValidateSet('UpdatedOnly','UpdatedAndCreated')]
+    [string]$ReconcileScope = 'UpdatedOnly',
+
+    # Continue keeps the row SUCCESS/PARTIAL when reconcile fails and records the reconcile failure.
+    # Fail marks the row as FAILED if reconcile fails.
+    [ValidateSet('Continue','Fail')]
+    [string]$ReconcileFailureAction = 'Continue',
 
     # Allows CSV Prop:<name> values that are not advertised in the platform definition.
     [switch]$AllowUnknownPlatformProperties,
@@ -1525,6 +1545,105 @@ function Invoke-AccountPatch {
         -ContentType 'application/json'
 }
 
+
+function Invoke-AccountReconcile {
+    <#
+        Submits CyberArk CPM reconcile for one account.
+
+        Endpoint:
+            POST Accounts/{AccountID}/Reconcile/
+
+        The action is only called when -Reconcile YES is supplied.
+        No password or secret is retrieved or logged.
+    #>
+    param(
+        [string]$AccountId,
+        [string]$Token,
+        [string]$Context
+    )
+
+    if (Test-BlankValue $AccountId) {
+        throw "Cannot reconcile because AccountID is blank. Context=$Context"
+    }
+
+    $id = [System.Uri]::EscapeDataString($AccountId)
+
+    Write-RunLog 'Invoke-AccountReconcile' "Submitting reconcile. AccountID=$AccountId Context=$Context" 'WARN'
+
+    Invoke-CyberArkRest `
+        -Method POST `
+        -Path "Accounts/$id/Reconcile/" `
+        -Token $Token `
+        -Body '' `
+        -ContentType 'application/json' | Out-Null
+
+    Write-RunLog 'Invoke-AccountReconcile' "Reconcile submitted. AccountID=$AccountId Context=$Context" 'INFO'
+}
+
+function Invoke-OptionalReconcile {
+    <#
+        Applies the command-line reconcile policy and returns a small status object
+        that can be written to the main report.
+
+        Reconcile=NO:
+            No action.
+
+        Reconcile=YES + ReconcileScope=UpdatedOnly:
+            Only successful in-place PATCH updates are reconciled.
+
+        Reconcile=YES + ReconcileScope=UpdatedAndCreated:
+            PATCH updates and newly created target accounts are reconciled.
+    #>
+    param(
+        [string]$AccountId,
+        [string]$Token,
+        [string]$Context,
+        [bool]$IsCreatedAccount = $false
+    )
+
+    if ($Reconcile -ne 'YES') {
+        return [pscustomobject]@{
+            Requested = 'No'
+            Status = 'NOT_REQUESTED'
+            Message = 'Reconcile was not requested.'
+        }
+    }
+
+    if ($IsCreatedAccount -and $ReconcileScope -ne 'UpdatedAndCreated') {
+        return [pscustomobject]@{
+            Requested = 'Yes'
+            Status = 'SKIPPED_SCOPE'
+            Message = "ReconcileScope=$ReconcileScope. Newly created target account was not reconciled."
+        }
+    }
+
+    try {
+        Invoke-AccountReconcile -AccountId $AccountId -Token $Token -Context $Context
+
+        return [pscustomobject]@{
+            Requested = 'Yes'
+            Status = 'SUBMITTED'
+            Message = "Reconcile submitted. Context=$Context"
+        }
+    }
+    catch {
+        $msg = $_.Exception.Message
+
+        Write-RunLog 'Invoke-OptionalReconcile' "Reconcile failed. AccountID=$AccountId Context=$Context Error=$msg" 'ERROR'
+
+        if ($ReconcileFailureAction -eq 'Fail') {
+            throw "Reconcile failed after successful update/create. AccountID=$AccountId Context=$Context Error=$msg"
+        }
+
+        return [pscustomobject]@{
+            Requested = 'Yes'
+            Status = 'FAILED_CONTINUED'
+            Message = $msg
+        }
+    }
+}
+
+
 function Invoke-SafeMoveCreate {
     <#
         Creates a same-device replacement account in a target Safe.
@@ -1553,7 +1672,7 @@ function Invoke-SafeMoveCreate {
     # The Automatic Password Management state for the new target account is controlled by:
     #   1. The row-level CSV AutomaticManagementEnabled / DisableAutomaticManagement columns, when supplied.
     #   2. Otherwise the command-line -TargetAutomaticManagementEnabled parameter.
-    # The script still does not call Accounts/{id}/Change or Accounts/{id}/Reconcile.
+    # The script does not call Accounts/{id}/Change. Accounts/{id}/Reconcile is called only when -Reconcile YES and scope allows it.
     $effectiveAutoManagement = if ($null -ne $AutomaticManagement) { [bool]$AutomaticManagement } else { [bool]$TargetAutomaticManagementEnabled }
     $effectiveManualReason = $ManualManagementReason
 
@@ -1625,7 +1744,7 @@ function Invoke-DeviceTypeMigrationCreate {
     # The Automatic Password Management state for the new target account is controlled by:
     #   1. The row-level CSV AutomaticManagementEnabled / DisableAutomaticManagement columns, when supplied.
     #   2. Otherwise the command-line -TargetAutomaticManagementEnabled parameter.
-    # The script still does not call Accounts/{id}/Change or Accounts/{id}/Reconcile.
+    # The script does not call Accounts/{id}/Change. Accounts/{id}/Reconcile is called only when -Reconcile YES and scope allows it.
     $effectiveAutoManagement = if ($null -ne $AutomaticManagement) { [bool]$AutomaticManagement } else { [bool]$TargetAutomaticManagementEnabled }
     $effectiveManualReason = $ManualManagementReason
 
@@ -1758,6 +1877,9 @@ function Invoke-RowUpdate {
         Action = ''
         Result = ''
         NewAccountID = ''
+        ReconcileRequested = 'No'
+        ReconcileStatus = 'NOT_REQUESTED'
+        ReconcileMessage = ''
         Message = ''
     }
 
@@ -1863,6 +1985,11 @@ function Invoke-RowUpdate {
 
             $result.NewAccountID = $newAccount.id
 
+            $reconcileOutcome = Invoke-OptionalReconcile -AccountId $newAccount.id -Token $Token -Context 'DeviceTypeMigrationCreate_TargetAccount' -IsCreatedAccount $true
+            $result.ReconcileRequested = $reconcileOutcome.Requested
+            $result.ReconcileStatus = $reconcileOutcome.Status
+            $result.ReconcileMessage = $reconcileOutcome.Message
+
             Add-RecreatedAccountRow -Row ([pscustomobject]@{
                 Row = $RowNumber
                 SourceAccountID = $current.id
@@ -1876,6 +2003,9 @@ function Invoke-RowUpdate {
                 SourceDeviceType = $currentDeviceType
                 TargetDeviceType = $targetDeviceType
                 NewAccountAutomaticManagement = if ([bool]$automaticManagement) { 'EnabledOnCreate' } else { 'DisabledOnCreate_NoImmediateCpmAction' }
+                ReconcileRequested = $result.ReconcileRequested
+                ReconcileStatus = $result.ReconcileStatus
+                ReconcileMessage = $result.ReconcileMessage
                 CreatedTime = (Get-Date -Format s)
             })
 
@@ -1934,8 +2064,9 @@ function Invoke-RowUpdate {
             Write-RunLog 'Invoke-RowUpdate' "SOURCE review. SourceAccountID=$($current.id) NewAccountID=$($newAccount.id) Status=$deleteStatus Note=$sourceNote" 'WARN'
 
             $result.Result = 'SUCCESS'
-            $newAccountCpmNote = if ([bool]$automaticManagement) { 'New account created with Automatic Password Management enabled; no manual Change/Reconcile action invoked by script.' } else { 'New account created with Automatic Password Management disabled; no manual Change/Reconcile action invoked by script.' }
-            $result.Message = "Device-type migration created new account. NewAccountID=$($newAccount.id). $newAccountCpmNote $sourceNote"
+            $newAccountCpmNote = if ([bool]$automaticManagement) { 'New account created with Automatic Password Management enabled; no manual Change action invoked by script; Reconcile is controlled by -Reconcile.' } else { 'New account created with Automatic Password Management disabled; no manual Change action invoked by script; Reconcile is controlled by -Reconcile.' }
+            $reconcileNote = if ($result.ReconcileRequested -eq 'Yes') { " ReconcileStatus=$($result.ReconcileStatus). $($result.ReconcileMessage)" } else { '' }
+            $result.Message = "Device-type migration created new account. NewAccountID=$($newAccount.id). $newAccountCpmNote $sourceNote$reconcileNote"
 
             return [pscustomobject]$result
         }
@@ -1978,6 +2109,11 @@ function Invoke-RowUpdate {
 
             $result.NewAccountID = $newAccount.id
 
+            $reconcileOutcome = Invoke-OptionalReconcile -AccountId $newAccount.id -Token $Token -Context 'SafeMoveCreate_TargetAccount' -IsCreatedAccount $true
+            $result.ReconcileRequested = $reconcileOutcome.Requested
+            $result.ReconcileStatus = $reconcileOutcome.Status
+            $result.ReconcileMessage = $reconcileOutcome.Message
+
             Add-RecreatedAccountRow -Row ([pscustomobject]@{
                 Row = $RowNumber
                 SourceAccountID = $current.id
@@ -1991,14 +2127,18 @@ function Invoke-RowUpdate {
                 SourceDeviceType = $currentDeviceType
                 TargetDeviceType = $targetDeviceType
                 NewAccountAutomaticManagement = if ([bool]$automaticManagement) { 'EnabledOnCreate' } else { 'DisabledOnCreate_NoImmediateCpmAction' }
+                ReconcileRequested = $result.ReconcileRequested
+                ReconcileStatus = $result.ReconcileStatus
+                ReconcileMessage = $result.ReconcileMessage
                 CreatedTime = (Get-Date -Format s)
             })
 
             try {
                 $deleteNote = Remove-SourceAccountAfterMove -AccountId $current.id -Token $Token
                 $result.Result = 'SUCCESS'
-                $newAccountCpmNote = if ([bool]$automaticManagement) { 'New account created with Automatic Password Management enabled; no manual Change/Reconcile action invoked by script.' } else { 'New account created with Automatic Password Management disabled; no manual Change/Reconcile action invoked by script.' }
-                $result.Message = "Created target Safe account. NewAccountID=$($newAccount.id). $newAccountCpmNote $deleteNote"
+                $newAccountCpmNote = if ([bool]$automaticManagement) { 'New account created with Automatic Password Management enabled; no manual Change action invoked by script; Reconcile is controlled by -Reconcile.' } else { 'New account created with Automatic Password Management disabled; no manual Change action invoked by script; Reconcile is controlled by -Reconcile.' }
+                $reconcileNote = if ($result.ReconcileRequested -eq 'Yes') { " ReconcileStatus=$($result.ReconcileStatus). $($result.ReconcileMessage)" } else { '' }
+                $result.Message = "Created target Safe account. NewAccountID=$($newAccount.id). $newAccountCpmNote $deleteNote$reconcileNote"
 
                 Add-DeleteCandidateRow -Row ([pscustomobject]@{
                     Row = $RowNumber
@@ -2050,8 +2190,14 @@ function Invoke-RowUpdate {
 
         Invoke-AccountPatch -AccountId $accountId -PatchOps $patchOps -Token $Token | Out-Null
 
+        $reconcileOutcome = Invoke-OptionalReconcile -AccountId $accountId -Token $Token -Context 'PatchAccount_InPlaceUpdate' -IsCreatedAccount $false
+        $result.ReconcileRequested = $reconcileOutcome.Requested
+        $result.ReconcileStatus = $reconcileOutcome.Status
+        $result.ReconcileMessage = $reconcileOutcome.Message
+
         $result.Result = 'SUCCESS'
-        $result.Message = "Patched account. Operation count=$($patchOps.Count)."
+        $reconcileNote = if ($result.ReconcileRequested -eq 'Yes') { " ReconcileStatus=$($result.ReconcileStatus). $($result.ReconcileMessage)" } else { '' }
+        $result.Message = "Patched account. Operation count=$($patchOps.Count).$reconcileNote"
 
         return [pscustomobject]$result
     }
@@ -2079,7 +2225,7 @@ function Start-AccountUpdateRun {
     }
 
     Write-RunLog 'Start-AccountUpdateRun' 'Device-type migration auto-detection is enabled. Source accounts are kept unless delete confirmation is explicitly supplied.' 'INFO'
-    Write-RunLog 'Start-AccountUpdateRun' "Duplicated/recreated target account default TargetAutomaticManagementEnabled=$TargetAutomaticManagementEnabled. CSV AutomaticManagementEnabled/DisableAutomaticManagement can override per row. No manual Change/Reconcile action is invoked by this script after create." 'WARN'
+    Write-RunLog 'Start-AccountUpdateRun' "Duplicated/recreated target account default TargetAutomaticManagementEnabled=$TargetAutomaticManagementEnabled. CSV AutomaticManagementEnabled/DisableAutomaticManagement can override per row. Reconcile=$Reconcile ReconcileScope=$ReconcileScope ReconcileFailureAction=$ReconcileFailureAction." 'WARN'
 
     Write-RunLog 'Start-AccountUpdateRun' "Using CSV file: $CsvFile" 'INFO'
 
