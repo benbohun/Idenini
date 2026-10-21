@@ -1,122 +1,69 @@
-#requires -version 5.1
-<#
-Targeted ASP.NET CS0016 repair for PAMHealthCheck on Windows Server.
-Run in elevated 64-bit Windows PowerShell 5.1.
-This file does not change the parent site, AIMWebService, global TEMP, or authentication.
-#>
+#requires -Version 5.1
 [CmdletBinding()]
 param(
-    [string]$PoolName = 'PAMHealthCheckPool',
-    [string]$SiteName = 'Default Web Site',
-    [string]$AppAlias = 'PAMHealthCheck',
-    [string]$WebRoot = 'C:\inetpub\PAMDailyHealthCheck',
-    [string]$DataRoot = 'C:\ProgramData\PAMDailyHealthCheck'
+    [Parameter(Mandatory=$true)]
+    [string[]]$AllowedIPs,
+    [string]$WebRoot = 'C:\inetpub\PAMDailyHealthCheck'
 )
-
 $ErrorActionPreference = 'Stop'
 
-function Invoke-Native {
-    param([string]$Executable, [string[]]$Arguments)
-    $results = & $Executable @Arguments 2>&1
-    $exitCode = $LASTEXITCODE
-    if ($exitCode -ne 0) {
-        throw ('Native command failed (exit ' + $exitCode + '): ' + $Executable + ' ' + ($Arguments -join ' ') + [Environment]::NewLine + ($results | Out-String))
-    }
-    return ($results | Out-String)
+function Assert-IPv4([string]$IP) {
+    $parsed = $null
+    if (-not [System.Net.IPAddress]::TryParse($IP, [ref]$parsed)) { throw "Invalid IP address: $IP" }
+    if ($parsed.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork) { throw "IPv4 address required: $IP" }
+    if ($IP -notmatch '^(?:\d{1,3}\.){3}\d{1,3}$') { throw "Use dotted-decimal IPv4 only: $IP" }
+    return $parsed.ToString()
 }
 
-function Grant-PoolModify {
-    param([string]$Directory, [string]$Principal)
-    if (-not (Test-Path -LiteralPath $Directory -PathType Container)) {
-        New-Item -ItemType Directory -Path $Directory -Force | Out-Null
-    }
-    $aclSpec = '{0}:(OI)(CI)M' -f $Principal
-    Invoke-Native -Executable "$env:windir\System32\icacls.exe" -Arguments @($Directory, '/grant', $aclSpec, '/T') | Out-Null
-}
-
-if (-not [Environment]::Is64BitProcess) {
-    throw 'This must run in 64-bit PowerShell. Open C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe as Administrator. Do not use SysWOW64 ISE.'
-}
-
-$principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
-if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    throw 'Run PowerShell as Administrator.'
-}
-
-$appCmd = Join-Path $env:windir 'System32\inetsrv\appcmd.exe'
 $webConfig = Join-Path $WebRoot 'web.config'
-$appId = $SiteName + '/' + $AppAlias
-$poolPrincipal = 'IIS APPPOOL\' + $PoolName
+$aspx = Join-Path $WebRoot 'Default.aspx'
+if (-not (Test-Path -LiteralPath $webConfig -PathType Leaf)) { throw "Missing $webConfig" }
+if (-not (Test-Path -LiteralPath $aspx -PathType Leaf)) { throw "Missing $aspx" }
 
-if (-not (Test-Path -LiteralPath $appCmd)) { throw 'IIS appcmd.exe not found.' }
-if (-not (Test-Path -LiteralPath $webConfig)) { throw ('Missing ' + $webConfig) }
-
-$appInfo = Invoke-Native -Executable $appCmd -Arguments @('list', 'app', $appId)
-if ($appInfo -notlike ('*applicationPool:' + $PoolName + '*')) {
-    throw ('The expected application pool was not found on this app: ' + $appInfo)
-}
-
-$poolInfo = Invoke-Native -Executable $appCmd -Arguments @('list', 'apppool', $PoolName, '/text:*')
-if ($poolInfo -notmatch 'identityType:"ApplicationPoolIdentity"') {
-    throw 'The pool is not using ApplicationPoolIdentity. No changes made.'
-}
+$normalized = @($AllowedIPs | ForEach-Object { $_ -split '[,;]' } | ForEach-Object { $_.Trim() } | Where-Object { $_ } | ForEach-Object { Assert-IPv4 $_ } | Select-Object -Unique)
+if ($normalized.Count -eq 0) { throw 'Provide at least one allowed IPv4 address.' }
 
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$backupDir = Join-Path $DataRoot ('ConfigBackups\CompilerRepair-' + $stamp)
-$tempDir = Join-Path $DataRoot 'CompilerWorkTemp'
-$compileDir = Join-Path $DataRoot ('CompilerOutput-' + $stamp)
+$backupDir = Join-Path 'C:\ProgramData\PAMDailyHealthCheck\ConfigBackups' ("UIAndIPs-$stamp")
+New-Item -Path $backupDir -ItemType Directory -ErrorAction Stop | Out-Null
+Copy-Item -LiteralPath $webConfig -Destination $backupDir -ErrorAction Stop
+Copy-Item -LiteralPath $aspx -Destination $backupDir -ErrorAction Stop
 
-New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
-Copy-Item -LiteralPath $webConfig -Destination (Join-Path $backupDir 'web.config') -Force
-Invoke-Native -Executable $appCmd -Arguments @('add', 'backup', ('PAMHC-' + $stamp)) | Out-Host
-
-try {
-    Grant-PoolModify -Directory $tempDir -Principal $poolPrincipal
-    Grant-PoolModify -Directory $compileDir -Principal $poolPrincipal
-
-    # Profile loading gives ASP.NET access to an isolated user profile.
-    Invoke-Native -Executable $appCmd -Arguments @('set', 'apppool', $PoolName, '/processModel.loadUserProfile:true') | Out-Host
-
-    # Scope TEMP and TMP to only this application pool, not the system.
-    # These are added to IIS applicationHost.config by appcmd.
-    $tempArg = '/+"[name=' + "'" + $PoolName + "'" + '].environmentVariables.[name=' + "'TEMP'" + ',value=' + "'" + $tempDir + "'" + ']"'
-    $tmpArg  = '/+"[name=' + "'" + $PoolName + "'" + '].environmentVariables.[name=' + "'TMP'" + ',value=' + "'" + $tempDir + "'" + ']"'
-
-    # Avoid duplicate variable insertion when rerun: inspect pool config first.
-    $latestPool = Invoke-Native -Executable $appCmd -Arguments @('list', 'apppool', $PoolName, '/text:*')
-    if ($latestPool -notmatch 'name:"TEMP"') {
-        Invoke-Native -Executable $appCmd -Arguments @('set', 'config', '-section:system.applicationHost/applicationPools', $tempArg, '/commit:apphost') | Out-Host
-    }
-    if ($latestPool -notmatch 'name:"TMP"') {
-        Invoke-Native -Executable $appCmd -Arguments @('set', 'config', '-section:system.applicationHost/applicationPools', $tmpArg, '/commit:apphost') | Out-Host
-    }
-
-    [xml]$doc = Get-Content -LiteralPath $webConfig -Raw
-    $root = $doc.DocumentElement
-    $systemWeb = $root.SelectSingleNode('system.web')
-    if ($null -eq $systemWeb) {
-        $systemWeb = $doc.CreateElement('system.web')
-        [void]$root.AppendChild($systemWeb)
-    }
-    $compilation = $systemWeb.SelectSingleNode('compilation')
-    if ($null -eq $compilation) {
-        $compilation = $doc.CreateElement('compilation')
-        [void]$systemWeb.AppendChild($compilation)
-    }
-    $compilation.SetAttribute('tempDirectory', $compileDir)
-    $doc.Save($webConfig)
-
-    Invoke-Native -Executable $appCmd -Arguments @('recycle', 'apppool', $PoolName) | Out-Host
-    Write-Host 'Completed targeted compilation repair.' -ForegroundColor Green
-    Write-Host ('Pool: ' + $PoolName)
-    Write-Host ('Work TEMP/TMP: ' + $tempDir)
-    Write-Host ('Compilation output: ' + $compileDir)
-    Write-Host ('Backup: ' + $backupDir)
-    Write-Host ('IIS backup: PAMHC-' + $stamp)
+# Update only this app's setting. No IIS site-wide authentication changes.
+[xml]$config = Get-Content -LiteralPath $webConfig -Raw -ErrorAction Stop
+$settings = $config.configuration.appSettings
+if ($null -eq $settings) { throw 'web.config has no appSettings section.' }
+$nodes = @($settings.SelectNodes("add[@key='DevAllowedClientIPs']"))
+if ($nodes.Count -gt 1) { throw 'Duplicate DevAllowedClientIPs keys found; correct manually.' }
+if ($nodes.Count -eq 0) {
+    $newItem = $config.CreateElement('add')
+    $newItem.SetAttribute('key','DevAllowedClientIPs')
+    $newItem.SetAttribute('value',($normalized -join ','))
+    [void]$settings.AppendChild($newItem)
+} else {
+    $nodes[0].SetAttribute('value',($normalized -join ','))
 }
-catch {
-    Write-Error ('Repair stopped: ' + $_.Exception.Message)
-    Write-Warning ('Backup is at ' + $backupDir)
-    Write-Warning ('IIS backup name: PAMHC-' + $stamp)
+
+# Replace only the completion button's inner text; preserve its behavior.
+$aspxText = [System.IO.File]::ReadAllText($aspx)
+$pattern = '(?s)(<button\b[^>]*\bvalue\s*=\s*[\x27\x22]Completed[\x27\x22][^>]*>).*?(</button>)'
+$matches = [regex]::Matches($aspxText, $pattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+if ($matches.Count -ne 1) { throw "Expected exactly one Completed button, found $($matches.Count). No changes made." }
+$updated = [regex]::Replace($aspxText, $pattern, '$1Complete &amp; Upload Evidence$2', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+
+# UTF-8 BOM helps legacy ASP.NET/Notepad consistently recognize encoding.
+$utf8 = New-Object System.Text.UTF8Encoding($true)
+try {
+    $config.Save($webConfig)
+    [System.IO.File]::WriteAllText($aspx, $updated, $utf8)
+} catch {
+    Copy-Item -LiteralPath (Join-Path $backupDir 'web.config') -Destination $webConfig -Force
+    Copy-Item -LiteralPath (Join-Path $backupDir 'Default.aspx') -Destination $aspx -Force
     throw
 }
+Write-Host 'Updated PAM Health Check settings successfully.' -ForegroundColor Green
+Write-Host ('Allowed IPs: ' + ($normalized -join ', '))
+Write-Host 'Button text: Complete & Upload Evidence'
+Write-Host ('Backup: ' + $backupDir)
+Write-Host 'Refresh the portal. Saving web.config normally restarts only this ASP.NET application.'
+Write-Warning 'DEV anonymous IP restriction is not an authentication substitute. Apply matching firewall/VIP restrictions.'
