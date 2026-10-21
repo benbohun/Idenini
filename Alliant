@@ -1,82 +1,70 @@
-
-# PAM Health Check - Temporary DEV Anonymous Access
-# Run as Administrator on the IIS server
-
-Import-Module WebAdministration -ErrorAction Stop
-
-$SiteName = "Default Web Site"
-$AppAlias = "PAMHealthCheck"
-$Location = "$SiteName/$AppAlias"
-
-# Locate installed application
-$App = Get-WebApplication -Site $SiteName |
-    Where-Object { $_.Path -eq "/$AppAlias" }
-
-if (-not $App) {
-    throw "PAMHealthCheck IIS application not found."
+$appcmd = Join-Path $env:windir 'System32\inetsrv\appcmd.exe'
+if (-not (Test-Path $appcmd)) { throw 'IIS appcmd.exe not found. Check IIS Web Server role installation.' }
+$location = "$SiteName/$AppAlias"
+function Invoke-AppCmd([string[]]$Arguments) {
+    $output = & $appcmd @Arguments 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "appcmd failed: $($Arguments -join ' ')`n$($output -join "`n")" }
+    return $output
 }
-
-$PhysicalPath = [Environment]::ExpandEnvironmentVariables(
-    $App.PhysicalPath
-)
-
-$WebConfig = Join-Path $PhysicalPath "web.config"
-
-if (-not (Test-Path $WebConfig)) {
-    throw "web.config not found: $WebConfig"
+# Confirm the exact IIS application exists; never touch AIMWebService.
+$appResult = Invoke-AppCmd -Arguments @('list','app',"$location/")
+if (-not ($appResult | Select-String -SimpleMatch 'APP ')) { throw "IIS application '$location/' was not found." }
+$virtualDir = Invoke-AppCmd -Arguments @('list','vdir',"$location/",'/text:physicalPath')
+$physical = [Environment]::ExpandEnvironmentVariables(($virtualDir | Select-Object -First 1).ToString().Trim().Trim('"'))
+if (-not [IO.Path]::IsPathRooted($physical)) { throw "Unexpected physical path: $physical" }
+$webConfig = Join-Path $physical 'web.config'
+if (-not (Test-Path -LiteralPath $webConfig)) { throw "Missing app web.config: $webConfig" }
+$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$backupFolder = Join-Path $env:ProgramData 'PAMDailyHealthCheck\ConfigBackups'
+New-Item -ItemType Directory -Path $backupFolder -Force | Out-Null
+$webBackup = Join-Path $backupFolder "web.config.$stamp.bak"
+Copy-Item -LiteralPath $webConfig -Destination $webBackup -ErrorAction Stop
+# Also back up the shared IIS applicationHost.config.
+Invoke-AppCmd -Arguments @('add','backup',"PAMHC-$stamp") | Out-Null
+# Change ASP.NET authentication specifically in the app web.config; preserve all other settings.
+[xml]$xml = Get-Content -LiteralPath $webConfig -Raw -ErrorAction Stop
+$systemWeb = $xml.configuration.'system.web'
+if ($null -eq $systemWeb) {
+    $systemWeb = $xml.CreateElement('system.web')
+    [void]$xml.configuration.AppendChild($systemWeb)
 }
-
-# Backup application configuration
-$Backup = "$WebConfig.bak-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
-Copy-Item $WebConfig $Backup -ErrorAction Stop
-
-Write-Host "Backup saved: $Backup"
-
-# Change ASP.NET authentication configuration
-[xml]$Config = Get-Content $WebConfig
-
-$SystemWeb = $Config.configuration.'system.web'
-
-if ($null -eq $SystemWeb) {
-    $SystemWeb = $Config.CreateElement("system.web")
-    [void]$Config.configuration.AppendChild($SystemWeb)
+$auth = $systemWeb.authentication
+if ($null -eq $auth) {
+    $auth = $xml.CreateElement('authentication')
+    [void]$systemWeb.AppendChild($auth)
 }
-
-$Authentication = $SystemWeb.authentication
-
-if ($null -eq $Authentication) {
-    $Authentication = $Config.CreateElement("authentication")
-    [void]$SystemWeb.AppendChild($Authentication)
+$auth.SetAttribute('mode', $(if ($Mode -eq 'Anonymous') {'None'} else {'Windows'}))
+$authorization = $systemWeb.authorization
+if ($Mode -eq 'Anonymous') {
+    if ($null -ne $authorization) { [void]$systemWeb.RemoveChild($authorization) }
+} else {
+    if ($null -eq $authorization) {
+        $authorization = $xml.CreateElement('authorization')
+        [void]$systemWeb.AppendChild($authorization)
+    }
+    # Preserve existing allow/deny group rules in Windows mode; do not loosen permissions.
 }
-
-$Authentication.SetAttribute("mode", "None")
-
-# Remove existing application authorization rules
-$Authorization = $SystemWeb.authorization
-
-if ($null -ne $Authorization) {
-    $SystemWeb.RemoveChild($Authorization) | Out-Null
+$xml.Save($webConfig)
+try {
+    # /commit:apphost stores scoped IIS auth override in applicationHost.config.
+    if ($Mode -eq 'Anonymous') {
+        Invoke-AppCmd -Arguments @('set','config',$location,'/section:system.webServer/security/authentication/windowsAuthentication','/enabled:false','/commit:apphost') | Out-Null
+        Invoke-AppCmd -Arguments @('set','config',$location,'/section:system.webServer/security/authentication/anonymousAuthentication','/enabled:true','/commit:apphost') | Out-Null
+    } else {
+        Invoke-AppCmd -Arguments @('set','config',$location,'/section:system.webServer/security/authentication/anonymousAuthentication','/enabled:false','/commit:apphost') | Out-Null
+        Invoke-AppCmd -Arguments @('set','config',$location,'/section:system.webServer/security/authentication/windowsAuthentication','/enabled:true','/commit:apphost') | Out-Null
+    }
+} catch {
+    Copy-Item -LiteralPath $webBackup -Destination $webConfig -Force
+    Write-Warning "web.config restored automatically; IIS backup PAMHC-$stamp can be restored separately with appcmd restore backup if authorized."
+    throw
 }
-
-$Config.Save($WebConfig)
-
-# Change IIS authentication for this application ONLY
-Set-WebConfigurationProperty `
-    -PSPath "MACHINE/WEBROOT/APPHOST" `
-    -Location $Location `
-    -Filter "system.webServer/security/authentication/windowsAuthentication" `
-    -Name enabled `
-    -Value $false
-
-Set-WebConfigurationProperty `
-    -PSPath "MACHINE/WEBROOT/APPHOST" `
-    -Location $Location `
-    -Filter "system.webServer/security/authentication/anonymousAuthentication" `
-    -Name enabled `
-    -Value $true
-
-Write-Host ""
-Write-Host "Temporary anonymous access enabled."
-Write-Host "Application: $Location"
-Write-Host "Existing AIMWebService configuration not intentionally changed."
-Write-Host "Restore authentication before production deployment."
+Write-Host "SUCCESS: $location configured for $Mode authentication" -ForegroundColor Green
+Write-Host "web.config backup: $webBackup"
+Write-Host "IIS backup name: PAMHC-$stamp"
+Write-Host 'Current IIS auth:'
+Invoke-AppCmd -Arguments @('list','config',$location,'/section:system.webServer/security/authentication/anonymousAuthentication') | Out-Host
+Invoke-AppCmd -Arguments @('list','config',$location,'/section:system.webServer/security/authentication/windowsAuthentication') | Out-Host
+if ($Mode -eq 'Anonymous') {
+    Write-Warning 'Anonymous access removes reliable operator identity. Keep approved test IP restrictions active and restore Windows mode before production.'
+}
