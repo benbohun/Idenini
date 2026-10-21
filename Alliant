@@ -1,102 +1,83 @@
 #requires -Version 5.1
 #requires -RunAsAdministrator
-<#
-.SYNOPSIS
-Repairs/changes PAMHealthCheck IIS authentication without WebAdministration COM calls.
-.EXAMPLE
-.\Fix-PAMHealthCheck-IIS.ps1 -Mode Windows
-.EXAMPLE
-.\Fix-PAMHealthCheck-IIS.ps1 -Mode Anonymous -ConfirmRestrictedNetwork
-NOTES: Anonymous mode is for isolated DEV testing only. First enforce approved source-IP restrictions at firewall/VIP.
-#>
 [CmdletBinding()]
 param(
-    [ValidateSet('Windows','Anonymous')][string]$Mode = 'Windows',
-    [string]$SiteName = 'Default Web Site',
-    [string]$AppAlias = 'PAMHealthCheck',
-    [switch]$ConfirmRestrictedNetwork
+ [Parameter(Mandatory=$true)][string[]]$AllowedClientIPs,
+ [string]$WebRoot='C:\inetpub\PAMDailyHealthCheck',
+ [string]$SiteName='Default Web Site',
+ [string]$AppAlias='PAMHealthCheck'
 )
-$ErrorActionPreference = 'Stop'
-if ($Mode -eq 'Anonymous' -and -not $ConfirmRestrictedNetwork) {
-    throw 'For anonymous mode, first restrict access at the firewall/VIP to approved DEV test IPs, then rerun with -ConfirmRestrictedNetwork. This flag confirms your action; the script cannot verify firewall restrictions.'
-}
-# Avoid 32-bit PowerShell and unsupported IIS COM registration entirely.
-if (-not [Environment]::Is64BitProcess) {
-    $ps64 = Join-Path $env:windir 'Sysnative\WindowsPowerShell\v1.0\powershell.exe'
-    if (-not (Test-Path $ps64)) { throw 'Cannot locate 64-bit Windows PowerShell.' }
-    $args64 = @('-NoProfile','-File',('"' + $PSCommandPath + '"'),'-Mode',$Mode,'-SiteName',('"' + $SiteName + '"'),'-AppAlias',('"' + $AppAlias + '"'))
-    if ($ConfirmRestrictedNetwork) { $args64 += '-ConfirmRestrictedNetwork' }
-    $p = Start-Process -FilePath $ps64 -ArgumentList $args64 -Wait -PassThru -NoNewWindow
-    if ($p.ExitCode -ne 0) { throw "64-bit execution failed (code $($p.ExitCode))." }
-    return
-}
-$appcmd = Join-Path $env:windir 'System32\inetsrv\appcmd.exe'
-if (-not (Test-Path $appcmd)) { throw 'IIS appcmd.exe not found. Check IIS Web Server role installation.' }
-$location = "$SiteName/$AppAlias"
-function Invoke-AppCmd([string[]]$Arguments) {
-    $output = & $appcmd @Arguments 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "appcmd failed: $($Arguments -join ' ')`n$($output -join "`n")" }
-    return $output
-}
-# Confirm the exact IIS application exists; never touch AIMWebService.
-$appResult = Invoke-AppCmd -Arguments @('list','app',"$location/")
-if (-not ($appResult | Select-String -SimpleMatch 'APP ')) { throw "IIS application '$location/' was not found." }
-$virtualDir = Invoke-AppCmd -Arguments @('list','vdir',"$location/",'/text:physicalPath')
-$physical = [Environment]::ExpandEnvironmentVariables(($virtualDir | Select-Object -First 1).ToString().Trim().Trim('"'))
-if (-not [IO.Path]::IsPathRooted($physical)) { throw "Unexpected physical path: $physical" }
-$webConfig = Join-Path $physical 'web.config'
-if (-not (Test-Path -LiteralPath $webConfig)) { throw "Missing app web.config: $webConfig" }
-$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$backupFolder = Join-Path $env:ProgramData 'PAMDailyHealthCheck\ConfigBackups'
-New-Item -ItemType Directory -Path $backupFolder -Force | Out-Null
-$webBackup = Join-Path $backupFolder "web.config.$stamp.bak"
-Copy-Item -LiteralPath $webConfig -Destination $webBackup -ErrorAction Stop
-# Also back up the shared IIS applicationHost.config.
-Invoke-AppCmd -Arguments @('add','backup',"PAMHC-$stamp") | Out-Null
-# Change ASP.NET authentication specifically in the app web.config; preserve all other settings.
-[xml]$xml = Get-Content -LiteralPath $webConfig -Raw -ErrorAction Stop
-$systemWeb = $xml.configuration.'system.web'
-if ($null -eq $systemWeb) {
-    $systemWeb = $xml.CreateElement('system.web')
-    [void]$xml.configuration.AppendChild($systemWeb)
-}
-$auth = $systemWeb.authentication
-if ($null -eq $auth) {
-    $auth = $xml.CreateElement('authentication')
-    [void]$systemWeb.AppendChild($auth)
-}
-$auth.SetAttribute('mode', $(if ($Mode -eq 'Anonymous') {'None'} else {'Windows'}))
-$authorization = $systemWeb.authorization
-if ($Mode -eq 'Anonymous') {
-    if ($null -ne $authorization) { [void]$systemWeb.RemoveChild($authorization) }
-} else {
-    if ($null -eq $authorization) {
-        $authorization = $xml.CreateElement('authorization')
-        [void]$systemWeb.AppendChild($authorization)
-    }
-    # Preserve existing allow/deny group rules in Windows mode; do not loosen permissions.
-}
-$xml.Save($webConfig)
+$ErrorActionPreference='Stop'
+if (-not [Environment]::Is64BitProcess) { throw 'Run from 64-bit Windows PowerShell 5.1 as Administrator.' }
+$ips=@($AllowedClientIPs | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+if ($ips.Count -eq 0) { throw 'Specify at least one client IP.' }
+foreach($addr in $ips){ $parsed=$null; if (-not [System.Net.IPAddress]::TryParse($addr,[ref]$parsed)) { throw "Invalid IP address: $addr. Use individual IPs, not CIDR ranges." } }
+$appcmd=Join-Path $env:windir 'System32\inetsrv\appcmd.exe'
+if (-not (Test-Path $appcmd)) { throw "IIS appcmd.exe not found: $appcmd" }
+$location="$SiteName/$AppAlias"
+$appOutput = & $appcmd list app "$location/" 2>&1
+if($LASTEXITCODE -ne 0 -or (-not ($appOutput -match '^APP '))) { throw "IIS application not found: $location. $appOutput" }
+$webconfig=Join-Path $WebRoot 'web.config'
+$page=Join-Path $WebRoot 'Default.aspx'
+if(-not (Test-Path $webconfig) -or -not (Test-Path $page)) { throw "Expected web.config and Default.aspx in $WebRoot. Supply -WebRoot if installed elsewhere." }
+$source=Get-Content $page -Raw
+$old='if (Context.User == null || !Context.User.Identity.IsAuthenticated) { Response.StatusCode=401; Response.End(); return; }'
+if (-not $source.Contains($old) -and -not $source.Contains('PAM_DEV_ANON_GUARD_V1')) { throw 'This Default.aspx does not match the supplied app version; no change made.' }
+$stamp=Get-Date -Format 'yyyyMMdd-HHmmss'
+$backup=Join-Path $env:ProgramData "PAMDailyHealthCheck\ConfigBackups\DEVRepair-$stamp"
+New-Item -ItemType Directory -Path $backup -Force | Out-Null
+Copy-Item $webconfig (Join-Path $backup 'web.config') -ErrorAction Stop
+Copy-Item $page (Join-Path $backup 'Default.aspx') -ErrorAction Stop
+Write-Host "Backup: $backup"
+$block=@'
+// PAM_DEV_ANON_GUARD_V1 - temporary DEV-only allowlist, NOT individual authentication.
+      if (Context.User == null || !Context.User.Identity.IsAuthenticated) {
+        string allowed = System.Configuration.ConfigurationManager.AppSettings["DevAllowedClientIPs"] ?? "";
+        string remoteIp = Request.UserHostAddress ?? "";
+        bool permitted = allowed.Split(new char[]{','}, StringSplitOptions.RemoveEmptyEntries)
+          .Any(ip => String.Equals(ip.Trim(), remoteIp, StringComparison.OrdinalIgnoreCase));
+        if (!Request.IsSecureConnection || !permitted) {
+          Response.StatusCode = 403;
+          Response.Write("DEV access denied: HTTPS and an explicitly allowed client IP are required.");
+          Context.ApplicationInstance.CompleteRequest(); return;
+        }
+        var identity = new System.Security.Principal.GenericIdentity("DEV-ANONYMOUS-IP-" + remoteIp, "DevAnonymous");
+        var principal = new System.Security.Principal.GenericPrincipal(identity, new string[0]);
+        Context.User = principal;
+        System.Threading.Thread.CurrentPrincipal = principal;
+      }
+'@
 try {
-    # /commit:apphost stores scoped IIS auth override in applicationHost.config.
-    if ($Mode -eq 'Anonymous') {
-        Invoke-AppCmd -Arguments @('set','config',$location,'/section:system.webServer/security/authentication/windowsAuthentication','/enabled:false','/commit:apphost') | Out-Null
-        Invoke-AppCmd -Arguments @('set','config',$location,'/section:system.webServer/security/authentication/anonymousAuthentication','/enabled:true','/commit:apphost') | Out-Null
-    } else {
-        Invoke-AppCmd -Arguments @('set','config',$location,'/section:system.webServer/security/authentication/anonymousAuthentication','/enabled:false','/commit:apphost') | Out-Null
-        Invoke-AppCmd -Arguments @('set','config',$location,'/section:system.webServer/security/authentication/windowsAuthentication','/enabled:true','/commit:apphost') | Out-Null
-    }
+ if (-not $source.Contains('PAM_DEV_ANON_GUARD_V1')) {
+   $source=$source.Replace($old,$block.TrimEnd())
+   [System.IO.File]::WriteAllText($page,$source,(New-Object System.Text.UTF8Encoding($false)))
+ }
+ [xml]$xml=Get-Content -LiteralPath $webconfig -Raw
+ $root=$xml.configuration
+ $settings=$root.appSettings
+ if($null -eq $settings){ $settings=$xml.CreateElement('appSettings'); [void]$root.PrependChild($settings) }
+ $entry=@($settings.add | Where-Object { $_.GetAttribute('key') -eq 'DevAllowedClientIPs' }) | Select-Object -First 1
+ if($null -eq $entry){ $entry=$xml.CreateElement('add');$entry.SetAttribute('key','DevAllowedClientIPs');[void]$settings.AppendChild($entry) }
+ $entry.SetAttribute('value',($ips -join ','))
+ $sys=$root.'system.web'
+ if($null -eq $sys) { throw 'Missing system.web configuration.' }
+ $auth=$sys.authentication
+ if($null -eq $auth){$auth=$xml.CreateElement('authentication');[void]$sys.AppendChild($auth)}
+ $auth.SetAttribute('mode','None')
+ if($null -ne $sys.authorization){[void]$sys.RemoveChild($sys.authorization)}
+ $xml.Save($webconfig)
+ # Only edit application-scoped authentication; never the Default Web Site itself.
+ $output=& $appcmd set config $location '/section:system.webServer/security/authentication/windowsAuthentication' '/enabled:false' '/commit:apphost' 2>&1
+ if($LASTEXITCODE -ne 0){throw "IIS Windows auth configuration failed: $output"}
+ $output=& $appcmd set config $location '/section:system.webServer/security/authentication/anonymousAuthentication' '/enabled:true' '/commit:apphost' 2>&1
+ if($LASTEXITCODE -ne 0){throw "IIS anonymous auth configuration failed: $output"}
+ Write-Host "Configured DEV-only access for: $($ips -join ', ')" -ForegroundColor Green
+ Write-Host "Application: $location"
+ Write-Host 'Open the portal over HTTPS from an allowed IP. Other clients are denied at the application layer.'
+ Write-Warning 'Configure an independent firewall/VIP IP allowlist as well. The application audit will say DEV-ANONYMOUS-IP-... instead of recording an authenticated individual. Restore Windows authentication for production.'
 } catch {
-    Copy-Item -LiteralPath $webBackup -Destination $webConfig -Force
-    Write-Warning "web.config restored automatically; IIS backup PAMHC-$stamp can be restored separately with appcmd restore backup if authorized."
-    throw
-}
-Write-Host "SUCCESS: $location configured for $Mode authentication" -ForegroundColor Green
-Write-Host "web.config backup: $webBackup"
-Write-Host "IIS backup name: PAMHC-$stamp"
-Write-Host 'Current IIS auth:'
-Invoke-AppCmd -Arguments @('list','config',$location,'/section:system.webServer/security/authentication/anonymousAuthentication') | Out-Host
-Invoke-AppCmd -Arguments @('list','config',$location,'/section:system.webServer/security/authentication/windowsAuthentication') | Out-Host
-if ($Mode -eq 'Anonymous') {
-    Write-Warning 'Anonymous access removes reliable operator identity. Keep approved test IP restrictions active and restore Windows mode before production.'
+ Copy-Item (Join-Path $backup 'web.config') $webconfig -Force
+ Copy-Item (Join-Path $backup 'Default.aspx') $page -Force
+ Write-Warning 'Application files restored. IIS authentication may need restoring to Windows mode if it was partially changed.'
+ throw
 }
