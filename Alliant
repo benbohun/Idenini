@@ -1,128 +1,194 @@
-#Requires -Version 5.1
-<#
-.SYNOPSIS
-  Diagnoses persistent CS0016 for PAMHealthCheck without changing AIMWebService.
-.DESCRIPTION
-  Default mode is read-only. -Apply creates a fresh private ASP.NET compilation
-  directory, grants only the IIS application pool identity Modify to that directory,
-  and changes only PAMHealthCheck/web.config. Backs up web.config and ACL report.
-  Never edits Windows Temp ACLs, security products, IIS auth, or other app pools.
-.EXAMPLE
-  .\Repair-PAMHealthCheck-Deep-CS0016.ps1
-.EXAMPLE
-  .\Repair-PAMHealthCheck-Deep-CS0016.ps1 -Apply
-#>
-[CmdletBinding()]
-param(
- [switch]$Apply,
- [string]$WebRoot = 'C:\inetpub\PAMDailyHealthCheck',
- [string]$PoolName = 'PAMHealthCheckPool',
- [string]$DataRoot = 'C:\ProgramData\PAMDailyHealthCheck'
-)
-$ErrorActionPreference='Stop'
-$logDir = Join-Path $DataRoot 'Diagnostics'
-New-Item -ItemType Directory -Path $logDir -Force | Out-Null
-$stamp=Get-Date -Format 'yyyyMMdd-HHmmss'
-$report=Join-Path $logDir "Deep-CS0016-$stamp.txt"
-Start-Transcript -Path $report -Force | Out-Null
-function Section($name) { Write-Host "`n==== $name ====" -ForegroundColor Cyan }
-function Show-Acls($path) {
- Write-Host "Path: $path"
- if (Test-Path -LiteralPath $path) {
-  & "$env:WINDIR\System32\icacls.exe" $path 2>&1 | Out-Host
-  try { $a=Get-Acl -LiteralPath $path; Write-Host "Owner: $($a.Owner) InheritanceProtected: $($a.AreAccessRulesProtected)";
-    $a.Access | Where-Object {$_.AccessControlType -eq 'Deny'} | Format-Table IdentityReference,FileSystemRights,IsInherited -AutoSize | Out-Host
-  } catch { Write-Warning $_.Exception.Message }
- } else { Write-Warning 'Path absent' }
-}
-function Get-ToolPath($name) {
- $native=Join-Path $env:WINDIR "System32\inetsrv\$name"
- if (Test-Path $native) { return $native }
- $sysnative=Join-Path $env:WINDIR "Sysnative\inetsrv\$name"
- if (Test-Path $sysnative) { return $sysnative }
- return $null
-}
-try {
- Section 'Environment'
- Write-Host "Computer=$env:COMPUTERNAME User=$env:USERNAME 64bit=$([Environment]::Is64BitProcess) PS=$($PSVersionTable.PSVersion)"
- $configPath=Join-Path $WebRoot 'web.config'
- if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) { throw "Missing $configPath" }
- [xml]$xml=Get-Content -LiteralPath $configPath -Raw
- $comp=$xml.SelectSingleNode('/configuration/system.web/compilation')
- $compilePath = if ($comp) {$comp.GetAttribute('tempDirectory')} else {''}
- Write-Host "WebRoot=$WebRoot"
- Write-Host "ConfiguredCompilationDir=$compilePath"
- Write-Host "Machine TEMP=$([Environment]::GetEnvironmentVariable('TEMP','Machine'))"
- Write-Host "Machine TMP=$([Environment]::GetEnvironmentVariable('TMP','Machine'))"
- Section 'IIS app pool settings'
- $appcmd=Get-ToolPath 'appcmd.exe'
- if ($appcmd) {
-  & $appcmd list app "Default Web Site/PAMHealthCheck" 2>&1 | Out-Host
-  & $appcmd list apppool "$PoolName" /text:* 2>&1 | Out-Host
- } else { Write-Warning 'appcmd unavailable; cannot verify pool identity.' }
- Section 'ACL inspection (read-only)'
- Show-Acls $WebRoot
- Show-Acls $DataRoot
- if ($compilePath) { Show-Acls $compilePath; Show-Acls (Join-Path $compilePath 'pamhealthcheck') }
- Show-Acls (Join-Path $env:WINDIR 'Temp')
- Show-Acls (Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\Temporary ASP.NET Files')
- Section 'ASP.NET impersonation'
- $identityNode=$xml.SelectSingleNode('/configuration/system.web/identity')
- if ($identityNode) {Write-Host "impersonate=$($identityNode.GetAttribute('impersonate'))"} else { Write-Host 'No explicit ASP.NET impersonation' }
- Section 'Current compilation failures'
- try {
-  Get-WinEvent -FilterHashtable @{LogName='Application'; StartTime=(Get-Date).AddHours(-4)} -ErrorAction Stop |
-    Where-Object {$_.ProviderName -eq 'ASP.NET 4.0.30319.0' -and $_.Id -eq 1310 -and $_.Message -match '/PAMHealthCheck'} |
-    Select-Object -First 5 TimeCreated, @{N='Failure';E={if ($_.Message -match '(?s)Exception message: (.*?)(?:\s+at System\.Web|\s+Request information:)') {$matches[1]} else {$_.Message.Substring(0,[Math]::Min(800,$_.Message.Length))}}} |
-    Format-List | Out-Host
- } catch {Write-Warning "Could not query events: $($_.Exception.Message)"}
- Section 'Security policy signals (read-only)'
- foreach ($reg in @('HKLM:\SOFTWARE\Policies\Microsoft\Windows\Safer\CodeIdentifiers','HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy')) {
-  Write-Host "$reg present: $(Test-Path $reg)"
- }
- try { Get-MpPreference -ErrorAction Stop | Select-Object -ExpandProperty EnableControlledFolderAccess | Out-Host } catch {Write-Host 'Microsoft Defender configuration not available (other endpoint controls may still apply).'}
- if ($Apply) {
-  Section 'Scoped remediation'
-  $me=[Security.Principal.WindowsIdentity]::GetCurrent()
-  $wp=New-Object Security.Principal.WindowsPrincipal($me)
-  if (-not $wp.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {throw 'Apply requires elevated PowerShell.'}
-  if (-not $appcmd) {throw 'Cannot safely verify IIS application and pool without appcmd.'}
-  $appText=(& $appcmd list app 'Default Web Site/PAMHealthCheck' 2>&1 | Out-String)
-  $poolText=(& $appcmd list apppool "$PoolName" /text:* 2>&1 | Out-String)
-  if ($LASTEXITCODE -ne 0 -or $appText -notmatch [regex]::Escape('Default Web Site/PAMHealthCheck') -or $appText -notmatch [regex]::Escape("applicationPool:$PoolName")) {throw 'Application/pool mismatch; refusing to change settings.'}
-  if ($poolText -notmatch '(?im)^\s*processModel\.identityType:\s*ApplicationPoolIdentity\s*$') {
-   throw 'Pool identity is not confirmed as ApplicationPoolIdentity. Review diagnostic output; no changes made.'
-  }
-  $base=Join-Path $DataRoot 'ASPNetCompile-Isolated'
-  $fresh=Join-Path $base "compile-$stamp"
-  $backup=Join-Path $logDir "web.config-$stamp.bak"
-  Copy-Item -LiteralPath $configPath -Destination $backup -ErrorAction Stop
-  Write-Host "web.config backup=$backup"
-  New-Item -ItemType Directory -Path $fresh -Force -ErrorAction Stop | Out-Null
-  $principal="IIS APPPOOL\$PoolName"
-  & "$env:WINDIR\System32\icacls.exe" $fresh /grant "${principal}:(OI)(CI)M" 2>&1 | Out-Host
-  if ($LASTEXITCODE -ne 0) {throw 'icacls grant failed; web.config unchanged.'}
-  # Parent must be traversable; existing inherited denies are reported above and not removed.
-  Show-Acls $fresh
-  if (-not $comp) {
-    $sw=$xml.SelectSingleNode('/configuration/system.web')
-    if (-not $sw) {throw 'system.web missing; refuse to rewrite config.'}
-    $comp=$xml.CreateElement('compilation')
-    [void]$sw.AppendChild($comp)
-  }
-  $comp.SetAttribute('tempDirectory',$fresh)
-  try {$xml.Save($configPath)} catch {Copy-Item $backup $configPath -Force; throw}
-  Write-Host "Compilation redirected to $fresh" -ForegroundColor Green
-  Write-Host 'Only web.config and private compilation folder were changed. No IISRESET performed.'
-  Write-Host 'If CS0016 persists, investigate C:\Windows\Temp or endpoint/application-control denials using ProcMon with security team.' -ForegroundColor Yellow
- }
- Section 'Result'
- Write-Host "Report=$report"
- if (-not $Apply) { Write-Host 'Read-only check complete. Re-run with -Apply only after reviewing findings.' }
-} catch {
- Write-Host "FAILED: $($_.Exception.Message)" -ForegroundColor Red
- throw
-} finally {
- Stop-Transcript | Out-Null
- Write-Host "Saved diagnostic transcript: $report"
-}
+**********************
+Windows PowerShell transcript start
+Start time: 20261021173702
+Username: CNAW2K\CAG1896a
+RunAs User: CNAW2K\CAG1896a
+Configuration Name: 
+Machine: VSKAU1P1216 (Microsoft Windows NT 10.0.17763.0)
+Host Application: C:\windows\syswow64\WindowsPowerShell\v1.0\PowerShell_ISE.exe
+Process ID: 1920
+PSVersion: 5.1.17763.9245
+PSEdition: Desktop
+PSCompatibleVersions: 1.0, 2.0, 3.0, 4.0, 5.0, 5.1.17763.9245
+BuildVersion: 10.0.17763.9245
+CLRVersion: 4.0.30319.42000
+WSManStackVersion: 3.0
+PSRemotingProtocolVersion: 2.3
+SerializationVersion: 1.1.0.1
+**********************
+
+==== Environment ====
+Computer=VSKAU1P1216 User=CAG1896a 64bit=False PS=5.1.17763.9245
+WebRoot=C:\inetpub\PAMDailyHealthCheck
+ConfiguredCompilationDir=C:\ProgramData\PAMDailyHealthCheck\AspNetCompilationTemp
+Machine TEMP=C:\windows\TEMP
+Machine TMP=C:\windows\TEMP
+
+==== IIS app pool settings ====
+APP "Default Web Site/PAMHealthCheck" (applicationPool:PAMHealthCheckPool)
+APPPOOL
+  APPPOOL.NAME:"PAMHealthCheckPool"
+  PipelineMode:"Integrated"
+  RuntimeVersion:"v4.0"
+  state:"Started"
+  [add]
+    name:"PAMHealthCheckPool"
+    queueLength:"1000"
+    autoStart:"true"
+    enable32BitAppOnWin64:"false"
+    managedRuntimeVersion:"v4.0"
+    managedRuntimeLoader:"webengine4.dll"
+    enableConfigurationOverride:"true"
+    managedPipelineMode:"Integrated"
+    CLRConfigFile:""
+    passAnonymousToken:"true"
+    startMode:"OnDemand"
+    [processModel]
+      identityType:"ApplicationPoolIdentity"
+      userName:""
+      password:""
+      requestQueueDelegatorIdentity:""
+      loadUserProfile:"false"
+      setProfileEnvironment:"true"
+      logonType:"LogonBatch"
+      manualGroupMembership:"false"
+      idleTimeout:"00:20:00"
+      idleTimeoutAction:"Terminate"
+      maxProcesses:"1"
+      shutdownTimeLimit:"00:01:30"
+      startupTimeLimit:"00:01:30"
+      pingingEnabled:"true"
+      pingInterval:"00:00:30"
+      pingResponseTime:"00:01:30"
+      logEventOnProcessModel:"IdleTimeout"
+    [recycling]
+      disallowOverlappingRotation:"false"
+      disallowRotationOnConfigChange:"false"
+      logEventOnRecycle:"Time, Requests, Schedule, Memory, IsapiUnhealthy, OnDemand, ConfigChange, PrivateMemory"
+      [periodicRestart]
+        memory:"0"
+        privateMemory:"0"
+        requests:"0"
+        time:"1.05:00:00"
+        [schedule]
+    [failure]
+      loadBalancerCapabilities:"HttpLevel"
+      orphanWorkerProcess:"false"
+      orphanActionExe:""
+      orphanActionParams:""
+      rapidFailProtection:"true"
+      rapidFailProtectionInterval:"00:05:00"
+      rapidFailProtectionMaxCrashes:"5"
+      autoShutdownExe:""
+      autoShutdownParams:""
+    [cpu]
+      limit:"0"
+      action:"NoAction"
+      resetInterval:"00:05:00"
+      smpAffinitized:"false"
+      smpProcessorAffinityMask:"4294967295"
+      smpProcessorAffinityMask2:"4294967295"
+      processorGroup:"0"
+      numaNodeAssignment:"MostAvailableMemory"
+      numaNodeAffinityMode:"Soft"
+    [environmentVariables]
+
+==== ACL inspection (read-only) ====
+Path: C:\inetpub\PAMDailyHealthCheck
+C:\inetpub\PAMDailyHealthCheck IIS APPPOOL\PAMHealthCheckPool:(OI)(CI)(RX)
+                               BUILTIN\Administrators:(OI)(CI)(F)
+                               NT AUTHORITY\SYSTEM:(OI)(CI)(F)
+
+Successfully processed 1 files; Failed processing 0 files
+Owner: BUILTIN\Administrators InheritanceProtected: True
+Path: C:\ProgramData\PAMDailyHealthCheck
+C:\ProgramData\PAMDailyHealthCheck IIS APPPOOL\PAMHealthCheckPool:(OI)(CI)(M)
+                                   BUILTIN\Administrators:(OI)(CI)(F)
+                                   NT AUTHORITY\SYSTEM:(OI)(CI)(F)
+
+Successfully processed 1 files; Failed processing 0 files
+Owner: BUILTIN\Administrators InheritanceProtected: True
+Path: C:\ProgramData\PAMDailyHealthCheck\AspNetCompilationTemp
+C:\ProgramData\PAMDailyHealthCheck\AspNetCompilationTemp IIS APPPOOL\PAMHealthCheckPool:(OI)(CI)(M)
+                                                         IIS APPPOOL\PAMHealthCheckPool:(I)(OI)(CI)(M)
+                                                         BUILTIN\Administrators:(I)(OI)(CI)(F)
+                                                         NT AUTHORITY\SYSTEM:(I)(OI)(CI)(F)
+
+Successfully processed 1 files; Failed processing 0 files
+Owner: BUILTIN\Administrators InheritanceProtected: False
+Path: C:\ProgramData\PAMDailyHealthCheck\AspNetCompilationTemp\pamhealthcheck
+C:\ProgramData\PAMDailyHealthCheck\AspNetCompilationTemp\pamhealthcheck IIS APPPOOL\PAMHealthCheckPool:(OI)(CI)(M)
+                                                                        IIS APPPOOL\PAMHealthCheckPool:(I)(OI)(CI)(M)
+                                                                        BUILTIN\Administrators:(I)(OI)(CI)(F)
+                                                                        NT AUTHORITY\SYSTEM:(I)(OI)(CI)(F)
+
+Successfully processed 1 files; Failed processing 0 files
+Owner: IIS APPPOOL\PAMHealthCheckPool InheritanceProtected: False
+Path: C:\windows\Temp
+C:\windows\Temp NT AUTHORITY\SYSTEM:(OI)(CI)(S,RD)
+                BUILTIN\IIS_IUSRS:(OI)(CI)(S,RD)
+                VSKAU1P1216\PLAID:(OI)(CI)(F)
+                NT SERVICE\TrustedInstaller:(I)(F)
+                NT SERVICE\TrustedInstaller:(I)(CI)(IO)(F)
+                NT AUTHORITY\SYSTEM:(I)(F)
+                NT AUTHORITY\SYSTEM:(I)(OI)(CI)(IO)(F)
+                BUILTIN\Administrators:(I)(F)
+                BUILTIN\Administrators:(I)(OI)(CI)(IO)(F)
+                BUILTIN\Users:(I)(RX)
+                BUILTIN\Users:(I)(OI)(CI)(IO)(GR,GE)
+                CREATOR OWNER:(I)(OI)(CI)(IO)(F)
+                APPLICATION PACKAGE AUTHORITY\ALL APPLICATION PACKAGES:(I)(RX)
+                APPLICATION PACKAGE AUTHORITY\ALL APPLICATION PACKAGES:(I)(OI)(CI)(IO)(GR,GE)
+                APPLICATION PACKAGE AUTHORITY\ALL RESTRICTED APPLICATION PACKAGES:(I)(RX)
+                APPLICATION PACKAGE AUTHORITY\ALL RESTRICTED APPLICATION PACKAGES:(I)(OI)(CI)(IO)(GR,GE)
+
+Successfully processed 1 files; Failed processing 0 files
+Owner: BUILTIN\Administrators InheritanceProtected: False
+Path: C:\windows\Microsoft.NET\Framework64\v4.0.30319\Temporary ASP.NET Files
+C:\windows\Microsoft.NET\Framework64\v4.0.30319\Temporary ASP.NET Files NT AUTHORITY\SYSTEM:(F)
+                                                                        CREATOR OWNER:(OI)(CI)(IO)(F)
+                                                                        NT AUTHORITY\SYSTEM:(OI)(CI)(F)
+                                                                        BUILTIN\Administrators:(OI)(CI)(F)
+                                                                        BUILTIN\IIS_IUSRS:(OI)(CI)(M,DC)
+                                                                        BUILTIN\Users:(RX)
+                                                                        BUILTIN\Users:(OI)(CI)(IO)(GR,GE)
+
+Successfully processed 1 files; Failed processing 0 files
+Owner: NT AUTHORITY\SYSTEM InheritanceProtected: True
+
+==== ASP.NET impersonation ====
+No explicit ASP.NET impersonation
+
+==== Current compilation failures ====
+
+
+TimeCreated : 10/21/2026 5:32:26 PM
+Failure     : (0): error CS0016: Could not write to output file 'c:\ProgramData\PAMDailyHealthCheck\AspNetCompilationTemp\pamhealthcheck\8081f22f\4c7f02c\App_Web_default.aspx.cdcab7d2.682lonfv.dll' -- 'Access is denied. '
+
+TimeCreated : 10/21/2026 5:28:47 PM
+Failure     : (0): error CS0016: Could not write to output file 'c:\ProgramData\PAMDailyHealthCheck\AspNetCompilationTemp\pamhealthcheck\8081f22f\4c7f02c\App_Web_default.aspx.cdcab7d2.ms4pruhe.dll' -- 'Access is denied. '
+
+TimeCreated : 10/21/2026 5:25:33 PM
+Failure     : (0): error CS0016: Could not write to output file 'c:\Windows\Microsoft.NET\Framework64\v4.0.30319\Temporary ASP.NET Files\pamhealthcheck\8081f22f\4c7f02c\App_Web_default.aspx.cdcab7d2.wifuh80b.dll' -- 'Access is denied. '
+
+TimeCreated : 10/21/2026 5:24:05 PM
+Failure     : (0): error CS0016: Could not write to output file 'c:\Windows\Microsoft.NET\Framework64\v4.0.30319\Temporary ASP.NET Files\pamhealthcheck\8081f22f\4c7f02c\App_Web_default.aspx.cdcab7d2.7slhlddk.dll' -- 'Access is denied. '
+
+TimeCreated : 10/21/2026 5:17:54 PM
+Failure     : (0): error CS0016: Could not write to output file 'c:\Windows\Microsoft.NET\Framework64\v4.0.30319\Temporary ASP.NET Files\pamhealthcheck\8081f22f\4c7f02c\App_Web_default.aspx.cdcab7d2.lhaxugft.dll' -- 'Access is denied. '
+
+
+
+
+==== Security policy signals (read-only) ====
+HKLM:\SOFTWARE\Policies\Microsoft\Windows\Safer\CodeIdentifiers present: True
+HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy present: True
+Microsoft Defender configuration not available (other endpoint controls may still apply).
+
+==== Result ====
+Report=C:\ProgramData\PAMDailyHealthCheck\Diagnostics\Deep-CS0016-20261021-173702.txt
+Read-only check complete. Re-run with -Apply only after reviewing findings.
+**********************
+Windows PowerShell transcript end
+End time: 20261021173703
+**********************
