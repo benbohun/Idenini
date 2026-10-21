@@ -1,83 +1,20 @@
 #requires -Version 5.1
-#requires -RunAsAdministrator
 [CmdletBinding()]
-param(
- [Parameter(Mandatory=$true)][string[]]$AllowedClientIPs,
- [string]$WebRoot='C:\inetpub\PAMDailyHealthCheck',
- [string]$SiteName='Default Web Site',
- [string]$AppAlias='PAMHealthCheck'
-)
-$ErrorActionPreference='Stop'
-if (-not [Environment]::Is64BitProcess) { throw 'Run from 64-bit Windows PowerShell 5.1 as Administrator.' }
-$ips=@($AllowedClientIPs | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-if ($ips.Count -eq 0) { throw 'Specify at least one client IP.' }
-foreach($addr in $ips){ $parsed=$null; if (-not [System.Net.IPAddress]::TryParse($addr,[ref]$parsed)) { throw "Invalid IP address: $addr. Use individual IPs, not CIDR ranges." } }
+param([string]$SiteName='Default Web Site',[string]$AppAlias='PAMHealthCheck',[int]$Minutes=45)
+$ErrorActionPreference='Continue'
+$dest=Join-Path $env:ProgramData ('PAMDailyHealthCheck\Diagnostics\PAM-'+(Get-Date -Format 'yyyyMMdd-HHmmss')+'.txt')
+New-Item -ItemType Directory -Path (Split-Path $dest) -Force | Out-Null
+function Section([string]$name,[scriptblock]$body){"`r`n==== $name ====" | Out-File $dest -Append -Encoding UTF8; try {& $body 2>&1 | Out-String -Width 280 | Out-File $dest -Append -Encoding UTF8}catch{($_|Out-String)|Out-File $dest -Append}}
 $appcmd=Join-Path $env:windir 'System32\inetsrv\appcmd.exe'
-if (-not (Test-Path $appcmd)) { throw "IIS appcmd.exe not found: $appcmd" }
-$location="$SiteName/$AppAlias"
-$appOutput = & $appcmd list app "$location/" 2>&1
-if($LASTEXITCODE -ne 0 -or (-not ($appOutput -match '^APP '))) { throw "IIS application not found: $location. $appOutput" }
-$webconfig=Join-Path $WebRoot 'web.config'
-$page=Join-Path $WebRoot 'Default.aspx'
-if(-not (Test-Path $webconfig) -or -not (Test-Path $page)) { throw "Expected web.config and Default.aspx in $WebRoot. Supply -WebRoot if installed elsewhere." }
-$source=Get-Content $page -Raw
-$old='if (Context.User == null || !Context.User.Identity.IsAuthenticated) { Response.StatusCode=401; Response.End(); return; }'
-if (-not $source.Contains($old) -and -not $source.Contains('PAM_DEV_ANON_GUARD_V1')) { throw 'This Default.aspx does not match the supplied app version; no change made.' }
-$stamp=Get-Date -Format 'yyyyMMdd-HHmmss'
-$backup=Join-Path $env:ProgramData "PAMDailyHealthCheck\ConfigBackups\DEVRepair-$stamp"
-New-Item -ItemType Directory -Path $backup -Force | Out-Null
-Copy-Item $webconfig (Join-Path $backup 'web.config') -ErrorAction Stop
-Copy-Item $page (Join-Path $backup 'Default.aspx') -ErrorAction Stop
-Write-Host "Backup: $backup"
-$block=@'
-// PAM_DEV_ANON_GUARD_V1 - temporary DEV-only allowlist, NOT individual authentication.
-      if (Context.User == null || !Context.User.Identity.IsAuthenticated) {
-        string allowed = System.Configuration.ConfigurationManager.AppSettings["DevAllowedClientIPs"] ?? "";
-        string remoteIp = Request.UserHostAddress ?? "";
-        bool permitted = allowed.Split(new char[]{','}, StringSplitOptions.RemoveEmptyEntries)
-          .Any(ip => String.Equals(ip.Trim(), remoteIp, StringComparison.OrdinalIgnoreCase));
-        if (!Request.IsSecureConnection || !permitted) {
-          Response.StatusCode = 403;
-          Response.Write("DEV access denied: HTTPS and an explicitly allowed client IP are required.");
-          Context.ApplicationInstance.CompleteRequest(); return;
-        }
-        var identity = new System.Security.Principal.GenericIdentity("DEV-ANONYMOUS-IP-" + remoteIp, "DevAnonymous");
-        var principal = new System.Security.Principal.GenericPrincipal(identity, new string[0]);
-        Context.User = principal;
-        System.Threading.Thread.CurrentPrincipal = principal;
-      }
-'@
-try {
- if (-not $source.Contains('PAM_DEV_ANON_GUARD_V1')) {
-   $source=$source.Replace($old,$block.TrimEnd())
-   [System.IO.File]::WriteAllText($page,$source,(New-Object System.Text.UTF8Encoding($false)))
- }
- [xml]$xml=Get-Content -LiteralPath $webconfig -Raw
- $root=$xml.configuration
- $settings=$root.appSettings
- if($null -eq $settings){ $settings=$xml.CreateElement('appSettings'); [void]$root.PrependChild($settings) }
- $entry=@($settings.add | Where-Object { $_.GetAttribute('key') -eq 'DevAllowedClientIPs' }) | Select-Object -First 1
- if($null -eq $entry){ $entry=$xml.CreateElement('add');$entry.SetAttribute('key','DevAllowedClientIPs');[void]$settings.AppendChild($entry) }
- $entry.SetAttribute('value',($ips -join ','))
- $sys=$root.'system.web'
- if($null -eq $sys) { throw 'Missing system.web configuration.' }
- $auth=$sys.authentication
- if($null -eq $auth){$auth=$xml.CreateElement('authentication');[void]$sys.AppendChild($auth)}
- $auth.SetAttribute('mode','None')
- if($null -ne $sys.authorization){[void]$sys.RemoveChild($sys.authorization)}
- $xml.Save($webconfig)
- # Only edit application-scoped authentication; never the Default Web Site itself.
- $output=& $appcmd set config $location '/section:system.webServer/security/authentication/windowsAuthentication' '/enabled:false' '/commit:apphost' 2>&1
- if($LASTEXITCODE -ne 0){throw "IIS Windows auth configuration failed: $output"}
- $output=& $appcmd set config $location '/section:system.webServer/security/authentication/anonymousAuthentication' '/enabled:true' '/commit:apphost' 2>&1
- if($LASTEXITCODE -ne 0){throw "IIS anonymous auth configuration failed: $output"}
- Write-Host "Configured DEV-only access for: $($ips -join ', ')" -ForegroundColor Green
- Write-Host "Application: $location"
- Write-Host 'Open the portal over HTTPS from an allowed IP. Other clients are denied at the application layer.'
- Write-Warning 'Configure an independent firewall/VIP IP allowlist as well. The application audit will say DEV-ANONYMOUS-IP-... instead of recording an authenticated individual. Restore Windows authentication for production.'
-} catch {
- Copy-Item (Join-Path $backup 'web.config') $webconfig -Force
- Copy-Item (Join-Path $backup 'Default.aspx') $page -Force
- Write-Warning 'Application files restored. IIS authentication may need restoring to Windows mode if it was partially changed.'
- throw
-}
+if(-not (Test-Path $appcmd)){ $appcmd=Join-Path $env:windir 'Sysnative\inetsrv\appcmd.exe' }
+$loc="$SiteName/$AppAlias"
+Section 'System' { "Computer=$env:COMPUTERNAME"; "Time=$(Get-Date -Format o)"; "64bit=$([Environment]::Is64BitProcess)"; "PowerShell=$($PSVersionTable.PSVersion)" }
+Section 'IIS application' {& $appcmd list app "$loc/"}
+Section 'IIS AppPool' {& $appcmd list app "$loc/" /text:applicationPool; & $appcmd list apppool}
+Section 'Authentication (effective)' {& $appcmd list config "$loc" /section:system.webServer/security/authentication/windowsAuthentication; & $appcmd list config "$loc" /section:system.webServer/security/authentication/anonymousAuthentication }
+Section 'Application errors (recent)' {Get-WinEvent -FilterHashtable @{LogName='Application';StartTime=(Get-Date).AddMinutes(-$Minutes)} -ErrorAction Stop | Where-Object {$_.ProviderName -match 'ASP.NET|\.NET Runtime|Application Error|IIS|WAS' -or $_.Message -match 'PAMHealthCheck|Default\.aspx'} | Select-Object -First 25 TimeCreated,ProviderName,Id,LevelDisplayName,Message | Format-List}
+Section 'ASP.NET/IIS installed features' {try { Import-Module ServerManager -ErrorAction Stop;Get-WindowsFeature Web-Asp-Net45,Web-Net-Ext45,Web-ISAPI-Ext,Web-ISAPI-Filter,Web-Windows-Auth,Web-Scripting-Tools | Format-Table -AutoSize }catch{ $_.Exception.Message }}
+Section 'Site app configuration location and existence' { $line=(& $appcmd list vdir "$loc/" 2>&1 | Out-String);$line; if ($line -match 'physicalPath:([^\)]*)'){ $p=$Matches[1].Trim();"Physical=$p";"ConfigExists=$(Test-Path (Join-Path $p 'web.config'))";"AspxExists=$(Test-Path (Join-Path $p 'Default.aspx'))"} }
+Section 'ASP.NET event log sources' { Get-EventLog -LogName Application -Newest 15 -ErrorAction SilentlyContinue | Where-Object {$_.Source -like 'ASP.NET*'} | Select-Object TimeGenerated,EntryType,Message | Format-List }
+Write-Host "Diagnostics saved to: $dest" -ForegroundColor Green
+Write-Host 'Review/redact user names, hostnames and paths before sharing.'
