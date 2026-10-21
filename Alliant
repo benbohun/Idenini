@@ -1,95 +1,122 @@
 #requires -version 5.1
 <#
-.SYNOPSIS
-  Targeted IIS ASP.NET CS0016 remediation for PAMHealthCheck.
-.DESCRIPTION
-  Isolates app-pool TEMP/TMP and ASP.NET compilation directory; does not touch parent IIS site, AIMWebService,
-  global Windows Temp permissions, machine environment or authentication.
-  Run elevated PowerShell 5.1. No IIS PowerShell provider required.
+Targeted ASP.NET CS0016 repair for PAMHealthCheck on Windows Server.
+Run in elevated 64-bit Windows PowerShell 5.1.
+This file does not change the parent site, AIMWebService, global TEMP, or authentication.
 #>
-[CmdletBinding(SupportsShouldProcess=$true, ConfirmImpact='Medium')]
+[CmdletBinding()]
 param(
-  [string]$SiteName='Default Web Site',
-  [string]$AppAlias='PAMHealthCheck',
-  [string]$PoolName='PAMHealthCheckPool',
-  [string]$WebRoot='C:\inetpub\PAMDailyHealthCheck',
-  [string]$DataRoot='C:\ProgramData\PAMDailyHealthCheck'
+    [string]$PoolName = 'PAMHealthCheckPool',
+    [string]$SiteName = 'Default Web Site',
+    [string]$AppAlias = 'PAMHealthCheck',
+    [string]$WebRoot = 'C:\inetpub\PAMDailyHealthCheck',
+    [string]$DataRoot = 'C:\ProgramData\PAMDailyHealthCheck'
 )
-$ErrorActionPreference='Stop'
-function Fail([string]$m){throw $m}
-function RunNative([string]$exe,[string[]]$args){
-  Write-Host ('> '+$exe+' '+($args -join ' '))
-  $output = & $exe @args 2>&1
-  $rc=$LASTEXITCODE
-  if ($rc -ne 0){Fail ("Command failed ($rc): $exe $($args -join ' ')`n$($output -join [Environment]::NewLine)")}
-  return ($output -join [Environment]::NewLine)
-}
-if(-not [Environment]::Is64BitProcess){
-  Fail 'Use elevated 64-bit Windows PowerShell: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe (not SysWOW64/PowerShell_ISE.exe).'
-}
-$admin=[Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
-if(-not $admin.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){Fail 'Start PowerShell as Administrator.'}
-$appcmd=Join-Path $env:windir 'System32\inetsrv\appcmd.exe'
-if(-not (Test-Path -LiteralPath $appcmd)){Fail "Missing $appcmd"}
-if(-not (Test-Path -LiteralPath (Join-Path $WebRoot 'web.config'))){Fail 'Portal web.config not found.'}
-$appId="$SiteName/$AppAlias"
-$appInfo=RunNative $appcmd @('list','app',"$appId")
-if($appInfo -notmatch [regex]::Escape("applicationPool:$PoolName")){Fail "Portal not running in expected $PoolName : $appInfo"}
-$poolInfo=RunNative $appcmd @('list','apppool',"$PoolName",'/text:*')
-if($poolInfo -notmatch 'identityType:"ApplicationPoolIdentity"'){Fail 'Pool identity is not ApplicationPoolIdentity; stop and review manually.'}
-if($poolInfo -notmatch 'RuntimeVersion:"v4.0"'){Fail 'Pool does not use CLR v4.0; stop and review manually.'}
-$identity="IIS APPPOOL\$PoolName"
-$now=Get-Date -Format 'yyyyMMdd-HHmmss'
-$backupRoot=Join-Path $DataRoot ("ConfigBackups\CompilerIsolation-$now")
-$tempRoot=Join-Path $DataRoot 'CompilerWorkTemp'
-$compRoot=Join-Path $DataRoot ('CompilerOutput-'+$now)
-$webConfig=Join-Path $WebRoot 'web.config'
 
-function GrantModify([string]$path){
-  if(-not (Test-Path -LiteralPath $path)){[void](New-Item -ItemType Directory -Force -Path $path)}
-  # No grant to IIS_IUSRS or Everyone. Explicit app-pool identity only.
-  RunNative "$env:windir\System32\icacls.exe" @($path,'/grant',("$($identity):(OI)(CI)M"),'/T','/C') | Out-Host
+$ErrorActionPreference = 'Stop'
+
+function Invoke-Native {
+    param([string]$Executable, [string[]]$Arguments)
+    $results = & $Executable @Arguments 2>&1
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0) {
+        throw ('Native command failed (exit ' + $exitCode + '): ' + $Executable + ' ' + ($Arguments -join ' ') + [Environment]::NewLine + ($results | Out-String))
+    }
+    return ($results | Out-String)
 }
-function SetPoolEnv([string]$name,[string]$value){
-  $existing=RunNative $appcmd @('list','apppool',"$PoolName",'/text:*')
-  # Existing variables might be set already. AppCmd set via collection replacement, not duplicate entry.
-  if($existing -match ('(?m)^\s*name:"'+[regex]::Escape($name)+'"')){
-    RunNative $appcmd @('set','config','-section:system.applicationHost/applicationPools',("/[name='$PoolName'].environmentVariables.[name='$name'].value:$value"),'/commit:apphost') | Out-Host
-  } else {
-    RunNative $appcmd @('set','config','-section:system.applicationHost/applicationPools',("/+[name='$PoolName'].environmentVariables.[name='$name',value='$value']"),'/commit:apphost') | Out-Host
-  }
+
+function Grant-PoolModify {
+    param([string]$Directory, [string]$Principal)
+    if (-not (Test-Path -LiteralPath $Directory -PathType Container)) {
+        New-Item -ItemType Directory -Path $Directory -Force | Out-Null
+    }
+    $aclSpec = '{0}:(OI)(CI)M' -f $Principal
+    Invoke-Native -Executable "$env:windir\System32\icacls.exe" -Arguments @($Directory, '/grant', $aclSpec, '/T') | Out-Null
 }
-if ($PSCmdlet.ShouldProcess($appId,'Back up app config, set isolated ASP.NET compiler TEMP/TMP, recycle only dedicated app pool')) {
-  New-Item -ItemType Directory -Path $backupRoot -Force | Out-Null
-  Copy-Item -LiteralPath $webConfig -Destination (Join-Path $backupRoot 'web.config') -Force
-  $apphost=Join-Path $env:windir 'System32\inetsrv\config\applicationHost.config'
-  Copy-Item -LiteralPath $apphost -Destination (Join-Path $backupRoot 'applicationHost.config.reference-only') -Force
-  RunNative $appcmd @('add','backup',"PAMHealthCheck-$now") | Out-Host
-  GrantModify $tempRoot
-  GrantModify $compRoot
 
-  # Load application-pool service identity profile and inject scoped TEMP/TMP.
-  RunNative $appcmd @('set','apppool',"$PoolName",'/processModel.loadUserProfile:true') | Out-Host
-  SetPoolEnv 'TEMP' $tempRoot
-  SetPoolEnv 'TMP' $tempRoot
+if (-not [Environment]::Is64BitProcess) {
+    throw 'This must run in 64-bit PowerShell. Open C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe as Administrator. Do not use SysWOW64 ISE.'
+}
 
-  # Change only the compilation tempDirectory in this app's web.config.
-  [xml]$doc=Get-Content -LiteralPath $webConfig -Raw
-  $root=$doc.DocumentElement
-  $sysWeb=$root.SelectSingleNode('system.web')
-  if($null -eq $sysWeb){$sysWeb=$doc.CreateElement('system.web');[void]$root.AppendChild($sysWeb)}
-  $comp=$sysWeb.SelectSingleNode('compilation')
-  if($null -eq $comp){$comp=$doc.CreateElement('compilation');[void]$sysWeb.AppendChild($comp)}
-  $comp.SetAttribute('tempDirectory',$compRoot)
-  $doc.Save($webConfig)
+$principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw 'Run PowerShell as Administrator.'
+}
 
-  RunNative $appcmd @('recycle','apppool',"$PoolName") | Out-Host
-  Write-Host "`nTargeted repair completed." -ForegroundColor Green
-  Write-Host "App pool: $PoolName"
-  Write-Host "Identity: $identity"
-  Write-Host "Pool TEMP/TMP: $tempRoot"
-  Write-Host "ASP.NET compilation: $compRoot"
-  Write-Host "Backup: $backupRoot"
-  Write-Host "IIS native backup: PAMHealthCheck-$now"
-  Write-Host "Refresh https://<ccp-host>/$AppAlias/Default.aspx and read the newest ASP.NET event if it fails."
-  Write-Host "If CS0016 persists with these permissions, inspect application-control/AV events or ProcMon; do not broaden system ACLs."
+$appCmd = Join-Path $env:windir 'System32\inetsrv\appcmd.exe'
+$webConfig = Join-Path $WebRoot 'web.config'
+$appId = $SiteName + '/' + $AppAlias
+$poolPrincipal = 'IIS APPPOOL\' + $PoolName
+
+if (-not (Test-Path -LiteralPath $appCmd)) { throw 'IIS appcmd.exe not found.' }
+if (-not (Test-Path -LiteralPath $webConfig)) { throw ('Missing ' + $webConfig) }
+
+$appInfo = Invoke-Native -Executable $appCmd -Arguments @('list', 'app', $appId)
+if ($appInfo -notlike ('*applicationPool:' + $PoolName + '*')) {
+    throw ('The expected application pool was not found on this app: ' + $appInfo)
+}
+
+$poolInfo = Invoke-Native -Executable $appCmd -Arguments @('list', 'apppool', $PoolName, '/text:*')
+if ($poolInfo -notmatch 'identityType:"ApplicationPoolIdentity"') {
+    throw 'The pool is not using ApplicationPoolIdentity. No changes made.'
+}
+
+$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$backupDir = Join-Path $DataRoot ('ConfigBackups\CompilerRepair-' + $stamp)
+$tempDir = Join-Path $DataRoot 'CompilerWorkTemp'
+$compileDir = Join-Path $DataRoot ('CompilerOutput-' + $stamp)
+
+New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
+Copy-Item -LiteralPath $webConfig -Destination (Join-Path $backupDir 'web.config') -Force
+Invoke-Native -Executable $appCmd -Arguments @('add', 'backup', ('PAMHC-' + $stamp)) | Out-Host
+
+try {
+    Grant-PoolModify -Directory $tempDir -Principal $poolPrincipal
+    Grant-PoolModify -Directory $compileDir -Principal $poolPrincipal
+
+    # Profile loading gives ASP.NET access to an isolated user profile.
+    Invoke-Native -Executable $appCmd -Arguments @('set', 'apppool', $PoolName, '/processModel.loadUserProfile:true') | Out-Host
+
+    # Scope TEMP and TMP to only this application pool, not the system.
+    # These are added to IIS applicationHost.config by appcmd.
+    $tempArg = '/+"[name=' + "'" + $PoolName + "'" + '].environmentVariables.[name=' + "'TEMP'" + ',value=' + "'" + $tempDir + "'" + ']"'
+    $tmpArg  = '/+"[name=' + "'" + $PoolName + "'" + '].environmentVariables.[name=' + "'TMP'" + ',value=' + "'" + $tempDir + "'" + ']"'
+
+    # Avoid duplicate variable insertion when rerun: inspect pool config first.
+    $latestPool = Invoke-Native -Executable $appCmd -Arguments @('list', 'apppool', $PoolName, '/text:*')
+    if ($latestPool -notmatch 'name:"TEMP"') {
+        Invoke-Native -Executable $appCmd -Arguments @('set', 'config', '-section:system.applicationHost/applicationPools', $tempArg, '/commit:apphost') | Out-Host
+    }
+    if ($latestPool -notmatch 'name:"TMP"') {
+        Invoke-Native -Executable $appCmd -Arguments @('set', 'config', '-section:system.applicationHost/applicationPools', $tmpArg, '/commit:apphost') | Out-Host
+    }
+
+    [xml]$doc = Get-Content -LiteralPath $webConfig -Raw
+    $root = $doc.DocumentElement
+    $systemWeb = $root.SelectSingleNode('system.web')
+    if ($null -eq $systemWeb) {
+        $systemWeb = $doc.CreateElement('system.web')
+        [void]$root.AppendChild($systemWeb)
+    }
+    $compilation = $systemWeb.SelectSingleNode('compilation')
+    if ($null -eq $compilation) {
+        $compilation = $doc.CreateElement('compilation')
+        [void]$systemWeb.AppendChild($compilation)
+    }
+    $compilation.SetAttribute('tempDirectory', $compileDir)
+    $doc.Save($webConfig)
+
+    Invoke-Native -Executable $appCmd -Arguments @('recycle', 'apppool', $PoolName) | Out-Host
+    Write-Host 'Completed targeted compilation repair.' -ForegroundColor Green
+    Write-Host ('Pool: ' + $PoolName)
+    Write-Host ('Work TEMP/TMP: ' + $tempDir)
+    Write-Host ('Compilation output: ' + $compileDir)
+    Write-Host ('Backup: ' + $backupDir)
+    Write-Host ('IIS backup: PAMHC-' + $stamp)
+}
+catch {
+    Write-Error ('Repair stopped: ' + $_.Exception.Message)
+    Write-Warning ('Backup is at ' + $backupDir)
+    Write-Warning ('IIS backup name: PAMHC-' + $stamp)
+    throw
+}
