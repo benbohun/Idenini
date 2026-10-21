@@ -1,80 +1,60 @@
 #Requires -Version 5.1
-<#
-.SYNOPSIS
-Repairs ASP.NET CS0016 compilation 'Access denied' for the PAMHealthCheck application.
-.DESCRIPTION
-Sets an application-specific ASP.NET compilation temp directory and grants only
-IIS APPPOOL\PAMHealthCheckPool Modify rights to it. Does NOT touch global
-Temporary ASP.NET Files ACLs, IIS authentication, other app pools, or AIMWebService.
-Run as administrator in Windows PowerShell 5.1.
+<#[.SYNOPSIS]
+Fixes ACLs within only the PAMHealthCheck ASP.NET compilation cache.
+No global IIS ACL changes, no auth changes, no IISRESET.
+Run as local administrator in Windows PowerShell 5.1.
 #>
 [CmdletBinding()]
 param(
-    [string]$WebRoot = 'C:\inetpub\PAMDailyHealthCheck',
-    [string]$AppPool = 'PAMHealthCheckPool',
-    [string]$DataRoot = 'C:\ProgramData\PAMDailyHealthCheck'
+ [string]$TempDir = 'C:\ProgramData\PAMDailyHealthCheck\AspNetCompilationTemp',
+ [string]$AppPool = 'PAMHealthCheckPool',
+ [string]$WebRoot = 'C:\inetpub\PAMDailyHealthCheck',
+ [switch]$SkipRecycle
 )
-$ErrorActionPreference = 'Stop'
-function Step([string]$Text) { Write-Host "[PAM] $Text" -ForegroundColor Cyan }
-function Assert-True($Condition, $Message) { if (-not $Condition) { throw $Message } }
-try {
-    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
-    Assert-True ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) 'Run from an elevated PowerShell window.'
-    $webConfig = Join-Path $WebRoot 'web.config'
-    Assert-True (Test-Path -LiteralPath $webConfig -PathType Leaf) "Missing web.config: $webConfig"
-    Assert-True (Test-Path -LiteralPath (Join-Path $WebRoot 'Default.aspx') -PathType Leaf) "Missing Default.aspx in $WebRoot"
-    $tempDir = Join-Path $DataRoot 'AspNetCompilationTemp'
-    $backupDir = Join-Path $DataRoot 'ConfigBackups'
-    New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
-    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $backup = Join-Path $backupDir "web.config.before-CS0016-$stamp.bak"
-    Copy-Item -LiteralPath $webConfig -Destination $backup -ErrorAction Stop
-    Step "Backed up web.config to $backup"
-    New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
-    $appPoolIdentity = "IIS APPPOOL\$AppPool"
-    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-        $appPoolIdentity,
-        [System.Security.AccessControl.FileSystemRights]::Modify,
-        [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit',
-        [System.Security.AccessControl.PropagationFlags]::None,
-        [System.Security.AccessControl.AccessControlType]::Allow
-    )
-    $acl = Get-Acl -LiteralPath $tempDir
-    $acl.SetAccessRule($rule)
-    Set-Acl -LiteralPath $tempDir -AclObject $acl
-    Step "Granted Modify on $tempDir to $appPoolIdentity"
-
-    [xml]$config = Get-Content -LiteralPath $webConfig -Raw
-    Assert-True ($null -ne $config.configuration) 'Invalid web.config: no configuration element.'
-    $sysWeb = $config.configuration.SelectSingleNode('system.web')
-    if ($null -eq $sysWeb) {
-        $sysWeb = $config.CreateElement('system.web')
-        [void]$config.configuration.AppendChild($sysWeb)
-    }
-    $compilation = $sysWeb.SelectSingleNode('compilation')
-    if ($null -eq $compilation) {
-        $compilation = $config.CreateElement('compilation')
-        [void]$sysWeb.AppendChild($compilation)
-    }
-    $compilation.SetAttribute('tempDirectory', $tempDir)
-    try {
-        $config.Save($webConfig)
-    } catch {
-        Copy-Item -LiteralPath $backup -Destination $webConfig -Force
-        throw
-    }
-    Step "Configured ASP.NET compilation tempDirectory: $tempDir"
-    Write-Host ''
-    Write-Host 'SUCCESS: Application-specific compilation directory configured.' -ForegroundColor Green
-    Write-Host "Backup: $backup"
-    Write-Host "App: $WebRoot"
-    Write-Host "Temp: $tempDir"
-    Write-Host "ACL: $appPoolIdentity - Modify"
-    Write-Host 'web.config update triggers ASP.NET application restart; no iisreset required.'
-    Write-Host 'Now retry /PAMHealthCheck/Default.aspx over HTTPS.'
-    Write-Host 'If a different error occurs, collect the newest ASP.NET event ID 1310.'
-} catch {
-    Write-Error "Repair FAILED: $($_.Exception.Message)"
-    exit 1
+$ErrorActionPreference='Stop'
+function Invoke-Native([string]$Exe,[string[]]$Arguments) {
+ & $Exe @Arguments
+ if ($LASTEXITCODE -ne 0) { throw "$Exe exited $LASTEXITCODE" }
 }
+$me=[Security.Principal.WindowsIdentity]::GetCurrent()
+$p=New-Object Security.Principal.WindowsPrincipal($me)
+if (-not $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Run elevated (Run as administrator).' }
+if (-not (Test-Path -LiteralPath (Join-Path $WebRoot 'web.config') -PathType Leaf)) { throw "web.config absent: $WebRoot" }
+if (-not (Test-Path -LiteralPath $TempDir -PathType Container)) { throw "Compilation folder absent: $TempDir. Run the earlier CS0016 script first." }
+$expected='C:\ProgramData\PAMDailyHealthCheck\AspNetCompilationTemp'
+if ($TempDir.TrimEnd('\') -ne $expected.TrimEnd('\')) { throw "Safety guard: this repair only supports $expected" }
+$account="IIS APPPOOL\$AppPool"
+$backupDir='C:\ProgramData\PAMDailyHealthCheck\ConfigBackups'
+New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
+$stamp=Get-Date -Format 'yyyyMMdd-HHmmss'
+$aclBackup=Join-Path $backupDir "CompileACL-$stamp.txt"
+$log=Join-Path $backupDir "CompileACL-Repair-$stamp.log"
+Start-Transcript -Path $log -Force | Out-Null
+try {
+ Write-Host "Compilation folder: $TempDir"
+ Write-Host "Application pool identity: $account"
+ Write-Host 'Backing up folder ACLs...'
+ Push-Location (Split-Path -Parent $TempDir)
+ try { Invoke-Native "$env:windir\System32\icacls.exe" @((Split-Path -Leaf $TempDir),'/save',$aclBackup,'/T','/C') }
+ finally { Pop-Location }
+ Write-Host "ACL backup: $aclBackup"
+ # Do not reset, remove, or replace existing ACLs; grant only this app pool on its private directory and children.
+ Invoke-Native "$env:windir\System32\icacls.exe" @($TempDir,'/grant',"${account}:(OI)(CI)M",'/T','/C')
+ Write-Host 'Resulting ACLs at compilation root:'
+ Invoke-Native "$env:windir\System32\icacls.exe" @($TempDir)
+ $deny=(Get-Acl -LiteralPath $TempDir).Access | Where-Object { $_.AccessControlType -eq 'Deny' }
+ if ($deny) { Write-Warning 'Explicit deny ACLs exist at the compilation root; they may override the allow. Review the log.'; $deny | Format-Table -AutoSize | Out-Host }
+ [xml]$cfg=Get-Content -LiteralPath (Join-Path $WebRoot 'web.config') -Raw
+ $node=$cfg.SelectSingleNode('/configuration/system.web/compilation')
+ if (-not $node -or $node.GetAttribute('tempDirectory').TrimEnd('\') -ne $TempDir.TrimEnd('\')) {
+  Write-Warning 'web.config compilation tempDirectory does not match this path. Check the previous repair and physical application path.'
+ }
+ if (-not $SkipRecycle) {
+  $appcmd=Join-Path $env:windir 'System32\inetsrv\appcmd.exe'
+  if (Test-Path $appcmd) { Invoke-Native $appcmd @('recycle','apppool',"/apppool.name:$AppPool") }
+  else { Write-Warning 'appcmd.exe was not found; recycle only PAMHealthCheckPool through IIS Manager.' }
+ }
+ Write-Host 'Complete. Refresh the page once, then read the newest ASP.NET event 1310.' -ForegroundColor Green
+ Write-Host 'If CS0016 persists in this same directory, check endpoint protection, application control, and effective NTFS denies rather than granting Everyone rights.'
+}
+finally { Stop-Transcript | Out-Null; Write-Host "Log: $log" }
