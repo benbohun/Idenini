@@ -1,69 +1,68 @@
 #requires -Version 5.1
+<#
+.SYNOPSIS
+Updates only two visible labels in the existing PAM Daily Health Check dashboard.
+Does not read/change web.config, IIS authentication, allowed IPs, audit attribution,
+or the evidence upload behavior.
+#>
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory=$true)]
-    [string[]]$AllowedIPs,
     [string]$WebRoot = 'C:\inetpub\PAMDailyHealthCheck'
 )
+
 $ErrorActionPreference = 'Stop'
-
-function Assert-IPv4([string]$IP) {
-    $parsed = $null
-    if (-not [System.Net.IPAddress]::TryParse($IP, [ref]$parsed)) { throw "Invalid IP address: $IP" }
-    if ($parsed.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork) { throw "IPv4 address required: $IP" }
-    if ($IP -notmatch '^(?:\d{1,3}\.){3}\d{1,3}$') { throw "Use dotted-decimal IPv4 only: $IP" }
-    return $parsed.ToString()
-}
-
-$webConfig = Join-Path $WebRoot 'web.config'
 $aspx = Join-Path $WebRoot 'Default.aspx'
-if (-not (Test-Path -LiteralPath $webConfig -PathType Leaf)) { throw "Missing $webConfig" }
-if (-not (Test-Path -LiteralPath $aspx -PathType Leaf)) { throw "Missing $aspx" }
+if (-not [System.IO.File]::Exists($aspx)) { throw "Default.aspx not found: $aspx" }
 
-$normalized = @($AllowedIPs | ForEach-Object { $_ -split '[,;]' } | ForEach-Object { $_.Trim() } | Where-Object { $_ } | ForEach-Object { Assert-IPv4 $_ } | Select-Object -Unique)
-if ($normalized.Count -eq 0) { throw 'Provide at least one allowed IPv4 address.' }
+# Read with BOM-aware UTF-8. The deployed page is a UTF-8 source file.
+$encoding = New-Object System.Text.UTF8Encoding($true)
+$original = [System.IO.File]::ReadAllText($aspx, [System.Text.Encoding]::UTF8)
+$updated = $original
 
-$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$backupDir = Join-Path 'C:\ProgramData\PAMDailyHealthCheck\ConfigBackups' ("UIAndIPs-$stamp")
-New-Item -Path $backupDir -ItemType Directory -ErrorAction Stop | Out-Null
-Copy-Item -LiteralPath $webConfig -Destination $backupDir -ErrorAction Stop
-Copy-Item -LiteralPath $aspx -Destination $backupDir -ErrorAction Stop
-
-# Update only this app's setting. No IIS site-wide authentication changes.
-[xml]$config = Get-Content -LiteralPath $webConfig -Raw -ErrorAction Stop
-$settings = $config.configuration.appSettings
-if ($null -eq $settings) { throw 'web.config has no appSettings section.' }
-$nodes = @($settings.SelectNodes("add[@key='DevAllowedClientIPs']"))
-if ($nodes.Count -gt 1) { throw 'Duplicate DevAllowedClientIPs keys found; correct manually.' }
-if ($nodes.Count -eq 0) {
-    $newItem = $config.CreateElement('add')
-    $newItem.SetAttribute('key','DevAllowedClientIPs')
-    $newItem.SetAttribute('value',($normalized -join ','))
-    [void]$settings.AppendChild($newItem)
-} else {
-    $nodes[0].SetAttribute('value',($normalized -join ','))
+# The header remains informational only; the actual anonymous/IP audit value is unchanged.
+$oldHeader = 'Signed in: <strong>"+H(Context.User.Identity.Name)+"</strong> | Server-local time:'
+$newHeader = 'Signed in as <strong>CNA PAM Admin</strong> | Server-local time:'
+if ($updated.Contains($oldHeader)) {
+    $updated = $updated.Replace($oldHeader, $newHeader)
+} elseif (-not $updated.Contains($newHeader)) {
+    throw 'Cannot locate expected dashboard header. File has not been changed.'
 }
 
-# Replace only the completion button's inner text; preserve its behavior.
-$aspxText = [System.IO.File]::ReadAllText($aspx)
-$pattern = '(?s)(<button\b[^>]*\bvalue\s*=\s*[\x27\x22]Completed[\x27\x22][^>]*>).*?(</button>)'
-$matches = [regex]::Matches($aspxText, $pattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-if ($matches.Count -ne 1) { throw "Expected exactly one Completed button, found $($matches.Count). No changes made." }
-$updated = [regex]::Replace($aspxText, $pattern, '$1Complete &amp; Upload Evidence$2', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+# Change only the text within the Completed submit button, not its tag/attributes.
+$pattern = '(?is)(<button\b[^>]*\bname\s*=\s*["'']outcome["''][^>]*\bvalue\s*=\s*["'']Completed["''][^>]*>)(.*?)(</button>)'
+$matches = [System.Text.RegularExpressions.Regex]::Matches($updated, $pattern)
+if ($matches.Count -ne 1) {
+    throw "Expected one Completed button; found $($matches.Count). File has not been changed."
+}
+$updated = [System.Text.RegularExpressions.Regex]::Replace(
+    $updated, $pattern,
+    [System.Text.RegularExpressions.MatchEvaluator]{ param($m)
+        $m.Groups[1].Value + 'Complete &amp; Upload Evidence' + $m.Groups[3].Value
+    }
+)
 
-# UTF-8 BOM helps legacy ASP.NET/Notepad consistently recognize encoding.
-$utf8 = New-Object System.Text.UTF8Encoding($true)
+if ($updated -eq $original) {
+    Write-Host 'The UI labels are already current. No changes made.' -ForegroundColor Green
+    return
+}
+
+$backupDir = Join-Path $WebRoot 'UIBackups'
+if (-not (Test-Path -LiteralPath $backupDir)) {
+    [void](New-Item -ItemType Directory -Path $backupDir -Force)
+}
+$backup = Join-Path $backupDir ('Default.aspx.' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '.bak')
+[System.IO.File]::Copy($aspx, $backup, $false)
 try {
-    $config.Save($webConfig)
-    [System.IO.File]::WriteAllText($aspx, $updated, $utf8)
+    [System.IO.File]::WriteAllText($aspx, $updated, $encoding)
 } catch {
-    Copy-Item -LiteralPath (Join-Path $backupDir 'web.config') -Destination $webConfig -Force
-    Copy-Item -LiteralPath (Join-Path $backupDir 'Default.aspx') -Destination $aspx -Force
+    [System.IO.File]::Copy($backup, $aspx, $true)
     throw
 }
-Write-Host 'Updated PAM Health Check settings successfully.' -ForegroundColor Green
-Write-Host ('Allowed IPs: ' + ($normalized -join ', '))
-Write-Host 'Button text: Complete & Upload Evidence'
-Write-Host ('Backup: ' + $backupDir)
-Write-Host 'Refresh the portal. Saving web.config normally restarts only this ASP.NET application.'
-Write-Warning 'DEV anonymous IP restriction is not an authentication substitute. Apply matching firewall/VIP restrictions.'
+
+Write-Host 'PAM Health Check UI labels updated.' -ForegroundColor Green
+Write-Host 'Header: Signed in as CNA PAM Admin | Server-local time: [live server time]'
+Write-Host 'Button: Complete & Upload Evidence'
+Write-Host "Backup: $backup"
+Write-Host 'IP allowlist, web.config, IIS settings, evidence handling, and audit attribution were not changed.'
+Write-Warning 'CNA PAM Admin is a display label, not an authenticated user. DEV anonymous/IP-restricted mode remains in effect.'
+Write-Host 'Refresh your browser with Ctrl+F5.'
