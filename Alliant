@@ -2,26 +2,22 @@
 #requires -RunAsAdministrator
 <#
 .SYNOPSIS
-  Adds safe 2-octet wildcard support (for example 10.21.*) to the existing
-  PAMHealthCheck DEV IP allowlist. Does not alter IIS authentication or CCP.
-.DESCRIPTION
-  Replaces the exact-match C# expression in the PAM_DEV_ANON_GUARD_V1 block.
-  Backs up Default.aspx and web.config and validates the expected source first.
-  Existing exact IP entries keep working. A bare * is deliberately unsupported.
-  Update DevAllowedClientIPs manually after applying if desired.
+  Fixes the PAM Daily Health Check DEV allowlist to support one- or two-octet
+  IPv4 prefixes such as 10.* and 10.21.*. No IIS or CCP changes.
+.NOTES
+  10.* covers the entire 10.0.0.0/8 private network. This is NOT authentication.
+  Use only within an independently restricted DEV network.
 #>
 [CmdletBinding()]
-param(
-    [string]$WebRoot = 'C:\inetpub\PAMDailyHealthCheck'
-)
+param([string]$WebRoot = 'C:\inetpub\PAMDailyHealthCheck')
+
 $ErrorActionPreference = 'Stop'
 $page = Join-Path $WebRoot 'Default.aspx'
 $config = Join-Path $WebRoot 'web.config'
-if (-not (Test-Path -LiteralPath $page -PathType Leaf)) { throw "Cannot find $page" }
-if (-not (Test-Path -LiteralPath $config -PathType Leaf)) { throw "Cannot find $config" }
+if (-not (Test-Path -LiteralPath $page -PathType Leaf)) { throw "Missing file: $page" }
+if (-not (Test-Path -LiteralPath $config -PathType Leaf)) { throw "Missing file: $config" }
 
-# Respect UTF-8 and other existing encodings when editing the page.
-$bytes = [IO.File]::ReadAllBytes($page)
+$bytes = [System.IO.File]::ReadAllBytes($page)
 $enc = New-Object System.Text.UTF8Encoding($false)
 if ($bytes.Length -ge 2 -and $bytes[0] -eq 255 -and $bytes[1] -eq 254) {
     $enc = [System.Text.Encoding]::Unicode
@@ -30,19 +26,15 @@ if ($bytes.Length -ge 2 -and $bytes[0] -eq 255 -and $bytes[1] -eq 254) {
 }
 $source = $enc.GetString($bytes)
 if ($source.Length -gt 0 -and [int]$source[0] -eq 0xFEFF) { $source = $source.Substring(1) }
+
 if (-not $source.Contains('PAM_DEV_ANON_GUARD_V1')) {
-    throw 'Expected DEV guard not found. No files changed. This script targets the deployed DEV repair version.'
+    throw 'Expected DEV IP guard not found. No change made.'
 }
-$marker = 'PAM_DEV_IP_WILDCARD_V1'
-$old = '.Any(ip => String.Equals(ip.Trim(), remoteIp, StringComparison.OrdinalIgnoreCase));'
-$new = @'
-.Any(ip => {
-            string rule = ip.Trim();
-            if (String.Equals(rule, remoteIp, StringComparison.OrdinalIgnoreCase)) return true;
-            // PAM_DEV_IP_WILDCARD_V1: 10.21.* matches 10.21.0.0 through 10.21.255.255.
-            // A plain * is NOT supported. Never treat this as AD authentication.
-            if (rule.EndsWith(".*", StringComparison.Ordinal)) {
-              string prefix = rule.Substring(0, rule.Length - 2);
+if (-not $source.Contains('PAM_DEV_IP_WILDCARD_V1')) {
+    throw 'Expected prior two-octet wildcard patch not found. No change made.'
+}
+
+$original = @'
               string[] octets = prefix.Split('.');
               if (octets.Length != 2) return false;
               byte a, b;
@@ -52,31 +44,48 @@ $new = @'
                   parsed.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork) return false;
               byte[] ipBytes = parsed.GetAddressBytes();
               return ipBytes[0] == a && ipBytes[1] == b;
-            }
-            return false;
-          });
 '@
-if ($source.Contains($marker)) {
-    Write-Host 'Wildcard support already installed. No page change needed.' -ForegroundColor Yellow
+$replacement = @'
+              string[] octets = prefix.Split('.');
+              // Support 10.* and 10.21.* while rejecting a bare *.
+              if (octets.Length != 1 && octets.Length != 2) return false;
+              byte a, b = 0;
+              if (!Byte.TryParse(octets[0], out a)) return false;
+              if (octets.Length == 2 && !Byte.TryParse(octets[1], out b)) return false;
+              System.Net.IPAddress parsed;
+              if (!System.Net.IPAddress.TryParse(remoteIp, out parsed) ||
+                  parsed.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork) return false;
+              byte[] ipBytes = parsed.GetAddressBytes();
+              return ipBytes[0] == a && (octets.Length == 1 || ipBytes[1] == b);
+'@
+
+# Normalize only newlines for matching; preserve original line-ending convention.
+$unixSource = $source.Replace("`r`n", "`n")
+$oldUnix = $original.Replace("`r`n", "`n")
+$newUnix = $replacement.Replace("`r`n", "`n")
+if ($unixSource.Contains('Support 10.* and 10.21.* while rejecting a bare *')) {
+    Write-Host 'One-octet wildcard support is already installed. No files changed.' -ForegroundColor Yellow
     exit 0
 }
-$matches = ([regex]::Matches($source, [regex]::Escape($old))).Count
-if ($matches -ne 1) { throw "Expected exactly one match for original guard; found $matches. Nothing changed." }
+$matchCount = ([regex]::Matches($unixSource, [regex]::Escape($oldUnix))).Count
+if ($matchCount -ne 1) {
+    throw "Expected old wildcard code exactly once; found $matchCount. No files changed."
+}
 
-$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$backup = Join-Path $env:ProgramData "PAMDailyHealthCheck\ConfigBackups\IPWildcard-$stamp"
-New-Item -ItemType Directory -Path $backup -Force | Out-Null
+$backup = Join-Path $env:ProgramData ('PAMDailyHealthCheck\ConfigBackups\Wildcard10-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+New-Item -ItemType Directory -Path $backup -Force -ErrorAction Stop | Out-Null
 Copy-Item -LiteralPath $page -Destination (Join-Path $backup 'Default.aspx') -ErrorAction Stop
 Copy-Item -LiteralPath $config -Destination (Join-Path $backup 'web.config') -ErrorAction Stop
+
 try {
-    $updated = $source.Replace($old, $new.TrimEnd("`r", "`n"))
-    [IO.File]::WriteAllText($page, $updated, $enc)
-    Write-Host 'Wildcard logic installed in Default.aspx.' -ForegroundColor Green
-    Write-Host "Backup folder: $backup"
-    Write-Host "Next, edit $config"
-    Write-Host 'Set DevAllowedClientIPs to 10.21.* (or 10.21.*,other.exact.IPs).'
+    $updated = $unixSource.Replace($oldUnix, $newUnix)
+    if ($source.Contains("`r`n")) { $updated = $updated.Replace("`n", "`r`n") }
+    [System.IO.File]::WriteAllText($page, $updated, $enc)
+    Write-Host 'SUCCESS: Added support for 10.* and 10.21.* in Default.aspx' -ForegroundColor Green
+    Write-Host "Backup: $backup"
+    Write-Host 'Your existing DevAllowedClientIPs entry in web.config was NOT changed.'
     Write-Host 'A bare * remains unsupported.'
-    Write-Warning '10.21.* permits the entire 10.21.0.0/16 range (65,536 IP addresses) if routed to this app. Keep firewall/VIP rules restricting access.'
+    Write-Warning '10.* covers all of 10.0.0.0/8; use independent network restrictions and restore authenticated sign-in before production.'
 } catch {
     Copy-Item -LiteralPath (Join-Path $backup 'Default.aspx') -Destination $page -Force
     throw
