@@ -1,68 +1,83 @@
 #requires -Version 5.1
+#requires -RunAsAdministrator
 <#
 .SYNOPSIS
-Updates only two visible labels in the existing PAM Daily Health Check dashboard.
-Does not read/change web.config, IIS authentication, allowed IPs, audit attribution,
-or the evidence upload behavior.
+  Adds safe 2-octet wildcard support (for example 10.21.*) to the existing
+  PAMHealthCheck DEV IP allowlist. Does not alter IIS authentication or CCP.
+.DESCRIPTION
+  Replaces the exact-match C# expression in the PAM_DEV_ANON_GUARD_V1 block.
+  Backs up Default.aspx and web.config and validates the expected source first.
+  Existing exact IP entries keep working. A bare * is deliberately unsupported.
+  Update DevAllowedClientIPs manually after applying if desired.
 #>
 [CmdletBinding()]
 param(
     [string]$WebRoot = 'C:\inetpub\PAMDailyHealthCheck'
 )
-
 $ErrorActionPreference = 'Stop'
-$aspx = Join-Path $WebRoot 'Default.aspx'
-if (-not [System.IO.File]::Exists($aspx)) { throw "Default.aspx not found: $aspx" }
+$page = Join-Path $WebRoot 'Default.aspx'
+$config = Join-Path $WebRoot 'web.config'
+if (-not (Test-Path -LiteralPath $page -PathType Leaf)) { throw "Cannot find $page" }
+if (-not (Test-Path -LiteralPath $config -PathType Leaf)) { throw "Cannot find $config" }
 
-# Read with BOM-aware UTF-8. The deployed page is a UTF-8 source file.
-$encoding = New-Object System.Text.UTF8Encoding($true)
-$original = [System.IO.File]::ReadAllText($aspx, [System.Text.Encoding]::UTF8)
-$updated = $original
-
-# The header remains informational only; the actual anonymous/IP audit value is unchanged.
-$oldHeader = 'Signed in: <strong>"+H(Context.User.Identity.Name)+"</strong> | Server-local time:'
-$newHeader = 'Signed in as <strong>CNA PAM Admin</strong> | Server-local time:'
-if ($updated.Contains($oldHeader)) {
-    $updated = $updated.Replace($oldHeader, $newHeader)
-} elseif (-not $updated.Contains($newHeader)) {
-    throw 'Cannot locate expected dashboard header. File has not been changed.'
+# Respect UTF-8 and other existing encodings when editing the page.
+$bytes = [IO.File]::ReadAllBytes($page)
+$enc = New-Object System.Text.UTF8Encoding($false)
+if ($bytes.Length -ge 2 -and $bytes[0] -eq 255 -and $bytes[1] -eq 254) {
+    $enc = [System.Text.Encoding]::Unicode
+} elseif ($bytes.Length -ge 3 -and $bytes[0] -eq 239 -and $bytes[1] -eq 187 -and $bytes[2] -eq 191) {
+    $enc = New-Object System.Text.UTF8Encoding($true)
 }
-
-# Change only the text within the Completed submit button, not its tag/attributes.
-$pattern = '(?is)(<button\b[^>]*\bname\s*=\s*["'']outcome["''][^>]*\bvalue\s*=\s*["'']Completed["''][^>]*>)(.*?)(</button>)'
-$matches = [System.Text.RegularExpressions.Regex]::Matches($updated, $pattern)
-if ($matches.Count -ne 1) {
-    throw "Expected one Completed button; found $($matches.Count). File has not been changed."
+$source = $enc.GetString($bytes)
+if ($source.Length -gt 0 -and [int]$source[0] -eq 0xFEFF) { $source = $source.Substring(1) }
+if (-not $source.Contains('PAM_DEV_ANON_GUARD_V1')) {
+    throw 'Expected DEV guard not found. No files changed. This script targets the deployed DEV repair version.'
 }
-$updated = [System.Text.RegularExpressions.Regex]::Replace(
-    $updated, $pattern,
-    [System.Text.RegularExpressions.MatchEvaluator]{ param($m)
-        $m.Groups[1].Value + 'Complete &amp; Upload Evidence' + $m.Groups[3].Value
-    }
-)
-
-if ($updated -eq $original) {
-    Write-Host 'The UI labels are already current. No changes made.' -ForegroundColor Green
-    return
+$marker = 'PAM_DEV_IP_WILDCARD_V1'
+$old = '.Any(ip => String.Equals(ip.Trim(), remoteIp, StringComparison.OrdinalIgnoreCase));'
+$new = @'
+.Any(ip => {
+            string rule = ip.Trim();
+            if (String.Equals(rule, remoteIp, StringComparison.OrdinalIgnoreCase)) return true;
+            // PAM_DEV_IP_WILDCARD_V1: 10.21.* matches 10.21.0.0 through 10.21.255.255.
+            // A plain * is NOT supported. Never treat this as AD authentication.
+            if (rule.EndsWith(".*", StringComparison.Ordinal)) {
+              string prefix = rule.Substring(0, rule.Length - 2);
+              string[] octets = prefix.Split('.');
+              if (octets.Length != 2) return false;
+              byte a, b;
+              if (!Byte.TryParse(octets[0], out a) || !Byte.TryParse(octets[1], out b)) return false;
+              System.Net.IPAddress parsed;
+              if (!System.Net.IPAddress.TryParse(remoteIp, out parsed) ||
+                  parsed.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork) return false;
+              byte[] ipBytes = parsed.GetAddressBytes();
+              return ipBytes[0] == a && ipBytes[1] == b;
+            }
+            return false;
+          });
+'@
+if ($source.Contains($marker)) {
+    Write-Host 'Wildcard support already installed. No page change needed.' -ForegroundColor Yellow
+    exit 0
 }
+$matches = ([regex]::Matches($source, [regex]::Escape($old))).Count
+if ($matches -ne 1) { throw "Expected exactly one match for original guard; found $matches. Nothing changed." }
 
-$backupDir = Join-Path $WebRoot 'UIBackups'
-if (-not (Test-Path -LiteralPath $backupDir)) {
-    [void](New-Item -ItemType Directory -Path $backupDir -Force)
-}
-$backup = Join-Path $backupDir ('Default.aspx.' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '.bak')
-[System.IO.File]::Copy($aspx, $backup, $false)
+$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$backup = Join-Path $env:ProgramData "PAMDailyHealthCheck\ConfigBackups\IPWildcard-$stamp"
+New-Item -ItemType Directory -Path $backup -Force | Out-Null
+Copy-Item -LiteralPath $page -Destination (Join-Path $backup 'Default.aspx') -ErrorAction Stop
+Copy-Item -LiteralPath $config -Destination (Join-Path $backup 'web.config') -ErrorAction Stop
 try {
-    [System.IO.File]::WriteAllText($aspx, $updated, $encoding)
+    $updated = $source.Replace($old, $new.TrimEnd("`r", "`n"))
+    [IO.File]::WriteAllText($page, $updated, $enc)
+    Write-Host 'Wildcard logic installed in Default.aspx.' -ForegroundColor Green
+    Write-Host "Backup folder: $backup"
+    Write-Host "Next, edit $config"
+    Write-Host 'Set DevAllowedClientIPs to 10.21.* (or 10.21.*,other.exact.IPs).'
+    Write-Host 'A bare * remains unsupported.'
+    Write-Warning '10.21.* permits the entire 10.21.0.0/16 range (65,536 IP addresses) if routed to this app. Keep firewall/VIP rules restricting access.'
 } catch {
-    [System.IO.File]::Copy($backup, $aspx, $true)
+    Copy-Item -LiteralPath (Join-Path $backup 'Default.aspx') -Destination $page -Force
     throw
 }
-
-Write-Host 'PAM Health Check UI labels updated.' -ForegroundColor Green
-Write-Host 'Header: Signed in as CNA PAM Admin | Server-local time: [live server time]'
-Write-Host 'Button: Complete & Upload Evidence'
-Write-Host "Backup: $backup"
-Write-Host 'IP allowlist, web.config, IIS settings, evidence handling, and audit attribution were not changed.'
-Write-Warning 'CNA PAM Admin is a display label, not an authenticated user. DEV anonymous/IP-restricted mode remains in effect.'
-Write-Host 'Refresh your browser with Ctrl+F5.'
