@@ -1,92 +1,170 @@
-#requires -Version 5.1
-#requires -RunAsAdministrator
-<#
-.SYNOPSIS
-  Fixes the PAM Daily Health Check DEV allowlist to support one- or two-octet
-  IPv4 prefixes such as 10.* and 10.21.*. No IIS or CCP changes.
-.NOTES
-  10.* covers the entire 10.0.0.0/8 private network. This is NOT authentication.
-  Use only within an independently restricted DEV network.
-#>
-[CmdletBinding()]
-param([string]$WebRoot = 'C:\inetpub\PAMDailyHealthCheck')
-
-$ErrorActionPreference = 'Stop'
-$page = Join-Path $WebRoot 'Default.aspx'
-$config = Join-Path $WebRoot 'web.config'
-if (-not (Test-Path -LiteralPath $page -PathType Leaf)) { throw "Missing file: $page" }
-if (-not (Test-Path -LiteralPath $config -PathType Leaf)) { throw "Missing file: $config" }
-
-$bytes = [System.IO.File]::ReadAllBytes($page)
-$enc = New-Object System.Text.UTF8Encoding($false)
-if ($bytes.Length -ge 2 -and $bytes[0] -eq 255 -and $bytes[1] -eq 254) {
-    $enc = [System.Text.Encoding]::Unicode
-} elseif ($bytes.Length -ge 3 -and $bytes[0] -eq 239 -and $bytes[1] -eq 187 -and $bytes[2] -eq 191) {
-    $enc = New-Object System.Text.UTF8Encoding($true)
-}
-$source = $enc.GetString($bytes)
-if ($source.Length -gt 0 -and [int]$source[0] -eq 0xFEFF) { $source = $source.Substring(1) }
-
-if (-not $source.Contains('PAM_DEV_ANON_GUARD_V1')) {
-    throw 'Expected DEV IP guard not found. No change made.'
-}
-if (-not $source.Contains('PAM_DEV_IP_WILDCARD_V1')) {
-    throw 'Expected prior two-octet wildcard patch not found. No change made.'
-}
-
-$original = @'
-              string[] octets = prefix.Split('.');
-              if (octets.Length != 2) return false;
-              byte a, b;
-              if (!Byte.TryParse(octets[0], out a) || !Byte.TryParse(octets[1], out b)) return false;
-              System.Net.IPAddress parsed;
-              if (!System.Net.IPAddress.TryParse(remoteIp, out parsed) ||
-                  parsed.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork) return false;
-              byte[] ipBytes = parsed.GetAddressBytes();
-              return ipBytes[0] == a && ipBytes[1] == b;
-'@
-$replacement = @'
-              string[] octets = prefix.Split('.');
-              // Support 10.* and 10.21.* while rejecting a bare *.
-              if (octets.Length != 1 && octets.Length != 2) return false;
-              byte a, b = 0;
-              if (!Byte.TryParse(octets[0], out a)) return false;
-              if (octets.Length == 2 && !Byte.TryParse(octets[1], out b)) return false;
-              System.Net.IPAddress parsed;
-              if (!System.Net.IPAddress.TryParse(remoteIp, out parsed) ||
-                  parsed.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork) return false;
-              byte[] ipBytes = parsed.GetAddressBytes();
-              return ipBytes[0] == a && (octets.Length == 1 || ipBytes[1] == b);
-'@
-
-# Normalize only newlines for matching; preserve original line-ending convention.
-$unixSource = $source.Replace("`r`n", "`n")
-$oldUnix = $original.Replace("`r`n", "`n")
-$newUnix = $replacement.Replace("`r`n", "`n")
-if ($unixSource.Contains('Support 10.* and 10.21.* while rejecting a bare *')) {
-    Write-Host 'One-octet wildcard support is already installed. No files changed.' -ForegroundColor Yellow
-    exit 0
-}
-$matchCount = ([regex]::Matches($unixSource, [regex]::Escape($oldUnix))).Count
-if ($matchCount -ne 1) {
-    throw "Expected old wildcard code exactly once; found $matchCount. No files changed."
-}
-
-$backup = Join-Path $env:ProgramData ('PAMDailyHealthCheck\ConfigBackups\Wildcard10-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
-New-Item -ItemType Directory -Path $backup -Force -ErrorAction Stop | Out-Null
-Copy-Item -LiteralPath $page -Destination (Join-Path $backup 'Default.aspx') -ErrorAction Stop
-Copy-Item -LiteralPath $config -Destination (Join-Path $backup 'web.config') -ErrorAction Stop
-
-try {
-    $updated = $unixSource.Replace($oldUnix, $newUnix)
-    if ($source.Contains("`r`n")) { $updated = $updated.Replace("`n", "`r`n") }
-    [System.IO.File]::WriteAllText($page, $updated, $enc)
-    Write-Host 'SUCCESS: Added support for 10.* and 10.21.* in Default.aspx' -ForegroundColor Green
-    Write-Host "Backup: $backup"
-    Write-Host 'Your existing DevAllowedClientIPs entry in web.config was NOT changed.'
-    Write-Host 'A bare * remains unsupported.'
-    Write-Warning '10.* covers all of 10.0.0.0/8; use independent network restrictions and restore authenticated sign-in before production.'
-} catch {
-    Copy-Item -LiteralPath (Join-Path $backup 'Default.aspx') -Destination $page -Force
-    throw
-}
+Central Credential Provider (CCP)
+Windows Server installation, certificate authentication & prerequisite validation
+Deployment engineering runbook | 23 October 2026 | Prepared for CyberArk Privilege Cloud / IDIRA
+Scope: new on-premises Windows IIS CCP installation with TLS and client certificate authentication. This guide is not a substitute for the version-matched CyberArk release notes or tenant-specific Privilege Cloud connector configuration.
+1. Executive implementation decisions
+•	Preferred design: dedicated Windows Server 2022/2025 Desktop Experience with IIS 10 and a dedicated internal DNS name, such as ccp.company.example. Use only a CyberArk-supported installation package for the chosen OS and tenant.
+•	Use a trusted enterprise CA-issued HTTPS server certificate and separate CA-issued client certificates for each consumer application or workload; protect private keys and plan rotation.
+•	Separate two application IDs: internal AIMWebService AppID used by the CCP web service to communicate with its local provider; external consumer AppID passed in REST requests. Each identity has different authentication and Safe permission requirements.
+•	Choose one client-auth pattern and document it: direct IIS client certificates (preferred when possible); alternatively a validated load-balancer implementation compliant with CyberArk forwarded-certificate settings.
+•	Use certificate serial-number authentication for a straightforward initial rollout. Certificate-attribute authentication is also supported but its configuration is API-based.
+2. Official supported baseline and staging checklist
+Requirement	Minimum / required	Engineering note
+OS	Windows Server 2016/2019/2022/2025 Desktop Experience	Confirm support with exact CCP version
+IIS	IIS 10 and IIS 6 compatibility / Metabase	Install roles before CCP installer
+.NET Framework	4.8 or later	Not .NET 8 hosting bundle
+CPU / RAM	2 cores / 4 GB minimum	Production capacity based on request load
+Free space	115 MB installer + ~400 MB log growth	Allocate more operational headroom
+VC++	Visual C++ 2019 x86 and x64	Credential Provider installer installs automatically
+Network	Client -> CCP 443; CCP -> approved Privilege Cloud endpoints	Do not assume a single vendor port/host
+DNS / PKI	FQDN, server TLS cert, CA chain, CRL/OCSP	Subject Alternative Name must match name used
+CyberArk governance	AppID, Safe, permissions, vaulted account	Apply least-privilege and authenticate apps
+CyberArk documentation distinguishes IIS base prerequisite roles from optional Windows Authentication and client-certificate mapping roles. Add the latter when required by the chosen authentication design, not blindly on every host.
+Required Windows features
+Install-WindowsFeature Web-Server,Web-Asp-Net45,Web-Net-Ext45,Web-ASP,Web-ISAPI-Ext,Web-ISAPI-Filter,Web-Mgmt-Compat,Web-Metabase -IncludeManagementTools
+Optional when using IIS one-to-one certificate mapping:
+Install-WindowsFeature Web-Cert-Auth,Web-Client-Auth -IncludeManagementTools
+Optional ONLY for Windows Integrated Authentication endpoints:
+Install-WindowsFeature Web-Windows-Auth
+Feature installation changes the server; do not run until prerequisite assessment and change approval. A restart may be required.
+3. Preinstallation assessment (read-only)
+1.	Copy Test-CCPPrerequisites.ps1 to the proposed CCP machine. Open elevated 64-bit Windows PowerShell 5.1.
+2.	Run the command below with your approved FQDN and tenant hostname.
+3.	Review CSV/TXT report; remediate FAIL findings. Treat WARN and MANUAL as engineering review items, not automatic blockers.
+4.	Save the report in the change ticket. Record exceptions, approvals, responsible teams and targeted remediation date.
+.\\Test-CCPPrerequisites.ps1 -CcpFqdn "ccp.company.example" -PrivilegeCloudHost "TENANT.privilegecloud.cyberark.cloud" -OutputDirectory "C:\\Temp\\CCP-Audit"
+The checker does NOT install IIS, create certificates, modify registry, test real credentials, or prove tenant-side Vault connectivity. It performs DNS and TCP probes only if names are supplied. Client-certificate correctness must also be validated on each consuming host.
+4. Firewall, DNS, PKI and access change requests
+Traffic / object	Direction	Purpose
+Consumers -> CCP DNS/VIP TCP 443	Inbound to CCP	HTTPS client certificate requests
+CCP -> approved Privilege Cloud endpoint(s)	Outbound	Tenant-approved Credential Provider/Vault connectivity; verify actual connectivity model with CyberArk
+CCP -> CA CRL/OCSP URLs	Outbound	Certificate revocation verification
+CCP -> DNS, NTP, domain services	As needed	Domain resolution, time and account trust
+Operations -> CCP via controlled PSM	Restricted admin path	Recorded privileged access and patching
+5.	Request a DNS A record or approved VIP name for CCP.
+6.	Request a TLS Server Authentication certificate with exact CCP FQDN in DNS SAN and an export/provisioning method approved by PKI.
+7.	Request unique Client Authentication certificates for each application/workload. Ensure client key is installed and readable only by the calling identity.
+8.	Distribute enterprise root/intermediate CA trust chains. Validate CRL/OCSP reachability from CCP and callers.
+9.	Restrict inbound 443 to approved applications/subnets/load balancer. Disable legacy SSL/TLS protocols according to approved baseline and validate cipher negotiation.
+10.	If using a load balancer, document TLS passthrough versus TLS termination; do not trust arbitrary X-Client-Certificate or X-Forwarded-For headers from clients.
+5. Install Windows Credential Provider (first)
+11.	Obtain approved, matching Windows Credential Provider and Central Credential Provider Web Service media from the entitled CyberArk download location; check signatures, checksums and supported versions.
+12.	Sign in using approved recorded administrative access. Stage the media in secured local folders (e.g. C:\Install\Central Credential Provider\Windows and ...\Central Credential Provider Web Service).
+13.	Run the Credential Provider for Windows setup from the package first, following the package wizard and the Privilege Cloud integration instructions appropriate for your tenant.
+14.	Supply tenant-specific registration, provider/installation identity and connection information required by that approved installation workflow. Do not invent or hardcode tenant credentials in scripts.
+15.	Check the provider registration/connection status and installation logs. Verify the internal provider can communicate using tenant-supported architecture before proceeding.
+IMPORTANT: The Credential Provider connects to CyberArk, while the AIMWebService is hosted in IIS. The web-service installation is not a replacement for provider installation.
+6. Install the CCP AIMWebService (second)
+16.	Use the Central Credential Provider Web Service folder from the SAME versioned package as the Credential Provider.
+17.	Launch setup.exe elevated and complete the AIMWebService setup wizard. Alternatively run the package MSI in an approved deployment pipeline.
+18.	Verify AIMWebService is visible under IIS > Sites > Default Web Site (unless customized).
+19.	Confirm the application pool uses .NET CLR v4.0, which is the IIS runtime label for .NET Framework 4.x; ensure the appropriate app-pool identity is used.
+20.	Inspect C:\inetpub\wwwroot\AIMWebService\web.config. Preserve default configuration and only change documented settings. Verify AppID matches the internal web-service identity.
+msiexec.exe /i "<staged path>\AIMWebService.msi" /qn /L*v "C:\Temp\AIMWebService-install.log"
+After installation, the CyberArk-documented help page is https://<CCP-FQDN>/AIMWebService/Help. The installation itself does not securely configure IIS; perform the next phase before production use.
+7. Configure server-side HTTPS
+21.	In certlm.msc, import the approved TLS server PFX with its private key into Local Computer > Personal > Certificates. Confirm chain, EKU Server Authentication and SAN name.
+22.	Open inetmgr and navigate to Sites > Default Web Site > Bindings. Add/edit https on TCP 443 and select the installed certificate. If sharing port 443, validate hostname/SNI binding behavior before deployment.
+23.	At IIS > Default Web Site > AIMWebService > SSL Settings, select Require SSL.
+24.	On a dedicated certificate-only endpoint, set Client certificates: Require after client cert provisioning is ready. Use Accept only when intentionally allowing clients without mandatory IIS client certificate enforcement.
+25.	Validate https://<CCP-FQDN>/AIMWebService/Help from an approved test client; certificate errors must be resolved, never bypassed.
+26.	Enforce enterprise TLS baselines, certificate lifecycle, firewall scoping and HSTS as appropriate. Validate HSTS settings carefully on any shared site or subdomains.
+8. Configure client certificates, mapping and client identity
+8.1 Client certificate provisioning
+27.	For each consuming application, have PKI issue a client certificate with Client Authentication EKU (1.3.6.1.5.5.7.3.2), unique identity and valid date range.
+28.	Install the client certificate and private key on the application machine or approved HSM/key store; never distribute PFX and password casually.
+29.	Install appropriate client certificate issuing root/intermediate CA chain on the CCP machine; ensure IIS can build and revoke-check the chain.
+30.	For each approved client, record serial number and certificate subject / SAN / issuer as required by the chosen CyberArk AppID method.
+31.	Test client certificate presentation from the consumer to the IIS CCP endpoint.
+8.2 IIS certificate authentication and optional mapping
+32.	On IIS AIMWebService SSL Settings, set Client certificates = Require for a certificate-only endpoint.
+33.	CyberArk additionally documents certificate mapping authentication role services and one-to-one certificate mappings. Install Web-Cert-Auth and Web-Client-Auth only when implementing that mapping approach.
+34.	If implementing IIS certificate mapping, configure its appropriate user mapping, filesystem permissions and authentication settings with your IIS/security team, and disable Anonymous Authentication as required by the CyberArk mapping sequence.
+35.	Do not turn on Windows Authentication solely to use certificate serial-number authentication. Windows Authentication is a separate optional endpoint pattern.
+36.	If multiple consumers require incompatible IIS authentication settings, use CyberArk-documented separate web-service virtual applications / endpoints; retest all endpoints after upgrades.
+Defense in depth: IIS TLS client certificate enforcement authenticates the TLS client at the web server; a consumer AppID certificate serial-number/attribute rule is configured separately in CyberArk. Do not confuse IIS authentication mappings with application Safe authorization.
+8.3 OPTIONAL — Restrict client certificate Subject/CN through IIS Configuration Editor
+Purpose: For environments that require additional IIS-side filtering before a caller reaches AIMWebService, IIS Client Certificate Mapping Authentication supports many-to-one mappings that compare Subject attributes (for example CN or OU) or Issuer attributes. This is optional and distinct from CyberArk AppID certificate serial number/attribute authentication. Implement only after an IIS/security design review: mapping associates a matched certificate with a Windows account and is not merely a stand-alone text filter.
+Prerequisites and design checks
+•	Confirm the AIMWebService IIS application/endpoint to secure (typically Default Web Site > AIMWebService); avoid applying settings globally to unrelated applications.
+•	Confirm IIS Client Certificate Mapping Authentication role service is installed (Windows feature Web-CertProvider). Verify the feature name available on your Windows Server release before making changes. Active Directory Client Certificate Mapping Authentication is a different method.
+•	Ensure valid HTTPS binding and trusted client CA chain; check certificate Client Authentication EKU, revocation reachability, and the required authentication scheme. Take a backup of IIS configuration and document rollback.
+•	Create or identify a designated least-privilege Windows account for the mapping with only the necessary access. Coordinate password storage/rotation and IIS mapping credential protection with the Windows team; do not embed passwords in runbooks.
+•	For a certificate-only endpoint, IIS SSL Settings must require SSL and client certificates. Review how IIS authentication (including Anonymous Authentication) interacts with chosen certificate mapping; test before production.
+Configuration Editor — optional many-to-one CN match
+37.	Open IIS Manager (inetmgr). Select the intended CCP site/application configuration scope and open Management > Configuration Editor.
+38.	In Section, choose system.webServer/security/authentication/iisClientCertificateMappingAuthentication.
+39.	Set enabled = True; set manyToOneCertificateMappingsEnabled = True. The one-to-one mapping setting is a separate option and is not needed for this CN-rule example.
+40.	Open manyToOneMappings (ellipsis) and add a mapping: name = CCP-Approved-Ansible; enabled = True; permissionMode = Allow; userName = <approved mapped Windows account>; password = <supplied securely in IIS interface>.
+41.	In the mapping item, open rules (ellipsis) > Add and set certificateField = Subject, certificateSubField = CN, matchCriteria = ccp-ansible-client.company.com, compareCaseSensitive = True (example values; use the exact PKI-issued Subject CN).
+42.	Optionally add another rule for Issuer, such as certificateField = Issuer, certificateSubField = O and matchCriteria = <approved CA organization>. Confirm rule combination behavior in your test environment and never rely on a broadly shared CN as unique identity.
+43.	Apply changes; confirm they are committed at the intended site/application scope in IIS applicationHost.config. Recheck Authentication and SSL Settings, then perform controlled recycle/restart only if required by your change procedure.
+44.	Test three cases: approved client cert with matching CN (allowed if the Windows mapping and CyberArk AppID checks also pass); valid trusted cert with different CN (denied); and no client certificate (denied). Also test a matching CN from an unapproved issuer.
+Example rule values (documentation placeholders, not a deployable credential):
+•	certificateField: Subject
+•	certificateSubField: CN
+•	matchCriteria: ccp-ansible-client.company.com
+•	compareCaseSensitive: True
+•	permissionMode: Allow (in the many-to-one mapping, with the approved Windows account)
+Important limitations and recommended alternatives
+•	IIS CN filtering is a mapped Windows-authentication mechanism, NOT CyberArk application authorization. Continue configuring the consumer AppID with certificate serial number authentication or CyberArk-supported certificate attribute restrictions and least-privilege Safe access.
+•	Matching a CN does not distinguish two otherwise trusted certificates using the same CN. For tighter identity control, use per-application certificates and CyberArk serial-number authentication; rotate/update the permitted serial when renewing certificates.
+•	CyberArk certificate-attribute authentication is configured through its documented REST API and supports Subject, Issuer and supported SAN formats; do not invent a web.config setting to restrict certificate CN.
+•	Do not use the ClientCertificateHTTPHeaderFieldName web.config parameter for direct client-to-IIS authentication. That setting is for carefully secured load-balancer certificate forwarding, where the load balancer controls header injection.
+•	If mapping produces HTTP 401/403 or CyberArk reports APPAP330E, confirm IIS mapping identity, client certificate delivery and chain, then check AppID restrictions separately. Revert the optional mapping if it disrupts the already functioning certificate-auth flow.
+References for this optional section
+Microsoft: Configure many-to-one client mappings — https://learn.microsoft.com/en-us/troubleshoot/developer/webapps/iis/www-authentication-authorization/configure-many-to-one-client-mappings
+Microsoft: IIS many-to-one mapping rules — https://learn.microsoft.com/en-us/iis/configuration/system.webServer/security/authentication/iisClientCertificateMappingAuthentication/manyToOneMappings/add/rules/
+CyberArk: Central Credential Provider web service configuration — https://docs.cyberark.com/credential-providers/latest/en/content/ccp/configure_ccpwindows.htm
+CyberArk: Application authentication methods — https://docs.cyberark.com/credential-providers/latest/en/content/cp%20and%20ascp/application-authentication-methods-general.htm
+9. Configure CyberArk Privilege Cloud applications
+9.1 Internal AIMWebService identity
+45.	In Privilege Cloud/PVWA, go to Applications and add internal application AIMWebService (or your intentional custom web.config AppID).
+46.	Configure permitted CCP host(s) under Allowed Machines using approved host/DNS/IP values.
+47.	Configure the installed web service DLL path (default C:\inetpub\wwwroot\AIMWebService\bin\AIMWebService.dll) and/or internal IIS operating system identity as supported for your deployment.
+48.	If using Hash authentication, calculate hash with the CyberArk NetAIMGetAppInfo utility according to CyberArk instructions and manage changes during upgrades.
+49.	Validate the internal identity has only rights needed to service approved CCP requests.
+9.2 External consumer application identity
+50.	Create a distinct AppID for each caller, such as AAP-CCP-Prod. Do not reuse AIMWebService as the consumer application ID.
+51.	Add certificate serial-number authentication (or certificate attribute authentication through the documented REST API). Use precisely formatted values.
+52.	Optionally apply source Allowed Machines restrictions, recognizing load balancer forwarding implications.
+53.	On the approved Safe, authorize the consumer AppID for retrieval/listing as needed, following least privilege; verify application access rights rather than granting Safe administrator.
+54.	Identify the vaulted account by Safe/Object or approved search parameters; ensure the account object and platform are correct.
+55.	Repeat per consumer; document owner, certificate expiry, approved Safe, app ID and renewal responsibility.
+CyberArk serial-number application authentication accepts hexadecimal [a-fA-F0-9] and # characters. Certificate attribute authentication supports SAN/Subject/Issuer and has REST API-only configuration according to the reference guide.
+10. Test and acceptance criteria
+56.	Validate DNS resolves to expected server/VIP; network team verifies approved source-to-destination paths.
+57.	From an authorized client with a valid certificate, load the Help page using HTTPS with trusted TLS.
+58.	Invoke GetPassword from a test process with certificate selected and a least-privileged test AppID. Never print or save the returned password in logs or tickets.
+59.	Test WITHOUT certificate: expect IIS access rejection when Require client certificates is enabled.
+60.	Test WRONG / untrusted client certificate: request should fail. Test valid-but-unapproved certificate: CyberArk AppID authorization should fail.
+61.	Test wrong AppID / unpermitted Safe/object: access must be denied.
+62.	Review IIS access logs, AIMWebService/provider logs and Privilege Cloud audit events for correlated access without disclosing secrets.
+63.	Restart IIS in a controlled test and verify recovery; rehearse certificate expiration and replacement, rollback and backup.
+GET https://<CCP-FQDN>/AIMWebService/api/Accounts?AppID=<consumer-AppID>&Safe=<safe-name>&Object=<object-name>
+The above is a request shape, not a ready-to-run security test. Use your application’s approved HTTP client with the client certificate and securely handle the response. An HTTP 200 alone does not prove intended access controls.
+11. Troubleshooting matrix
+Symptom	Probable investigation
+TLS name mismatch	Inspect URL hostname and certificate DNS SAN / load balancer certificate.
+403.7 / client certificate required	Verify client PFX/private key presented, IIS Require setting, client EKU and trust.
+403 / certificate mapping failure	Review mapping roles, identity, configured mappings and IIS authentication.
+Timeout to tenant	Check CCP/provider outbound channel, DNS, firewalls, proxy and documented endpoints.
+Help URL not loading	Check W3SVC, IIS binding, app pool .NET v4.0, web app path, TLS and logs.
+Application not authorized	Check two separate AppIDs, consumer certificate matching, Allowed Machines, Safe and object permissions.
+Works direct, fails behind F5/LB	Validate client TLS termination, forwarded certificate header, trusted proxies and audit IP. Do not accept unsigned spoofable headers.
+CRL/OCSP failure	Validate certificate chain and network access to certificate revocation services.
+12. Operational handoff / change acceptance
+•	Approved OS/patch level and vulnerability scan, endpoint/DNS, backup/DR and patching owner.
+•	Prerequisite report CSV, exceptions, IIS role inventory, CCP/CP software versions and hashes.
+•	Certificate inventory: serial numbers, thumbprints, certificate purpose, issuers, expiration and designated owners; exclude private keys from documentation.
+•	Internal AppID and external AppIDs, Safe access approvals and periodic recertification.
+•	Incident contacts, monitored logs, capacity baseline, certificate renewal process and rollback plan.
+•	Positive retrieval, no-certificate denial, invalid-certificate denial, unapproved-AppID denial and negative-safe-permission tests.
+13. Authoritative references checked
+System requirements — https://docs.cyberark.com/credential-providers/latest/en/content/cp%20and%20ascp/sysreq-central-credential-provider.htm
+Install the CCP — https://docs.cyberark.com/credential-providers/latest/en/content/ccp/ccp-installation.htm
+IIS web service / TLS / client certificate / mapping — https://docs.cyberark.com/credential-providers/latest/en/content/ccp/configure_ccpwindows.htm
+Application authentication methods — https://docs.cyberark.com/credential-providers/latest/en/content/cp%20and%20ascp/application-authentication-methods-general.htm
+Load balancers and certificate forwarding — https://docs.cyberark.com/credential-providers/latest/en/content/ccp/load-balancing-the-central-credential-provider.htm
+REST GetPassword — https://docs.cyberark.com/credential-providers/latest/en/content/ccp/calling-the-web-service-using-rest.htm
+Final gate: confirm the actual version-matched Credential Provider for Windows installer procedure, Privilege Cloud/tenant connectivity requirements, and supportability with your CyberArk tenant administrator or support before applying changes.
