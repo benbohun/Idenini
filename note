@@ -1,78 +1,51 @@
 #requires -Version 5.1
 <#
-.SYNOPSIS
-Fixes misencoded evidence-download link text and footer separators in PAMHealthCheck.
-.DESCRIPTION
-Changes only UI text in Default.aspx. Does not change IIS, authentication,
-web.config, uploaded evidence, completion records, or the archive job.
+PAM Daily Health Check: descriptive filenames for NEW uploads.
+Does not rename existing evidence or modify web.config/IIS/authentication.
+Updates the upload filename and download filename validation together.
 #>
 [CmdletBinding()]
 param([string]$WebRoot = 'C:\inetpub\PAMDailyHealthCheck')
-
 $ErrorActionPreference = 'Stop'
-$aspx = Join-Path $WebRoot 'Default.aspx'
-if (-not (Test-Path -LiteralPath $aspx -PathType Leaf)) {
-    throw "Application page not found: $aspx"
+$file = Join-Path $WebRoot 'Default.aspx'
+if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "Missing application file: $file" }
+$backupRoot = 'C:\ProgramData\PAMDailyHealthCheck\ConfigBackups'
+New-Item -Path $backupRoot -ItemType Directory -Force | Out-Null
+$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$backup = Join-Path $backupRoot ("Default-before-evidence-names-$stamp.aspx")
+Copy-Item -LiteralPath $file -Destination $backup -ErrorAction Stop
+$enc = New-Object System.Text.UTF8Encoding($false)
+$source = [System.IO.File]::ReadAllText($file)
+$oldSave = 'saved=id.ToString("00")+"_"+Guid.NewGuid().ToString("N")+ext;'
+$newSave = @'
+// Human-readable filename; retain a unique identifier to prevent collisions.
+            string descriptiveName=System.Text.RegularExpressions.Regex.Replace(Checks[id-1], @"[^A-Za-z0-9]+", "-").Trim('-');
+            if(descriptiveName.Length>75) descriptiveName=descriptiveName.Substring(0,75).TrimEnd('-');
+            saved=id.ToString("00")+"_"+descriptiveName+"_"+Guid.NewGuid().ToString("N")+ext;
+'@.TrimEnd()
+$oldRegex = '@"^\d{2}_[0-9a-f]{32}\.docx?$"'
+$newRegex = '@"^\d{2}_(?:[A-Za-z0-9-]{1,75}_)?[0-9a-f]{32}\.docx?$"'
+if ($source.Contains($newRegex) -and $source.Contains('string descriptiveName=')) {
+    Write-Host 'Descriptive evidence naming is already installed.' -ForegroundColor Green
+    exit 0
 }
-
-# BOM-aware read, then write UTF-8 with BOM for classic ASP.NET source handling.
-$before = [System.IO.File]::ReadAllText($aspx, [System.Text.Encoding]::UTF8)
-$after = $before
-
-# Replace ONLY link text. The href/GET download handler is deliberately retained.
-# Accepts correctly rendered Unicode arrows as well as previously mojibaked variants.
-$pattern = '(?is)(<a\s+href\s*=\s*[''\"]\?download=\s*[''\"]?\s*\+\s*i\s*\+\s*[''\"][^>]*>)([^<]*Download Word evidence[^<]*)(</a>)'
-$rx = [System.Text.RegularExpressions.Regex]::new($pattern)
-$found = $rx.Matches($after)
-if ($found.Count -ne 1) {
-    # Slightly broader match for patched versions, still restricted to the download link.
-    $pattern = '(?is)(<a\s+href\s*=\s*[''\"][^''\"]*\?download=[^''\"]*[''\"][^>]*>)([^<]*Download Word evidence[^<]*)(</a>)'
-    $rx = [System.Text.RegularExpressions.Regex]::new($pattern)
-    $found = $rx.Matches($after)
-}
-if ($found.Count -ne 1) {
-    throw "Expected exactly one evidence download link expression, found $($found.Count). No changes made."
-}
-$after = $rx.Replace($after, [System.Text.RegularExpressions.MatchEvaluator]{
-    param($m)
-    $m.Groups[1].Value + 'Download Word Evidence' + $m.Groups[3].Value
-}, 1)
-
-# Replace non-ASCII footer separators with ASCII/HTML-safe separators.
-# Operates only inside the static footer div, never on code or stored data.
-$footerRx = [System.Text.RegularExpressions.Regex]::new('(?is)(<div class=''footer''>)(.*?)(</div>)')
-$footers = $footerRx.Matches($after)
-if ($footers.Count -eq 1) {
-    $after = $footerRx.Replace($after, [System.Text.RegularExpressions.MatchEvaluator]{
-        param($m)
-        $content = $m.Groups[2].Value
-        # Normalize all common mojibake footer delimiters and the Unicode bullet.
-        $content = [System.Text.RegularExpressions.Regex]::Replace($content, '\s*(?:\u2022|\u00e2\u20ac\u00a2|\u00c3\u00a2\u00e2\u201a\u00ac\u00a2)\s*', ' &bull; ')
-        $m.Groups[1].Value + $content + $m.Groups[3].Value
-    }, 1)
-}
-
-if ($after -eq $before) {
-    Write-Host 'Evidence link already corrected; nothing changed.' -ForegroundColor Green
-    return
-}
-
-$backupDir = Join-Path $WebRoot 'UIBackups'
-if (-not (Test-Path -LiteralPath $backupDir)) {
-    New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
-}
-$backup = Join-Path $backupDir ('Default.aspx.EvidenceLink.' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '.bak')
-[System.IO.File]::Copy($aspx, $backup, $false)
-
+if (-not $source.Contains($oldSave)) { throw "Expected upload filename logic was not found. No changes made. Backup: $backup" }
+if (-not $source.Contains($oldRegex)) { throw "Expected download filename validation was not found. No changes made. Backup: $backup" }
+$updated = $source.Replace($oldSave,$newSave).Replace($oldRegex,$newRegex)
+if ($updated -eq $source -or -not $updated.Contains($newRegex) -or -not $updated.Contains('string descriptiveName=')) { throw 'Patch verification failed. No changes made.' }
+$tmp = "$file.$stamp.tmp"
 try {
-    $utf8Bom = New-Object System.Text.UTF8Encoding($true)
-    [System.IO.File]::WriteAllText($aspx, $after, $utf8Bom)
+    [System.IO.File]::WriteAllText($tmp,$updated,$enc)
+    # Validate replacement without touching other application features.
+    $verify = [System.IO.File]::ReadAllText($tmp)
+    if (-not $verify.Contains($newRegex) -or -not $verify.Contains($newSave)) { throw 'Staged file verification failed.' }
+    Copy-Item -LiteralPath $tmp -Destination $file -Force -ErrorAction Stop
+    Write-Host "SUCCESS: New evidence filenames will include check description." -ForegroundColor Green
+    Write-Host "Application page: $file"
+    Write-Host "Backup: $backup"
+    Write-Host 'Existing records and files were left unchanged. Existing evidence links remain valid.'
+    Write-Host 'Example: 01_Verify-and-change-password-for-g-test-pam1-confirm-both-operations-succeed_<GUID>.docx'
 } catch {
-    [System.IO.File]::Copy($backup, $aspx, $true)
+    Copy-Item -LiteralPath $backup -Destination $file -Force -ErrorAction SilentlyContinue
     throw
-}
-
-Write-Host 'Evidence download link label corrected to: Download Word Evidence' -ForegroundColor Green
-Write-Host "Backup: $backup"
-Write-Host 'No changes made to evidence files, records, IPs, authentication, or IIS settings.'
-Write-Host 'Refresh the portal with Ctrl+F5.'
+} finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
