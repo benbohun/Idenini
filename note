@@ -1,51 +1,61 @@
 #requires -Version 5.1
 <#
-PAM Daily Health Check: descriptive filenames for NEW uploads.
-Does not rename existing evidence or modify web.config/IIS/authentication.
-Updates the upload filename and download filename validation together.
+Back up and clear TODAY's test Records and Evidence only.
+Never deletes prior dates, archives, or audit.tsv.
+Run from elevated PowerShell when no one is submitting checks.
+Use -ResetToday to confirm destructive action (after backup).
 #>
 [CmdletBinding()]
-param([string]$WebRoot = 'C:\inetpub\PAMDailyHealthCheck')
+param(
+    [string]$DataRoot = 'C:\ProgramData\PAMDailyHealthCheck',
+    [switch]$ResetToday
+)
 $ErrorActionPreference = 'Stop'
-$file = Join-Path $WebRoot 'Default.aspx'
-if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "Missing application file: $file" }
-$backupRoot = 'C:\ProgramData\PAMDailyHealthCheck\ConfigBackups'
-New-Item -Path $backupRoot -ItemType Directory -Force | Out-Null
-$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$backup = Join-Path $backupRoot ("Default-before-evidence-names-$stamp.aspx")
-Copy-Item -LiteralPath $file -Destination $backup -ErrorAction Stop
-$enc = New-Object System.Text.UTF8Encoding($false)
-$source = [System.IO.File]::ReadAllText($file)
-$oldSave = 'saved=id.ToString("00")+"_"+Guid.NewGuid().ToString("N")+ext;'
-$newSave = @'
-// Human-readable filename; retain a unique identifier to prevent collisions.
-            string descriptiveName=System.Text.RegularExpressions.Regex.Replace(Checks[id-1], @"[^A-Za-z0-9]+", "-").Trim('-');
-            if(descriptiveName.Length>75) descriptiveName=descriptiveName.Substring(0,75).TrimEnd('-');
-            saved=id.ToString("00")+"_"+descriptiveName+"_"+Guid.NewGuid().ToString("N")+ext;
-'@.TrimEnd()
-$oldRegex = '@"^\d{2}_[0-9a-f]{32}\.docx?$"'
-$newRegex = '@"^\d{2}_(?:[A-Za-z0-9-]{1,75}_)?[0-9a-f]{32}\.docx?$"'
-if ($source.Contains($newRegex) -and $source.Contains('string descriptiveName=')) {
-    Write-Host 'Descriptive evidence naming is already installed.' -ForegroundColor Green
+$today = Get-Date -Format 'yyyy-MM-dd'
+$records = Join-Path (Join-Path $DataRoot 'Records') $today
+$evidence = Join-Path (Join-Path $DataRoot 'Evidence') $today
+$backupBase = Join-Path $DataRoot 'TestResetBackups'
+$backupPath = Join-Path $backupBase ("$today-$(Get-Date -Format yyyyMMdd-HHmmss)-$([guid]::NewGuid().ToString('N').Substring(0,6))")
+$items = @()
+if (Test-Path -LiteralPath $records -PathType Container) { $items += @{Type='Records'; Path=$records} }
+if (Test-Path -LiteralPath $evidence -PathType Container) { $items += @{Type='Evidence'; Path=$evidence} }
+Write-Host "Date to reset (server-local): $today" -ForegroundColor Cyan
+foreach($item in $items) {
+    $count = @(Get-ChildItem -LiteralPath $item.Path -Recurse -File -ErrorAction Stop).Count
+    Write-Host "$($item.Type): $count files at $($item.Path)"
+}
+if (-not $ResetToday) {
+    Write-Host 'DRY RUN ONLY. To back up and clear today, re-run with -ResetToday.' -ForegroundColor Yellow
     exit 0
 }
-if (-not $source.Contains($oldSave)) { throw "Expected upload filename logic was not found. No changes made. Backup: $backup" }
-if (-not $source.Contains($oldRegex)) { throw "Expected download filename validation was not found. No changes made. Backup: $backup" }
-$updated = $source.Replace($oldSave,$newSave).Replace($oldRegex,$newRegex)
-if ($updated -eq $source -or -not $updated.Contains($newRegex) -or -not $updated.Contains('string descriptiveName=')) { throw 'Patch verification failed. No changes made.' }
-$tmp = "$file.$stamp.tmp"
-try {
-    [System.IO.File]::WriteAllText($tmp,$updated,$enc)
-    # Validate replacement without touching other application features.
-    $verify = [System.IO.File]::ReadAllText($tmp)
-    if (-not $verify.Contains($newRegex) -or -not $verify.Contains($newSave)) { throw 'Staged file verification failed.' }
-    Copy-Item -LiteralPath $tmp -Destination $file -Force -ErrorAction Stop
-    Write-Host "SUCCESS: New evidence filenames will include check description." -ForegroundColor Green
-    Write-Host "Application page: $file"
-    Write-Host "Backup: $backup"
-    Write-Host 'Existing records and files were left unchanged. Existing evidence links remain valid.'
-    Write-Host 'Example: 01_Verify-and-change-password-for-g-test-pam1-confirm-both-operations-succeed_<GUID>.docx'
-} catch {
-    Copy-Item -LiteralPath $backup -Destination $file -Force -ErrorAction SilentlyContinue
-    throw
-} finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+if ($items.Count -eq 0) { Write-Host 'Nothing to reset for today.'; exit 0 }
+New-Item -ItemType Directory -Path $backupPath -Force | Out-Null
+# Copy both directories and validate file counts and content hashes before any deletion.
+foreach ($item in $items) {
+    $target = Join-Path $backupPath $item.Type
+    Copy-Item -LiteralPath $item.Path -Destination $target -Recurse -Force -ErrorAction Stop
+}
+foreach ($item in $items) {
+    $target = Join-Path $backupPath $item.Type
+    $sourceFiles = @(Get-ChildItem -LiteralPath $item.Path -Recurse -File -ErrorAction Stop)
+    $destFiles = @(Get-ChildItem -LiteralPath $target -Recurse -File -ErrorAction Stop)
+    if ($sourceFiles.Count -ne $destFiles.Count) { throw "Backup count mismatch for $($item.Type). No files deleted." }
+    foreach ($original in $sourceFiles) {
+        $relative = $original.FullName.Substring($item.Path.Length).TrimStart('\')
+        $copy = Join-Path $target $relative
+        if (-not (Test-Path -LiteralPath $copy -PathType Leaf)) { throw "Missing backup: $copy" }
+        if ((Get-FileHash -LiteralPath $original.FullName -Algorithm SHA256).Hash -ne (Get-FileHash -LiteralPath $copy -Algorithm SHA256).Hash) {
+            throw "Backup checksum mismatch: $copy. No files deleted."
+        }
+    }
+}
+# Rename directories to a quarantine location before removal to avoid partial checklist state.
+foreach ($item in $items) {
+    Remove-Item -LiteralPath $item.Path -Recurse -Force -ErrorAction Stop
+}
+$log = Join-Path $DataRoot 'test-resets.log'
+$line = "$(Get-Date -Format o)`tRESET`t$today`t$env:USERDOMAIN\$env:USERNAME`tBackup=$backupPath"
+Add-Content -LiteralPath $log -Value $line -Encoding UTF8
+Write-Host "SUCCESS: Today ($today) reset to pending. Verified backup: $backupPath" -ForegroundColor Green
+Write-Host 'Older dates, Archive, web.config, application source, and audit.tsv unchanged.'
+Write-Warning 'Previous test submissions remain in audit.tsv; test reset activity is documented in test-resets.log.'
