@@ -1,3 +1,78 @@
-https://help.salesforce.com/s/articleView?id=xcloud.admin_sessions.htm&type=5
+#requires -Version 5.1
+<#
+.SYNOPSIS
+Fixes misencoded evidence-download link text and footer separators in PAMHealthCheck.
+.DESCRIPTION
+Changes only UI text in Default.aspx. Does not change IIS, authentication,
+web.config, uploaded evidence, completion records, or the archive job.
+#>
+[CmdletBinding()]
+param([string]$WebRoot = 'C:\inetpub\PAMDailyHealthCheck')
 
-Salesforce explicitly documents Force logout on session timeout, which refreshes the browser back to login once the session expires.
+$ErrorActionPreference = 'Stop'
+$aspx = Join-Path $WebRoot 'Default.aspx'
+if (-not (Test-Path -LiteralPath $aspx -PathType Leaf)) {
+    throw "Application page not found: $aspx"
+}
+
+# BOM-aware read, then write UTF-8 with BOM for classic ASP.NET source handling.
+$before = [System.IO.File]::ReadAllText($aspx, [System.Text.Encoding]::UTF8)
+$after = $before
+
+# Replace ONLY link text. The href/GET download handler is deliberately retained.
+# Accepts correctly rendered Unicode arrows as well as previously mojibaked variants.
+$pattern = '(?is)(<a\s+href\s*=\s*[''\"]\?download=\s*[''\"]?\s*\+\s*i\s*\+\s*[''\"][^>]*>)([^<]*Download Word evidence[^<]*)(</a>)'
+$rx = [System.Text.RegularExpressions.Regex]::new($pattern)
+$found = $rx.Matches($after)
+if ($found.Count -ne 1) {
+    # Slightly broader match for patched versions, still restricted to the download link.
+    $pattern = '(?is)(<a\s+href\s*=\s*[''\"][^''\"]*\?download=[^''\"]*[''\"][^>]*>)([^<]*Download Word evidence[^<]*)(</a>)'
+    $rx = [System.Text.RegularExpressions.Regex]::new($pattern)
+    $found = $rx.Matches($after)
+}
+if ($found.Count -ne 1) {
+    throw "Expected exactly one evidence download link expression, found $($found.Count). No changes made."
+}
+$after = $rx.Replace($after, [System.Text.RegularExpressions.MatchEvaluator]{
+    param($m)
+    $m.Groups[1].Value + 'Download Word Evidence' + $m.Groups[3].Value
+}, 1)
+
+# Replace non-ASCII footer separators with ASCII/HTML-safe separators.
+# Operates only inside the static footer div, never on code or stored data.
+$footerRx = [System.Text.RegularExpressions.Regex]::new('(?is)(<div class=''footer''>)(.*?)(</div>)')
+$footers = $footerRx.Matches($after)
+if ($footers.Count -eq 1) {
+    $after = $footerRx.Replace($after, [System.Text.RegularExpressions.MatchEvaluator]{
+        param($m)
+        $content = $m.Groups[2].Value
+        # Normalize all common mojibake footer delimiters and the Unicode bullet.
+        $content = [System.Text.RegularExpressions.Regex]::Replace($content, '\s*(?:\u2022|\u00e2\u20ac\u00a2|\u00c3\u00a2\u00e2\u201a\u00ac\u00a2)\s*', ' &bull; ')
+        $m.Groups[1].Value + $content + $m.Groups[3].Value
+    }, 1)
+}
+
+if ($after -eq $before) {
+    Write-Host 'Evidence link already corrected; nothing changed.' -ForegroundColor Green
+    return
+}
+
+$backupDir = Join-Path $WebRoot 'UIBackups'
+if (-not (Test-Path -LiteralPath $backupDir)) {
+    New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
+}
+$backup = Join-Path $backupDir ('Default.aspx.EvidenceLink.' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '.bak')
+[System.IO.File]::Copy($aspx, $backup, $false)
+
+try {
+    $utf8Bom = New-Object System.Text.UTF8Encoding($true)
+    [System.IO.File]::WriteAllText($aspx, $after, $utf8Bom)
+} catch {
+    [System.IO.File]::Copy($backup, $aspx, $true)
+    throw
+}
+
+Write-Host 'Evidence download link label corrected to: Download Word Evidence' -ForegroundColor Green
+Write-Host "Backup: $backup"
+Write-Host 'No changes made to evidence files, records, IPs, authentication, or IIS settings.'
+Write-Host 'Refresh the portal with Ctrl+F5.'
