@@ -1,61 +1,94 @@
-#requires -Version 5.1
+#Requires -Version 5.1
 <#
-Back up and clear TODAY's test Records and Evidence only.
-Never deletes prior dates, archives, or audit.tsv.
-Run from elevated PowerShell when no one is submitting checks.
-Use -ResetToday to confirm destructive action (after backup).
+.SYNOPSIS
+ Adds check 24 to the existing CyberArk PAM Daily Health Check ASP.NET Web Forms portal.
+.DESCRIPTION
+ Changes ONLY the Checks array inside Default.aspx. Does not touch existing
+ evidence, records, web.config, app-pool, IIS authentication, or scheduled tasks.
+ Re-running after successful patch is safe.
 #>
 [CmdletBinding()]
 param(
-    [string]$DataRoot = 'C:\ProgramData\PAMDailyHealthCheck',
-    [switch]$ResetToday
+    [string]$WebRoot = 'C:\inetpub\PAMDailyHealthCheck'
 )
+
+Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$today = Get-Date -Format 'yyyy-MM-dd'
-$records = Join-Path (Join-Path $DataRoot 'Records') $today
-$evidence = Join-Path (Join-Path $DataRoot 'Evidence') $today
-$backupBase = Join-Path $DataRoot 'TestResetBackups'
-$backupPath = Join-Path $backupBase ("$today-$(Get-Date -Format yyyyMMdd-HHmmss)-$([guid]::NewGuid().ToString('N').Substring(0,6))")
-$items = @()
-if (Test-Path -LiteralPath $records -PathType Container) { $items += @{Type='Records'; Path=$records} }
-if (Test-Path -LiteralPath $evidence -PathType Container) { $items += @{Type='Evidence'; Path=$evidence} }
-Write-Host "Date to reset (server-local): $today" -ForegroundColor Cyan
-foreach($item in $items) {
-    $count = @(Get-ChildItem -LiteralPath $item.Path -Recurse -File -ErrorAction Stop).Count
-    Write-Host "$($item.Type): $count files at $($item.Path)"
+
+$aspx = Join-Path $WebRoot 'Default.aspx'
+$description = 'Check Session Diagnostics and filter System Error (CyberArk Setup tile > Session Diagnostics); investigate the cause of any errors'
+
+if (-not (Test-Path -LiteralPath $aspx -PathType Leaf)) {
+    throw "Default.aspx not found at: $aspx"
 }
-if (-not $ResetToday) {
-    Write-Host 'DRY RUN ONLY. To back up and clear today, re-run with -ResetToday.' -ForegroundColor Yellow
+
+# Encoding-preserving UTF-8 read/write: retain BOM when present. Source is ASPX/C#.
+$rawBytes = [System.IO.File]::ReadAllBytes($aspx)
+$hasBom = $rawBytes.Length -ge 3 -and $rawBytes[0] -eq 239 -and $rawBytes[1] -eq 187 -and $rawBytes[2] -eq 191
+$utf8Strict = New-Object System.Text.UTF8Encoding($hasBom, $true)
+$source = $utf8Strict.GetString($rawBytes)
+$source = $source.TrimStart([char]0xFEFF)
+
+# Locate just the static check array. Do not replace unrelated application code.
+$pattern = '(?s)(private\s+static\s+readonly\s+string\[\]\s+Checks\s*=\s*new\s*\[\]\s*\{)(.*?)(\r?\n\s*\};)'
+$match = [regex]::Match($source, $pattern)
+if (-not $match.Success) {
+    throw 'Could not uniquely locate the Checks array in Default.aspx. No files changed.'
+}
+if ([regex]::Matches($source, $pattern).Count -ne 1) {
+    throw 'Multiple Checks arrays found. No files changed.'
+}
+
+$body = $match.Groups[2].Value
+# Each item in this application is a C# string literal on its own line.
+$entries = [regex]::Matches($body, '(?m)^\s*"(?:[^"\\]|\\.)*"\s*,?\s*$')
+if ($body.Contains($description)) {
+    Write-Host 'Session Diagnostics check already exists. No changes made.' -ForegroundColor Green
+    Write-Host ("Current count: {0}" -f $entries.Count)
     exit 0
 }
-if ($items.Count -eq 0) { Write-Host 'Nothing to reset for today.'; exit 0 }
-New-Item -ItemType Directory -Path $backupPath -Force | Out-Null
-# Copy both directories and validate file counts and content hashes before any deletion.
-foreach ($item in $items) {
-    $target = Join-Path $backupPath $item.Type
-    Copy-Item -LiteralPath $item.Path -Destination $target -Recurse -Force -ErrorAction Stop
+if ($entries.Count -ne 23) {
+    throw ("Expected 23 existing checks; found {0}. Refusing to modify the portal to avoid overwriting customized items." -f $entries.Count)
 }
-foreach ($item in $items) {
-    $target = Join-Path $backupPath $item.Type
-    $sourceFiles = @(Get-ChildItem -LiteralPath $item.Path -Recurse -File -ErrorAction Stop)
-    $destFiles = @(Get-ChildItem -LiteralPath $target -Recurse -File -ErrorAction Stop)
-    if ($sourceFiles.Count -ne $destFiles.Count) { throw "Backup count mismatch for $($item.Type). No files deleted." }
-    foreach ($original in $sourceFiles) {
-        $relative = $original.FullName.Substring($item.Path.Length).TrimStart('\')
-        $copy = Join-Path $target $relative
-        if (-not (Test-Path -LiteralPath $copy -PathType Leaf)) { throw "Missing backup: $copy" }
-        if ((Get-FileHash -LiteralPath $original.FullName -Algorithm SHA256).Hash -ne (Get-FileHash -LiteralPath $copy -Algorithm SHA256).Hash) {
-            throw "Backup checksum mismatch: $copy. No files deleted."
-        }
-    }
+
+# Add a comma to the previous last entry if absent, preserving its content.
+$last = $entries[$entries.Count - 1]
+$line = $last.Value
+if ($line -notmatch ',\s*$') {
+    $lineFixed = $line.TrimEnd() + ','
+    $newBody = $body.Substring(0, $last.Index) + $lineFixed + $body.Substring($last.Index + $last.Length)
+} else {
+    $newBody = $body
 }
-# Rename directories to a quarantine location before removal to avoid partial checklist state.
-foreach ($item in $items) {
-    Remove-Item -LiteralPath $item.Path -Recurse -Force -ErrorAction Stop
+
+$newline = if ($source.Contains("`r`n")) { "`r`n" } else { "`n" }
+# Preserve indentation and line ending conventions.
+$indent = ([regex]::Match($line, '^\s*')).Value
+$newEntry = $newline + $indent + '"' + $description + '"'
+$newBody = $newBody.TrimEnd("`r", "`n") + $newEntry
+
+$replacement = $match.Groups[1].Value + $newBody + $match.Groups[3].Value
+$updated = $source.Substring(0, $match.Index) + $replacement + $source.Substring($match.Index + $match.Length)
+
+$updatedMatch = [regex]::Match($updated, $pattern)
+$updatedEntries = [regex]::Matches($updatedMatch.Groups[2].Value, '(?m)^\s*"(?:[^"\\]|\\.)*"\s*,?\s*$')
+if ($updatedEntries.Count -ne 24 -or -not $updated.Contains($description)) {
+    throw 'Post-update checklist verification failed. No files changed.'
 }
-$log = Join-Path $DataRoot 'test-resets.log'
-$line = "$(Get-Date -Format o)`tRESET`t$today`t$env:USERDOMAIN\$env:USERNAME`tBackup=$backupPath"
-Add-Content -LiteralPath $log -Value $line -Encoding UTF8
-Write-Host "SUCCESS: Today ($today) reset to pending. Verified backup: $backupPath" -ForegroundColor Green
-Write-Host 'Older dates, Archive, web.config, application source, and audit.tsv unchanged.'
-Write-Warning 'Previous test submissions remain in audit.tsv; test reset activity is documented in test-resets.log.'
+
+$backupDir = Join-Path $WebRoot 'ConfigBackups'
+[void][System.IO.Directory]::CreateDirectory($backupDir)
+$backup = Join-Path $backupDir ('Default.aspx.before-check24-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.bak')
+Copy-Item -LiteralPath $aspx -Destination $backup -ErrorAction Stop
+
+try {
+    [System.IO.File]::WriteAllText($aspx, $updated, $utf8Strict)
+    Write-Host 'SUCCESS: Check 24 added to the PAM Daily Health Check checklist.' -ForegroundColor Green
+    Write-Host ('New total: {0}' -f $updatedEntries.Count)
+    Write-Host ('Check 24: {0}' -f $description)
+    Write-Host ('Backup: {0}' -f $backup)
+    Write-Host 'Reload the page (Ctrl+F5). ASP.NET will automatically recompile Default.aspx.'
+} catch {
+    Copy-Item -LiteralPath $backup -Destination $aspx -Force
+    throw
+}
