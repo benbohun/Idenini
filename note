@@ -126,3 +126,62 @@ $download=@'
       XElement record=ReadRecord(day,id);
       string filename=Attr(record,"evidence");
       if(!System.Text.RegularExpressions.Regex.IsMatch(filename,@"^\d{2}_(?:[A-Za-z0-9-]{1,75}_)?[0-9a-f]{32}\.(pdf|jpe?g|png|gif|webp|txt|csv|docx?|xlsx?|pptx?)$",System.Text.RegularExpressions.RegexOptions.IgnoreCase)) { Response.StatusCode=404; Context.ApplicationInstance.CompleteRequest(); return; }
+      if(!filename.StartsWith(id.ToString("00")+"_",StringComparison.Ordinal)) { Response.StatusCode=404; Context.ApplicationInstance.CompleteRequest(); return; }
+      string path=EvidencePath(day,filename);
+      if(!File.Exists(path)) path=Path.Combine(DataRoot,"Archive",day,"Evidence",filename);
+      if(!File.Exists(path)) { Response.StatusCode=404; Context.ApplicationInstance.CompleteRequest(); return; }
+      Response.Clear(); Response.ContentType="application/octet-stream";
+      Response.AddHeader("X-Content-Type-Options","nosniff");
+      Response.AddHeader("Content-Disposition","attachment; filename=\""+filename+"\"");
+      Response.TransmitFile(path); Context.ApplicationInstance.CompleteRequest();
+    }
+'@
+$patched=Replace-Section $source '    private void SavePost() {' '    private void Flash(' $save
+$patched=Replace-Section $patched '    private void Download() {' '    private void RenderPage() {' $download
+# Add actions only to the existing completed-card branch; keep all later customizations intact.
+$needle='        } else if(editable) {'
+$inject=@'
+          if(editable) {
+            sb.Append("<details class='amend'><summary>Manage submission</summary><p class='muted'>Upload a corrected evidence file, or reopen this check to submit it again. Previous versions are kept in the local Revisions folder.</p>");
+            sb.Append("<form method='post' enctype='multipart/form-data'><input type='hidden' name='csrf' value='"+H(Token)+"'><input type='hidden' name='id' value='"+i+"'><label class='muted'>Correction notes (optional)</label><textarea name='notes' maxlength='2000' placeholder='Reason for replacing the evidence'></textarea><div class='formrow'><input type='file' name='evidence' accept='.pdf,.jpg,.jpeg,.png,.gif,.webp,.txt,.csv,.doc,.docx,.xls,.xlsx,.ppt,.pptx' required><button type='submit' name='outcome' value='Replace' onclick='return confirm(&quot;Replace the current evidence? The previous version will be retained for audit.&quot;)'>Replace Evidence</button></div></form>");
+            sb.Append("<form method='post'><input type='hidden' name='csrf' value='"+H(Token)+"'><input type='hidden' name='id' value='"+i+"'><button type='submit' class='warn' name='outcome' value='Reopen' onclick='return confirm(&quot;Reopen this check? The current submission will be retained in Revisions, and the check will become Pending.&quot;)'>Reopen Check</button></form></details>");
+          }
+        } else if(editable) {
+'@
+if(([regex]::Matches($patched,[regex]::Escape($needle))).Count -ne 1) { throw 'Multiple renderer insertion points detected; refusing to patch.' }
+$patched=$patched.Replace($needle,$inject.TrimEnd("`r","`n"))
+# Any original accept attribute: replace only its known file selector variants
+$patched=$patched.Replace("accept='.doc,.docx'","accept='.pdf,.jpg,.jpeg,.png,.gif,.webp,.txt,.csv,.doc,.docx,.xls,.xlsx,.ppt,.pptx'")
+$patched=$patched.Replace('A Word evidence document is required','An evidence file is required')
+$patched=$patched.Replace('Download Word Evidence','Download Evidence').Replace('Download Word evidence','Download Evidence')
+$patched=$patched.Replace('Completed items require .doc/.docx evidence (up to 9 MB).','Completed items require evidence (PDF, image, text, CSV or Office file; up to 9 MB).')
+$patched=$patched.Replace('local Word evidence.','local supporting evidence.')
+$patched=$patched.Replace('Each item is signed once per day.','Each item can be reopened or its evidence replaced.')
+# Current app has no user-side reset; selecting a file can always be cancelled before submit.
+# Add JS clear control adjacent to upload inputs via delegated handler, without affecting POST workflow.
+# Append to the final render-generated HTML, not the ASPX source outside script.
+$tag='      Response.ContentType="text/html; charset=utf-8"; Response.Write(sb.ToString());'
+if(-not $patched.Contains($tag)) { throw 'Unexpected HTML rendering code. No files changed.' }
+# JavaScript clear control inserted in server-generated markup via string literal.
+$jsCsharp='      sb.Append(@"<script>document.addEventListener(''DOMContentLoaded'',function(){document.querySelectorAll(''input[type=file][name=evidence]'').forEach(function(input){var clear=document.createElement(''button'');clear.type=''button'';clear.textContent=''Clear selection'';clear.style.cssText=''background:#62758a;padding:7px 11px;font-size:12px'';clear.addEventListener(''click'',function(){input.value='''';});input.insertAdjacentElement(''afterend'',clear);});});</script>");'
+# Replace doubled JS single quotes: inside C# verbatim string, single quotes should not be doubled.
+$jsCsharp=$jsCsharp.Replace("''","'")
+$patched=$patched.Replace($tag,$jsCsharp+"`r`n"+$tag)
+if(-not $patched.Contains('private bool EvidenceValid(HttpPostedFile f') -or -not $patched.Contains('Replace Evidence') -or -not $patched.Contains('Reopen Check')) { throw 'Patch self-validation failed.' }
+$backupDir=Join-Path $WebRoot 'ConfigBackups'; [void][IO.Directory]::CreateDirectory($backupDir)
+$stamp=Get-Date -Format 'yyyyMMdd-HHmmss'
+$backup=Join-Path $backupDir ("Default.before-evidence-workflow-$stamp.aspx")
+Copy-Item -LiteralPath $path -Destination $backup -ErrorAction Stop
+$staged="$path.$stamp.staged"
+try {
+ [IO.File]::WriteAllText($staged,$patched,$utf8)
+ if(-not ([IO.File]::ReadAllText($staged)).Contains('Reopen Check')) { throw 'Staged verification failed.' }
+ Move-Item -LiteralPath $staged -Destination $path -Force
+ Write-Host 'Updated health check upload workflow. Refresh the portal.' -ForegroundColor Green
+ Write-Host "Backup: $backup"
+ Write-Host 'Previous evidence will be saved under DataRoot\Revisions\yyyy-MM-dd\checkID.'
+ Write-Host 'No changes made to web.config, existing records, IP rules, or IIS.'
+} catch {
+ Copy-Item -LiteralPath $backup -Destination $path -Force -ErrorAction SilentlyContinue
+ throw
+} finally { Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue }
