@@ -3,6 +3,7 @@
 Patch the existing PAMDailyHealthCheck Default.aspx without touching checklist,
 web.config, authentication, HTTPS bindings, previous submissions, or archive job.
 Supports replacement/reopen and safe common evidence formats.
+Does not reset or delete daily submissions.
 #>
 [CmdletBinding()]
 param([string]$WebRoot='C:\inetpub\PAMDailyHealthCheck')
@@ -174,15 +175,35 @@ $stageSource=Join-Path $stageRoot 'source'
 $stageOut=Join-Path $stageRoot 'compiled'
 New-Item -ItemType Directory -Path $stageSource,$stageOut -Force | Out-Null
 try {
-  Copy-Item -Path (Join-Path $WebRoot '*') -Destination $stageSource -Recurse -Force -ErrorAction Stop
+  # Only stage runtime application files. Never stage ConfigBackups, including old
+  # failed *.aspx pages: aspnet_compiler treats every ASPX below -p as build input.
+  Copy-Item -LiteralPath (Join-Path $WebRoot 'web.config') -Destination (Join-Path $stageSource 'web.config') -Force -ErrorAction Stop
+  foreach($dir in @('bin','App_Code','App_GlobalResources','App_LocalResources')) {
+    $folder=Join-Path $WebRoot $dir
+    if(Test-Path -LiteralPath $folder -PathType Container) { Copy-Item -LiteralPath $folder -Destination (Join-Path $stageSource $dir) -Recurse -Force -ErrorAction Stop }
+  }
+  # Default.aspx comes from the patched in-memory source, written immediately below.
+
   [IO.File]::WriteAllText((Join-Path $stageSource 'Default.aspx'),$patched,$utf8)
   # -p compiles the physical directory as its own ASP.NET application. The staging copy
   # never processes incoming web requests or modifies the production Records/Evidence.
   $output=& $compiler '-v' '/PAMHealthCheck' '-p' $stageSource '-f' $stageOut 2>&1
   if($LASTEXITCODE -ne 0) { throw "ASP.NET precompilation FAILED (live site untouched):`n$($output -join [Environment]::NewLine)" }
   Write-Host 'ASP.NET compilation passed on the staging copy.' -ForegroundColor Green
-  $backupDir=Join-Path $WebRoot 'ConfigBackups'
+  # Move old ASPX source backups outside the live IIS application tree.
+  # They are NOT needed for runtime operation, and compiling them causes CS1010.
+  $backupDir=Join-Path 'C:\ProgramData\PAMDailyHealthCheck' 'ConfigBackups'
   [void][IO.Directory]::CreateDirectory($backupDir)
+  $webBackupDir=Join-Path $WebRoot 'ConfigBackups'
+  if(Test-Path -LiteralPath $webBackupDir -PathType Container) {
+    $oldPages=@(Get-ChildItem -LiteralPath $webBackupDir -Recurse -File -Filter '*.aspx' -ErrorAction Stop)
+    foreach($oldPage in $oldPages) {
+      $dest=Join-Path $backupDir ($oldPage.BaseName+'-'+[guid]::NewGuid().ToString('N').Substring(0,8)+$oldPage.Extension)
+      Move-Item -LiteralPath $oldPage.FullName -Destination $dest -ErrorAction Stop
+      Write-Host "Moved old ASPX backup outside IIS root: $dest"
+    }
+  }
+  # Ensure all future source backups remain outside the IIS application.
   $backup=Join-Path $backupDir ("Default.before-evidence-workflow-$stamp.aspx")
   Copy-Item -LiteralPath $path -Destination $backup -ErrorAction Stop
   $temp=Join-Path $WebRoot ("Default.workflow-$stamp.tmp")
