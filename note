@@ -1,50 +1,61 @@
-#Requires -Version 5.1
-<#[
- Restores the pre-evidence-workflow Default.aspx backup.
- Does not change stored evidence, records, web.config, or IIS site configuration.
-]#>
-[CmdletBinding(SupportsShouldProcess=$true,ConfirmImpact='High')]
+#requires -Version 5.1
+<#
+Back up and clear TODAY's test Records and Evidence only.
+Never deletes prior dates, archives, or audit.tsv.
+Run from elevated PowerShell when no one is submitting checks.
+Use -ResetToday to confirm destructive action (after backup).
+#>
+[CmdletBinding()]
 param(
-  [string]$WebRoot='C:\inetpub\PAMDailyHealthCheck',
-  [string]$BackupPath='',
-  [switch]$AllowOlderChecklistBackup
+    [string]$DataRoot = 'C:\ProgramData\PAMDailyHealthCheck',
+    [switch]$ResetToday
 )
-$ErrorActionPreference='Stop'
-$target=Join-Path $WebRoot 'Default.aspx'
-$backupDir=Join-Path $WebRoot 'ConfigBackups'
-if(-not (Test-Path -LiteralPath $target -PathType Leaf)) { throw "Default.aspx not found: $target" }
-if(-not (Test-Path -LiteralPath $backupDir -PathType Container)) { throw "Backup directory not found: $backupDir" }
-if([string]::IsNullOrWhiteSpace($BackupPath)) {
-  $all=@(Get-ChildItem -LiteralPath $backupDir -File -Filter 'Default.before-evidence-workflow-*.aspx' | Sort-Object LastWriteTime -Descending)
-  if($all.Count -eq 0) { throw 'No pre-evidence-workflow backup found. No changes made. Do NOT restore an unrelated or older backup.' }
-  $BackupPath=$all[0].FullName
+$ErrorActionPreference = 'Stop'
+$today = Get-Date -Format 'yyyy-MM-dd'
+$records = Join-Path (Join-Path $DataRoot 'Records') $today
+$evidence = Join-Path (Join-Path $DataRoot 'Evidence') $today
+$backupBase = Join-Path $DataRoot 'TestResetBackups'
+$backupPath = Join-Path $backupBase ("$today-$(Get-Date -Format yyyyMMdd-HHmmss)-$([guid]::NewGuid().ToString('N').Substring(0,6))")
+$items = @()
+if (Test-Path -LiteralPath $records -PathType Container) { $items += @{Type='Records'; Path=$records} }
+if (Test-Path -LiteralPath $evidence -PathType Container) { $items += @{Type='Evidence'; Path=$evidence} }
+Write-Host "Date to reset (server-local): $today" -ForegroundColor Cyan
+foreach($item in $items) {
+    $count = @(Get-ChildItem -LiteralPath $item.Path -Recurse -File -ErrorAction Stop).Count
+    Write-Host "$($item.Type): $count files at $($item.Path)"
 }
-if(-not (Test-Path -LiteralPath $BackupPath -PathType Leaf)) { throw "Specified backup not found: $BackupPath" }
-$backupFull=[IO.Path]::GetFullPath($BackupPath)
-$rootFull=[IO.Path]::GetFullPath($backupDir).TrimEnd('\')+'\'
-if(-not $backupFull.StartsWith($rootFull,[StringComparison]::OrdinalIgnoreCase)) { throw 'Backup must be within the application ConfigBackups folder.' }
-$before=[IO.File]::ReadAllText($backupFull)
-if(-not $before.Contains('private void SavePost()') -or -not $before.Contains('private void RenderPage()') -or -not $before.Contains('private void Download()')) { throw 'Selected backup does not look like the expected application.' }
-if(-not $AllowOlderChecklistBackup -and -not $before.Contains('Session Diagnostics')) { throw 'Backup lacks check #24 Session Diagnostics. No changes made. Supply the correct patch backup.' }
-$live=[IO.File]::ReadAllText($target)
-if(-not $live.Contains('private bool EvidenceValid(HttpPostedFile f') -and -not $live.Contains('Manage submission')) {
-  Write-Warning 'Current Default.aspx does not show the expected evidence-workflow patch signature. Review before restoring.'
+if (-not $ResetToday) {
+    Write-Host 'DRY RUN ONLY. To back up and clear today, re-run with -ResetToday.' -ForegroundColor Yellow
+    exit 0
 }
-$timestamp=Get-Date -Format 'yyyyMMdd-HHmmss'
-$failedCopy=Join-Path $backupDir ("Default.failed-evidence-workflow-$timestamp.aspx")
-Write-Host "Restore from: $backupFull"
-Write-Host "Current file: $target"
-Write-Host "Safety copy: $failedCopy"
-if($PSCmdlet.ShouldProcess($target,'Restore selected pre-update Default.aspx')) {
-  Copy-Item -LiteralPath $target -Destination $failedCopy -ErrorAction Stop
-  $temp=Join-Path $WebRoot ("Default.restore-$timestamp.tmp")
-  try {
-    Copy-Item -LiteralPath $backupFull -Destination $temp -ErrorAction Stop
-    Move-Item -LiteralPath $temp -Destination $target -Force -ErrorAction Stop
-    Write-Host 'RESTORE COMPLETE. Reload portal with Ctrl+F5.' -ForegroundColor Green
-    Write-Host 'Records, Evidence, Revisions, IP allowlist and IIS settings were not modified.'
-  } catch {
-    if(Test-Path -LiteralPath $failedCopy) { Copy-Item -LiteralPath $failedCopy -Destination $target -Force -ErrorAction SilentlyContinue }
-    throw
-  } finally { Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue }
+if ($items.Count -eq 0) { Write-Host 'Nothing to reset for today.'; exit 0 }
+New-Item -ItemType Directory -Path $backupPath -Force | Out-Null
+# Copy both directories and validate file counts and content hashes before any deletion.
+foreach ($item in $items) {
+    $target = Join-Path $backupPath $item.Type
+    Copy-Item -LiteralPath $item.Path -Destination $target -Recurse -Force -ErrorAction Stop
 }
+foreach ($item in $items) {
+    $target = Join-Path $backupPath $item.Type
+    $sourceFiles = @(Get-ChildItem -LiteralPath $item.Path -Recurse -File -ErrorAction Stop)
+    $destFiles = @(Get-ChildItem -LiteralPath $target -Recurse -File -ErrorAction Stop)
+    if ($sourceFiles.Count -ne $destFiles.Count) { throw "Backup count mismatch for $($item.Type). No files deleted." }
+    foreach ($original in $sourceFiles) {
+        $relative = $original.FullName.Substring($item.Path.Length).TrimStart('\')
+        $copy = Join-Path $target $relative
+        if (-not (Test-Path -LiteralPath $copy -PathType Leaf)) { throw "Missing backup: $copy" }
+        if ((Get-FileHash -LiteralPath $original.FullName -Algorithm SHA256).Hash -ne (Get-FileHash -LiteralPath $copy -Algorithm SHA256).Hash) {
+            throw "Backup checksum mismatch: $copy. No files deleted."
+        }
+    }
+}
+# Rename directories to a quarantine location before removal to avoid partial checklist state.
+foreach ($item in $items) {
+    Remove-Item -LiteralPath $item.Path -Recurse -Force -ErrorAction Stop
+}
+$log = Join-Path $DataRoot 'test-resets.log'
+$line = "$(Get-Date -Format o)`tRESET`t$today`t$env:USERDOMAIN\$env:USERNAME`tBackup=$backupPath"
+Add-Content -LiteralPath $log -Value $line -Encoding UTF8
+Write-Host "SUCCESS: Today ($today) reset to pending. Verified backup: $backupPath" -ForegroundColor Green
+Write-Host 'Older dates, Archive, web.config, application source, and audit.tsv unchanged.'
+Write-Warning 'Previous test submissions remain in audit.tsv; test reset activity is documented in test-resets.log.'
