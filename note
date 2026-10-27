@@ -1,187 +1,50 @@
 #Requires -Version 5.1
-<#
-Patch the existing PAMDailyHealthCheck Default.aspx without touching checklist,
-web.config, authentication, HTTPS bindings, previous submissions, or archive job.
-Supports replacement/reopen and safe common evidence formats.
-#>
-[CmdletBinding()]
-param([string]$WebRoot='C:\inetpub\PAMDailyHealthCheck')
+<#[
+ Restores the pre-evidence-workflow Default.aspx backup.
+ Does not change stored evidence, records, web.config, or IIS site configuration.
+]#>
+[CmdletBinding(SupportsShouldProcess=$true,ConfirmImpact='High')]
+param(
+  [string]$WebRoot='C:\inetpub\PAMDailyHealthCheck',
+  [string]$BackupPath='',
+  [switch]$AllowOlderChecklistBackup
+)
 $ErrorActionPreference='Stop'
-Set-StrictMode -Version Latest
-$path=Join-Path $WebRoot 'Default.aspx'
-if(-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Missing $path" }
-$b=[IO.File]::ReadAllBytes($path)
-$bom=($b.Length -ge 3 -and $b[0] -eq 239 -and $b[1] -eq 187 -and $b[2] -eq 191)
-$utf8=New-Object System.Text.UTF8Encoding($bom,$true)
-$source=$utf8.GetString($b).TrimStart([char]0xFEFF)
-if($source.Contains('private bool EvidenceValid(HttpPostedFile f')) { Write-Host 'Evidence workflow already patched; no changes made.'; exit 0 }
-if(-not $source.Contains('private void SavePost()') -or -not $source.Contains('private void Download()') -or -not $source.Contains('private void RenderPage()')) { throw 'Unrecognized ASPX structure. No changes made.' }
-if(-not $source.Contains('if(r!=null) {') -or -not $source.Contains('} else if(editable) {')) { throw 'Unable to locate existing checklist renderer. No changes made.' }
-function Replace-Section([string]$text,[string]$from,[string]$to,[string]$replacement) {
-  $a=$text.IndexOf($from,[StringComparison]::Ordinal)
-  if($a -lt 0) { throw "Missing section: $from" }
-  $z=$text.IndexOf($to,$a+$from.Length,[StringComparison]::Ordinal)
-  if($z -lt 0) { throw "Missing following section: $to" }
-  return $text.Substring(0,$a)+$replacement+$text.Substring($z)
+$target=Join-Path $WebRoot 'Default.aspx'
+$backupDir=Join-Path $WebRoot 'ConfigBackups'
+if(-not (Test-Path -LiteralPath $target -PathType Leaf)) { throw "Default.aspx not found: $target" }
+if(-not (Test-Path -LiteralPath $backupDir -PathType Container)) { throw "Backup directory not found: $backupDir" }
+if([string]::IsNullOrWhiteSpace($BackupPath)) {
+  $all=@(Get-ChildItem -LiteralPath $backupDir -File -Filter 'Default.before-evidence-workflow-*.aspx' | Sort-Object LastWriteTime -Descending)
+  if($all.Count -eq 0) { throw 'No pre-evidence-workflow backup found. No changes made. Do NOT restore an unrelated or older backup.' }
+  $BackupPath=$all[0].FullName
 }
-$save=@'
-    private bool EvidenceValid(HttpPostedFile f, out string ext, out string reason) {
-      ext=""; reason="";
-      if(f==null || f.ContentLength==0) { reason="Select an evidence file."; return false; }
-      if(f.ContentLength > 9*1024*1024) { reason="Maximum evidence size is 9 MB."; return false; }
-      ext=Path.GetExtension(Path.GetFileName(f.FileName) ?? "").ToLowerInvariant();
-      string allowed="|.pdf|.jpg|.jpeg|.png|.gif|.webp|.txt|.csv|.doc|.docx|.xls|.xlsx|.ppt|.pptx|";
-      if(!allowed.Contains("|"+ext+"|")) { reason="Unsupported file type. Use PDF, images, text, CSV or Office documents."; return false; }
-      byte[] head=new byte[16]; int n=f.InputStream.Read(head,0,head.Length); f.InputStream.Position=0;
-      bool zip=n>=4 && head[0]==0x50 && head[1]==0x4b && head[2]==0x03 && head[3]==0x04;
-      bool ole=n>=8 && head[0]==0xd0 && head[1]==0xcf && head[2]==0x11 && head[3]==0xe0 && head[4]==0xa1 && head[5]==0xb1 && head[6]==0x1a && head[7]==0xe1;
-      bool pdf=n>=5 && head[0]==0x25 && head[1]==0x50 && head[2]==0x44 && head[3]==0x46 && head[4]==0x2d;
-      bool jpg=n>=3 && head[0]==0xff && head[1]==0xd8 && head[2]==0xff;
-      bool png=n>=8 && head[0]==137 && head[1]==80 && head[2]==78 && head[3]==71 && head[4]==13 && head[5]==10 && head[6]==26 && head[7]==10;
-      bool gif=n>=6 && head[0]==71 && head[1]==73 && head[2]==70 && head[3]==56 && (head[4]==55 || head[4]==57) && head[5]==97;
-      bool webp=n>=12 && head[0]==82 && head[1]==73 && head[2]==70 && head[3]==70 && head[8]==87 && head[9]==69 && head[10]==66 && head[11]==80;
-      bool plain=n>0 && !head.Take(n).Any(b=>b==0);
-      bool ok=(ext==".pdf" && pdf) || ((ext==".jpg" || ext==".jpeg") && jpg) || (ext==".png" && png) || (ext==".gif" && gif) || (ext==".webp" && webp) || ((ext==".txt" || ext==".csv") && plain) || ((ext==".docx" || ext==".xlsx" || ext==".pptx") && zip) || ((ext==".doc" || ext==".xls" || ext==".ppt") && ole);
-      if(!ok) { reason="The file content does not match its extension."; return false; }
-      return true;
-    }
-    private string NewEvidenceName(int id, string ext) {
-      string desc=System.Text.RegularExpressions.Regex.Replace(Checks[id-1],@"[^A-Za-z0-9]+","-").Trim('-');
-      if(desc.Length>75) desc=desc.Substring(0,75).TrimEnd('-');
-      return id.ToString("00")+"_"+desc+"_"+Guid.NewGuid().ToString("N")+ext;
-    }
-    private void SavePost() {
-      string token=Request.Form["csrf"] ?? "";
-      if(token.Length!=32 || !String.Equals(token,Token,StringComparison.Ordinal)) { Flash("Session expired. Refresh and try again.",true); return; }
-      int id; if(!Int32.TryParse(Request.Form["id"],out id) || id<1 || id>Checks.Length) { Flash("Invalid check number.",true); return; }
-      string action=Request.Form["outcome"] ?? "";
-      if(action!="Completed" && action!="Issue" && action!="Replace" && action!="Reopen") { Flash("Unsupported action.",true); return; }
-      string note=(Request.Form["notes"] ?? "").Trim();
-      if(note.Length>2000) { Flash("Notes exceed 2,000 characters.",true); return; }
-      if(action=="Issue" && note.Length==0) { Flash("Describe the issue before submitting.",true); return; }
-      var upload=Request.Files["evidence"];
-      string ext="",reason="";
-      if(action=="Completed" || action=="Replace") {
-        if(!EvidenceValid(upload,out ext,out reason)) { Flash(reason,true); return; }
-      } else if(upload!=null && upload.ContentLength>0 && !EvidenceValid(upload,out ext,out reason)) { Flash(reason,true); return; }
-      string day=DateKey;
-      lock(WriteLock) {
-        string file=RecordPath(day,id);
-        bool exists=File.Exists(file);
-        if((action=="Completed" || action=="Issue") && exists) { Flash("Already submitted today. Choose Replace evidence or Reopen instead.",true); return; }
-        if((action=="Replace" || action=="Reopen") && !exists) { Flash("This check has not been submitted today.",true); return; }
-        Directory.CreateDirectory(RootDir("Records",day));
-        Directory.CreateDirectory(RootDir("Evidence",day));
-        string existingEvidence="",oldStatus="";
-        if(exists) {
-          try { var old=XDocument.Load(file).Root; existingEvidence=Attr(old,"evidence"); oldStatus=Attr(old,"outcome"); }
-          catch { Flash("Existing record could not be read. Nothing changed.",true); return; }
-        }
-        string saved="",staged="";
-        try {
-          string revisionDir=Path.Combine(DataRoot,"Revisions",day,id.ToString("00"),DateTime.UtcNow.ToString("yyyyMMddTHHmmssfff")+"_"+Guid.NewGuid().ToString("N"));
-          // Retain immutable previous record and evidence before any change.
-          if(exists) {
-            Directory.CreateDirectory(revisionDir);
-            File.Copy(file,Path.Combine(revisionDir,"record.xml"),false);
-            if(existingEvidence!="" && System.Text.RegularExpressions.Regex.IsMatch(existingEvidence,@"^\d{2}_(?:[A-Za-z0-9-]{1,75}_)?[0-9a-f]{32}\.[A-Za-z0-9]{1,5}$")) {
-              string previous=EvidencePath(day,existingEvidence);
-              if(File.Exists(previous)) File.Copy(previous,Path.Combine(revisionDir,existingEvidence),false);
-            }
-          }
-          if(action!="Reopen") {
-            if(upload!=null && upload.ContentLength>0) {
-              saved=NewEvidenceName(id,ext);
-              using(var fs=new FileStream(EvidencePath(day,saved),FileMode.CreateNew,FileAccess.Write,FileShare.None)) upload.InputStream.CopyTo(fs);
-            } else saved=existingEvidence;
-            string newStatus=(action=="Replace") ? oldStatus : action;
-            XElement element=new XElement("HealthCheck",new XAttribute("id",id),new XAttribute("date",day),new XAttribute("outcome",newStatus),new XAttribute("user",Context.User.Identity.Name),new XAttribute("utc",DateTime.UtcNow.ToString("o")),new XAttribute("evidence",saved),new XElement("Notes",note));
-            staged=file+"."+Guid.NewGuid().ToString("N")+".tmp";
-            new XDocument(element).Save(staged);
-            if(exists) File.Replace(staged,file,null); else File.Move(staged,file);
-          } else File.Delete(file);
-          // Prior evidence is retained in Revisions; remove previous active copy after successful update.
-          if(exists && existingEvidence!="" && existingEvidence!=saved) {
-            string prior=EvidencePath(day,existingEvidence);
-            if(File.Exists(prior) && File.Exists(Path.Combine(revisionDir,existingEvidence))) { try { File.Delete(prior); } catch {} }
-          }
-          string who=(Context.User != null && Context.User.Identity != null) ? Context.User.Identity.Name : "";
-          File.AppendAllText(Path.Combine(DataRoot,"audit.tsv"),DateTime.UtcNow.ToString("o")+"\t"+day+"\t"+id+"\t"+action+"\t"+who+"\t"+saved+Environment.NewLine,Encoding.UTF8);
-          Flash(action=="Reopen" ? "Check "+id+" reopened for correction." : action=="Replace" ? "Evidence for check "+id+" replaced. Previous version retained." : "Check "+id+" submitted.",false);
-        } catch(Exception) {
-          if(staged!="" && File.Exists(staged)) { try { File.Delete(staged); } catch {} }
-          // Never delete the new upload if record replacement has succeeded.
-          if(saved!="" && !File.Exists(file)) { try { File.Delete(EvidencePath(day,saved)); } catch {} }
-          Flash("Unable to update this check. Contact the portal administrator.",true);
-        }
-      }
-      Response.Redirect(Request.RawUrl.Split('?')[0],false); Context.ApplicationInstance.CompleteRequest();
-    }
-'@
-$download=@'
-    private void Download() {
-      int id; string day=Request.QueryString["date"] ?? "";
-      DateTime validDate;
-      if(!DateTime.TryParseExact(day,"yyyy-MM-dd",CultureInfo.InvariantCulture,DateTimeStyles.None,out validDate) || !Int32.TryParse(Request.QueryString["download"],out id) || id<1 || id>Checks.Length) { Response.StatusCode=400; Context.ApplicationInstance.CompleteRequest(); return; }
-      XElement record=ReadRecord(day,id);
-      string filename=Attr(record,"evidence");
-      if(!System.Text.RegularExpressions.Regex.IsMatch(filename,@"^\d{2}_(?:[A-Za-z0-9-]{1,75}_)?[0-9a-f]{32}\.(pdf|jpe?g|png|gif|webp|txt|csv|docx?|xlsx?|pptx?)$",System.Text.RegularExpressions.RegexOptions.IgnoreCase)) { Response.StatusCode=404; Context.ApplicationInstance.CompleteRequest(); return; }
-      if(!filename.StartsWith(id.ToString("00")+"_",StringComparison.Ordinal)) { Response.StatusCode=404; Context.ApplicationInstance.CompleteRequest(); return; }
-      string path=EvidencePath(day,filename);
-      if(!File.Exists(path)) path=Path.Combine(DataRoot,"Archive",day,"Evidence",filename);
-      if(!File.Exists(path)) { Response.StatusCode=404; Context.ApplicationInstance.CompleteRequest(); return; }
-      Response.Clear(); Response.ContentType="application/octet-stream";
-      Response.AddHeader("X-Content-Type-Options","nosniff");
-      Response.AddHeader("Content-Disposition","attachment; filename=\""+filename+"\"");
-      Response.TransmitFile(path); Context.ApplicationInstance.CompleteRequest();
-    }
-'@
-$patched=Replace-Section $source '    private void SavePost() {' '    private void Flash(' $save
-$patched=Replace-Section $patched '    private void Download() {' '    private void RenderPage() {' $download
-# Add actions only to the existing completed-card branch; keep all later customizations intact.
-$needle='        } else if(editable) {'
-$inject=@'
-          if(editable) {
-            sb.Append("<details class='amend'><summary>Manage submission</summary><p class='muted'>Upload a corrected evidence file, or reopen this check to submit it again. Previous versions are kept in the local Revisions folder.</p>");
-            sb.Append("<form method='post' enctype='multipart/form-data'><input type='hidden' name='csrf' value='"+H(Token)+"'><input type='hidden' name='id' value='"+i+"'><label class='muted'>Correction notes (optional)</label><textarea name='notes' maxlength='2000' placeholder='Reason for replacing the evidence'></textarea><div class='formrow'><input type='file' name='evidence' accept='.pdf,.jpg,.jpeg,.png,.gif,.webp,.txt,.csv,.doc,.docx,.xls,.xlsx,.ppt,.pptx' required><button type='submit' name='outcome' value='Replace' onclick='return confirm(&quot;Replace the current evidence? The previous version will be retained for audit.&quot;)'>Replace Evidence</button></div></form>");
-            sb.Append("<form method='post'><input type='hidden' name='csrf' value='"+H(Token)+"'><input type='hidden' name='id' value='"+i+"'><button type='submit' class='warn' name='outcome' value='Reopen' onclick='return confirm(&quot;Reopen this check? The current submission will be retained in Revisions, and the check will become Pending.&quot;)'>Reopen Check</button></form></details>");
-          }
-        } else if(editable) {
-'@
-if(([regex]::Matches($patched,[regex]::Escape($needle))).Count -ne 1) { throw 'Multiple renderer insertion points detected; refusing to patch.' }
-$patched=$patched.Replace($needle,$inject.TrimEnd("`r","`n"))
-# Any original accept attribute: replace only its known file selector variants
-$patched=$patched.Replace("accept='.doc,.docx'","accept='.pdf,.jpg,.jpeg,.png,.gif,.webp,.txt,.csv,.doc,.docx,.xls,.xlsx,.ppt,.pptx'")
-$patched=$patched.Replace('A Word evidence document is required','An evidence file is required')
-$patched=$patched.Replace('Download Word Evidence','Download Evidence').Replace('Download Word evidence','Download Evidence')
-$patched=$patched.Replace('Completed items require .doc/.docx evidence (up to 9 MB).','Completed items require evidence (PDF, image, text, CSV or Office file; up to 9 MB).')
-$patched=$patched.Replace('local Word evidence.','local supporting evidence.')
-$patched=$patched.Replace('Each item is signed once per day.','Each item can be reopened or its evidence replaced.')
-# Current app has no user-side reset; selecting a file can always be cancelled before submit.
-# Add JS clear control adjacent to upload inputs via delegated handler, without affecting POST workflow.
-# Append to the final render-generated HTML, not the ASPX source outside script.
-$tag='      Response.ContentType="text/html; charset=utf-8"; Response.Write(sb.ToString());'
-if(-not $patched.Contains($tag)) { throw 'Unexpected HTML rendering code. No files changed.' }
-# JavaScript clear control inserted in server-generated markup via string literal.
-$jsCsharp='      sb.Append(@"<script>document.addEventListener(''DOMContentLoaded'',function(){document.querySelectorAll(''input[type=file][name=evidence]'').forEach(function(input){var clear=document.createElement(''button'');clear.type=''button'';clear.textContent=''Clear selection'';clear.style.cssText=''background:#62758a;padding:7px 11px;font-size:12px'';clear.addEventListener(''click'',function(){input.value='''';});input.insertAdjacentElement(''afterend'',clear);});});</script>");'
-# Replace doubled JS single quotes: inside C# verbatim string, single quotes should not be doubled.
-$jsCsharp=$jsCsharp.Replace("''","'")
-$patched=$patched.Replace($tag,$jsCsharp+"`r`n"+$tag)
-if(-not $patched.Contains('private bool EvidenceValid(HttpPostedFile f') -or -not $patched.Contains('Replace Evidence') -or -not $patched.Contains('Reopen Check')) { throw 'Patch self-validation failed.' }
-$backupDir=Join-Path $WebRoot 'ConfigBackups'; [void][IO.Directory]::CreateDirectory($backupDir)
-$stamp=Get-Date -Format 'yyyyMMdd-HHmmss'
-$backup=Join-Path $backupDir ("Default.before-evidence-workflow-$stamp.aspx")
-Copy-Item -LiteralPath $path -Destination $backup -ErrorAction Stop
-$staged="$path.$stamp.staged"
-try {
- [IO.File]::WriteAllText($staged,$patched,$utf8)
- if(-not ([IO.File]::ReadAllText($staged)).Contains('Reopen Check')) { throw 'Staged verification failed.' }
- Move-Item -LiteralPath $staged -Destination $path -Force
- Write-Host 'Updated health check upload workflow. Refresh the portal.' -ForegroundColor Green
- Write-Host "Backup: $backup"
- Write-Host 'Previous evidence will be saved under DataRoot\Revisions\yyyy-MM-dd\checkID.'
- Write-Host 'No changes made to web.config, existing records, IP rules, or IIS.'
-} catch {
- Copy-Item -LiteralPath $backup -Destination $path -Force -ErrorAction SilentlyContinue
- throw
-} finally { Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue }
+if(-not (Test-Path -LiteralPath $BackupPath -PathType Leaf)) { throw "Specified backup not found: $BackupPath" }
+$backupFull=[IO.Path]::GetFullPath($BackupPath)
+$rootFull=[IO.Path]::GetFullPath($backupDir).TrimEnd('\')+'\'
+if(-not $backupFull.StartsWith($rootFull,[StringComparison]::OrdinalIgnoreCase)) { throw 'Backup must be within the application ConfigBackups folder.' }
+$before=[IO.File]::ReadAllText($backupFull)
+if(-not $before.Contains('private void SavePost()') -or -not $before.Contains('private void RenderPage()') -or -not $before.Contains('private void Download()')) { throw 'Selected backup does not look like the expected application.' }
+if(-not $AllowOlderChecklistBackup -and -not $before.Contains('Session Diagnostics')) { throw 'Backup lacks check #24 Session Diagnostics. No changes made. Supply the correct patch backup.' }
+$live=[IO.File]::ReadAllText($target)
+if(-not $live.Contains('private bool EvidenceValid(HttpPostedFile f') -and -not $live.Contains('Manage submission')) {
+  Write-Warning 'Current Default.aspx does not show the expected evidence-workflow patch signature. Review before restoring.'
+}
+$timestamp=Get-Date -Format 'yyyyMMdd-HHmmss'
+$failedCopy=Join-Path $backupDir ("Default.failed-evidence-workflow-$timestamp.aspx")
+Write-Host "Restore from: $backupFull"
+Write-Host "Current file: $target"
+Write-Host "Safety copy: $failedCopy"
+if($PSCmdlet.ShouldProcess($target,'Restore selected pre-update Default.aspx')) {
+  Copy-Item -LiteralPath $target -Destination $failedCopy -ErrorAction Stop
+  $temp=Join-Path $WebRoot ("Default.restore-$timestamp.tmp")
+  try {
+    Copy-Item -LiteralPath $backupFull -Destination $temp -ErrorAction Stop
+    Move-Item -LiteralPath $temp -Destination $target -Force -ErrorAction Stop
+    Write-Host 'RESTORE COMPLETE. Reload portal with Ctrl+F5.' -ForegroundColor Green
+    Write-Host 'Records, Evidence, Revisions, IP allowlist and IIS settings were not modified.'
+  } catch {
+    if(Test-Path -LiteralPath $failedCopy) { Copy-Item -LiteralPath $failedCopy -Destination $target -Force -ErrorAction SilentlyContinue }
+    throw
+  } finally { Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue }
+}
