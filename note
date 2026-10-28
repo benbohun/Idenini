@@ -1,81 +1,78 @@
-#Requires -Version 5.1
-<#[
-Read-only local RDP/TLS preflight for a co-located CyberArk DPA/PSM host.
-Does not negotiate RDP TLS itself and cannot evaluate SIA tenant uploaded CA trust.
-#>
-[CmdletBinding()]
-param([string]$TargetFqdn='vskau1p1228.cna.com',[int]$Port=3389)
-$ErrorActionPreference='Continue'
-$results=New-Object System.Collections.Generic.List[object]
-function Add-Result {param($Check,$Status,$Details) $results.Add([pscustomobject]@{Check=$Check;Status=$Status;Details=[string]$Details})}
-function Match-DnsName { param([string]$Pattern,[string]$Name)
- if([string]::IsNullOrWhiteSpace($Pattern)){return $false}
- if($Pattern -ieq $Name){return $true}
- if($Pattern.StartsWith('*.')){ $suffix=$Pattern.Substring(1); return ($Name.EndsWith($suffix,[StringComparison]::OrdinalIgnoreCase) -and ($Name.Substring(0,$Name.Length-$suffix.Length).TrimEnd('.').IndexOf('.') -lt 0)) }
- return $false
+#Requires -RunAsAdministrator
+[CmdletBinding(SupportsShouldProcess=$true)]
+param(
+    [switch]$Apply,
+    [switch]$Rollback,
+    [string]$BackupFile,
+    [string]$BackupDirectory = 'C:\ProgramData\CyberArk-RDP-TLS-Backup'
+)
+$ErrorActionPreference = 'Stop'
+$ns = 'root/cimv2/TerminalServices'
+$filter = "TerminalName='RDP-tcp'"
+$policyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+$localPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
+function CurrentSetting {
+    Get-CimInstance -Namespace $ns -ClassName Win32_TSGeneralSetting -Filter $filter -ErrorAction Stop
 }
-Write-Host "`nCyberArk SIA / PSM RDP TLS Preflight (read only)" -ForegroundColor Cyan
-Write-Host "Target: $TargetFqdn`:$Port | Computer: $env:COMPUTERNAME" 
-foreach($name in @('CyberArkDPAConnector','CyberArk Privileged Session Manager','TermService')) {
- $svc=Get-Service -Name $name -ErrorAction SilentlyContinue
- if($svc){Add-Result "Service $name" $(if($svc.Status -eq 'Running'){'PASS'}else{'WARN'}) $svc.Status}
- else {Add-Result "Service $name" 'WARN' 'Not found under this service name'}
+function Set-Layer([int]$layer) {
+    $obj = CurrentSetting
+    $result = Invoke-CimMethod -InputObject $obj -MethodName SetSecurityLayer -Arguments @{SecurityLayer=[uint32]$layer}
+    if ($result.ReturnValue -ne 0) { throw "SetSecurityLayer failed, return value $($result.ReturnValue). Check RDP policy and encryption level." }
 }
-try {
- $addresses=[System.Net.Dns]::GetHostAddresses($TargetFqdn) | ForEach-Object IPAddressToString
- Add-Result 'DNS resolution' 'INFO' ($addresses -join ', ')
- if($addresses -contains '::1'){Add-Result 'IPv6 loopback result' 'WARN' 'FQDN resolves to ::1; inspect hosts file/DNS policy; not proof of RDP failure'}
-} catch {Add-Result 'DNS resolution' 'FAIL' $_.Exception.Message}
-try {
- $tcp=New-Object System.Net.Sockets.TcpClient
- $ar=$tcp.BeginConnect($TargetFqdn,$Port,$null,$null)
- $connected=$ar.AsyncWaitHandle.WaitOne(4000,$false)
- if($connected){try{$tcp.EndConnect($ar);Add-Result 'RDP TCP reachability' 'PASS' "$TargetFqdn`:$Port reachable"}catch{Add-Result 'RDP TCP reachability' 'FAIL' $_.Exception.Message}}
- else {Add-Result 'RDP TCP reachability' 'FAIL' 'TCP connection timed out after 4 seconds'}
- $tcp.Close()
-} catch {Add-Result 'RDP TCP reachability' 'FAIL' $_.Exception.Message}
-try {
- $listener=Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction Stop
- Add-Result 'RDP port listener' 'PASS' (($listener|ForEach-Object {"$($_.LocalAddress):$($_.LocalPort) PID=$($_.OwningProcess)"}) -join '; ')
-} catch {Add-Result 'RDP port listener' 'WARN' $_.Exception.Message}
-try {
- $rdp=Get-CimInstance -Namespace root/cimv2/TerminalServices -ClassName Win32_TSGeneralSetting -Filter "TerminalName='RDP-tcp'" -ErrorAction Stop
- if(-not $rdp){throw 'RDP-tcp settings not found'}
- $layer=@{'0'='RDP Security';'1'='Negotiate';'2'='SSL/TLS'}[[string]$rdp.SecurityLayer]
- Add-Result 'RDP SecurityLayer' 'INFO' "$($rdp.SecurityLayer) ($layer)"
- Add-Result 'RDP UserAuthentication (NLA)' 'INFO' "Value=$($rdp.UserAuthentication) (1 usually requires NLA)"
- $thumb=([string]$rdp.SSLCertificateSHA1Hash -replace '[^a-fA-F0-9]','').ToUpperInvariant()
- if(!$thumb){Add-Result 'RDP certificate binding' 'WARN' 'No thumbprint returned by WMI; Windows may use an automatically generated RDP certificate'}
- else {
-  Add-Result 'RDP certificate binding' 'INFO' "Thumbprint $thumb"
-  $cert=Get-ChildItem Cert:\LocalMachine -Recurse -ErrorAction SilentlyContinue | Where-Object {$_.Thumbprint -eq $thumb} | Select-Object -First 1
-  if(!$cert){Add-Result 'Bound certificate location' 'WARN' 'Thumbprint not found in enumerated LocalMachine stores (RDP store permissions/storage may differ)'}
-  else {
-   Write-Host "`nBound certificate: Subject=$($cert.Subject) | Issuer=$($cert.Issuer) | Expires=$($cert.NotAfter)" -ForegroundColor Cyan
-   Add-Result 'Certificate validity dates' $(if($cert.NotBefore -le (Get-Date) -and $cert.NotAfter -gt (Get-Date)){'PASS'}else{'FAIL'}) "NotBefore=$($cert.NotBefore); NotAfter=$($cert.NotAfter)"
-   $names=@()
-   foreach($ext in $cert.Extensions){if($ext.Oid.Value -eq '2.5.29.17') { $formatted=$ext.Format($true); $names+=([regex]::Matches($formatted,'DNS Name\s*=\s*([^\r\n,]+)') | ForEach-Object {$_.Groups[1].Value.Trim()}) }}
-   if($names.Count -gt 0) {Add-Result 'Certificate DNS SAN' $(if(@($names|Where-Object {Match-DnsName $_ $TargetFqdn}).Count -gt 0){'PASS'}else{'FAIL'}) ($names -join ', ')}
-   else {Add-Result 'Certificate DNS SAN' 'WARN' 'No DNS SAN identified; check certificate manually (CN alone may not satisfy clients)'}
-   $eku=@($cert.EnhancedKeyUsageList | ForEach-Object {$_.ObjectId})
-   $accepted=@('1.3.6.1.5.5.7.3.1','1.3.6.1.4.1.311.54.1.2')
-   Add-Result 'Server/RDP Authentication EKU' $(if($eku.Count -eq 0){'INFO'}elseif(@($eku|Where-Object {$accepted -contains $_}).Count -gt 0){'PASS'}else{'WARN'}) ($eku -join ', ')
-   $chain=New-Object System.Security.Cryptography.X509Certificates.X509Chain
-   $chain.ChainPolicy.RevocationMode=[System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
-   $ok=$chain.Build($cert)
-   $chainstatus=($chain.ChainStatus|ForEach-Object {"$($_.Status): $($_.StatusInformation.Trim())"}) -join '; '
-   Add-Result 'Local Windows certificate trust' $(if($ok){'PASS'}else{'WARN'}) $(if($ok){'Chain builds locally; revocation NOT checked'}else{$chainstatus})
-   Write-Host 'Certificate chain (leaf to root):' -ForegroundColor Cyan
-   $chain.ChainElements | ForEach-Object {Write-Host " - $($_.Certificate.Subject) | $($_.Certificate.Thumbprint)"}
-  }
- }
-} catch {Add-Result 'RDP WMI / certificate check' 'WARN' $_.Exception.Message}
-try {
- $reg=Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -ErrorAction Stop
- Add-Result 'RDP registry SecurityLayer' 'INFO' "SecurityLayer=$($reg.SecurityLayer); UserAuthentication=$($reg.UserAuthentication) (WMI/GPO may supersede)"
-} catch {Add-Result 'RDP registry check' 'WARN' $_.Exception.Message}
-Add-Result 'SIA tenant TLS trust' 'NOT TESTED' 'Cannot verify uploaded CA certificates or tenant Target Validation from local Windows PowerShell. Use CyberArk SIA Doctor check-target and SIA portal.'
-Add-Result 'Live RDP TLS handshake' 'NOT TESTED' 'TCP and installed certificate checks do not prove RDP X.224/TLS negotiation or what certificate the connector receives.'
-Write-Host "`n=== SUMMARY ===" -ForegroundColor Cyan
-$results | Format-Table -AutoSize -Wrap
-Write-Host "`nNext: run SIA Doctor check-target with protocol RDP to validate the actual server cert against SIA tenant-uploaded trust." -ForegroundColor Yellow
+$service = Get-Service TermService -ErrorAction SilentlyContinue
+$setting = CurrentSetting
+$policy = if (Test-Path $policyPath) { Get-ItemProperty $policyPath -ErrorAction Stop } else { $null }
+$policyLayer = if ($null -ne $policy -and $policy.PSObject.Properties.Name -contains 'SecurityLayer') { $policy.SecurityLayer } else { $null }
+Write-Host "Host: $env:COMPUTERNAME" -ForegroundColor Cyan
+Write-Host "TermService: $($service.Status)"
+Write-Host "Effective SecurityLayer: $($setting.SecurityLayer) (0=RDP, 1=Negotiate, 2=SSL/TLS)"
+Write-Host "PolicySourceSecurityLayer: $($setting.PolicySourceSecurityLayer) (0=server,1=GPO,2=default)"
+Write-Host "GPO registry SecurityLayer: $policyLayer"
+Write-Host "MinEncryptionLevel: $($setting.MinEncryptionLevel)"
+Write-Host "RDP certificate thumbprint: $($setting.SSLCertificateSHA1Hash)"
+if ($Apply -and $Rollback) { throw 'Specify only -Apply or -Rollback.' }
+if (-not $Apply -and -not $Rollback) {
+    Write-Host 'Audit only. Use -Apply to require SSL/TLS, or -Rollback -BackupFile <path> to restore.' -ForegroundColor Yellow
+    return
+}
+if ($setting.PolicySourceSecurityLayer -eq 1 -or $null -ne $policyLayer) {
+    throw "RDP security layer is controlled by Group Policy. No changes made. Change 'Require use of specific security layer for remote (RDP) connections' to SSL in the applicable GPO."
+}
+if ($Rollback) {
+    if (-not $BackupFile) { throw 'Provide -BackupFile pointing to an earlier JSON backup.' }
+    $backup = Get-Content -LiteralPath $BackupFile -Raw | ConvertFrom-Json
+    if ($backup.ComputerName -ne $env:COMPUTERNAME) { throw 'Backup belongs to a different computer.' }
+    $previous = [int]$backup.SecurityLayer
+    if ($previous -notin 0,1,2) { throw 'Invalid previous SecurityLayer in backup.' }
+    if ($PSCmdlet.ShouldProcess('Local RDP-Tcp','Restore SecurityLayer to ' + $previous)) { Set-Layer $previous }
+} else {
+    if ($setting.SecurityLayer -eq 2) { Write-Host 'Already configured for SSL/TLS. No change needed.' -ForegroundColor Green; return }
+    if ($setting.MinEncryptionLevel -eq 1) { throw 'RDP minimum encryption is Low (1); Windows does not permit SSL/TLS SecurityLayer=2 with this encryption level. No changes made.' }
+    if ([string]::IsNullOrWhiteSpace($setting.SSLCertificateSHA1Hash)) { throw 'No bound RDP TLS certificate. No changes made.' }
+    $thumb = $setting.SSLCertificateSHA1Hash -replace '\s',''
+    $cert = Get-ChildItem Cert:\LocalMachine -Recurse -ErrorAction SilentlyContinue | Where-Object Thumbprint -eq $thumb | Select-Object -First 1
+    if (-not $cert -or -not $cert.HasPrivateKey -or $cert.NotAfter -le (Get-Date) -or $cert.NotBefore -gt (Get-Date)) {
+        throw 'Bound RDP certificate is absent, invalid, or has no accessible private key. No changes made.'
+    }
+    if ($PSCmdlet.ShouldProcess('Local RDP-Tcp','Back up settings and set SecurityLayer to 2 (SSL/TLS)')) {
+        New-Item -ItemType Directory -Path $BackupDirectory -Force | Out-Null
+        $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+        $backupPath = Join-Path $BackupDirectory "RDP-TLS-$env:COMPUTERNAME-$stamp.json"
+        [pscustomobject]@{
+            ComputerName=$env:COMPUTERNAME
+            Timestamp=(Get-Date).ToString('o')
+            SecurityLayer=[int]$setting.SecurityLayer
+            PolicySourceSecurityLayer=[int]$setting.PolicySourceSecurityLayer
+            CertificateThumbprint=$thumb
+        } | ConvertTo-Json | Set-Content -LiteralPath $backupPath -Encoding UTF8
+        $regBackup = Join-Path $BackupDirectory "RDP-Tcp-$env:COMPUTERNAME-$stamp.reg"
+        & reg.exe export 'HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' $regBackup /y | Out-Null
+        Set-Layer 2
+        Write-Host "Backup JSON: $backupPath" -ForegroundColor Green
+        Write-Host "Registry backup: $regBackup"
+    }
+}
+$new = CurrentSetting
+Write-Host "Current effective SecurityLayer: $($new.SecurityLayer)" -ForegroundColor Cyan
+if ($new.SecurityLayer -ne $(if ($Rollback) {$previous} else {2})) { Write-Warning 'Setting does not match requested value. Check Group Policy and applied configuration.' }
+Write-Warning 'Do not restart TermService automatically on a production PSM; it may disconnect sessions. Test a new connection in an approved change window and review SIA Session Diagnostics.'
