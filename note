@@ -1,85 +1,81 @@
-#Requires -RunAsAdministrator
-<#
-.SYNOPSIS
-  Backs up and optionally removes only the local CyberArk DPA Connector service and install folder.
-.EXAMPLE
-  .\Remove-CyberArkDPAConnector.ps1
-.EXAMPLE
-  .\Remove-CyberArkDPAConnector.ps1 -Remove
-.NOTES
-  Does not alter other CyberArk services, certificates, shared registry keys, or SIA cloud registration.
-  Does not uninstall an MSI product; if present, uninstall through Apps & Features first.
+#Requires -Version 5.1
+<#[
+Read-only local RDP/TLS preflight for a co-located CyberArk DPA/PSM host.
+Does not negotiate RDP TLS itself and cannot evaluate SIA tenant uploaded CA trust.
 #>
 [CmdletBinding()]
-param([switch]$Remove)
-$ErrorActionPreference = 'Stop'
-$ServiceName = 'CyberArkDPAConnector'
-$InstallDir = 'C:\Program Files\CyberArk\DPAConnector'
-$BackupRoot = 'C:\CyberArkDPA-RemovalBackup'
-$Stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-$BackupDir = Join-Path $BackupRoot $Stamp
-
-function Get-DPAService {
-    Get-CimInstance Win32_Service -Filter "Name='$ServiceName'" -ErrorAction Stop
+param([string]$TargetFqdn='vskau1p1228.cna.com',[int]$Port=3389)
+$ErrorActionPreference='Continue'
+$results=New-Object System.Collections.Generic.List[object]
+function Add-Result {param($Check,$Status,$Details) $results.Add([pscustomobject]@{Check=$Check;Status=$Status;Details=[string]$Details})}
+function Match-DnsName { param([string]$Pattern,[string]$Name)
+ if([string]::IsNullOrWhiteSpace($Pattern)){return $false}
+ if($Pattern -ieq $Name){return $true}
+ if($Pattern.StartsWith('*.')){ $suffix=$Pattern.Substring(1); return ($Name.EndsWith($suffix,[StringComparison]::OrdinalIgnoreCase) -and ($Name.Substring(0,$Name.Length-$suffix.Length).TrimEnd('.').IndexOf('.') -lt 0)) }
+ return $false
 }
-
-Write-Host "DPA service: $ServiceName" -ForegroundColor Cyan
-Write-Host "DPA directory: $InstallDir" -ForegroundColor Cyan
-$svc = Get-DPAService
-if ($svc) {
-    Write-Host "Service state: $($svc.State)"
-    Write-Host "Executable path: $($svc.PathName)"
-    # Safety: do not remove a service with this name if its executable points outside the dedicated folder.
-    $exePath = [Environment]::ExpandEnvironmentVariables($svc.PathName).Trim()
-    if ($exePath -notmatch '(?i)^[\s\"]*C:\\Program Files\\CyberArk\\DPAConnector\\') {
-        throw "Service executable is not under $InstallDir. Aborting to avoid deleting an unexpected service."
-    }
-} else { Write-Host 'DPA service is not registered.' }
-$hasDir = Test-Path -LiteralPath $InstallDir -PathType Container
-Write-Host "Installation folder found: $hasDir"
-if (-not $svc -and -not $hasDir) { Write-Host 'No local DPA connector service or installation folder found.'; return }
-if (-not $Remove) {
-    Write-Host 'Discovery mode only. No changes made. Run with -Remove to back up and remove.' -ForegroundColor Yellow
-    return
+Write-Host "`nCyberArk SIA / PSM RDP TLS Preflight (read only)" -ForegroundColor Cyan
+Write-Host "Target: $TargetFqdn`:$Port | Computer: $env:COMPUTERNAME" 
+foreach($name in @('CyberArkDPAConnector','CyberArk Privileged Session Manager','TermService')) {
+ $svc=Get-Service -Name $name -ErrorAction SilentlyContinue
+ if($svc){Add-Result "Service $name" $(if($svc.Status -eq 'Running'){'PASS'}else{'WARN'}) $svc.Status}
+ else {Add-Result "Service $name" 'WARN' 'Not found under this service name'}
 }
-$confirmation = Read-Host "Enter REMOVE-DPA to back up and remove only the DPA connector"
-if ($confirmation -cne 'REMOVE-DPA') { Write-Host 'Cancelled; no changes made.'; return }
-New-Item -Path $BackupDir -ItemType Directory -Force | Out-Null
-if ($svc) {
-    $svc | Select-Object Name, DisplayName, State, StartMode, PathName, StartName |
-        Format-List | Out-File -LiteralPath (Join-Path $BackupDir 'service-details.txt') -Encoding utf8
-}
-if ($hasDir) {
-    Write-Host 'Backing up DPA installation folder ...'
-    Copy-Item -LiteralPath $InstallDir -Destination (Join-Path $BackupDir 'DPAConnector') -Recurse -Force
-    # A copy error must stop the operation before deletion.
-}
-Write-Host "Backup saved to $BackupDir" -ForegroundColor Green
-if ($svc) {
-    Write-Host 'Stopping DPA service ...'
-    if ($svc.State -ne 'Stopped') {
-        & sc.exe stop $ServiceName | Out-Host
-        Start-Sleep -Seconds 4
-    }
-    $svc = Get-DPAService
-    if ($svc -and $svc.ProcessId -gt 0) {
-        $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$($svc.ProcessId)" -ErrorAction SilentlyContinue
-        if ($proc -and $proc.ExecutablePath -and $proc.ExecutablePath.StartsWith($InstallDir + '\', [StringComparison]::OrdinalIgnoreCase)) {
-            Write-Host "Stopping lingering DPA process PID $($svc.ProcessId) ..."
-            Stop-Process -Id $svc.ProcessId -Force -ErrorAction Stop
-        } else { throw 'The remaining service process could not be verified as a DPA executable. Aborting.' }
-    }
-    Write-Host 'Deleting DPA Windows service ...'
-    & sc.exe delete $ServiceName | Out-Host
-    if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 1060) { throw "sc.exe delete failed: $LASTEXITCODE. Folder retained." }
-}
-if (Test-Path -LiteralPath $InstallDir -PathType Container) {
-    Write-Host 'Removing dedicated DPA installation folder ...'
-    Remove-Item -LiteralPath $InstallDir -Recurse -Force -ErrorAction Stop
-}
-Write-Host 'Local DPA cleanup completed.' -ForegroundColor Green
-Write-Host "Backup: $BackupDir"
-Write-Host 'Verify: Get-Service CyberArkDPAConnector -ErrorAction SilentlyContinue'
-Write-Host "Verify: Test-Path '$InstallDir'"
-Write-Warning 'If Windows says the service is marked for deletion, close Services.msc or reboot before reinstalling.'
-Write-Warning 'MSI/Programs registration and SIA cloud connector registration are intentionally not removed.'
+try {
+ $addresses=[System.Net.Dns]::GetHostAddresses($TargetFqdn) | ForEach-Object IPAddressToString
+ Add-Result 'DNS resolution' 'INFO' ($addresses -join ', ')
+ if($addresses -contains '::1'){Add-Result 'IPv6 loopback result' 'WARN' 'FQDN resolves to ::1; inspect hosts file/DNS policy; not proof of RDP failure'}
+} catch {Add-Result 'DNS resolution' 'FAIL' $_.Exception.Message}
+try {
+ $tcp=New-Object System.Net.Sockets.TcpClient
+ $ar=$tcp.BeginConnect($TargetFqdn,$Port,$null,$null)
+ $connected=$ar.AsyncWaitHandle.WaitOne(4000,$false)
+ if($connected){try{$tcp.EndConnect($ar);Add-Result 'RDP TCP reachability' 'PASS' "$TargetFqdn`:$Port reachable"}catch{Add-Result 'RDP TCP reachability' 'FAIL' $_.Exception.Message}}
+ else {Add-Result 'RDP TCP reachability' 'FAIL' 'TCP connection timed out after 4 seconds'}
+ $tcp.Close()
+} catch {Add-Result 'RDP TCP reachability' 'FAIL' $_.Exception.Message}
+try {
+ $listener=Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction Stop
+ Add-Result 'RDP port listener' 'PASS' (($listener|ForEach-Object {"$($_.LocalAddress):$($_.LocalPort) PID=$($_.OwningProcess)"}) -join '; ')
+} catch {Add-Result 'RDP port listener' 'WARN' $_.Exception.Message}
+try {
+ $rdp=Get-CimInstance -Namespace root/cimv2/TerminalServices -ClassName Win32_TSGeneralSetting -Filter "TerminalName='RDP-tcp'" -ErrorAction Stop
+ if(-not $rdp){throw 'RDP-tcp settings not found'}
+ $layer=@{'0'='RDP Security';'1'='Negotiate';'2'='SSL/TLS'}[[string]$rdp.SecurityLayer]
+ Add-Result 'RDP SecurityLayer' 'INFO' "$($rdp.SecurityLayer) ($layer)"
+ Add-Result 'RDP UserAuthentication (NLA)' 'INFO' "Value=$($rdp.UserAuthentication) (1 usually requires NLA)"
+ $thumb=([string]$rdp.SSLCertificateSHA1Hash -replace '[^a-fA-F0-9]','').ToUpperInvariant()
+ if(!$thumb){Add-Result 'RDP certificate binding' 'WARN' 'No thumbprint returned by WMI; Windows may use an automatically generated RDP certificate'}
+ else {
+  Add-Result 'RDP certificate binding' 'INFO' "Thumbprint $thumb"
+  $cert=Get-ChildItem Cert:\LocalMachine -Recurse -ErrorAction SilentlyContinue | Where-Object {$_.Thumbprint -eq $thumb} | Select-Object -First 1
+  if(!$cert){Add-Result 'Bound certificate location' 'WARN' 'Thumbprint not found in enumerated LocalMachine stores (RDP store permissions/storage may differ)'}
+  else {
+   Write-Host "`nBound certificate: Subject=$($cert.Subject) | Issuer=$($cert.Issuer) | Expires=$($cert.NotAfter)" -ForegroundColor Cyan
+   Add-Result 'Certificate validity dates' $(if($cert.NotBefore -le (Get-Date) -and $cert.NotAfter -gt (Get-Date)){'PASS'}else{'FAIL'}) "NotBefore=$($cert.NotBefore); NotAfter=$($cert.NotAfter)"
+   $names=@()
+   foreach($ext in $cert.Extensions){if($ext.Oid.Value -eq '2.5.29.17') { $formatted=$ext.Format($true); $names+=([regex]::Matches($formatted,'DNS Name\s*=\s*([^\r\n,]+)') | ForEach-Object {$_.Groups[1].Value.Trim()}) }}
+   if($names.Count -gt 0) {Add-Result 'Certificate DNS SAN' $(if(@($names|Where-Object {Match-DnsName $_ $TargetFqdn}).Count -gt 0){'PASS'}else{'FAIL'}) ($names -join ', ')}
+   else {Add-Result 'Certificate DNS SAN' 'WARN' 'No DNS SAN identified; check certificate manually (CN alone may not satisfy clients)'}
+   $eku=@($cert.EnhancedKeyUsageList | ForEach-Object {$_.ObjectId})
+   $accepted=@('1.3.6.1.5.5.7.3.1','1.3.6.1.4.1.311.54.1.2')
+   Add-Result 'Server/RDP Authentication EKU' $(if($eku.Count -eq 0){'INFO'}elseif(@($eku|Where-Object {$accepted -contains $_}).Count -gt 0){'PASS'}else{'WARN'}) ($eku -join ', ')
+   $chain=New-Object System.Security.Cryptography.X509Certificates.X509Chain
+   $chain.ChainPolicy.RevocationMode=[System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
+   $ok=$chain.Build($cert)
+   $chainstatus=($chain.ChainStatus|ForEach-Object {"$($_.Status): $($_.StatusInformation.Trim())"}) -join '; '
+   Add-Result 'Local Windows certificate trust' $(if($ok){'PASS'}else{'WARN'}) $(if($ok){'Chain builds locally; revocation NOT checked'}else{$chainstatus})
+   Write-Host 'Certificate chain (leaf to root):' -ForegroundColor Cyan
+   $chain.ChainElements | ForEach-Object {Write-Host " - $($_.Certificate.Subject) | $($_.Certificate.Thumbprint)"}
+  }
+ }
+} catch {Add-Result 'RDP WMI / certificate check' 'WARN' $_.Exception.Message}
+try {
+ $reg=Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -ErrorAction Stop
+ Add-Result 'RDP registry SecurityLayer' 'INFO' "SecurityLayer=$($reg.SecurityLayer); UserAuthentication=$($reg.UserAuthentication) (WMI/GPO may supersede)"
+} catch {Add-Result 'RDP registry check' 'WARN' $_.Exception.Message}
+Add-Result 'SIA tenant TLS trust' 'NOT TESTED' 'Cannot verify uploaded CA certificates or tenant Target Validation from local Windows PowerShell. Use CyberArk SIA Doctor check-target and SIA portal.'
+Add-Result 'Live RDP TLS handshake' 'NOT TESTED' 'TCP and installed certificate checks do not prove RDP X.224/TLS negotiation or what certificate the connector receives.'
+Write-Host "`n=== SUMMARY ===" -ForegroundColor Cyan
+$results | Format-Table -AutoSize -Wrap
+Write-Host "`nNext: run SIA Doctor check-target with protocol RDP to validate the actual server cert against SIA tenant-uploaded trust." -ForegroundColor Yellow
